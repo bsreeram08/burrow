@@ -12,6 +12,6 @@
   "protocol": "chatcore-commands-1",
   "wasmBindgen": "0.2.129",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-  "source": "bd7411a022f7163dd98c32cebc9b8c8a918f6825a132897ca104e02be3822074",
+  "source": "4f9640e7f53f1b660203a07200c373cb261ead90899a800f814cb0313780968c",
   "host": "darwin-arm64"
 }

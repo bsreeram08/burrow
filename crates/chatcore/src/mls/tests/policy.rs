@@ -507,3 +507,46 @@ fn a_snapshot_of_another_group_or_a_corrupt_one_is_refused() {
     // The failed restores left the group intact.
     f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
 }
+
+#[test]
+fn a_pin_that_changes_after_verification_fails_the_next_gated_call() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let key = format!("peer:{}", f.carol.id);
+    // Verified and cached: these calls all pass without a restart.
+    f.b1.groups.encrypt(&mut f.b1.store, &gid, "ok").unwrap();
+    f.b1.groups.members(&mut f.b1.store, &gid).unwrap();
+
+    for (name, row) in [
+        ("blocked", Some(serde_json::json!({ "aik": f.carol.pin(), "blocked": true }))),
+        ("changed", Some(serde_json::json!({ "aik": Account::new().pin() }))),
+        ("deleted", None),
+    ] {
+        match &row { Some(value) => f.b1.store.put(&key, value.clone()).unwrap(), None => f.b1.store.delete(&key).unwrap() }
+        // No restart: the cached verification must not survive the pin change.
+        assert!(f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").is_err(), "{name}");
+        assert!(f.b1.groups.members(&mut f.b1.store, &gid).is_err(), "{name}");
+        assert!(f.b1.groups.process(&mut f.b1.store, &gid, &f.server.log[&g][0]).is_err(), "{name}");
+        f.b1.store.put(&key, serde_json::json!({ "aik": f.carol.pin() })).unwrap();
+        f.b1.groups.encrypt(&mut f.b1.store, &gid, "restored").unwrap();
+    }
+
+    // The DS side: the registry pin for a member changes under a verified group.
+    let msg = f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").unwrap();
+    assert!(f.server.submit(&g, &msg).is_ok());
+    let pin = format!("mlsdsx:pin:{}", f.carol.id);
+    f.server.store.delete(&pin).unwrap();
+    assert!(f.server.submit(&g, &msg).unwrap_err().message.contains("no pinned account key"));
+    f.server.store.put(&pin, serde_json::json!({ "aik": Account::new().pin() })).unwrap();
+    assert!(f.server.submit(&g, &msg).is_err());
+    f.server.store.put(&pin, serde_json::json!({ "aik": f.carol.pin() })).unwrap();
+    assert!(f.server.submit(&g, &msg).is_ok());
+
+    // The device's own certificate record changing is caught the same way.
+    let record = f.b1.store.get("mlsx:device").unwrap().unwrap();
+    let old: DeviceCert = serde_json::from_value(record["cert"].clone()).unwrap();
+    let swapped = DeviceCert::issue(&f.b1.aik, &old.user_id, &rid(), &old.platform, &key32(&old.leaf_sig_key).unwrap(), 0).unwrap();
+    f.b1.store.put("mlsx:device", serde_json::json!({ "cert": swapped })).unwrap();
+    assert!(f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").is_err());
+}

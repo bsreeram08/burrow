@@ -7,6 +7,8 @@ pub mod api;
 pub mod commands;
 pub mod core;
 pub mod error;
+#[cfg(any(feature = "mls", feature = "ds"))]
+pub mod mls;
 pub mod primitives;
 pub mod protocol;
 pub mod sas;

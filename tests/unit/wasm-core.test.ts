@@ -70,3 +70,29 @@ describe('committed WebAssembly core', () => {
         expect(brotli).toBeLessThanOrEqual(700 * 1024);
     });
 });
+
+// The delivery service's validator core (packages/signaling/ds-core): the same chatcore, built with `--features ds`.
+// The server loads it at startup and refuses to run on an unverifiable one (channels.test.ts).
+describe('committed delivery-service core', () => {
+    const dsDir = fileURLToPath(new URL('../../packages/signaling/ds-core/', import.meta.url));
+    const ds = JSON.parse(readFileSync(join(dsDir, 'manifest.json'), 'utf8')) as typeof manifest & { variant: string; features: string[]; source: string };
+    test('passes the same verification as the browser core and was built from the same source', () => {
+        expect([...verifyCore(dsDir).keys()].sort()).toEqual(['manifest.json', ds.js, ds.wasm].sort());
+        expect(ds).toMatchObject({ variant: 'ds', features: ['ds'], wasmBindgen: manifest.wasmBindgen });
+        expect(ds.source).toBe((manifest as any).source);
+    });
+    test('a modified validator is refused', () => {
+        const target = mkdtempSync(join(tmpdir(), 'ds-verify-'));
+        try {
+            cpSync(dsDir, target, { recursive: true });
+            const bytes = readFileSync(join(target, ds.wasm)); bytes[bytes.length - 1] ^= 1;
+            writeFileSync(join(target, ds.wasm), bytes);
+            expect(() => verifyCore(target)).toThrow('does not match its recorded SHA-256');
+        } finally { rmSync(target, { recursive: true, force: true }); }
+    });
+    test('size: at most 1.2 MB raw and 400 KB brotli (the server only; the browser never loads it)', () => {
+        const wasm = readFileSync(join(dsDir, ds.wasm));
+        expect(wasm.length).toBeLessThanOrEqual(1.2 * 1024 * 1024);
+        expect(brotliCompressSync(wasm, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length).toBeLessThanOrEqual(400 * 1024);
+    });
+});

@@ -304,8 +304,23 @@ export function createDevices(deps: Deps) {
         return [200, { revoked: [deviceId] }];
     }
 
+    /**
+     * A device that may hold an MLS leaf: named by the signed device list, whose signer is the account's current
+     * identity key (so its certificate chains to the AIK the list is signed with). Pending, revoked and placeholder
+     * devices, and any device after an identity change (which voids the lists), are not.
+     */
+    function eligible(userId: string, deviceId: string | null) {
+        if (!deviceId) return false;
+        const row = db.query<{ state: string }, [string, string]>('SELECT state FROM devices WHERE id = ? AND user_id = ?').get(deviceId, userId);
+        const list = db.query<{ aik_sign: string }, [string]>('SELECT aik_sign FROM device_lists WHERE user_id = ?').get(userId);
+        const aik = aikOf(userId);
+        return row?.state === 'listed' && Boolean(list && aik && list.aik_sign === aik);
+    }
+    /** The device's own registered Ed25519 key (its announce), which verifies what the device signs. */
+    const sigKey = (deviceId: string) => db.query<{ sig_key: string | null }, [string]>('SELECT sig_key FROM devices WHERE id = ?').get(deviceId)?.sig_key ?? null;
+
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, identityChanged, touch, sessionDevice };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, identityChanged, touch, sessionDevice, eligible, sigKey, aikOf };
 }
 export type Devices = ReturnType<typeof createDevices>;

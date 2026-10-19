@@ -9,6 +9,7 @@ import { requestLimiter } from './rate-limit';
 import type { Push } from './push';
 import { migrate } from './migrations';
 import { createDevices } from './devices';
+import type { Channels } from './channels';
 
 // Accounts identify people and introduce them; message content never reaches this module.
 // The server learns usernames, the contact graph, presence and passkey public keys.
@@ -18,7 +19,7 @@ export type SessionUser = User & { session: string; client: string };
 export const NATIVE_CLIENTS = new Set(['ios', 'android', 'macos', 'windows', 'linux']);
 /** Oldest app versions the server still supports; apps below these show "update required". */
 export const MIN_CLIENT = { ios: '1.0.0', android: '1.0.0', macos: '1.0.0', windows: '1.0.0', linux: '1.0.0' };
-export type EventsConnection = { kind: 'events'; userId: string; session: string; allow: () => boolean; sent: Set<string> };
+export type EventsConnection = { kind: 'events'; userId: string; session: string; allow: () => boolean; sent: Set<string>; groups: Map<string, number> };
 export type Calls = {
     /** Opens (or for calls, replaces) the pair's room and issues fresh participant credentials. */
     pairRoom(users: string[], requester: string, kind: 'chat' | 'voice' | 'video'): { roomId: string; token: string; peerToken?: string } | 'busy' | 'full';
@@ -75,6 +76,8 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     // Passkeys made in the Android app sign the app's key hash as their origin; iOS apps sign the web origin.
     const expectedOrigins = (client: string) => client === 'web' ? options.origin : [options.origin, ...(options.androidOrigins ?? [])];
     const listeners = new Map<string, Set<ServerWebSocket<EventsConnection>>>();
+    // Group delivery (channels.ts) plugs in here: it fans the log and Welcomes out through the same streams.
+    let channels: Channels | undefined;
     const allowAuth = requestLimiter({ perSource: 10, global: 100 });
     const allowSend = requestLimiter({ perSource: 20, global: 2000 }), allowEphemeral = requestLimiter({ perSource: 10, global: 2000 }), allowBundle = requestLimiter({ perSource: 3, global: 500 });
     // Each registration pushes a nonce to the claimed device, so one account may not trigger many per second.
@@ -223,7 +226,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         if (sent.size >= INFLIGHT || socket.readyState !== 1) return;
         // Envelopes are addressed to devices; a stream reads its own device's inbox (legacy clients: the primary's).
         const device = devices.inboxFor(userId, session);
-        if (!device) return; // An unbound session of an account whose messaging device is known: nothing for it.
+        if (!device) { channels?.pump(socket); return; } // An unbound session of an account whose messaging device is known: no 1:1 envelopes for it.
         const rows = db.query<{ id: string; sender_id: string; username: string; envelope: Uint8Array; created_at: number }, [string, number]>(
             'SELECT m.id, m.sender_id, u.username, m.envelope, m.created_at FROM device_inbox m JOIN users u ON u.id = m.sender_id WHERE m.device_id = ? AND m.created_at > ? ORDER BY m.created_at, m.id LIMIT 128').all(device, now() - MAILBOX_TTL);
         for (const row of rows) {
@@ -232,6 +235,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             sent.add(row.id);
             socket.send(JSON.stringify({ type: 'envelope', id: row.id, from: { id: row.sender_id, username: row.username }, envelope: Buffer.from(row.envelope).toString('base64url'), createdAt: row.created_at }));
         }
+        channels?.pump(socket);
     }
     /** Wakes the callee's devices unless an open app confirms the call is ringing on screen. */
     function ringOrPush(callee: string, from: string, kind: 'voice' | 'video', roomId: string) {
@@ -251,7 +255,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             const user = sessionUser(request);
             if (!user) return json({ error: 'Unauthorized' }, 401);
             if ((listeners.get(user.id)?.size ?? 0) >= 8) return json({ error: 'Too many connections' }, 429);
-            if (server.upgrade(request, { data: { kind: 'events', userId: user.id, session: user.session, allow: packetBudget(200), sent: new Set() } })) return undefined;
+            if (server.upgrade(request, { data: { kind: 'events', userId: user.id, session: user.session, allow: packetBudget(200), sent: new Set(), groups: new Map() } })) return undefined;
             return json({ error: 'WebSocket upgrade required' }, 400);
         }
         const path = url.pathname;
@@ -508,6 +512,11 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
 
     const self = {
         handle, notify, sessionUser, online, pump, devices,
+        /** For channels.ts: the account directory it needs, and the plug for group delivery. */
+        mutual, userByName,
+        streams: (userId: string) => listeners.get(userId) ?? [],
+        pumpUser(userId: string) { for (const socket of listeners.get(userId) ?? []) pump(socket); },
+        attach(next: Channels) { channels = next; },
         roomEnded(users: string[], roomId: string, code = 1000) {
             for (const id of users) notify(id, { type: 'ended', roomId });
             clearTimeout(ringAcks.get(roomId)); ringAcks.delete(roomId);
@@ -528,6 +537,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             closeDeadStreams();
             db.query('DELETE FROM device_inbox WHERE created_at <= ?').run(now() - MAILBOX_TTL);
             push?.sweep();
+            channels?.sweep();
         },
         events: {
             open(socket: ServerWebSocket<EventsConnection>) {
@@ -556,10 +566,12 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                     if (calls.ringingFor?.(socket.data.userId, message.roomId)) { clearTimeout(ringAcks.get(message.roomId)); ringAcks.delete(message.roomId); }
                     return;
                 }
+                if (message?.type === 'cursor' && channels && Object.keys(message).length === 3 && typeof message.channel === 'string' && Number.isSafeInteger(message.seq)) { channels.cursorFrame(socket, message); return; }
                 if (!message || message.type !== 'ack' || Object.keys(message).length !== 2 || typeof message.id !== 'string' || !MESSAGE_ID.test(message.id)) { socket.close(1008, 'Invalid event message'); return; }
                 // Only envelopes in this stream's own device inbox can be deleted.
                 const device = devices.inboxFor(socket.data.userId, socket.data.session);
                 if (device) db.query('DELETE FROM device_inbox WHERE id = ? AND device_id = ?').run(message.id, device);
+                channels?.ackWelcome(socket, message.id);
                 socket.data.sent.delete(message.id);
                 pump(socket);
             },

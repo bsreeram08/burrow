@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:uuid/uuid.dart';
@@ -273,6 +274,9 @@ class Messenger {
   /// Live-only envelopes carry typing and nothing else. They are never acknowledged (the server keeps
   /// nothing to delete) and any failure is dropped silently: a lost typing hint is harmless.
   Future<void> _receiveEphemeral(EnvelopeEvent event) async {
+    // Live-only envelopes may only continue an existing session: an X3DH initial message would claim a prekey
+    // slot outside the stored path, so it is dropped before decrypting.
+    if (startsSession(event.envelope)) return;
     try {
       final decrypted = await crypto.decryptFrom(event.fromId, event.envelope);
       // A new identity never arrives on a live-only envelope; a session must already exist.
@@ -286,10 +290,12 @@ class Messenger {
       } on PayloadException {
         payload = null;
       }
-      await crypto.commit(decrypted.commitId, rotate: false);
-      if (payload == null || payload['type'] != 'typing') return;
       final safety = await crypto.safety(me.username, event.fromId, event.fromUsername);
-      if (safety?.blocked ?? false) return;
+      if (payload == null || payload['type'] != 'typing' || (safety?.blocked ?? false)) {
+        await crypto.abort(decrypted.commitId); // Discarded unsaved, like the web client.
+        return;
+      }
+      await crypto.commit(decrypted.commitId, rotate: false);
       final on = payload['on'] as bool, at = payload['at'] as int;
       if (on && (_now() - at).abs() > typingFreshMs) return;
       _setTyping(event.fromId, on);
@@ -599,5 +605,15 @@ class Messenger {
     await _identity.close();
     await _activeChanges.close();
     await _lockedChanges.close();
+  }
+}
+
+/// True when an envelope carries an X3DH header (or can't be read): it would open a new session.
+bool startsSession(String envelope) {
+  try {
+    final packet = jsonDecode(utf8.decode(base64Url.decode(base64Url.normalize(envelope))));
+    return packet is! Map || packet.containsKey('x');
+  } catch (_) {
+    return true;
   }
 }

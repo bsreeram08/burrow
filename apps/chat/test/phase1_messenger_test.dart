@@ -216,4 +216,11 @@ void main() {
       expect(changes, isNotEmpty);
     });
   });
+
+  test('a live-only envelope that would open a session (X3DH header) or is unreadable is never decrypted', () {
+    String env(Map<String, Object?> packet) => base64Url.encode(utf8.encode(jsonEncode(packet))).replaceAll('=', '');
+    expect(startsSession(env({'v': 1, 'sid': 's', 'h': {}, 'c': '', 'x': {'spk': 1}})), isTrue);
+    expect(startsSession(env({'v': 1, 'sid': 's', 'h': {}, 'c': ''})), isFalse);
+    expect(startsSession('not base64 json'), isTrue);
+  });
 }

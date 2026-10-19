@@ -31,7 +31,7 @@ function events(cookie: string) {
     socket.onmessage = event => inbox.push(JSON.parse(String(event.data)));
     return { socket, inbox, opened: new Promise(resolve => socket.addEventListener('open', resolve, { once: true })) };
 }
-const stored = () => { const db = openDatabase(dataDir); const count = (db.query('SELECT COUNT(*) AS count FROM mailbox').get() as { count: number }).count; db.close(); return count; };
+const stored = () => { const db = openDatabase(dataDir); const count = (db.query('SELECT COUNT(*) AS count FROM device_inbox').get() as { count: number }).count; db.close(); return count; };
 
 describe('ephemeral envelopes', () => {
     test('reach every open stream of the recipient and are never stored', async () => {

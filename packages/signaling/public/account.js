@@ -194,15 +194,22 @@
   // ---------- Receiving ----------
   const coded = (code, text) => Object.assign(new Error(text), { code });
   const attempts = new Map();
+  /** True when an envelope carries an X3DH header (or can't be read): it would open a new session. */
+  function startsSession(envelope) {
+    try { return JSON.parse(atob(String(envelope).replace(/-/g, '+').replace(/_/g, '/'))).x !== undefined; } catch { return true; }
+  }
   async function receiveEnvelope(socket, message) {
     if (!await ready || !box) return; // Unacknowledged: redelivered once this device can decrypt.
     if (inactive) return; // Meant for the active device: never decrypt-fail and acknowledge it away.
     const from = message.from, conversationId = await pairId(from.id), viewing = () => body.dataset.screen === 'conversation' && current?.id === from.id;
     // Ephemeral envelopes (typing) were never stored by the server: nothing to acknowledge, nothing to report.
     if (message.ephemeral === true) {
+      // Live-only envelopes may only continue an existing session: an X3DH initial message here would claim a
+      // prekey slot and pin an identity outside the stored path's warnings. Anything but typing is discarded unsaved.
+      if (startsSession(message.envelope)) return;
       try {
         await box.decryptFrom(from.id, message.envelope, async (payload, info) => {
-          if (window.ChatStore.checkPayload(payload) !== 'typing' || info.identityChanged || (await box.peer(from.id))?.blocked) return;
+          if (window.ChatStore.checkPayload(payload) !== 'typing' || info.identity || info.identityChanged || (await box.peer(from.id))?.blocked) throw new Error('ignored');
           typing(from.id, payload);
         });
       } catch {}

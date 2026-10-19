@@ -7,6 +7,13 @@
   // form still shows the message. kind 'action' is a /me line; kind 'poll' carries {question, options}
   // and local tallies in `votes` ({me, peer}: option index or null) — 1:1 chats have two voters.
   const OPTIONAL = ['kind', 'poll', 'votes'], MAX_OPTIONS = 10, MAX_OPTION = 200;
+  // Phase 1 content (docs/phase1-protocol.md §1–3). `replyTo`, `attachment` and `link` arrive with the message
+  // and never change. `reactions` ({me, peer}: emoji lists) and `editedText`/`editedAt` are later mutations.
+  const CONTENT = ['replyTo', 'attachment', 'link'], MUTABLE = ['reactions', 'editedText', 'editedAt'];
+  const STATUSES = ['queued', 'sent', 'delivered', 'read', 'uncertain'], RANK = { queued: 0, uncertain: 0, sent: 1, delivered: 2, read: 3 };
+  const MAX_PAYLOAD = 16384, MAX_BLOB = 25 * 1024 * 1024, MAX_REACTIONS = 20, MAX_READ_IDS = 100;
+  const ATTACHMENT_KINDS = ['image', 'video', 'audio', 'voice', 'file'];
+  const B64URL = /^[A-Za-z0-9_-]+$/, MIME = /^[a-z0-9][a-z0-9.+-]{0,40}\/[a-z0-9][a-z0-9.+-]{0,60}(?:;[ -~]{0,60})?$/i, CUSTOM = /^:[a-z0-9_+-]{2,32}:$/; // Custom emoji names as the server allows them.
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const ROOM = /^[A-Za-z0-9_-]{43}$/;
   const FORMAT = 'webrtc-bun-chat-backup';
@@ -24,10 +31,64 @@
         poll.options.length < 2 || poll.options.length > MAX_OPTIONS || !poll.options.every(option => shortText(option, MAX_OPTION))) throw new Error('Invalid poll.');
     return { question: poll.question, options: [...poll.options] };
   }
+  const bytes = text => encoder.encode(text).byteLength;
+  const isInt = (value, min, max) => Number.isSafeInteger(value) && value >= min && value <= max;
+  const optional = (value, test) => value === undefined || test(value);
+  const fieldsWithin = (value, allowed, required = []) => value && typeof value === 'object' && !Array.isArray(value) &&
+    Object.keys(value).every(key => allowed.includes(key)) && required.every(key => Object.hasOwn(value, key));
+  /** A `data:image/jpeg;base64,` placeholder of at most 4 KB decoded. */
+  const thumbOk = value => typeof value === 'string' && value.startsWith('data:image/jpeg;base64,') && value.length <= 23 + 5464 && /^[A-Za-z0-9+/]+={0,2}$/.test(value.slice(23));
+  const httpsUrl = value => { if (typeof value !== 'string' || value.length > 2048) return false; try { const url = new URL(value); return url.protocol === 'https:' && !url.username && !url.password; } catch { return false; } };
+  const graphemeCount = text => globalThis.Intl?.Segmenter ? [...new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)].length : [...text].length;
+  /** One emoji grapheme or a custom `:name:`, at most 40 UTF-8 bytes. */
+  function emojiOk(value) {
+    if (typeof value !== 'string' || !value || bytes(value) > 40) return false;
+    if (CUSTOM.test(value)) return true;
+    return graphemeCount(value) === 1 && /\p{Extended_Pictographic}|\p{Regional_Indicator}|[#*0-9]\uFE0F?\u20E3/u.test(value);
+  }
+  function cleanReply(reply) {
+    if (!exactObject(reply, ['id', 'text']) || typeof reply.id !== 'string' || !UUID.test(reply.id) || typeof reply.text !== 'string' || reply.text.length > 140) throw new Error('Invalid reply.');
+    return { id: reply.id.toLowerCase(), text: reply.text };
+  }
+  function cleanLink(link, text) {
+    if (!fieldsWithin(link, ['url', 'title', 'description', 'site', 'thumb'], ['url']) || !httpsUrl(link.url) || !text.includes(link.url) ||
+        !optional(link.title, value => typeof value === 'string' && value.length <= 200) || !optional(link.description, value => typeof value === 'string' && value.length <= 300) ||
+        !optional(link.site, value => typeof value === 'string' && value.length <= 60) || !optional(link.thumb, thumbOk)) throw new Error('Invalid link preview.');
+    return Object.fromEntries(['url', 'title', 'description', 'site', 'thumb'].filter(key => link[key] !== undefined).map(key => [key, link[key]]));
+  }
+  // Bidi controls, isolates and zero-width characters let "report\u202Efdp.exe" read as "reportexe.pdf": stored names drop them.
+  const INVISIBLE = /[\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2069\uFEFF]/g;
+  const ATTACHMENT_FIELDS = ['kind', 'blob', 'key', 'sha256', 'mime', 'name', 'size', 'width', 'height', 'duration', 'waveform', 'thumb'];
+  function cleanAttachment(file) {
+    const visual = ['image', 'video'].includes(file?.kind), timed = ['audio', 'voice', 'video'].includes(file?.kind);
+    if (!fieldsWithin(file, ATTACHMENT_FIELDS, ['kind', 'blob', 'key', 'sha256', 'mime', 'name', 'size']) || !ATTACHMENT_KINDS.includes(file.kind) ||
+        typeof file.blob !== 'string' || file.blob.length < 16 || file.blob.length > 64 || !B64URL.test(file.blob) ||
+        typeof file.key !== 'string' || file.key.length !== 43 || !B64URL.test(file.key) || typeof file.sha256 !== 'string' || file.sha256.length !== 43 || !B64URL.test(file.sha256) ||
+        typeof file.mime !== 'string' || !MIME.test(file.mime) || typeof file.name !== 'string' || file.name.length > 120 || !isInt(file.size, 0, MAX_BLOB) ||
+        !optional(file.width, value => visual && isInt(value, 1, 32768)) || !optional(file.height, value => visual && isInt(value, 1, 32768)) ||
+        !optional(file.duration, value => timed && typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 86400) ||
+        !optional(file.waveform, value => ['voice', 'audio'].includes(file.kind) && Array.isArray(value) && value.length <= 64 && value.every(level => isInt(level, 0, 31))) ||
+        !optional(file.thumb, value => visual && thumbOk(value))) throw new Error('Invalid attachment.');
+    const out = Object.fromEntries(ATTACHMENT_FIELDS.filter(key => file[key] !== undefined).map(key => [key, file[key]]));
+    if (out.waveform) out.waveform = [...out.waveform];
+    out.name = out.name.replace(INVISIBLE, '').trim() || 'file';
+    return out;
+  }
+  function cleanReactions(reactions) {
+    if (!fieldsWithin(reactions, ['me', 'peer'])) throw new Error('Invalid reactions.');
+    const out = {}, all = new Set();
+    for (const [who, list] of Object.entries(reactions)) {
+      if (!Array.isArray(list) || !list.every(emojiOk) || new Set(list).size !== list.length) throw new Error('Invalid reactions.');
+      if (list.length) out[who] = [...list];
+      for (const emoji of list) all.add(emoji);
+    }
+    if (all.size > MAX_REACTIONS) throw new Error('Invalid reactions.');
+    return out;
+  }
   const voteOk = (value, count) => value === null || Number.isSafeInteger(value) && value >= 0 && value < count;
   function cleanRich(message) {
     const extra = Object.keys(message).filter(key => !FIELDS.includes(key));
-    if (extra.some(key => !OPTIONAL.includes(key))) throw new Error('Invalid chat message.');
+    if (extra.some(key => !OPTIONAL.includes(key) && !CONTENT.includes(key) && !MUTABLE.includes(key))) throw new Error('Invalid chat message.');
     const out = {};
     if (message.kind === undefined) { if (message.poll !== undefined || message.votes !== undefined) throw new Error('Invalid chat message.'); return out; }
     if (message.direction === 'system' || !['action', 'poll'].includes(message.kind)) throw new Error('Invalid chat message.');
@@ -48,28 +109,54 @@
     if (!message || typeof message !== 'object' || Array.isArray(message) || !FIELDS.every(key => Object.hasOwn(message, key)) || typeof message.id !== 'string' || !UUID.test(message.id) ||
         typeof message.conversationId !== 'string' || !ROOM.test(message.conversationId) ||
         !(['incoming', 'outgoing'].includes(message.direction) || allowSystem && message.direction === 'system') || typeof message.text !== 'string' ||
-        message.text.length === 0 || encoder.encode(message.text).byteLength > 4096 ||
+        message.text.length === 0 && message.attachment === undefined || encoder.encode(message.text).byteLength > 4096 ||
         !Number.isSafeInteger(message.createdAt) || message.createdAt < 0 || message.createdAt > 8640000000000000 ||
-        !['queued', 'sent', 'delivered', 'uncertain'].includes(message.status) ||
+        !STATUSES.includes(message.status) ||
         !(message.expiresAt === null || Number.isSafeInteger(message.expiresAt) &&
           message.expiresAt > message.createdAt && message.expiresAt <= Math.min(8640000000000000, message.createdAt + MAX_AGE))) {
       throw new Error('Invalid chat message. Only message content and delivery metadata are allowed.');
     }
     const rich = cleanRich(message);
+    const extra = Object.keys(message).filter(key => CONTENT.includes(key) || MUTABLE.includes(key));
+    if (extra.length) {
+      if (message.direction === 'system' || rich.kind === 'poll' && (message.attachment !== undefined || message.link !== undefined)) throw new Error('Invalid chat message.');
+      try {
+        if (message.replyTo !== undefined) rich.replyTo = cleanReply(message.replyTo);
+        if (message.attachment !== undefined) rich.attachment = cleanAttachment(message.attachment);
+        if (message.link !== undefined) rich.link = cleanLink(message.link, message.text);
+        if (message.reactions !== undefined) { const reactions = cleanReactions(message.reactions); if (Object.keys(reactions).length) rich.reactions = reactions; }
+        if ((message.editedText === undefined) !== (message.editedAt === undefined)) throw new Error('Invalid edit.');
+        if (message.editedText !== undefined) {
+          if (typeof message.editedText !== 'string' || message.editedText.length === 0 && !rich.attachment || bytes(message.editedText) > 4096 ||
+              !isInt(message.editedAt, 0, 8640000000000000) || rich.kind === 'poll') throw new Error('Invalid edit.');
+          rich.editedText = message.editedText; rich.editedAt = message.editedAt;
+        }
+      } catch { throw new Error('Invalid chat message.'); }
+    }
+    // The content a sender committed to (what travels in the payload) stays within the 16 KB payload bound.
+    if (bytes(JSON.stringify([message.text, rich.kind, rich.poll, rich.replyTo, rich.attachment, rich.link])) > MAX_PAYLOAD) throw new Error('Invalid chat message.');
     // Explicitly construct the stored record: never serialize invitation tokens, keys or UI state.
     return { ...Object.fromEntries(FIELDS.map(key => [key, key === 'id' ? message.id.toLowerCase() : message[key]])), ...rich };
   }
   const expired = (message, now = Date.now()) => message.expiresAt !== null && message.expiresAt <= now;
   const key = message => `${message.conversationId}:${message.id.toLowerCase()}`;
   const sorted = messages => messages.sort((a, b) => a.createdAt - b.createdAt || key(a).localeCompare(key(b)));
-  // Same message: identical fields, kind and poll (votes are local tallies and never conflict).
-  const sameContent = (a, b) => FIELDS.every(field => field === 'status' || a[field] === b[field]) && a.kind === b.kind && JSON.stringify(a.poll) === JSON.stringify(b.poll);
+  // Same message: identical fields, kind, poll, reply, attachment and link. Votes, reactions and edits are
+  // later mutations and never conflict; the original `text` stays immutable so a redelivery still matches.
+  const sameContent = (a, b) => FIELDS.every(field => field === 'status' || a[field] === b[field]) && a.kind === b.kind &&
+    ['poll', ...CONTENT].every(field => JSON.stringify(a[field]) === JSON.stringify(b[field]));
+  /** Delivery only moves forward once confirmed: delivered and read are never downgraded, and read beats delivered. */
+  const forward = (previous, status) => ['delivered', 'read'].includes(previous) && RANK[previous] >= RANK[status] ? previous : status;
   function combine(previous, next) {
     if (previous && !sameContent(previous, next)) {
       throw new Error('A duplicate message has conflicting content or expiration. Nothing was imported.');
     }
-    const merged = previous?.votes ? { ...next, votes: previous.votes } : next;
-    return previous?.status === 'delivered' ? { ...merged, status: 'delivered' } : merged;
+    if (!previous) return next;
+    const merged = { ...next, status: forward(previous.status, next.status) };
+    if (previous.votes) merged.votes = previous.votes;
+    if (previous.reactions) merged.reactions = previous.reactions;
+    if (previous.editedAt !== undefined && !(next.editedAt > previous.editedAt)) { merged.editedText = previous.editedText; merged.editedAt = previous.editedAt; }
+    return merged;
   }
   function openDatabase() {
     if (!database) database = new Promise((resolve, reject) => {
@@ -142,6 +229,7 @@
       createdAt = now;
     }
     const rich = payload?.kind === undefined ? {} : payload.kind === 'poll' ? { kind: 'poll', poll: payload.poll } : { kind: payload.kind };
+    for (const field of CONTENT) if (payload?.[field] !== undefined) rich[field] = payload[field];
     try { message = validate({ id: payload?.id, conversationId, direction: 'incoming', text: payload?.text, createdAt, status: 'delivered', expiresAt, ...rich }); }
     catch { throw coded('invalid', 'Invalid incoming message.'); }
     if (expired(message)) return 'expired';
@@ -165,11 +253,23 @@
   function checkPayload(payload) {
     const bad = () => coded('invalid', 'Invalid message');
     if (!payload || typeof payload !== 'object' || Array.isArray(payload) || payload.v !== 1 || typeof payload.id !== 'string' || !UUID.test(payload.id)) throw bad();
-    const size = Object.keys(payload).length;
+    const size = Object.keys(payload).length, keys = Object.keys(payload);
+    let encoded = Infinity; try { encoded = encoder.encode(JSON.stringify(payload)).byteLength; } catch {}
+    if (encoded > MAX_PAYLOAD) throw bad();
     switch (payload.type) {
       case 'receipt': case 'burn': if (size === 3) return payload.type; break;
-      // Plain (6 keys), a /me action (+kind) or a poll (+kind, +poll); content is validated by receive().
-      case 'message': if (size === 6 && !('kind' in payload) || size === 7 && payload.kind === 'action' || size === 8 && payload.kind === 'poll' && 'poll' in payload) return payload.type; break;
+      // Plain, a /me action (+kind) or a poll (+kind, +poll), each optionally with a reply, one attachment and
+      // a link preview; content is validated by receive().
+      case 'message': {
+        const base = ['v', 'type', 'id', 'text', 'createdAt', 'expiresAt'];
+        if (!base.every(key => keys.includes(key)) || keys.some(key => !base.includes(key) && !['kind', 'poll', ...CONTENT].includes(key))) break;
+        if (payload.kind === undefined ? !('poll' in payload) && !('kind' in payload) : payload.kind === 'action' ? !('poll' in payload) : payload.kind === 'poll' && 'poll' in payload) return payload.type;
+        break;
+      }
+      case 'react': if (size === 6 && typeof payload.target === 'string' && UUID.test(payload.target) && emojiOk(payload.emoji) && typeof payload.on === 'boolean') return payload.type; break;
+      case 'edit': if (size === 6 && typeof payload.target === 'string' && UUID.test(payload.target) && typeof payload.text === 'string' && bytes(payload.text) <= 4096 && isInt(payload.editedAt, 0, 8640000000000000)) return payload.type; break;
+      case 'read': if (size === 4 && Array.isArray(payload.ids) && payload.ids.length >= 1 && payload.ids.length <= MAX_READ_IDS && payload.ids.every(id => typeof id === 'string' && UUID.test(id))) return payload.type; break;
+      case 'typing': if (size === 5 && isInt(payload.at, 0, 8640000000000000) && typeof payload.on === 'boolean') return payload.type; break;
       case 'vote': if (size === 5 && typeof payload.poll === 'string' && UUID.test(payload.poll) && (payload.option === null || Number.isSafeInteger(payload.option) && payload.option >= 0 && payload.option < MAX_OPTIONS)) return payload.type; break;
       case 'rotate': if (size === 4 && ['manual', 'scheduled'].includes(payload.reason)) return payload.type; break;
       case 'policy': if (size === 4 && Number.isSafeInteger(payload.rotateEveryMs) && payload.rotateEveryMs >= 0) return payload.type; break;
@@ -205,6 +305,59 @@
       return { writes: [{ ...poll, votes: { ...poll.votes, [voter]: option } }], result: true };
     });
   }
+  /**
+   * Toggles one person's reaction on a message in this conversation ('me' or 'peer'; 1:1 chats have two).
+   * Each person holds a set of emoji; at most 20 distinct emoji per message. Unknown targets are ignored.
+   * Updates in place, so reactions add no rows. Resolves true when the target exists.
+   */
+  async function react(conversationId, targetId, who, emoji, on) {
+    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !['me', 'peer'].includes(who) || !emojiOk(emoji) || typeof on !== 'boolean') throw coded('invalid', 'Invalid reaction.');
+    return transaction(active => {
+      const target = active.get(`${conversationId}:${targetId.toLowerCase()}`);
+      if (!target || target.direction === 'system') return { result: false };
+      const reactions = { me: [...target.reactions?.me || []], peer: [...target.reactions?.peer || []] }, mine = reactions[who];
+      if (on === mine.includes(emoji)) return { result: true };
+      if (on) {
+        if (new Set([...reactions.me, ...reactions.peer, emoji]).size > MAX_REACTIONS) return { result: true };
+        mine.push(emoji);
+      } else reactions[who] = mine.filter(value => value !== emoji);
+      const next = { ...target }; delete next.reactions;
+      const kept = Object.fromEntries(Object.entries(reactions).filter(([, list]) => list.length));
+      if (Object.keys(kept).length) next.reactions = kept;
+      return { writes: [next], result: true };
+    });
+  }
+  /**
+   * Applies an edit. Only the author may edit: 'peer' edits apply to incoming messages, 'me' edits to outgoing
+   * ones, never polls. The latest editedAt wins, so a reordered or repeated edit is harmless. Attachments and
+   * link previews are not editable. Resolves true when the edit is now the shown text.
+   */
+  async function edit(conversationId, targetId, who, text, editedAt) {
+    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !['me', 'peer'].includes(who) ||
+        typeof text !== 'string' || bytes(text) > 4096 || !isInt(editedAt, 0, 8640000000000000)) throw coded('invalid', 'Invalid edit.');
+    return transaction(active => {
+      const target = active.get(`${conversationId}:${targetId.toLowerCase()}`);
+      if (!target || target.direction !== (who === 'me' ? 'outgoing' : 'incoming') || target.kind === 'poll') return { result: false };
+      if (!text.trim() && !target.attachment) return { result: false };
+      if (target.editedAt !== undefined && editedAt <= target.editedAt) return { result: editedAt === target.editedAt && text === target.editedText };
+      return { writes: [validate({ ...target, editedText: text, editedAt })], result: true };
+    });
+  }
+  /**
+   * Marks messages read: 'outgoing' when the other person's read receipt arrives, 'incoming' once this device has
+   * shown them (so each is reported once). At most 100 ids; unknown ids are ignored. Resolves the ids changed.
+   */
+  async function markRead(conversationId, ids, direction) {
+    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || !Array.isArray(ids) || ids.length > MAX_READ_IDS || !ids.every(id => typeof id === 'string' && UUID.test(id)) || !['incoming', 'outgoing'].includes(direction)) throw coded('invalid', 'Invalid read receipt.');
+    return transaction(active => {
+      const writes = [];
+      for (const id of new Set(ids.map(value => value.toLowerCase()))) {
+        const record = active.get(`${conversationId}:${id}`);
+        if (record?.direction === direction && record.status !== 'read' && (direction === 'incoming' || ['sent', 'delivered', 'uncertain'].includes(record.status))) writes.push({ ...record, status: 'read' });
+      }
+      return { writes, result: writes.map(record => record.id) };
+    });
+  }
   /** Rows a contact can cause on this device: their messages and the system lines their payloads add. */
   function fromPeer(active, conversationId) {
     let count = 0;
@@ -226,14 +379,14 @@
   const list = () => transaction(active => ({ result: sorted([...active.values()]) }));
   async function setStatus(conversationId, id, status) {
     if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof id !== 'string' || !UUID.test(id) ||
-        !['queued', 'sent', 'delivered', 'uncertain'].includes(status)) throw new Error('Invalid message delivery update.');
+        !STATUSES.includes(status)) throw new Error('Invalid message delivery update.');
     return transaction(active => {
       const previous = active.get(`${conversationId}:${id.toLowerCase()}`);
       // A late ACK or send completion must never recreate cleared or expired content.
       if (!previous) return { result: false };
       // Nor may an old send completion turn freshly restored history back into an outbound queue.
       if (previous.status === 'uncertain' && ['queued', 'sent'].includes(status)) return { result: false };
-      return { writes: [{ ...previous, status: previous.status === 'delivered' ? 'delivered' : status }], result: true };
+      return { writes: [{ ...previous, status: forward(previous.status, status) }], result: true };
     });
   }
   // Burning one conversation deletes only its records, keyed by the room identifier.
@@ -326,7 +479,7 @@
         combine(previous, message); // Reject conflicting immutable fields before accepting a duplicate.
         // Restored history is never an outbound queue. Existing live records win over old backups.
         if (previous) continue;
-        const next = message.direction === 'outgoing' && message.status !== 'delivered' ? { ...message, status: 'uncertain' } : message;
+        const next = message.direction === 'outgoing' && !['delivered', 'read'].includes(message.status) ? { ...message, status: 'uncertain' } : message;
         count++; active.set(identity, next);
         writes.set(identity, next);
       }
@@ -334,5 +487,5 @@
       return { writes: [...writes.values()], result: count };
     });
   }
-  window.ChatStore = Object.freeze({ put, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, checkPayload, inboundDisposition, MAX_OPTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
+  window.ChatStore = Object.freeze({ put, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, react, edit, markRead, checkPayload, inboundDisposition, emojiOk, MAX_OPTIONS, MAX_BLOB, MAX_REACTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
 })();

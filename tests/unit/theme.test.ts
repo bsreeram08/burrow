@@ -59,4 +59,30 @@ describe('themes', () => {
         Theme.setAccount(null);
         expect(vars.get('--bg')).toBe(Theme.PRESETS.midnight.bg);
     });
+    test('theme families: light and dark variants (Midnight dark only), own bubbles in the accent with readable text', () => {
+        const { Theme } = load();
+        expect(Object.keys(Theme.FAMILIES)).toEqual(['classic', 'forest', 'ocean', 'dusk', 'rose', 'paper', 'mono', 'midnight']);
+        for (const family of Object.keys(Theme.FAMILIES)) for (const scheme of family === 'midnight' ? ['dark'] : ['light', 'dark']) {
+            const tokens = Theme.tokens(`${family}-${scheme}`);
+            expect(tokens.scheme).toBe(scheme);
+            expect(tokens.mine).toBe(tokens.accent);
+            expect(Theme.contrast(tokens.mine, tokens['mine-text'])).toBeGreaterThanOrEqual(4.5);
+            expect(Theme.contrast(tokens.muted, tokens.bg)).toBeGreaterThanOrEqual(4.5);
+        }
+        expect(Theme.PRESETS['midnight-light']).toBeUndefined();
+        expect(Theme.tokens('ocean-light').bg).toBe('#f1f8f8');
+        expect(Theme.tokens('classic-light').accent).toBe('#5869e9'); // Already 4.5:1 with white text, as in the Flutter app.
+        expect(Theme.tokens('paper-dark').font).toContain('Georgia');
+        // "System" follows the OS (dark when it cannot tell).
+        expect(Theme.tokens('rose-system').bg).toBe(Theme.tokens('rose-dark').bg);
+    });
+    test('appearance is per device and sanitised: text size, spacing and list style', () => {
+        const stored: Record<string, string> = { 'appearance-v1': JSON.stringify({ size: 'huge', density: 'compact', list: 'compact' }) };
+        const { Theme } = load(stored);
+        expect(Theme.appearance).toEqual({ size: 'm', density: 'compact', list: 'compact' });
+        expect(Theme.setAppearance({ size: 'xl' })).toBe(true);
+        expect(Theme.setAppearance({ size: '9px;}' })).toBe(false);
+        expect(Theme.toggleDensity()).toBe('comfortable');
+        expect(JSON.parse(stored['appearance-v1']!)).toEqual({ size: 'xl', density: 'comfortable', list: 'compact' });
+    });
 });

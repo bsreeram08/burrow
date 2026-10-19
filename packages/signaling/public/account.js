@@ -198,6 +198,16 @@
     if (!await ready || !box) return; // Unacknowledged: redelivered once this device can decrypt.
     if (inactive) return; // Meant for the active device: never decrypt-fail and acknowledge it away.
     const from = message.from, conversationId = await pairId(from.id), viewing = () => body.dataset.screen === 'conversation' && current?.id === from.id;
+    // Ephemeral envelopes (typing) were never stored by the server: nothing to acknowledge, nothing to report.
+    if (message.ephemeral === true) {
+      try {
+        await box.decryptFrom(from.id, message.envelope, async (payload, info) => {
+          if (window.ChatStore.checkPayload(payload) !== 'typing' || info.identityChanged || (await box.peer(from.id))?.blocked) return;
+          typing(from.id, payload);
+        });
+      } catch {}
+      return;
+    }
     let receipt = null, burned = false, rotated = false, failure = null;
     try {
       await box.decryptFrom(from.id, message.envelope, async (payload, info) => {
@@ -221,6 +231,11 @@
             return { rotate: true }; // The box keeps only the peer's new session, in its own write.
           }
           else if (type === 'policy') rememberPeerRotation(from.id, payload.rotateEveryMs);
+          // Reactions, edits and read receipts change an existing row in place: no new row, no delivery receipt.
+          else if (type === 'react') await window.ChatStore.react(conversationId, payload.target, 'peer', payload.emoji, payload.on);
+          else if (type === 'edit') await window.ChatStore.edit(conversationId, payload.target, 'peer', payload.text, Math.min(payload.editedAt, Date.now() + 300000));
+          else if (type === 'read') { if (App.readReceipts) await window.ChatStore.markRead(conversationId, payload.ids, 'outgoing'); }
+          else if (type === 'typing') typing(from.id, payload); // A typing hint that came through the mailbox: shown only if still fresh.
           else if (type === 'vote') await window.ChatStore.vote(conversationId, payload.poll, 'peer', payload.option); // A tally update: no row, no receipt.
           else if (payload.type === 'receipt') await window.ChatStore.setStatus(conversationId, payload.id, 'delivered');
           else if (payload.type === 'burn') { await window.ChatStore.removeConversation(conversationId); burned = true; }
@@ -229,6 +244,7 @@
             if (untrusted) await rememberFlag(payload.id.toLowerCase());
             if (!viewing()) unread[from.id] = (unread[from.id] || 0) + 1;
             receipt = payload.id;
+            typing(from.id, null); // A message ends their typing.
           }
         } catch (error) { throw error.code ? error : coded('storage', error.message); }
       });
@@ -263,10 +279,10 @@
 
   // ---------- Sending ----------
   const bundleFor = contact => () => api(`/api/keys/${contact.username}`);
-  async function sendControl(contact, payload) {
+  async function sendControl(contact, payload, ephemeral = false) {
     if (!box) throw new Error('Encrypted messaging is unavailable in this browser.');
     const envelope = await box.encryptTo(contact.id, payload, bundleFor(contact));
-    await api('/api/messages', 'POST', { to: contact.username, envelope });
+    await api('/api/messages', 'POST', ephemeral ? { to: contact.username, envelope, ephemeral: true } : { to: contact.username, envelope });
   }
   /** Encrypts and posts every queued outgoing message, oldest first, one contact at a time. */
   async function flushOutgoing() {
@@ -371,6 +387,69 @@
     if (!contact) throw new Error('Open the conversation to vote.');
     await sendControl(contact, { v: 1, type: 'vote', id: crypto.randomUUID(), poll, option });
   };
+
+  // ---------- Reactions, edits, read receipts and typing (docs/phase1-protocol.md §2) ----------
+  const openContact = () => {
+    const contact = current && contactById(current.id);
+    if (!contact || contact.state !== 'mutual') throw new Error('Open the conversation first.');
+    if (inactive) throw new Error('Messaging is active on another device. Move it here first.');
+    return contact;
+  };
+  App.onReact = async (target, emoji, on) => { await sendControl(openContact(), { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }); };
+  App.onEdit = async (record, text) => {
+    const contact = openContact(), conversationId = await pairId(contact.id);
+    const editedAt = Math.max(Date.now(), (record.editedAt || 0) + 1);
+    if (!await window.ChatStore.edit(conversationId, record.id, 'me', text, editedAt)) throw new Error('This message can no longer be edited.');
+    // Not sent yet: it leaves this device with the new text. Otherwise the edit follows it end to end.
+    const latest = (await window.ChatStore.list()).find(value => value.conversationId === conversationId && value.id === record.id);
+    if (latest?.status === 'queued') { flushOutgoing(); return; }
+    await sendControl(contact, { v: 1, type: 'edit', id: crypto.randomUUID(), target: record.id, text, editedAt });
+  };
+  // Read receipts: once the conversation is on screen and focused, batched and at most once every 2 s.
+  // Every shown message is marked read here (so it is reported once); the receipt is only sent when allowed.
+  let readTimer = null, readAt = 0;
+  const looking = () => Boolean(current) && body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus();
+  App.onDisplayed = () => {
+    if (readTimer || !looking() || !box || inactive) return;
+    readTimer = setTimeout(sendReads, Math.max(0, 2000 - (Date.now() - readAt)));
+  };
+  async function sendReads() {
+    readTimer = null;
+    const contact = current && contactById(current.id);
+    if (!contact || !looking() || !box || inactive) return;
+    const conversationId = await pairId(contact.id);
+    const waiting = (await window.ChatStore.list()).filter(value => value.conversationId === conversationId && value.direction === 'incoming' && value.status === 'delivered').map(value => value.id);
+    if (!waiting.length) return;
+    readAt = Date.now();
+    const ids = await window.ChatStore.markRead(conversationId, waiting.slice(-100), 'incoming');
+    if (ids.length && App.readReceipts) sendControl(contact, { v: 1, type: 'read', id: crypto.randomUUID(), ids }).catch(() => {});
+    if (waiting.length > 100) App.onDisplayed();
+  }
+  window.addEventListener('focus', () => App.onDisplayed());
+  document.addEventListener('visibilitychange', () => App.onDisplayed());
+  // Typing: sent ephemeral (never stored by the server), only to an online contact with a session already open,
+  // so a hint never spends one of their one-time keys. `on` at most every 4 s while there is text; `off` on send/clear/blur.
+  let typingSent = 0, typingOn = false, typingHide = null, typingFrom = null;
+  App.onTyping = active => {
+    const contact = current && contactById(current.id);
+    if (!contact || contact.state !== 'mutual' || !box || inactive) { typingOn = false; return; }
+    if (active) {
+      if (!contact.online || Date.now() - typingSent < 4000) return;
+      typingSent = Date.now(); typingOn = true; sendTyping(contact, true);
+    } else if (typingOn) { typingOn = false; typingSent = 0; sendTyping(contact, false); }
+  };
+  async function sendTyping(contact, on) {
+    try { if (await box.sessionInfo(contact.id)) await sendControl(contact, { v: 1, type: 'typing', id: crypto.randomUUID(), at: Date.now(), on }, true); } catch {}
+  }
+  /** Shows "<name> is typing…" for 6 s after their last `on`; stale hints (over 15 s old) are dropped. */
+  function typing(fromId, payload) {
+    if (payload && (Date.now() - payload.at > 15000 || payload.at - Date.now() > 300000)) return;
+    const on = Boolean(payload?.on);
+    if (!on && typingFrom !== fromId) return;
+    clearTimeout(typingHide); typingFrom = on ? fromId : null;
+    if (on) typingHide = setTimeout(() => typing(fromId, null), 6000);
+    if (current?.id === fromId || !on) App.showTyping?.(on && current?.id === fromId);
+  }
 
   // ---------- Key rotation ----------
   // Sessions (ratchets) rotate; identities do not rotate on a timer — that would make security-code changes
@@ -553,7 +632,7 @@
       text.append(name, sub); row.append(avatar, text);
       if (contact.state === 'mutual') {
         const recent = last.get(await pairId(contact.id)), count = unread[contact.id] || 0;
-        sub.textContent = recent ? `${recent.direction === 'outgoing' ? 'You: ' : ''}${recent.text}` : contact.online ? 'Online' : 'Tap to chat';
+        sub.textContent = recent ? `${recent.direction === 'outgoing' ? 'You: ' : ''}${App.preview ? App.preview(recent) : recent.text}` : contact.online ? 'Online' : 'Say hello. Messages are end-to-end encrypted.';
         const side = document.createElement('span'); side.className = 'contact-side';
         const time = document.createElement('time'); time.textContent = recent ? clock(recent.createdAt) : '';
         side.append(time);
@@ -617,7 +696,7 @@
     if (App.active && App.conversationId !== conversationId) await App.end();
     current = contact; body.dataset.screen = 'conversation'; updateHeader();
     delete unread[contact.id]; try { localStorage.setItem(`unread-v1:${me.id}`, JSON.stringify(unread)); } catch {}
-    if (!App.active) App.openConversation({ conversationId, peerName: contact.username, online: contact.online });
+    if (!App.active) App.openConversation({ conversationId, peerName: contact.username, peerId: contact.id, online: contact.online });
     if (!await ready) App.chatStatus('This browser is too old for encrypted messaging. Update it to send and receive messages.');
     updateBanner(); flushOutgoing();
   }
@@ -632,7 +711,7 @@
     if (!pending.call) { openConversation(contact); return; }
     // A call notification must not start chat here: that would take over the waiting call's room.
     current = contact; body.dataset.screen = 'conversation'; updateHeader();
-    App.openConversation({ conversationId: await pairId(contact.id), peerName: contact.username, online: contact.online });
+    App.openConversation({ conversationId: await pairId(contact.id), peerName: contact.username, peerId: contact.id, online: contact.online });
   }
   if (window.Alerts) window.Alerts.onOpen = data => { window.pendingOpen = { user: data.user, call: Boolean(data.call) }; openPending(); };
   function stopCalling() { clearTimeout(noAnswerTimer); noAnswerTimer = undefined; Ring.stop(); }
@@ -644,7 +723,7 @@
       Ring.unlock(); // This click is the gesture that lets the ringback play.
       if (App.active) App.leave();
       const session = await api(`/api/conversations/${contact.username}/session`, 'POST', { kind });
-      await App.start({ ...session, kind, conversationId, peerName: contact.username });
+      await App.start({ ...session, kind, conversationId, peerName: contact.username, peerId: contact.id });
       if (!App.active) return;
       Ring.outgoing();
       clearTimeout(noAnswerTimer);
@@ -659,6 +738,7 @@
   $('conv-voice').onclick = () => call('voice');
   $('conv-video').onclick = () => call('video');
   $('conv-back').onclick = () => {
+    App.onTyping(false); App.showTyping?.(false);
     body.dataset.screen = 'list'; $('key-banner').hidden = true;
     if (!App.active) { App.closeConversation(); current = null; }
     render();
@@ -710,7 +790,7 @@
     if (!ring) return;
     if (App.active) App.leave();
     current = ring.contact; body.dataset.screen = 'conversation'; updateHeader(); updateBanner();
-    await App.start({ roomId: ring.roomId, token: ring.token, kind: ring.kind, audioOnly, conversationId: ring.conversationId, peerName: ring.contact.username });
+    await App.start({ roomId: ring.roomId, token: ring.token, kind: ring.kind, audioOnly, conversationId: ring.conversationId, peerName: ring.contact.username, peerId: ring.contact.id });
   }
   $('incoming-accept').onclick = () => accept(false);
   $('incoming-accept-audio').onclick = () => accept(true);
@@ -718,6 +798,12 @@
     const ring = ringing; ringing = null; hideRing();
     if (ring) { try { await api(`/api/conversations/${ring.contact.username}/decline`, 'POST', { roomId: ring.roomId }); } catch {} }
   };
+
+  // Command palette: every mutual contact is a conversation to jump to.
+  window.Palette?.register(() => !me ? [] : contacts.filter(contact => contact.state === 'mutual').map(contact => ({
+    id: `chat:${contact.id}`, group: 'Conversations', label: contact.username, hint: unread[contact.id] ? `${unread[contact.id]} unread` : contact.online ? 'online' : '',
+    run: () => { if (App.active && App.conversationId) return; openConversation(contact); },
+  })));
 
   App.onInvite = invite => { if (!me) { $('register-invite').value = invite; $('register-panel').open = true; $('register-username').focus(); } };
   App.onEnd = () => { stopCalling(); if (me) { if (current) updateHeader(); render(); } };

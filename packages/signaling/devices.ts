@@ -17,7 +17,7 @@ const Format = (globalThis as any).DeviceFormat as Format;
 export const MAX_DEVICES = Format.MAX_DEVICES;
 const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/, KEY = /^[A-Za-z0-9_-]{43}$/;
 /** A bind challenge is single use, for one session, and short lived. */
-const CHALLENGE_LIFETIME = 2 * 60 * 1000, MAX_CHALLENGES = 10000, MAX_SESSION_CHALLENGES = 4;
+const CHALLENGE_LIFETIME = 2 * 60 * 1000, MAX_CHALLENGES = 10000, MAX_SESSION_CHALLENGES = 4, MAX_ACCOUNT_CHALLENGE_SESSIONS = 32;
 /** The caller: a signed-in session. `client` is 'web' or the native platform it signed in with. */
 type Caller = { id: string; session: string; client: string };
 
@@ -192,18 +192,32 @@ export function createDevices(deps: Deps) {
     }
 
     // Outstanding bind challenges by session hash: a few each (tabs and retries may overlap), oldest dropped.
-    const challenges = new Map<string, { value: string; expiresAt: number }[]>();
+    // Bounded per session, per account and overall; expired entries are swept at most once a second.
+    const challenges = new Map<string, { user: string; items: { value: string; expiresAt: number }[] }>();
+    let sweptAt = 0;
+    function sweepChallenges() {
+        if (now() - sweptAt < 1000) return;
+        sweptAt = now();
+        for (const [key, entry] of challenges) { entry.items = entry.items.filter(item => item.expiresAt > now()); if (!entry.items.length) challenges.delete(key); }
+    }
     /** A fresh single-use challenge for this session to sign with its device key (announce). */
     function challenge(user: Caller): [number, object] {
-        for (const [key, list] of challenges) { const live = list.filter(item => item.expiresAt > now()); if (live.length) challenges.set(key, live); else challenges.delete(key); }
-        if (challenges.size >= MAX_CHALLENGES && !challenges.has(user.session)) return [503, { error: 'Busy, try again' }];
+        sweepChallenges();
+        const own = challenges.get(user.session);
+        if (!own) {
+            let mine = 0;
+            for (const entry of challenges.values()) if (entry.user === user.id) mine++;
+            if (mine >= MAX_ACCOUNT_CHALLENGE_SESSIONS) return [429, { error: 'Too many devices signing in at once. Try again in a few minutes.' }];
+            if (challenges.size >= MAX_CHALLENGES) return [503, { error: 'Busy, try again' }];
+        }
         const value = randomBytes(32).toString('base64url');
-        challenges.set(user.session, [...(challenges.get(user.session) ?? []), { value, expiresAt: now() + CHALLENGE_LIFETIME }].slice(-MAX_SESSION_CHALLENGES));
+        const items = [...(own?.items ?? []), { value, expiresAt: now() + CHALLENGE_LIFETIME }].slice(-MAX_SESSION_CHALLENGES);
+        challenges.set(user.session, { user: user.id, items });
         return [200, { challenge: value }];
     }
     /** Spends one of this session's outstanding challenges; false if it was never issued, expired or used. */
     function spend(session: string, value: unknown) {
-        const list = challenges.get(session) ?? [], index = list.findIndex(item => item.value === value);
+        const list = challenges.get(session)?.items ?? [], index = list.findIndex(item => item.value === value);
         if (index < 0) return false;
         const [item] = list.splice(index, 1);
         if (!list.length) challenges.delete(session);

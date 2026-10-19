@@ -2,7 +2,8 @@
 //! (tests/interop), the WASM build (the browser worker and the node interop party). One command object
 //! in; `{"ok": value}` or `{"error": message, "code": code|null}` out. Commands: identity, prekeys, opks,
 //! encrypt, decrypt, commit, abort, rotate, sessionInfo, sids, resetIdentity, safety, peer, notePeer,
-//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce.
+//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce; with the `mls`
+//! feature the `mls*` group commands and with `ds` the `ds*` delivery-service commands (crate::mls::commands).
 use serde_json::{json, Value};
 
 use crate::core::Core;
@@ -92,7 +93,11 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
         }
         "sasCommitment" => Ok(json!(sas::commitment(&text(command, "nonce")?)?)),
         "sasCheck" => Ok(json!(sas::check_reveal(&text(command, "commitment")?, &text(command, "nonce")?))),
-        other => Err(ChatError::transient(format!("unknown command {other}"))),
+        other => {
+            #[cfg(any(feature = "mls", feature = "ds"))]
+            if let Some(result) = crate::mls::commands::run(core, other, command) { return result; }
+            Err(ChatError::transient(format!("unknown command {other}")))
+        }
     }
 }
 

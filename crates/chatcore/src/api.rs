@@ -96,3 +96,116 @@ pub fn sas_check_reveal(peer_commitment: String, peer_nonce: String) -> bool { s
 pub fn sas_code(local_sdp: String, remote_sdp: String, my_nonce: String, peer_nonce: String) -> Result<String> {
     sas::sas_from_sdp(&local_sdp, &remote_sdp, [&my_nonce, &peer_nonce])
 }
+
+// ---------- Groups over MLS (src/mls; API.md "Groups over MLS") ----------
+// Group ids, KeyPackages, Welcomes, ratchet trees, GroupInfos and messages are base64url strings. Contact ids used
+// for 1:1 pins (`note_peer`) must be the user's canonical id for MLS to find that user's pinned account key.
+#[cfg(feature = "mls")]
+pub use crate::mls::cert::DeviceCert;
+#[cfg(feature = "mls")]
+pub use crate::mls::engine::{GroupView, MemberView, Outgoing, PendingCommit, Processed};
+#[cfg(feature = "mls")]
+pub use crate::mls::payload::Context as PayloadContext;
+#[cfg(feature = "mls")]
+pub use crate::mls::policy::{JoinPolicy, Kind, Roles};
+
+#[cfg(feature = "mls")]
+fn with_groups<T>(work: impl FnOnce(&mut crate::mls::engine::Groups, &mut dyn crate::store::Store) -> Result<T>) -> Result<T> {
+    with(|core| {
+        let (groups, store) = core.groups()?;
+        work(groups, store)
+    })
+}
+
+/// One device to remove: all of a user's devices when `device_id` is `None`.
+#[cfg(feature = "mls")]
+pub struct Removal {
+    pub user_id: String,
+    pub device_id: Option<String>,
+}
+
+/// Creates (once) this device's group identity, certified by the account identity key held by this core.
+#[cfg(feature = "mls")]
+pub fn mls_init_device(user_id: String, device_id: String, platform: String, issued_at_ms: u64) -> Result<DeviceCert> {
+    with(|core| {
+        let aik = core.account_signing_key()?;
+        let (groups, store) = core.groups()?;
+        groups.init_device(store, &user_id, &device_id, &platform, issued_at_ms, &aik)
+    })
+}
+
+/// KeyPackages for the server: `count` one-time ones (1–100), or one last-resort one.
+#[cfg(feature = "mls")]
+pub fn mls_key_packages(count: u32, last_resort: bool) -> Result<Vec<String>> {
+    with_groups(|groups, store| groups.key_packages(store, count, last_resort))
+}
+
+#[cfg(feature = "mls")]
+pub fn mls_create_group(group_id: String, roles: Roles) -> Result<GroupView> {
+    with_groups(|groups, store| groups.create(store, &crate::mls::engine::group_id(&group_id)?, &roles))
+}
+
+/// Builds a commit (adds, removals, a roles change, a self-update) and keeps it pending: submit `commit` to the
+/// delivery service, then `mls_merge_own` if it was accepted or `mls_clear_own` if it answered with a conflict.
+#[cfg(feature = "mls")]
+pub fn mls_commit(group_id: String, adds: Vec<String>, removes: Vec<Removal>, roles: Option<Roles>, update: bool) -> Result<Outgoing> {
+    let removes: Vec<(String, Option<String>)> = removes.into_iter().map(|r| (r.user_id, r.device_id)).collect();
+    with_groups(|groups, store| groups.commit(store, &crate::mls::engine::group_id(&group_id)?, &adds, &removes, roles.as_ref(), update))
+}
+
+#[cfg(feature = "mls")]
+pub fn mls_merge_own(group_id: String) -> Result<GroupView> {
+    with_groups(|groups, store| groups.merge_own(store, &crate::mls::engine::group_id(&group_id)?))
+}
+#[cfg(feature = "mls")]
+pub fn mls_clear_own(group_id: String) -> Result<()> {
+    with_groups(|groups, store| groups.clear_own(store, &crate::mls::engine::group_id(&group_id)?))
+}
+#[cfg(feature = "mls")]
+pub fn mls_pending_commit(group_id: String) -> Result<Option<PendingCommit>> {
+    with_groups(|groups, store| groups.pending_commit(store, &crate::mls::engine::group_id(&group_id)?))
+}
+
+/// Joins from a Welcome and the post-commit ratchet tree.
+#[cfg(feature = "mls")]
+pub fn mls_join(welcome: String, tree: String) -> Result<GroupView> { with_groups(|groups, store| groups.join(store, &welcome, &tree)) }
+
+/// External join (public channel, own new device, resync after `mls_forget_group`): submit the commit, then `mls_merge_own`.
+#[cfg(feature = "mls")]
+pub fn mls_join_external(group_info: String, tree: String) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree)) }
+
+#[cfg(feature = "mls")]
+pub fn mls_forget_group(group_id: String) -> Result<()> {
+    with_groups(|groups, store| groups.forget_group(store, &crate::mls::engine::group_id(&group_id)?))
+}
+
+/// Encrypts one payload (64 KiB at most; 60 KiB of plaintext) for the group's current epoch.
+#[cfg(feature = "mls")]
+pub fn mls_encrypt(group_id: String, plaintext: String) -> Result<String> {
+    with_groups(|groups, store| groups.encrypt(store, &crate::mls::engine::group_id(&group_id)?, &plaintext))
+}
+
+/// Phase one of receiving a message from the group's log; store the result, then `mls_receive_commit(pending_id)`.
+#[cfg(feature = "mls")]
+pub fn mls_receive(group_id: String, message: String) -> Result<Processed> {
+    with_groups(|groups, store| groups.process(store, &crate::mls::engine::group_id(&group_id)?, &message))
+}
+#[cfg(feature = "mls")]
+pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }
+#[cfg(feature = "mls")]
+pub fn mls_receive_abort(pending_id: String) -> Result<()> { with_groups(|groups, _| { groups.abort(&pending_id); Ok(()) }) }
+
+#[cfg(feature = "mls")]
+pub fn mls_members(group_id: String) -> Result<Vec<MemberView>> {
+    with_groups(|groups, store| groups.members(store, &crate::mls::engine::group_id(&group_id)?))
+}
+#[cfg(feature = "mls")]
+pub fn mls_roles(group_id: String) -> Result<Roles> { with_groups(|groups, store| groups.roles(store, &crate::mls::engine::group_id(&group_id)?)) }
+#[cfg(feature = "mls")]
+pub fn mls_group_view(group_id: String) -> Result<GroupView> {
+    with_groups(|groups, store| groups.group_view(store, &crate::mls::engine::group_id(&group_id)?))
+}
+
+/// Validates one decrypted payload (v2 schema and the sender's authority); returns its type.
+#[cfg(feature = "mls")]
+pub fn mls_validate_payload(payload_json: String, context: PayloadContext) -> Result<String> { crate::mls::payload::validate(&payload_json, &context) }

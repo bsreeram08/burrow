@@ -127,15 +127,16 @@ fn an_ambiguous_submit_is_resolved_from_the_log() {
     let g = f.group.clone();
     // The DS sequenced a1's commit but the response was lost: a1 still holds it pending.
     let out = f.a1.groups.commit(&mut f.a1.store, &group_id(&g).unwrap(), &[], &[], None, true).unwrap();
-    let pending = f.a1.groups.pending_digest(&mut f.a1.store, &group_id(&g).unwrap()).unwrap().unwrap();
-    assert_eq!(pending["digest"], out.digest);
+    let pending = f.a1.groups.pending_commit(&mut f.a1.store, &group_id(&g).unwrap()).unwrap().unwrap();
+    assert_eq!(pending.digest, out.digest);
+    assert_eq!(pending.epoch, out.epoch);
     f.server.submit(&g, &out.commit).unwrap();
     let before = f.a1.epoch(&g);
     let processed = f.a1.sync(&f.server, &g);
     assert_eq!(processed.last().unwrap().kind, "own");
     assert_eq!(processed.last().unwrap().digest.as_deref(), Some(out.digest.as_str()));
     assert_eq!(f.a1.epoch(&g), before + 1);
-    assert!(f.a1.groups.pending_digest(&mut f.a1.store, &group_id(&g).unwrap()).unwrap().is_none());
+    assert!(f.a1.groups.pending_commit(&mut f.a1.store, &group_id(&g).unwrap()).unwrap().is_none());
     f.b1.sync(&f.server, &g);
     f.b1.send(&mut f.server, &g, "ok");
     assert_eq!(f.a1.texts(&f.server, &g), vec!["ok".to_string()]);

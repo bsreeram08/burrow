@@ -40,13 +40,14 @@ fn a_pending_commit_survives_a_restart() {
     let gid = group_id(&g).unwrap();
     let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
     f.a1.restart();
-    let pending = f.a1.groups.pending_digest(&mut f.a1.store, &gid).unwrap().unwrap();
-    assert_eq!(pending["digest"], out.digest);
+    let pending = f.a1.groups.pending_commit(&mut f.a1.store, &gid).unwrap().unwrap();
+    assert_eq!(pending.digest, out.digest);
+    assert_eq!(pending.epoch, out.epoch);
     f.server.submit(&g, &out.commit).unwrap();
     let before = f.a1.epoch(&g);
     f.a1.groups.merge_own(&mut f.a1.store, &gid).unwrap();
     assert_eq!(f.a1.epoch(&g), before + 1);
-    assert!(f.a1.groups.pending_digest(&mut f.a1.store, &gid).unwrap().is_none());
+    assert!(f.a1.groups.pending_commit(&mut f.a1.store, &gid).unwrap().is_none());
 }
 
 #[test]
@@ -207,7 +208,7 @@ fn a_failed_write_leaves_the_device_at_its_last_persisted_state() {
     assert_eq!(f.a1.groups.encrypt(&mut f.a1.store, &gid, "x").unwrap_err().code(), Some("storage"), "memory ran ahead of disk: reload first");
     f.a1.restart();
     assert_eq!(f.a1.epoch(&g), epoch);
-    assert!(f.a1.groups.pending_digest(&mut f.a1.store, &gid).unwrap().is_none());
+    assert!(f.a1.groups.pending_commit(&mut f.a1.store, &gid).unwrap().is_none());
     f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
 }
 

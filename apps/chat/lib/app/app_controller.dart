@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -12,6 +13,7 @@ import 'package:sqflite/sqflite.dart';
 
 import '../calls/call_controller.dart';
 import '../core/api.dart';
+import '../core/devices.dart';
 import '../core/events.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
@@ -101,6 +103,30 @@ class SharedRotationPrefs implements RotationPrefs {
       _prefs.remove(key);
     }
   }
+}
+
+/// This device's id per account and contacts' pinned device lists (account.js `device-id-v1`, `device-pins-v1`).
+final devicePrefsProvider = Provider<Future<DevicePrefs> Function()>((ref) => () async => SharedDevicePrefs(await SharedPreferences.getInstance()));
+
+class SharedDevicePrefs implements DevicePrefs {
+  SharedDevicePrefs(this._prefs);
+  final SharedPreferences _prefs;
+  @override
+  String? deviceId(String userId) => _prefs.getString('device-id-v1:$userId');
+  @override
+  void setDeviceId(String userId, String id) => _prefs.setString('device-id-v1:$userId', id);
+  @override
+  DevicePin? pin(String userId, String contactId) {
+    final raw = _prefs.getString('device-pin-v1:$userId:$contactId');
+    try {
+      return raw == null ? null : DevicePin.fromJson(jsonDecode(raw));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  void setPin(String userId, String contactId, DevicePin pin) => _prefs.setString('device-pin-v1:$userId:$contactId', jsonEncode(pin.toJson()));
 }
 
 /// Opens the per-account message database.
@@ -261,6 +287,7 @@ class AppController extends Notifier<AppState> {
       ack: events.ack,
       viewing: () => viewingContact,
       rotation: await ref.read(rotationPrefsProvider)(user.id),
+      devices: await ref.read(devicePrefsProvider)(),
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
     );
     messenger = m;
@@ -276,6 +303,10 @@ class AppController extends Notifier<AppState> {
     unawaited(_checkActive());
     await loadContacts();
     unawaited(events.connect());
+    // Pin each contact's signed device list now, so a later rollback or injected device is caught.
+    for (final contact in state.contacts.where((c) => c.state == ContactState.mutual && c.id != null)) {
+      unawaited(m.verifyContactDevices(contact).catchError((_) => null));
+    }
   }
 
   Contact? contactById(String id) {
@@ -311,6 +342,10 @@ class AppController extends Notifier<AppState> {
       case KeysChanged(:final id):
         // Our own id: another device may have taken over this account's encryption.
         unawaited(id == state.user?.id ? _checkActive() : _checkIdentity(id));
+      case DevicesChanged(:final id):
+        // A contact's list: verify it against their pinned security code. (Ours: the app does not sign lists yet.)
+        final contact = contactById(id);
+        if (contact != null && id != state.user?.id) unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
       case Incoming():

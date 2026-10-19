@@ -68,7 +68,11 @@ const log = (page: any, text: string) => page.waitForFunction((t: string) => doc
 
 let code = 1;
 try {
-    await waitFor('ready');
+    // M1: the app announced its device with the published identity and now holds the account's own inbox.
+    const appDevice = await waitFor('ready');
+    const primary = testing.db.query("SELECT id, platform, state FROM devices WHERE user_id = ? AND is_primary = 1 AND state != 'revoked'").get(appUser.id) as any;
+    if (primary?.id !== appDevice || primary.platform !== 'ios') throw new Error(`the app's device is not the account's messaging device: ${JSON.stringify(primary)}`);
+    step('the app registered its device and took the account\'s per-device inbox');
     const { page } = await webPage();
     await page.click('#contact-list .contact.mutual .row-button');
     await page.fill('#chat-input', 'hello from web'); await page.click('#chat-send');
@@ -159,6 +163,9 @@ try {
     await page.click('#safety-close');
     signal('safety-checked', webNumber === appNumber.trim() ? 'match' : 'mismatch');
     if (webNumber !== appNumber.trim()) throw new Error(`safety numbers differ: web ${webNumber} vs app ${appNumber}`);
+    // By now the web published its signed device list v1, and the app verified it (Dart side, before 'safety').
+    if (!testing.db.query('SELECT version FROM device_lists WHERE user_id = ?').get(webUser.id)) throw new Error('the web client never published its device list');
+    step('the app verified and pinned the web account\'s signed device list');
     step(`safety numbers match on both clients (${webNumber.slice(0, 11)}…)`);
 
     await waitFor('reset-1');

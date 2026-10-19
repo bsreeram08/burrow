@@ -5,6 +5,7 @@ import 'dart:math' as math;
 import 'package:uuid/uuid.dart';
 
 import '../core/api.dart';
+import '../core/devices.dart';
 import '../core/events.dart';
 import '../core/pair_id.dart';
 import '../crypto/chat_crypto.dart';
@@ -64,9 +65,11 @@ class Messenger {
     required this.ack,
     this.viewing,
     RotationPrefs? rotation,
+    DevicePrefs? devices,
     bool Function()? readReceipts,
     int Function()? now,
   }) : rotation = rotation ?? MemoryRotationPrefs(),
+       devices = devices ?? MemoryDevicePrefs(),
        readReceipts = readReceipts ?? (() => true),
        _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
 
@@ -76,6 +79,9 @@ class Messenger {
 
   /// Chat key rotation settings (account.js `rotation-*`).
   final RotationPrefs rotation;
+
+  /// This device's id and contacts' pinned device lists (account.js `device-id-v1`, `device-pins-v1`).
+  final DevicePrefs devices;
 
   final Api api;
   final ChatCrypto crypto;
@@ -131,6 +137,17 @@ class Messenger {
     _activeChanges.add(value);
   }
 
+  /// This device's id for the account (docs/devices.md), created on first use.
+  String get deviceId => localDeviceId(devices, me.id);
+
+  /// Binds this session to [deviceId]; with our identity (only when it is the published one) the device
+  /// takes the account's messaging inbox. Best effort: a server without devices still delivers as before.
+  Future<void> _announce(Identity? identity) async {
+    try {
+      await api.announceDevice(deviceId, identity: identity?.toJson());
+    } catch (_) {}
+  }
+
   /// Compares the server's published identity with ours before uploading anything.
   /// Re-run on sign-in, on reconnect and on a `keys` event for our own id.
   Future<bool> checkActive() async {
@@ -138,9 +155,13 @@ class Messenger {
     final mine = await crypto.identity();
     final published = count.identity == null ? null : Identity.fromJson(count.identity!);
     if (published != null && published != mine) {
+      // Another device holds the keys: this one is a pending device of the account.
+      await _announce(null);
       _setActive(false);
       return false;
     }
+    // Before the first upload there is no published identity to show: the upload itself claims the inbox.
+    await _announce(published);
     final upload = await crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: published == null ? 0 : count.oneTimePreKeys);
     final spkId = upload.signedPreKey['id'];
     if (published == null || upload.oneTimePreKeys != null || upload.rotated || count.signedPreKeyId != spkId) await api.uploadKeys(upload.toJson());
@@ -152,6 +173,8 @@ class Messenger {
   /// Only on the user's tap: publish this device's identity, signed prekey and 100 fresh
   /// one-time prekeys. This device becomes active; contacts see a security-code change.
   Future<void> takeOver() async {
+    // A bound session: the new identity's upload moves the account's inbox to this device.
+    await _announce(null);
     final upload = await crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: 0);
     await api.uploadKeys(upload.toJson());
     _setActive(true);
@@ -586,6 +609,41 @@ class Messenger {
   }
 
   /// Settings → Security: new identity keys for this device (explicit only). Contacts see a code change.
+  // ---------- Contacts' device lists ----------
+  /// The last check of each contact's device list (contact id → result).
+  final Map<String, DeviceCheck> deviceChecks = {};
+
+  /// Verifies a contact's served device list against the identity pinned for them (never the server's
+  /// word) and advances the pin. A failure is reported once as a notice; nothing is trusted from it.
+  Future<DeviceCheck?> verifyContactDevices(Contact contact) async {
+    final id = contact.id;
+    if (id == null) return null;
+    final view = await api.devices(contact.username);
+    final served = view['identity'];
+    if (served is! Map<String, dynamic>) return null;
+    // Recording the served identity flags it if it is not the pinned one, so a list is only ever checked
+    // against the security code the user knows.
+    await crypto.notePeer(id, Identity.fromJson(served));
+    final safety = await crypto.safety(me.username, id, contact.username);
+    if (safety == null || safety.blocked) return deviceChecks[id] = const DeviceCheck.failed('identity');
+    final check = verifyView(
+      userId: id,
+      aikSign: served['sign'] as String,
+      list: view['list'],
+      signature: view['signature'],
+      certs: view['certs'],
+      pin: devices.pin(me.id, id),
+    );
+    final previous = deviceChecks[id];
+    deviceChecks[id] = check;
+    if (check.ok) {
+      devices.setPin(me.id, id, check.pin!);
+    } else if (check.reason != 'none' && previous?.reason != check.reason) {
+      _notices.add("${contact.username}'s device list failed verification (${check.reason}).");
+    }
+    return check;
+  }
+
   Future<void> regenerateIdentity() async {
     await crypto.resetIdentity();
     _confirmed.clear();

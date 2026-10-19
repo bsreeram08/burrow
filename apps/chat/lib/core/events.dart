@@ -23,6 +23,7 @@ sealed class AccountEvent {
         'presence' => Presence(m['id'] as String, m['online'] as bool),
         'contacts' => const ContactsChanged(),
         'keys' => KeysChanged(m['id'] as String),
+        'devices' => DevicesChanged(m['id'] as String),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
           fromId: (m['from'] as Map)['id'] as String,
@@ -50,6 +51,12 @@ sealed class AccountEvent {
 class Hello extends AccountEvent {
   const Hello(this.online);
   final List<String> online;
+}
+
+/// An account's device list changed (ours or a contact's): re-verify it.
+class DevicesChanged extends AccountEvent {
+  const DevicesChanged(this.id);
+  final String id;
 }
 
 class Presence extends AccountEvent {

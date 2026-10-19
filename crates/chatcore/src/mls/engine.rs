@@ -114,6 +114,15 @@ pub struct Outgoing {
     pub epoch: u64,
 }
 
+/// A commit built here and not yet resolved: the DS has neither accepted nor refused it as far as this device knows.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCommit {
+    /// SHA-256 of the commit bytes (hex): find it in the group's log to learn whether the DS sequenced it.
+    pub digest: String,
+    /// The epoch it was built on.
+    pub epoch: u64,
+}
+
 /// Public state of a group after a change: what the DS and joiners need.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GroupView {
@@ -436,7 +445,7 @@ impl Groups {
                 validate_staged(mls_group.extensions(), mls_group.members(), &Sender::Member(mls_group.own_leaf_index()), staged, &mut directory)?;
             }
             let outgoing = Outgoing { group_id: group_text(group), commit: b64(&commit), welcome, digest: digest(&commit), epoch: mls_group.epoch().as_u64() };
-            extra.push(Write::Put(pending_key(group), json!({ "digest": outgoing.digest, "epoch": outgoing.epoch })));
+            extra.push(Write::Put(pending_key(group), serde_json::to_value(PendingCommit { digest: outgoing.digest.clone(), epoch: outgoing.epoch }).expect("serializes")));
             Ok(outgoing)
         })
     }
@@ -481,8 +490,10 @@ impl Groups {
         })
     }
 
-    /// Our pending commit's digest and epoch, if any (to resolve an ambiguous submit against the log).
-    pub fn pending_digest(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<Option<Value>> { store.get(&pending_key(group)) }
+    /// Our pending commit, if any (to resolve an ambiguous submit against the log).
+    pub fn pending_commit(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<Option<PendingCommit>> {
+        store.get(&pending_key(group))?.map(|value| serde_json::from_value(value).map_err(ChatError::storage)).transpose()
+    }
 
     pub fn group_view(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<GroupView> {
         let cert = Self::device(store)?;
@@ -622,7 +633,7 @@ impl Groups {
         let cert = Self::device(store)?;
         self.gate(store, group)?;
         let message_digest = digest(&bytes);
-        let own_pending = store.get(&pending_key(group))?.and_then(|v| v.get("digest").and_then(Value::as_str).map(str::to_string));
+        let own_pending = self.pending_commit(store, group)?.map(|pending| pending.digest);
         if own_pending.as_deref() == Some(message_digest.as_str()) {
             // Our own commit, sequenced by the DS: merge it (after the same validation).
             self.merge_own(store, group)?;

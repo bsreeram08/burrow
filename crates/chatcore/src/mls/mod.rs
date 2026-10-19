@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{ChatError, Result};
 
 pub mod cert;
+pub mod commands;
 pub mod engine;
 pub mod payload;
 pub mod persist;

@@ -66,7 +66,7 @@
     loadContacts(); connectEvents(); window.Alerts?.signedIn();
   }
   function signedOut(message = '') {
-    me = null; contacts = []; current = null; pairs.clear(); box = null; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
+    me = null; contacts = []; current = null; pairs.clear(); box = null; deviceView = null; announced = ''; metaKey = null; deviceWarning = ''; deviceNotice = ''; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
     clearTimeout(retryTimer); clearTimeout(flushTimer); const previous = events; events = null; previous?.close();
     if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true;
     body.dataset.auth = 'out'; body.dataset.screen = ''; say('account-status', message);
@@ -121,7 +121,7 @@
     inactive = value; $('device-banner').hidden = !value;
     say('device-banner-text', keysLost
       ? 'This browser lost your encryption keys since you last used it here. That happens in private tabs and in apps’ built-in browsers (Instagram, WhatsApp, Telegram…). Open calls.sreerams.in in Safari or Chrome itself, or from the Home Screen app, and use that one.'
-      : 'Encrypted messaging for this account is active on another device or browser. Messages are not sent or received here.');
+      : 'Encrypted messaging for this account is active on your primary device. Link this browser from your primary device to use it here; messages are not sent or received here until then.');
     if (value) { say('chats-status', ''); if (current) App.chatStatus('Messaging is active on another device. Use this device from the chat list to send here.'); }
   }
   async function publishKeys(takeover = false) {
@@ -129,14 +129,153 @@
     const keys = await box.prekeys(), count = await api('/api/keys/count');
     const mine = count.identity, here = keys.identity;
     const other = Boolean(mine && (mine.dh !== here.dh || mine.sign !== here.sign));
-    if (other && !takeover) { setInactive(true); return; }
+    if (other && !takeover) { setInactive(true); announceDevice(null).catch(() => {}); return; }
     setInactive(false); keysLost = false;
+    // Holding the published identity: this device takes the messaging inbox (unless a signed list names another primary).
+    if (!other) await announceDevice(here).catch(() => {});
     try { localStorage.setItem(`keys-held-v1:${me.id}`, '1'); } catch {}
     const upload = { identity: here, signedPreKey: keys.signedPreKey };
     // Taking over replaces the identity, and the server drops the previous device's prekeys with it.
     if (other || count.oneTimePreKeys < 20 || count.signedPreKeyId === null) upload.oneTimePreKeys = await box.oneTimePreKeys(other ? 100 : 100 - Math.min(count.oneTimePreKeys, 100) || 100);
     if (other || upload.oneTimePreKeys || keys.rotated || count.signedPreKeyId !== keys.signedPreKey.id) await api('/api/keys', 'PUT', upload);
-    if (other) flushOutgoing();
+    if (other) { await announceDevice(here).catch(() => {}); flushOutgoing(); }
+    await syncDevices().catch(error => { deviceWarning = `Could not update the device list: ${error.message}`; renderDevices(); });
+  }
+
+  // ---------- Devices (docs/devices.md) ----------
+  // This browser's device id, kept per account. The device holding the account identity key is the primary:
+  // it signs the device list (AIK-signed, versioned, hash-chained) that contacts and the server go by.
+  let deviceWarning = '', deviceNotice = '', deviceView = null;
+  const Devices = window.DeviceFormat;
+  function localDeviceId() {
+    const key = `device-id-v1:${me.id}`;
+    let id = null;
+    try { id = localStorage.getItem(key); } catch {}
+    if (!id || !/^[A-Za-z0-9_-]{22}$/.test(id)) { id = Devices.newDeviceId(); try { localStorage.setItem(key, id); } catch {} }
+    return id;
+  }
+  // Highest verified list per account (own and contacts): a list may only move forward, never back or sideways.
+  const readPins = () => { try { return JSON.parse(localStorage.getItem(`device-pins-v1:${me.id}`) || '{}') || {}; } catch { return {}; } };
+  const writePins = pins => { try { localStorage.setItem(`device-pins-v1:${me.id}`, JSON.stringify(pins)); } catch {} };
+  async function rawSign(bytes) {
+    const identity = await box.identity();
+    if (!identity?.sign?.privateKey) throw new Error('this encryption core cannot sign device lists yet');
+    return new Uint8Array(await crypto.subtle.sign('Ed25519', identity.sign.privateKey, bytes));
+  }
+  const signWithIdentity = async bytes => Devices.b64(await rawSign(bytes));
+  // The key that seals device labels and platforms inside the list: derived from the identity key, per account.
+  let metaKey = null;
+  async function deviceMetaKey() {
+    const aik = (await box.identity()).pub.sign;
+    if (metaKey?.aik !== aik) metaKey = { aik, key: Devices.deviceMetaKey(me.id, rawSign) };
+    return metaKey.key;
+  }
+  /** Signs `list`, with an AIK-signed certificate for every device it names. */
+  async function signList(list) {
+    const certs = {};
+    for (const device of list.devices) certs[device.deviceId] = await signWithIdentity(Devices.certBytes(Devices.certFor(me.id, device)));
+    return { list, signature: await signWithIdentity(Devices.listBytes(list)), certs };
+  }
+  /** After publishing: advance our own pin (version, hash and tombstones for dropped devices) through the same checks contacts run. */
+  async function pinOwn(signed) {
+    const pins = readPins(), own = (await box.prekeys()).identity;
+    const after = await Devices.verifyView({ userId: me.id, aikSign: own.sign, ...signed, pin: pins[me.id] });
+    if (after.ok) { pins[me.id] = after.pin; writePins(pins); }
+  }
+  /**
+   * Binds this browser's session to its device id. A browser that does not hold the keys shows up as pending in
+   * the owner's Settings → Devices; one that holds the published identity says so and gets the messaging inbox.
+   */
+  let announced = '';
+  async function announceDevice(identity) {
+    if (!me || !Devices) return;
+    const key = `${me.id}|${identity ? identity.sign : ''}`;
+    if (announced === key) return;
+    await api('/api/devices/announce', 'POST', identity ? { deviceId: localDeviceId(), identity } : { deviceId: localDeviceId() });
+    announced = key;
+  }
+  /** On the identity-key holder: verify the served list against our own key and pins, and publish the next one if this device is missing. */
+  // One at a time: the key upload and a 'devices' event may both ask, and two signers would race for the same version.
+  let syncing = Promise.resolve();
+  function syncDevices() { const run = syncing.then(syncDevicesNow); syncing = run.catch(() => {}); return run; }
+  async function syncDevicesNow() {
+    if (!me || !box || inactive || !Devices || backendName === 'wasm') return; // The WebAssembly core cannot sign with the identity key yet (M2).
+    const id = localDeviceId(), own = (await box.prekeys()).identity;
+    const view = await api(`/api/devices/${me.username}`);
+    if (!view.identity || view.identity.sign !== own.sign || view.identity.dh !== own.dh) return; // Not the key holder: publishKeys decides.
+    const pins = readPins(), pin = pins[me.id];
+    let base = null;
+    if (view.list) {
+      const check = await Devices.verifyView({ userId: me.id, aikSign: own.sign, list: view.list, signature: view.signature, certs: view.certs, pin });
+      if (!check.ok) { deviceWarning = `The device list on the server is not one this device signed (${check.reason}). It was not changed.`; deviceView = view; renderDevices(); return; }
+      pins[me.id] = check.pin; writePins(pins);
+      base = { list: view.list, hash: check.hash };
+      const mine = view.devices.find(row => row.id === id);
+      if (view.currentDevice === id && mine?.primary && view.list.devices.some(device => device.deviceId === id)) { deviceWarning = ''; deviceView = view; renderDevices(); return; }
+    }
+    // Next version: this device plus every listed device the server still has, chained to the current list.
+    const keep = base ? base.list.devices.filter(device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && row.state === 'listed')) : [];
+    const self = base?.list.devices.find(device => device.deviceId === id) || { deviceId: id, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, id, { label: Devices.describeThisDevice(), platform: 'web' }) };
+    const list = { v: 1, userId: me.id, version: (base?.list.version || 0) + 1, prevHash: base?.hash || '', devices: [...keep, self].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
+    const signed = await signList(list);
+    await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
+    await pinOwn(signed);
+    deviceWarning = '';
+    deviceView = await api(`/api/devices/${me.username}`);
+    renderDevices();
+  }
+  const platformName = platform => ({ web: 'Web browser', ios: 'iPhone app', android: 'Android app', macos: 'Mac app', windows: 'Windows app', linux: 'Linux app' })[platform] || 'Device';
+  async function renderDevices() {
+    const list = $('device-list');
+    if (!list || !me) return;
+    say('devices-status', deviceWarning || deviceNotice);
+    if (!deviceView?.devices) { list.replaceChildren(); return; }
+    const amPrimary = deviceView.devices.some(row => row.current && row.primary);
+    // Only the identity-key holder can open the sealed labels; other browsers show the kind of client.
+    const key = amPrimary && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : null;
+    const rows = [];
+    for (const row of deviceView.devices) {
+      const item = document.createElement('li'); item.className = 'device-row'; item.dataset.deviceId = row.id; item.dataset.state = row.state;
+      const name = document.createElement('strong');
+      const entry = deviceView.list?.devices.find(device => device.deviceId === row.id);
+      const described = key && entry ? await Devices.openMeta(key, me.id, row.id, entry.meta) : null;
+      name.textContent = described?.label || platformName(described?.platform || row.platform);
+      const meta = document.createElement('small');
+      meta.textContent = [row.current ? 'This browser' : null, row.primary ? 'Primary · holds your keys' : null, row.state === 'pending' ? 'Signed in · not linked' : null, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
+      item.append(name, meta);
+      if (amPrimary && !row.current && !row.primary) {
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger-text device-remove'; remove.textContent = 'Remove';
+        remove.onclick = () => removeDevice(row).catch(error => { deviceWarning = `Could not remove the device: ${error.message}`; renderDevices(); });
+        item.append(remove);
+      }
+      rows.push(item);
+    }
+    list.replaceChildren(...rows);
+  }
+  /** Signs the device out everywhere and, if it was listed, publishes the list without it. */
+  async function removeDevice(row) {
+    let body = {};
+    if (row.state === 'listed') {
+      const current = deviceView.list, hash = await Devices.hash(Devices.listBytes(current));
+      const list = { v: 1, userId: me.id, version: current.version + 1, prevHash: hash, devices: current.devices.filter(device => device.deviceId !== row.id) };
+      body = await signList(list);
+    }
+    await api(`/api/devices/${row.id}`, 'DELETE', body);
+    if (body.list) await pinOwn(body);
+    deviceView = await api(`/api/devices/${me.username}`);
+    deviceNotice = 'Device removed: it was signed out and can no longer receive messages.';
+    renderDevices();
+  }
+  /** A contact's served list, checked against the identity key we pinned for them (never the server's word). */
+  async function verifyContactDevices(contact) {
+    const peer = await box?.peer(contact.id);
+    if (!peer?.identity?.sign || !Devices) return null;
+    const view = await api(`/api/devices/${contact.username}`);
+    if (!view.list) return { ok: false, reason: 'none' };
+    const pins = readPins(), pin = pins[contact.id];
+    const check = await Devices.verifyView({ userId: contact.id, aikSign: peer.identity.sign, list: view.list, signature: view.signature, certs: view.certs, pin });
+    if (check.ok) { pins[contact.id] = check.pin; writePins(pins); }
+    return { ...check, count: view.list.devices.length, version: view.list.version };
   }
   $('device-takeover').onclick = async () => {
     $('device-takeover').disabled = true; $('device-takeover').textContent = 'Moving…';
@@ -174,6 +313,8 @@
       else if (message.type === 'contacts') loadContacts();
       else if (message.type === 'incoming') incoming(message);
       else if (message.type === 'envelope') inbound = inbound.then(() => receiveEnvelope(socket, message)).catch(() => {});
+      else if (message.type === 'devices' && message.id === me?.id) { if (!inactive) syncDevices().catch(() => {}); else api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); }
+      else if (message.type === 'devices') { const contact = contactById(message.id); if (contact) verifyContactDevices(contact).catch(() => {}); }
       else if (message.type === 'keys' && message.id === me?.id) publishKeys().catch(() => {}); // Another device took over messaging.
       else if (message.type === 'keys') checkIdentity(message.id).then(flushOutgoing).catch(() => {});
       else if (message.type === 'ended' && ringing?.roomId === message.roomId) { const ring = ringing; ringing = null; hideRing(); say('chats-status', `Missed ${ring.kind} call from ${ring.contact.username} · ${clock(Date.now())}`); }
@@ -602,6 +743,13 @@
       $('safety-accept').hidden = !safety.blocked;
       const interval = effectiveRotation(contact.id), mine = myRotation(), theirs = peerRotation(contact.id);
       say('safety-rotation', interval ? `Chat keys rotate every ${every(interval)} (${mine === theirs ? 'both your settings' : interval === mine ? 'your setting' : 'their setting'}).` : 'Chat keys rotate when either of you resets the secure session. Automatic rotation is off for both of you.');
+      say('safety-devices', '');
+      verifyContactDevices(contact).then(result => {
+        if (!result) return;
+        say('safety-devices', result.ok ? `${contact.username} has ${result.count === 1 ? '1 device' : `${result.count} devices`} in a list signed by this security code (version ${result.version}).`
+          : result.reason === 'none' ? `${contact.username} has not published a device list yet.`
+          : `Warning: ${contact.username}'s device list failed verification (${result.reason}). Do not trust devices the server shows for them.`);
+      }).catch(() => {});
       $('safety').hidden = false; $('safety-close').focus();
     } catch (error) { App.chatStatus(error.status === 404 ? `${contact.username} has not set up encrypted messaging yet.` : error.message); }
   }
@@ -689,6 +837,7 @@
   };
   $('invite-close').onclick = () => { $('invite-result').hidden = true; $('invite-link').value = ''; };
   $('account-settings').onclick = () => { $('account-menu').open = false; $('settings').open = true; App.view('panel', 'settings'); };
+  $('settings').addEventListener('toggle', () => { if ($('settings').open && me) api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); });
 
   // ---------- Conversation ----------
   function updateHeader() {

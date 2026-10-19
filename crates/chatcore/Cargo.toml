@@ -18,20 +18,27 @@ hmac = "=0.12.1"
 sha2 = "=0.10.9"
 rand_core = { version = "=0.6.4", features = ["getrandom"] }
 base64 = "=0.22.1"
-serde = { version = "=1.0.219", features = ["derive"] }
-serde_json = { version = "=1.0.140", features = ["preserve_order"] }
-zeroize = { version = "=1.8.1", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = { version = "=1.0.151", features = ["preserve_order"] }
+zeroize = { version = "=1.9.1", features = ["derive"] }
 rusqlite = { version = "=0.32.1", features = ["bundled"], optional = true }
 # WebAssembly (crates/chatcore-wasm): browser randomness and clock.
 getrandom = { version = "=0.2.17", features = ["js"], optional = true }
 js-sys = { version = "=0.3.106", optional = true }
+# MLS groups (src/mls). Pinned exactly; see crates/chatcore/MLS.md and the spike's FINDINGS.md.
+openmls = { version = "=0.9.0", default-features = false }
+openmls_rust_crypto = "=0.6.0"
+openmls_traits = "=0.6.0"
+openmls_basic_credential = "=0.6.0"
+# RustCrypto 0.11-era crates pulled in by hpke-rs need getrandom 0.4 with its own wasm backend.
+getrandom04 = { package = "getrandom", version = "=0.4.3", features = ["wasm_js"], optional = true }
 
 [features]
 default = ["native"]
 # Native apps and the interop CLI: SQLite key database.
 native = ["dep:rusqlite"]
 # Browser build: no SQLite (the journal is persisted to IndexedDB by the JS shim).
-wasm = ["dep:getrandom", "dep:js-sys"]
+wasm = ["dep:getrandom", "dep:js-sys", "dep:getrandom04", "openmls/js"]
 
 [[bin]]
 name = "interop"

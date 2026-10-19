@@ -19,6 +19,7 @@ struct Flaky { inner: MemoryStore, fail: Arc<AtomicUsize> }
 impl Store for Flaky {
     fn get(&mut self, key: &str) -> chatcore::Result<Option<Value>> { self.inner.get(key) }
     fn delete_prefix(&mut self, prefix: &str) -> chatcore::Result<()> { self.inner.delete_prefix(prefix) }
+    fn scan(&mut self, prefix: &str) -> chatcore::Result<Vec<(String, Value)>> { self.inner.scan(prefix) }
     fn batch(&mut self, writes: Vec<Write>) -> chatcore::Result<()> {
         if self.fail.load(Ordering::SeqCst) > 0 { self.fail.fetch_sub(1, Ordering::SeqCst); return Err(ChatError::storage("injected")); }
         self.inner.batch(writes)

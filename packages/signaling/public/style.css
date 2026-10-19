@@ -634,3 +634,8 @@ body[data-rich="yes"] .composer[data-empty="true"]:not([data-editing="true"]) #c
   .lightbox-stage img { transition: transform .2s ease; }
   .msg-actions:not([hidden]) { animation: menu-in .12s ease-out; }
 }
+.device-list { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 8px; }
+.device-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.device-row small { grid-column: 1; color: var(--muted); }
+.device-row .device-remove { grid-column: 2; grid-row: 1 / span 2; }
+.device-row[data-state="pending"] { border-style: dashed; }

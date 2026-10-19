@@ -17,6 +17,7 @@
   <script src="/app.js" defer></script>
   <script src="/theme.js" defer></script>
   <script src="/alerts.js" defer></script>
+  <script src="/devices.js" defer></script>
   <script src="/account.js" defer></script>
   <script src="/install.js" defer></script>
 </head>
@@ -157,6 +158,7 @@
     <p id="safety-number" class="safety-number"></p>
     <p id="safety-state"></p>
     <p id="safety-rotation" class="note"></p>
+    <p id="safety-devices" class="note"></p>
     <div class="dialog-actions"><button id="safety-close" type="button">Close</button><button id="safety-accept" type="button" hidden>Accept new code</button><button id="safety-verify" class="primary" type="button">Mark as verified</button></div>
   </div></div>
 
@@ -263,6 +265,12 @@
       <label class="toggle"><input id="notify-toggle" type="checkbox"> Notify me about messages and calls on this device</label>
       <label class="toggle"><input id="ring-silent" type="checkbox"> Silent: no ringtone or vibration</label>
       <p id="notify-status" class="note" role="status" aria-live="polite"></p>
+    </div>
+    <div class="account-only devices-settings">
+      <h3>Devices</h3>
+      <p class="note">The device that holds your keys is the primary. It signs the list of your devices; contacts check that signature, so the server cannot add a device they would trust.</p>
+      <ul id="device-list" class="device-list" aria-label="Your devices"></ul>
+      <p id="devices-status" class="note" role="status" aria-live="polite"></p>
     </div>
     <div class="account-only">
       <h3>Security</h3>

@@ -45,6 +45,8 @@ jobs:
           path: wasm-rebuilt/
       - run: bun tests/interop/core-tamper.mjs
       - run: bun run test:interop
+      # The delivery service against real MLS clients (needs the Rust toolchain; skipped in the runtime job).
+      - run: bun test tests/unit/channels.test.ts
   calling:
     runs-on: ubuntu-latest
     timeout-minutes: 20

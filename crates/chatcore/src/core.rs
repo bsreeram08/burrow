@@ -8,6 +8,7 @@
 //! receive for that contact) is refused as transient, and redelivery simply decrypts again.
 use std::collections::{BTreeMap, VecDeque};
 
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -163,6 +164,14 @@ impl Core {
         self.store.put("identity", to_value(&identity))?;
         self.may_create_identity = false;
         Ok(identity)
+    }
+
+    /// Proves this device holds the account identity key for one device-claim challenge (docs/devices.md):
+    /// signs `claim_bytes` only, never caller-chosen bytes, and never creates an identity.
+    pub fn prove_identity(&mut self, user_id: &str, device_id: &str, challenge: &str) -> Result<String> {
+        let bytes = claim_bytes(user_id, device_id, challenge)?;
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
     }
 
     /// Current signed prekey, rotated weekly (`max_age_ms`); replay records under a retired prekey go with it.

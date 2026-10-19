@@ -2,7 +2,7 @@
 //! (tests/interop), the WASM build (the browser worker and the node interop party). One command object
 //! in; `{"ok": value}` or `{"error": message, "code": code|null}` out. Commands: identity, prekeys, opks,
 //! encrypt, decrypt, commit, abort, rotate, sessionInfo, sids, resetIdentity, safety, peer, notePeer,
-//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce.
+//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce, proveIdentity.
 use serde_json::{json, Value};
 
 use crate::core::Core;
@@ -66,6 +66,7 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
             let record = core.store_mut().get(&format!("sessions:{contact}"))?;
             Ok(record.and_then(|value| value.get("order").cloned()).unwrap_or(json!([])))
         }
+        "proveIdentity" => Ok(json!(core.prove_identity(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "challenge")?)?)),
         "resetIdentity" => { core.reset_identity()?; Ok(Value::Null) }
         "safety" => Ok(match core.safety(&text(command, "me")?, &text(command, "contact")?, &text(command, "them")?)? {
             Some(safety) => json!({ "number": safety.number, "verified": safety.verified, "changed": safety.changed, "blocked": safety.blocked }),

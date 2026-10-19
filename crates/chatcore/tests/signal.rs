@@ -604,3 +604,27 @@ fn an_existing_key_database_never_mints_a_new_identity_on_its_own() {
     assert_ne!(core.identity().unwrap().public, first);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn identity_proofs_sign_only_the_claim_bytes_and_match_devices_js() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    // The same bytes as packages/signaling/public/devices.js claimBytes (vector pinned in tests/unit/devices.test.ts).
+    let bytes = protocol::claim_bytes("user_1", &"a".repeat(22), &"A".repeat(43)).unwrap();
+    assert_eq!(hex(&Sha256::digest(&bytes)), "2238b7912ca08441271c164e5591d1f62afd2ae2afec60aa8b5a49054366ef40");
+    let mut alice = party();
+    let identity = alice.core.prekeys(NOW, None).unwrap().identity;
+    let challenge = URL_SAFE_NO_PAD.encode([7u8; 32]);
+    let signature = alice.core.prove_identity("user_1", &"b".repeat(22), &challenge).unwrap();
+    let key = VerifyingKey::from_bytes(&URL_SAFE_NO_PAD.decode(&identity.sign).unwrap().try_into().unwrap()).unwrap();
+    let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature).unwrap()).unwrap();
+    assert!(key.verify(&protocol::claim_bytes("user_1", &"b".repeat(22), &challenge).unwrap(), &signature).is_ok());
+    // Never a general signing oracle: anything that is not a well-formed claim is refused.
+    for (user, device, nonce) in [("no spaces", "b".repeat(22), challenge.clone()), ("user_1", "short".into(), challenge.clone()), ("user_1", "b".repeat(22), "A".repeat(42)), ("user_1", "b".repeat(22), URL_SAFE_NO_PAD.encode([1u8; 33]))] {
+        assert!(alice.core.prove_identity(user, &device, &nonce).is_err());
+    }
+    // And it never mints an identity in an empty store.
+    assert!(party().core.prove_identity("user_1", &"b".repeat(22), &challenge).is_err());
+}
+
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }

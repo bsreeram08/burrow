@@ -97,6 +97,18 @@ Future<SessionInfo?> sessionInfo({required String contactId}) =>
 
 Future<void> resetIdentity() => RustLib.instance.api.crateApiResetIdentity();
 
+/// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
+/// domain-separated bytes itself, so this is never a general signing oracle.
+Future<String> proveIdentity({
+  required String userId,
+  required String deviceId,
+  required String challenge,
+}) => RustLib.instance.api.crateApiProveIdentity(
+  userId: userId,
+  deviceId: deviceId,
+  challenge: challenge,
+);
+
 BigInt rotationInterval({required BigInt mine, required BigInt theirs}) =>
     RustLib.instance.api.crateApiRotationInterval(mine: mine, theirs: theirs);
 

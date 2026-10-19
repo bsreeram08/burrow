@@ -79,6 +79,8 @@ pub fn session_info(contact_id: String) -> Result<Option<SessionInfo>> {
 }
 
 /// Replaces this device's identity (explicit user action only); contacts see a security-code change.
+/// Signs a device-claim challenge with the account identity key (docs/devices.md); nothing else.
+pub fn prove_identity(user_id: String, device_id: String, challenge: String) -> Result<String> { with(|core| core.prove_identity(&user_id, &device_id, &challenge)) }
 pub fn reset_identity() -> Result<()> { with(|core| core.reset_identity()) }
 
 /// Chat key rotation schedule: the shorter non-off interval of the two sides wins (0 = off).

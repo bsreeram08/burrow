@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/crypto/chat_crypto.dart';
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
 
@@ -32,6 +33,19 @@ void main() {
     expect(upload.oneTimePreKeys, hasLength(100));
     await core.init('account'); // Reopen: same sealed database, same identity.
     expect(await core.identity(), identity);
+  }, skip: skip);
+
+  test('the core proves the identity key for a device claim, and refuses anything that is not one', () async {
+    final core = crypto(MemoryStoreKeys());
+    await core.init('claims');
+    final identity = await core.identity(), challenge = 'B' * 42 + 'A', device = 'd' * 22;
+    final proof = await core.proveIdentity('user_1', device, challenge);
+    expect(verifyBytes(identity.sign, claimBytes('user_1', device, challenge), proof), isTrue);
+    expect(verifyBytes(identity.sign, claimBytes('user_2', device, challenge), proof), isFalse);
+    // Never a general signing oracle: a malformed challenge, device or account is refused.
+    for (final args in [['user_1', device, 'short'], ['user_1', 'nope', challenge], ['no spaces', device, challenge]]) {
+      await expectLater(core.proveIdentity(args[0], args[1], args[2]), throwsA(isA<CryptoException>()));
+    }
   }, skip: skip);
 
   Matcher locked() => throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'storage').having((e) => e.keysLocked, 'keysLocked', isTrue));

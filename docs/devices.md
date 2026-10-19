@@ -52,11 +52,11 @@ The web client pins in `localStorage['device-pins-v1:<userId>']`. The app pins i
   - **Ephemeral envelopes** (typing) still go to every open stream of every device.
   - **Limits.** The size, per-sender and 30-day limits are unchanged.
 - **Which device is the messaging device?** A placeholder created by the migration or on first need, until one of these happens:
-  - a device announces with the published identity (`POST /api/devices/announce { deviceId, identity }`);
-  - a bound session uploads keys (`PUT /api/keys`);
+  - a device proves it holds the identity key: `announce` with `identityProof`, the published identity key's signature over `webrtc-bun-deviceclaim-v1 ‖ userId ‖ deviceId ‖ challenge` (the same single-use challenge as the binding);
+  - a bound session uploads a new identity (`PUT /api/keys`, first or changed: new keys, and contacts review the security code);
   - a signed list names a primary.
 
-  The first two (a "claim") need only what the server already trusted before M1: the session that holds the published identity. A signed list outranks a claim. A claim gives no client a reason to trust anything: that takes a signed list.
+  The first two are a "claim". Naming the identity, or re-uploading it unchanged, proves nothing (it is public) and claims nothing. Web signs the proof with the non-extractable identity key. The app and the WASM core use chatcore's `prove_identity(userId, deviceId, challenge)`, which builds these bytes itself and signs nothing else. A signed list outranks a claim. A claim gives no client a reason to trust anything: that takes a signed list.
 - **The `devices` frame** (`{ type: 'devices', id }`) goes to the account and its mutual contacts on every change. Clients re-fetch and re-verify.
 
 ## Migration of today's users

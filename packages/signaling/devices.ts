@@ -12,6 +12,7 @@ type Format = {
     validateList(list: unknown): DeviceList; listBytes(list: DeviceList): Uint8Array;
     certBytes(cert: object): Uint8Array; certFor(userId: string, device: DeviceEntry): object;
     bindBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
+    claimBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
 };
 const Format = (globalThis as any).DeviceFormat as Format;
 export const MAX_DEVICES = Format.MAX_DEVICES;
@@ -185,8 +186,8 @@ export function createDevices(deps: Deps) {
         })();
         return true;
     }
-    /** After PUT /api/keys: the session that uploaded the identity holds it, so its device may claim messaging. */
-    function keysUploaded(user: Caller) {
+    function keysUploaded(user: Caller, newIdentity: boolean) {
+        if (!newIdentity) return;
         const id = sessionDevice(user.session);
         if (id && claim(user.id, id)) { deps.notify(user.id, { type: 'devices', id: user.id }); deps.inboxChanged(user.id); }
     }
@@ -229,13 +230,14 @@ export function createDevices(deps: Deps) {
      * device's key: `signature` is the device key's signature over bindBytes(userId, deviceId, challenge) for
      * this session's single-use challenge. A new id registers `deviceKey`; an existing id is bound only with
      * its registered key, so another session of the account (or a stolen cookie) cannot become that device.
-     * It shows up as pending for the owner until a signed list names it. `identity`, when it matches the
-     * published identity, says this device holds the account keys: it then takes the messaging inbox (claim)
-     * unless a signed list says otherwise.
+     * It shows up as pending for the owner until a signed list names it. `identityProof` proves this device
+     * holds the account identity key: the published identity's signature over claimBytes(userId, deviceId,
+     * challenge), the same single-use challenge. With it the device takes the messaging inbox (claim) unless a
+     * signed list says otherwise. The identity itself is public, so naming it proves nothing.
      */
     function announce(user: Caller, body: Record<string, any> | null): [number, object] {
-        const deviceId = body?.deviceId, identity = body?.identity, nonce = body?.challenge;
-        if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || (identity !== undefined && (typeof identity?.dh !== 'string' || typeof identity?.sign !== 'string'))) return [400, { error: 'Invalid device' }];
+        const deviceId = body?.deviceId, proof = body?.identityProof, nonce = body?.challenge;
+        if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || (proof !== undefined && typeof proof !== 'string')) return [400, { error: 'Invalid device' }];
         // The challenge is spent by any attempt that names it, right or wrong.
         if (typeof nonce !== 'string' || !spend(user.session, nonce)) return [401, { error: 'The device challenge expired. Ask for a new one.' }];
         const bound = sessionDevice(user.session);
@@ -245,6 +247,10 @@ export function createDevices(deps: Deps) {
         const key = existing ? existing.sig_key! : body!.deviceKey;
         if (typeof key !== 'string' || !KEY.test(key)) return [400, { error: 'Invalid device key' }];
         if (!ed25519Verify(key, Format.bindBytes(user.id, deviceId, nonce), body!.signature)) return [403, { error: 'This session could not prove it is that device.' }];
+        // A claim must be signed by the published identity key for this challenge, account and device.
+        const published = aikOf(user.id);
+        const holder = proof !== undefined && published !== null && ed25519Verify(published, Format.claimBytes(user.id, deviceId, nonce), proof);
+        if (proof !== undefined && !holder) return [403, { error: 'The identity proof does not verify.' }];
         if (!existing && live(user.id).filter(row => row.state !== 'placeholder').length >= MAX_DEVICES) return [429, { error: `At most ${MAX_DEVICES} devices per account. Remove one in Settings → Devices.` }];
         const platform = Format.PLATFORMS.includes(user.client) ? user.client : 'unknown';
         db.transaction(() => {
@@ -252,8 +258,6 @@ export function createDevices(deps: Deps) {
             else db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), deviceId);
             db.query('UPDATE sessions SET device_id = ? WHERE token_hash = ?').run(deviceId, user.session);
         })();
-        const published = db.query<{ dh: string; sign: string }, [string]>('SELECT dh, sign FROM identity_keys WHERE user_id = ?').get(user.id);
-        const holder = Boolean(identity && published && published.dh === identity.dh && published.sign === identity.sign);
         const claimed = holder && claim(user.id, deviceId);
         if (!existing || claimed) deps.notify(user.id, { type: 'devices', id: user.id });
         deps.inboxChanged(user.id); // This session now reads its device's inbox.

@@ -132,7 +132,7 @@
     if (other && !takeover) { setInactive(true); announceDevice(null).catch(() => {}); return; }
     setInactive(false); keysLost = false;
     // Holding the published identity: this device takes the messaging inbox (unless a signed list names another primary).
-    if (!other) await announceDevice(here).catch(() => {});
+    if (!other) await announceDevice(mine ? here : null).catch(() => {}); // Before the first upload there is nothing to prove: the upload claims.
     try { localStorage.setItem(`keys-held-v1:${me.id}`, '1'); } catch {}
     const upload = { identity: here, signedPreKey: keys.signedPreKey };
     // Taking over replaces the identity, and the server drops the previous device's prekeys with it.
@@ -192,7 +192,9 @@
     // Proof of possession: the device key signs this session's single-use challenge.
     const device = await localDevice(), { challenge } = await api('/api/devices/challenge', 'POST', {});
     const signature = await device.sign(Devices.bindBytes(me.id, device.deviceId, challenge));
-    await api('/api/devices/announce', 'POST', { deviceId: device.deviceId, deviceKey: device.publicKey, challenge, signature, ...(identity ? { identity } : {}) });
+    // Holding the published identity: prove it with the identity key over the same challenge, to claim messaging.
+    const identityProof = identity ? await (backendName === 'wasm' ? box.proveIdentity(me.id, device.deviceId, challenge) : signWithIdentity(Devices.claimBytes(me.id, device.deviceId, challenge))) : undefined;
+    await api('/api/devices/announce', 'POST', { deviceId: device.deviceId, deviceKey: device.publicKey, challenge, signature, ...(identityProof ? { identityProof } : {}) });
     announced = key;
   }
   /** On the identity-key holder: verify the served list against our own key and pins, and publish the next one if this device is missing. */

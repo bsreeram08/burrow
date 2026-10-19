@@ -198,6 +198,11 @@ abstract class ChatCrypto {
   /// security-code change; upload it with takeover semantics afterwards.
   Future<void> resetIdentity();
 
+  /// Proves to the server that this device holds the account identity key, for one device-claim
+  /// challenge (docs/devices.md): the identity key's signature over the claim bytes, which the core builds
+  /// itself, so it signs nothing else. Base64url.
+  Future<String> proveIdentity(String userId, String deviceId, String challenge);
+
   /// Records an identity seen from the server (key-change events). A
   /// different identity than the pinned one is flagged and blocks sending.
   Future<void> notePeer(String contactId, Identity identity);

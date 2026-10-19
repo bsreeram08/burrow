@@ -141,10 +141,11 @@ class Messenger {
   Future<LocalDevice> device() => _device ??= localDevice(devices, me.id);
   Future<LocalDevice>? _device;
 
-  /// Binds this session to our device, signing the server's challenge with the device key; with our
-  /// identity (only when it is the published one) the device takes the account's messaging inbox.
+  /// Binds this session to our device, signing the server's challenge with the device key. With [claim]
+  /// (only when our identity is the published one) the identity key also proves it holds the account keys
+  /// for the same challenge, and the device takes the account's messaging inbox.
   /// Best effort: a server without devices still delivers as before.
-  Future<void> _announce(Identity? identity) async {
+  Future<void> _announce({bool claim = false}) async {
     try {
       final local = await device(), challenge = await api.deviceChallenge();
       await api.announceDevice(
@@ -152,7 +153,7 @@ class Messenger {
         deviceKey: local.publicKey,
         challenge: challenge,
         signature: local.sign(bindBytes(me.id, local.deviceId, challenge)),
-        identity: identity?.toJson(),
+        identityProof: claim ? await crypto.proveIdentity(me.id, local.deviceId, challenge) : null,
       );
     } catch (_) {}
   }
@@ -165,12 +166,12 @@ class Messenger {
     final published = count.identity == null ? null : Identity.fromJson(count.identity!);
     if (published != null && published != mine) {
       // Another device holds the keys: this one is a pending device of the account.
-      await _announce(null);
+      await _announce();
       _setActive(false);
       return false;
     }
-    // Before the first upload there is no published identity to show: the upload itself claims the inbox.
-    await _announce(published);
+    // Before the first upload there is nothing to prove: the upload of the new identity claims the inbox.
+    await _announce(claim: published != null);
     final upload = await crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: published == null ? 0 : count.oneTimePreKeys);
     final spkId = upload.signedPreKey['id'];
     if (published == null || upload.oneTimePreKeys != null || upload.rotated || count.signedPreKeyId != spkId) await api.uploadKeys(upload.toJson());
@@ -183,7 +184,7 @@ class Messenger {
   /// one-time prekeys. This device becomes active; contacts see a security-code change.
   Future<void> takeOver() async {
     // A bound session: the new identity's upload moves the account's inbox to this device.
-    await _announce(null);
+    await _announce();
     final upload = await crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: 0);
     await api.uploadKeys(upload.toJson());
     _setActive(true);

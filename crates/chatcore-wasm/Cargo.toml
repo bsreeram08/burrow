@@ -9,6 +9,15 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# The browser ships 1:1 only until the web client moves to groups (M4); flip the default then.
+default = []
+# MLS groups in the browser (the `mls*` commands).
+mls = ["chatcore/mls"]
+# The delivery service's validator for the Bun/Node server (the `ds*` commands): build with
+# `--no-default-features --features ds`.
+ds = ["chatcore/ds"]
+
 [dependencies]
 chatcore = { path = "../chatcore", default-features = false, features = ["wasm"] }
 # Pinned: the wasm-bindgen CLI used by scripts/build-wasm.ts must be exactly this version.

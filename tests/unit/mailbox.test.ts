@@ -156,8 +156,8 @@ describe('encrypted mailbox', () => {
         const alice = user('alice'), bob = user('bob'), carol = user('carol');
         await befriend(alice, bob); await befriend(carol, bob);
         const db = openDatabase(dataDir);
-        const insert = db.query('INSERT INTO mailbox (id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?)');
-        db.transaction(() => { for (let index = 0; index < 200; index++) insert.run(`f${String(index).padStart(21, '0')}`, bob.id, alice.id, new Uint8Array(8), Date.now()); })();
+        const insert = db.query('INSERT INTO device_inbox (id, device_id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?, ?)'), inbox = app.accounts!.testing.primaryDevice(bob.id);
+        db.transaction(() => { for (let index = 0; index < 200; index++) insert.run(`f${String(index).padStart(21, '0')}`, inbox, bob.id, alice.id, new Uint8Array(8), Date.now()); })();
         db.close();
         expect((await request('/api/messages', 'POST', alice.cookie, { to: 'bob', envelope: envelope() })).status).toBe(429);
         expect((await request('/api/messages', 'POST', carol.cookie, { to: 'bob', envelope: envelope() })).status).toBe(201);
@@ -166,12 +166,12 @@ describe('encrypted mailbox', () => {
         const alice = user('alice'), bob = user('bob');
         await befriend(alice, bob);
         const db = openDatabase(dataDir);
-        const insert = db.query('INSERT INTO mailbox (id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?)');
+        const insert = db.query('INSERT INTO device_inbox (id, device_id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?, ?)'), inbox = app.accounts!.testing.primaryDevice(bob.id);
         const old = Date.now() - 31 * 86400000;
-        db.transaction(() => { for (let index = 0; index < 1000; index++) insert.run(`m${String(index).padStart(21, '0')}`, bob.id, alice.id, new Uint8Array(8), old); })();
+        db.transaction(() => { for (let index = 0; index < 1000; index++) insert.run(`m${String(index).padStart(21, '0')}`, inbox, bob.id, alice.id, new Uint8Array(8), old); })();
         expect((await request('/api/messages', 'POST', alice.cookie, { to: 'bob', envelope: envelope() })).status).toBe(507);
         app.accounts!.sweep();
-        expect((db.query('SELECT COUNT(*) AS count FROM mailbox').get() as any).count).toBe(0);
+        expect((db.query('SELECT COUNT(*) AS count FROM device_inbox').get() as any).count).toBe(0);
         db.close();
         expect((await request('/api/messages', 'POST', alice.cookie, { to: 'bob', envelope: envelope() })).status).toBe(201);
     });
@@ -181,7 +181,7 @@ describe('encrypted mailbox', () => {
         await request('/api/messages', 'POST', alice.cookie, { to: 'bob', envelope: envelope() });
         expect((await request('/api/contacts/alice', 'DELETE', bob.cookie)).status).toBe(200);
         const db = openDatabase(dataDir);
-        expect((db.query('SELECT COUNT(*) AS count FROM mailbox').get() as any).count).toBe(0);
+        expect((db.query('SELECT COUNT(*) AS count FROM device_inbox').get() as any).count).toBe(0);
         db.close();
     });
 });

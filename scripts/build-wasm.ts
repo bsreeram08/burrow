@@ -1,8 +1,13 @@
 // Builds crates/chatcore-wasm for the browser into packages/signaling/public/core/ (content-hashed files plus
 // manifest.json).
 //
-//   bun run build:wasm                          rebuild the committed browser artifacts
-//   bun run build:wasm --check [--core-dir d]   fail unless the committed core is exactly what this source builds
+//   bun run build:wasm                          rebuild the committed artifacts: the browser core and the delivery service's
+//   bun run build:wasm --check [--core-dir d]   fail unless the committed cores are exactly what this source builds
+//
+// Two variants of crates/chatcore-wasm: `browser` (packages/signaling/public/core, served to clients) and `ds`
+// (packages/signaling/ds-core, loaded by the server only: the MLS delivery-service validator, built with
+// `--features ds`). `--core-dir d` / `--ds-dir d` point --check at a scratch copy of one variant; naming one of
+// them restricts the run to the variants named.
 //
 // The artifacts are committed because the server has no Rust toolchain: deploy.sh only pulls main.
 //
@@ -25,9 +30,13 @@ import { verifyCore } from '../packages/signaling/core-manifest';
 
 const root = resolve(import.meta.dir, '..');
 const crates = ['chatcore', 'chatcore-wasm'];
-const out = join(root, 'packages/signaling/public/core');
+const arg = (name: string) => process.argv.includes(name) ? resolve(process.argv[process.argv.indexOf(name) + 1]) : null;
 const check = process.argv.includes('--check');
-const coreDir = process.argv.includes('--core-dir') ? resolve(process.argv[process.argv.indexOf('--core-dir') + 1]) : out;
+type Variant = { name: string; features: string[]; out: string; checkDir: string };
+const variants: Variant[] = [
+    { name: 'browser', features: [], out: join(root, 'packages/signaling/public/core'), checkDir: arg('--core-dir') ?? join(root, 'packages/signaling/public/core') },
+    { name: 'ds', features: ['ds'], out: join(root, 'packages/signaling/ds-core'), checkDir: arg('--ds-dir') ?? join(root, 'packages/signaling/ds-core') },
+].filter(variant => (!arg('--core-dir') && !arg('--ds-dir')) || (variant.name === 'browser' ? arg('--core-dir') : arg('--ds-dir')) !== null);
 const CANONICAL_HOST = 'darwin-arm64';
 
 function run(command: string, argv: string[], env: Record<string, string> = {}) {
@@ -88,7 +97,8 @@ function copyRegular(from: string, to: string) {
     copyFileSync(from, to, constants.COPYFILE_EXCL);
 }
 
-function main() {
+function main(variant: Variant) {
+    const { out, checkDir: coreDir } = variant;
     const host = `${platform()}-${arch()}`;
     if (host !== CANONICAL_HOST) {
         console.error(`The committed core is built and checked on ${CANONICAL_HOST}; this is ${host}. Byte-for-byte checks across hosts are impossible (see the header), so run this on ${CANONICAL_HOST} (CI: macos-14).`);
@@ -101,7 +111,7 @@ function main() {
     rmSync(join(BUILD, 'crates'), { recursive: true, force: true });
     for (const name of crates) cpSync(join(root, 'crates', name), join(BUILD, 'crates', name), { recursive: true, verbatimSymlinks: true, filter: source => !source.split('/').includes('target') && !lstatSync(source).isSymbolicLink() });
     const remap = `--remap-path-prefix=${BUILD}=/src --remap-path-prefix=${join(homedir(), '.cargo')}=/cargo --remap-path-prefix=${join(homedir(), '.rustup')}=/rustup`;
-    run('cargo', ['build', '--release', '--locked', '--quiet', '--target', 'wasm32-unknown-unknown', '--manifest-path', join(BUILD, 'crates/chatcore-wasm/Cargo.toml')],
+    run('cargo', ['build', '--release', '--locked', '--quiet', '--target', 'wasm32-unknown-unknown', ...(variant.features.length ? ['--features', variant.features.join(',')] : []), '--manifest-path', join(BUILD, 'crates/chatcore-wasm/Cargo.toml')],
         { RUSTFLAGS: remap, CARGO_INCREMENTAL: '0', CARGO_TARGET_DIR: join(BUILD, 'target') });
     const built = join(BUILD, 'target/wasm32-unknown-unknown/release/chatcore_wasm.wasm');
 
@@ -118,11 +128,11 @@ function main() {
         if (check) {
             const committed = JSON.parse(readFileSync(join(coreDir, 'manifest.json'), 'utf8'));
             if (committed.source !== source) {
-                console.error('The committed WebAssembly core was not built from this source (its input hash differs).\nRun bun run build:wasm and commit packages/signaling/public/core/.');
+                console.error(`The committed ${variant.name} WebAssembly core was not built from this source (its input hash differs).\nRun bun run build:wasm and commit ${relative(root, out)}/.`);
                 return 1;
             }
             const same = committed.js === jsName && committed.wasm === wasmName && readFileSync(join(coreDir, jsName)).equals(glue) && readFileSync(join(coreDir, wasmName)).equals(wasm);
-            if (same) { console.log(`Committed core matches the source byte for byte: ${jsName}, ${wasmName}`); return 0; }
+            if (same) { console.log(`Committed ${variant.name} core matches the source byte for byte: ${jsName}, ${wasmName}`); return 0; }
             console.error(`The committed core is not what this source builds (different bytes).\n  committed: ${committed.js} ${committed.wasm}\n  rebuilt:   ${jsName} ${wasmName}`);
             const keep = join(root, 'wasm-rebuilt'); // CI uploads this so a mismatch can be inspected.
             mkdirSync(keep, { recursive: true });
@@ -142,13 +152,13 @@ function main() {
             js: jsName, wasm: wasmName,
             sha256: Object.fromEntries(Object.entries(written).map(([name, bytes]) => [name, sha(bytes)])),
             bytes: Object.fromEntries(Object.entries(written).map(([name, bytes]) => [name, bytes.length])),
-            protocol: 'chatcore-commands-1', wasmBindgen: pinned, rustc, source, host,
+            protocol: 'chatcore-commands-1', variant: variant.name, features: variant.features, wasmBindgen: pinned, rustc, source, host,
         };
         writeFileSync(join(out, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
-        console.log(`Built ${jsName} (${glue.length} B) and ${wasmName} (${wasm.length} B)`);
+        console.log(`Built ${variant.name}: ${jsName} (${glue.length} B) and ${wasmName} (${wasm.length} B)`);
         return 0;
     } finally {
         rmSync(staging, { recursive: true, force: true });
     }
 }
-process.exitCode = main();
+process.exitCode = variants.map(main).find(code => code !== 0) ?? 0;

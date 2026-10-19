@@ -397,3 +397,31 @@ fn a_dm_is_two_users_and_nobody_else() {
     b2.send(&mut server, &g, "hello alice");
     assert_eq!(a2.texts(&server, &g).last().unwrap(), "hello alice");
 }
+
+#[test]
+fn the_ds_inspects_key_packages_and_mirrors_membership() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let kp = f.b1.kp(1).remove(0);
+    let info = f.server.ds.key_package(&mut f.server.store, &kp).unwrap();
+    assert_eq!((info.user_id.as_str(), info.device_id.as_str(), info.last_resort), (f.bob.id.as_str(), f.b1.device.as_str(), false));
+    assert_eq!(info.not_after - info.not_before, 90 * 86_400 + 3_600, "90 days plus the one-hour clock-skew margin OpenMLS backdates");
+    assert!(f.server.ds.key_package(&mut f.server.store, &f.b1.last_resort()).unwrap().last_resort);
+
+    // An unpinned account, garbage and oversize are refused.
+    let mallory = Account::new();
+    let mut m1 = Dev::new(&mallory, "web", &[&mallory]);
+    assert!(f.server.ds.key_package(&mut f.server.store, &m1.kp(1)[0]).unwrap_err().message.contains("no pinned account key"));
+    assert!(f.server.ds.key_package(&mut f.server.store, &b64(b"nope")).is_err());
+    assert!(f.server.ds.key_package(&mut f.server.store, &b64(&vec![0u8; 4097])).unwrap_err().message.contains("exceeds"));
+    let mut bytes = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &kp).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 1;
+    assert!(f.server.ds.key_package(&mut f.server.store, &b64(&bytes)).is_err());
+
+    let listed = f.server.ds.members(&mut f.server.store, &group_id(&g).unwrap()).unwrap();
+    assert_eq!(listed.epoch, f.a1.epoch(&g));
+    assert_eq!(listed.members.len(), 5);
+    assert_eq!(listed.members.iter().filter(|m| m.admin).count(), 2);
+    assert!(listed.roles.is_admin(&f.alice.id));
+}

@@ -10,8 +10,10 @@
     "chatcore_bg.aa054a4481eb7d73.wasm": 366369
   },
   "protocol": "chatcore-commands-1",
+  "variant": "browser",
+  "features": [],
   "wasmBindgen": "0.2.129",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-  "source": "dadfa9682017e1d24a5d9c1318c49df718525a05dc123f3dc852f39458b222b0",
+  "source": "fd0aebfb3fe27b950af2c88cb368f25b002aa17d38615565aa58cb271c5611bf",
   "host": "darwin-arm64"
 }

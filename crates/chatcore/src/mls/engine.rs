@@ -23,7 +23,7 @@ use super::persist::{tag_of_group_json, Persist, Written};
 use super::policy::{capabilities, group_extensions, validate_context, validate_group_state, validate_staged, Kind, Roles};
 use super::rows::{Change, Rows};
 use super::storage::MlsStorage;
-use super::{bounded, digest, limits, CS};
+use super::{bounded, digest, limits, CS, ROLES_EXT};
 use crate::error::{ChatError, Result};
 use crate::store::{Store, Write};
 
@@ -203,6 +203,8 @@ impl Verified {
 }
 
 const MAX_PENDING: usize = 256;
+/// KeyPackages stay valid for 90 days (the delivery service keeps them until then).
+pub const KEY_PACKAGE_LIFETIME_SECS: u64 = 90 * 86_400;
 
 pub struct Groups {
     ns: &'static str,
@@ -361,7 +363,7 @@ impl Groups {
             let signer = Self::signer(provider, &cert)?;
             let credential = Self::credential(&cert)?;
             (0..count).map(|_| {
-                let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities());
+                let mut builder = KeyPackage::builder().leaf_node_capabilities(capabilities()).key_package_lifetime(Lifetime::new(KEY_PACKAGE_LIFETIME_SECS));
                 if last_resort { builder = builder.mark_as_last_resort(); }
                 let bundle = builder.build(CS, provider, &signer, credential.clone()).map_err(mls)?;
                 Ok(b64(&tls(&MlsMessageOut::from(bundle.key_package().clone()))?))
@@ -756,6 +758,35 @@ impl Groups {
 
 }
 
+/// A validated KeyPackage, as the delivery service records it (seconds since the Unix epoch for the lifetime).
+#[cfg(feature = "ds")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct KeyPackageInfo {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+    #[serde(rename = "leafSigKey")]
+    pub leaf_sig_key: String,
+    #[serde(rename = "aikSign")]
+    pub aik_sign: String,
+    #[serde(rename = "lastResort")]
+    pub last_resort: bool,
+    #[serde(rename = "notBefore")]
+    pub not_before: u64,
+    #[serde(rename = "notAfter")]
+    pub not_after: u64,
+}
+
+/// A group's public membership and roles.
+#[cfg(feature = "ds")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GroupMembers {
+    pub epoch: u64,
+    pub roles: Roles,
+    pub members: Vec<MemberView>,
+}
+
 /// The delivery service's validator over public (secret-free) group state, namespace `mlsds`. It runs the exact
 /// code members run (`validate_staged`) against the pre-commit state, so a commit it sequences is a commit every
 /// member accepts (poison commits aside: see [`Ds::snapshot`]).
@@ -867,6 +898,30 @@ impl Ds {
             Ok(json!({ "groupId": group_text(group), "epoch": public.group_context().epoch().as_u64() }))
         })?;
         Ok(value)
+    }
+
+    /// What the DS learns from a KeyPackage it is asked to store: validated (signature, lifetime, capabilities) and
+    /// its certificate checked under the pinned account key of its user.
+    pub fn key_package(&mut self, store: &mut dyn Store, text: &str) -> Result<KeyPackageInfo> {
+        let bytes = unb64(text, "KeyPackage")?;
+        bounded("KeyPackage", &bytes, limits::MAX_KEY_PACKAGE_BYTES)?;
+        let MlsMessageBodyIn::KeyPackage(package) = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.extract() else { return Err(invalid("not a KeyPackage")) };
+        let package = package.validate(self.groups.provider.crypto(), ProtocolVersion::Mls10).map_err(mls)?;
+        let leaf = package.leaf_node();
+        if !leaf.capabilities().extensions().contains(&ExtensionType::Unknown(ROLES_EXT)) { return Err(invalid("the KeyPackage does not support the roles extension")); }
+        let mut directory = Groups::ds_directory(store);
+        let cert = super::cert::verify_credential(&mut directory, leaf.credential(), leaf.signature_key().as_slice())?;
+        let lifetime = package.life_time();
+        Ok(KeyPackageInfo { user_id: cert.user_id, device_id: cert.device_id, leaf_sig_key: cert.leaf_sig_key, aik_sign: cert.aik_sign, last_resort: package.last_resort(), not_before: lifetime.not_before(), not_after: lifetime.not_after() })
+    }
+
+    /// Who is in the group right now, and its roles (public state: the DS mirrors this for fan-out).
+    pub fn members(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<GroupMembers> {
+        self.gate(store, group)?;
+        let public = Self::public(&self.groups.provider, group)?;
+        let roles = validate_context(public.group_context().extensions())?;
+        let members = public.members().filter_map(|m| cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform })).collect();
+        Ok(GroupMembers { epoch: public.group_context().epoch().as_u64(), roles, members })
     }
 
     pub fn epoch(&mut self, group: &GroupId) -> Result<u64> { Ok(Self::public(&self.groups.provider, group)?.group_context().epoch().as_u64()) }

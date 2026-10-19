@@ -122,6 +122,8 @@ fn run_ds(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> 
         match cmd {
             "dsPin" => { ds.pin(store, &text(command, "userId")?, &text(command, "aik")?)?; Ok(Value::Null) }
             "dsCreate" => Ok(ds.create(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "dsKeyPackage" => ok(ds.key_package(store, &text(command, "keyPackage")?)?),
+            "dsMembers" => ok(ds.members(store, &group()?)?),
             "dsSubmit" => ok(ds.submit(store, &group()?, &text(command, "message")?)?),
             "dsEpoch" => Ok(json!(ds.epoch(&group()?)?)),
             "dsTree" => ok(ds.tree(&group()?)?),

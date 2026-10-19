@@ -119,6 +119,10 @@ class FakeChatCrypto implements ChatCrypto {
   @override
   Future<SessionInfo?> sessionInfo(String contactId) async => sessions[contactId];
 
+  /// Not a signature: the fake identity has no real key. Readable so tests can see what was proven.
+  @override
+  Future<String> proveIdentity(String userId, String deviceId, String challenge) async => 'proof:${me.sign}:$userId:$deviceId:$challenge';
+
   @override
   Future<void> resetIdentity() async {
     me = Identity(dh: 'fake-dh-${_random.nextInt(1 << 31)}', sign: 'fake-sign');

@@ -15,7 +15,7 @@
   const USER_ID = /^[A-Za-z0-9_-]{1,64}$/, DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, HASH = /^[A-Za-z0-9_-]{43}$/, KEY = /^[A-Za-z0-9_-]{43}$/, SIG = /^[A-Za-z0-9_-]{86}$/;
   // Sealed metadata: 12-byte IV, at least the 16-byte tag, at most 512 bytes in all.
   const META = /^[A-Za-z0-9_-]{38,683}$/, META_MAX_LABEL = 64;
-  const LIST_LABEL = 'webrtc-bun-devicelist-v1', CERT_LABEL = 'webrtc-bun-devicecert-v1', META_LABEL = 'webrtc-bun-devicemeta-v1', BIND_LABEL = 'webrtc-bun-devicebind-v1';
+  const LIST_LABEL = 'webrtc-bun-devicelist-v1', CERT_LABEL = 'webrtc-bun-devicecert-v1', META_LABEL = 'webrtc-bun-devicemeta-v1', BIND_LABEL = 'webrtc-bun-devicebind-v1', CLAIM_LABEL = 'webrtc-bun-deviceclaim-v1';
   const CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
   const encoder = new TextEncoder();
 
@@ -98,6 +98,17 @@
     if (typeof userId !== 'string' || !USER_ID.test(userId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid device binding');
     if (typeof challenge !== 'string' || !CHALLENGE.test(challenge)) fail('Invalid device challenge');
     return writer().text16(BIND_LABEL).text16(userId).text16(deviceId).bytes8(unb64(challenge)).done();
+  }
+  /**
+   * What the account identity key signs to claim the account's messaging inbox for a device (announce
+   * `identityProof`): knowing the public identity is not enough; holding its key is. Same challenge as the
+   * binding, a distinct label, so neither signature can stand in for the other. crates/chatcore builds the
+   * same bytes (`claim_bytes`) and signs nothing else for it.
+   */
+  function claimBytes(userId, deviceId, challenge) {
+    if (typeof userId !== 'string' || !USER_ID.test(userId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid identity claim');
+    if (typeof challenge !== 'string' || !CHALLENGE.test(challenge)) fail('Invalid device challenge');
+    return writer().text16(CLAIM_LABEL).text16(userId).text16(deviceId).bytes8(unb64(challenge)).done();
   }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
@@ -204,5 +215,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

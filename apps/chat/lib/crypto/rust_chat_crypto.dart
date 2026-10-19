@@ -165,6 +165,10 @@ class RustChatCrypto implements ChatCrypto {
   Future<void> resetIdentity() => _call(core.resetIdentity);
 
   @override
+  Future<String> proveIdentity(String userId, String deviceId, String challenge) =>
+      _call(() => core.proveIdentity(userId: userId, deviceId: deviceId, challenge: challenge));
+
+  @override
   SasCommitment sasCommit() => _sync(() {
     final nonce = core.sasNewNonce();
     return SasCommitment(nonce: nonce, hash: core.sasCommitment(nonce: nonce));

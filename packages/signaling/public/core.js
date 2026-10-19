@@ -121,6 +121,8 @@
       rotate: contactId => run({ cmd: 'rotate', contact: contactId }),
       sessionInfo: contactId => run({ cmd: 'sessionInfo', contact: contactId }),
       resetIdentity: () => run({ cmd: 'resetIdentity' }),
+      // Signs only the device-claim bytes (chatcore claim_bytes) with the identity key: docs/devices.md.
+      proveIdentity: (userId, deviceId, challenge) => run({ cmd: 'proveIdentity', userId, deviceId, challenge }),
     };
   }
 

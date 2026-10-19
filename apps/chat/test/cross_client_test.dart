@@ -95,7 +95,17 @@ void main() {
     // 1. Keys: this device is the active one for the account.
     // It announced its device with the published identity, so the server routes the account's inbox to it.
     expect(await messenger.checkActive(), isTrue);
-    await signal('ready', (await messenger.device()).deviceId);
+    // The server accepts the Rust core's identity proof (chatcore prove_identity) for a fresh challenge.
+    final local = await messenger.device(), challenge = await api.deviceChallenge();
+    final claimed = await api.announceDevice(
+      local.deviceId,
+      deviceKey: local.publicKey,
+      challenge: challenge,
+      signature: local.sign(bindBytes(me.id, local.deviceId, challenge)),
+      identityProof: await crypto.proveIdentity(me.id, local.deviceId, challenge),
+    );
+    expect(claimed['primary'], isTrue);
+    await signal('ready', local.deviceId);
 
     // 2. Web → app: the web client opens the session (X3DH from signal.js, decrypted by the Rust core).
     await waitFor('sent-1');

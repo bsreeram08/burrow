@@ -40,6 +40,8 @@ describe('device list format', () => {
         expect(createHash('sha256').update(expected).digest('hex')).toBe('31f9b6f38de5a0d6180afcf54233e7272add9dd22c49e86e40fa3a7c48e938e6');
         expect(createHash('sha256').update(F.certBytes(F.certFor('user_1', list.devices[0]))).digest('hex')).toBe('5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea');
         expect(createHash('sha256').update(F.bindBytes('user_1', 'a'.repeat(22), 'A'.repeat(43))).digest('hex')).toBe('e11ceff09f689bbea340eef1c1fcc013f3fff12ff1167b7d44d664fbf5101b18');
+        // Pinned in crates/chatcore/tests/signal.rs too (prove_identity signs exactly these bytes).
+        expect(createHash('sha256').update(F.claimBytes('user_1', 'a'.repeat(22), 'A'.repeat(43))).digest('hex')).toBe('2238b7912ca08441271c164e5591d1f62afd2ae2afec60aa8b5a49054366ef40');
         // Key order of the JSON object does not matter; the canonical bytes do.
         const reordered = { devices: list.devices.map(device => ({ meta: device.meta, addedAt: device.addedAt, deviceId: device.deviceId })), prevHash: list.prevHash, version: 2, userId: 'user_1', v: 1 };
         expect(Buffer.from(F.listBytes(reordered)).equals(Buffer.from(F.listBytes(list)))).toBe(true);
@@ -139,12 +141,14 @@ const post = (auth: string, path: string, body: unknown) => owners.has(auth) && 
  * Binds a session to a device the way clients do: a fresh challenge signed with the device's own key
  * (created on first use of an id). `key` overrides the key that signs, to test impersonation.
  */
-async function announce(auth: string, id: string, extra: Record<string, unknown> = {}, key?: Aik) {
+async function announce(auth: string, id: string, extra: Record<string, unknown> = {}, key?: Aik, prove?: Aik) {
     const userId = owners.get(auth)!;
     const { challenge } = (await read(await post(auth, '/api/devices/challenge', {}))).body;
     if (!deviceKeys.has(id)) deviceKeys.set(id, aik());
     const signer = key ?? deviceKeys.get(id)!;
-    const response = await post(auth, '/api/devices/announce', { deviceId: id, deviceKey: signer.pub, challenge, signature: signBytes(signer, F.bindBytes(userId, id, challenge)), ...extra });
+    // `prove`: claim messaging with the account identity key's signature over this challenge (identityProof).
+    const proof = prove ? { identityProof: signBytes(prove, F.claimBytes(userId, id, challenge)) } : {};
+    const response = await post(auth, '/api/devices/announce', { deviceId: id, deviceKey: signer.pub, challenge, signature: signBytes(signer, F.bindBytes(userId, id, challenge)), ...proof, ...extra });
     if (response.status === 200) bound.add(auth);
     return response;
 }
@@ -333,8 +337,10 @@ describe('messaging device and per-device delivery', () => {
         const early = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
         const bearer = bearerFor(alice.id, 'ios');
         // A wrong identity is just a pending device; the published one moves messaging (and the waiting envelope) there.
-        expect((await read(await announce(bearer, phone, { identity: { ...identity, dh: 'A'.repeat(43) } }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
-        expect((await read(await announce(bearer, phone, { identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: true });
+        // Naming the (public) identity proves nothing; a proof by another key is refused; the identity key's proof claims.
+        expect((await read(await announce(bearer, phone, { identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
+        expect((await announce(bearer, phone, {}, undefined, aik())).status).toBe(403);
+        expect((await read(await announce(bearer, phone, {}, undefined, alice.key))).body).toEqual({ deviceId: phone, state: 'pending', primary: true });
         expect((await announce(laptopCookie, laptop)).status).toBe(200);
         const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
         expect(db.query('SELECT device_id FROM device_inbox WHERE id = ?').get(early.body.id)).toEqual({ device_id: phone });
@@ -363,12 +369,37 @@ describe('messaging device and per-device delivery', () => {
         acked.close();
         phoneStream.socket.close(); laptopStream.socket.close();
     });
+    test('claiming needs the identity key: proofs replayed from another challenge, device or account, and key re-uploads, claim nothing', async () => {
+        const alice = account('alice'), bob = account('bob'), phone = deviceId(), other = deviceId();
+        const identity = await publishKeys(alice); await publishKeys(bob); await befriend(alice, bob);
+        const waiting = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
+        const bearer = bearerFor(alice.id, 'ios');
+        const placeholder = () => { const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true }); const row = db.query('SELECT d.state FROM device_inbox i JOIN devices d ON d.id = i.device_id WHERE i.id = ?').get(waiting.body.id) as any; db.close(); return row?.state; };
+        // Bind without a claim, then try proofs made for something else.
+        expect((await read(await announce(bearer, phone))).body.primary).toBe(false);
+        const challenge = async () => (await read(await native('/api/devices/challenge', 'POST', bearer, {}))).body.challenge as string;
+        const attempt = async (proofFor: (challenge: string) => Uint8Array, nonce?: string) => {
+            const fresh = nonce ?? await challenge();
+            return native('/api/devices/announce', 'POST', bearer, { deviceId: phone, challenge: fresh, signature: signBytes(deviceKeys.get(phone)!, F.bindBytes(alice.id, phone, fresh)), identityProof: signBytes(alice.key, proofFor(fresh)) });
+        };
+        const old = await challenge();
+        expect((await attempt(() => F.claimBytes(alice.id, phone, old))).status).toBe(403); // another challenge
+        expect((await attempt(fresh => F.claimBytes(alice.id, other, fresh))).status).toBe(403); // another device
+        expect((await attempt(fresh => F.claimBytes(bob.id, phone, fresh))).status).toBe(403); // another account
+        expect((await attempt(fresh => F.bindBytes(alice.id, phone, fresh))).status).toBe(403); // a binding signature is not a claim
+        // Re-uploading the unchanged public identity from the bound session claims nothing either.
+        expect((await native('/api/keys', 'PUT', bearer, { identity, oneTimePreKeys: [] })).status).toBe(200);
+        expect(placeholder()).toBe('placeholder');
+        // The identity key's proof for this challenge, device and account claims the inbox.
+        expect((await read(await attempt(fresh => F.claimBytes(alice.id, phone, fresh)))).body.primary).toBe(true);
+        expect(placeholder()).toBe('pending');
+    });
     test('a signed list outranks a claim: the listed primary keeps the inbox', async () => {
         const alice = account('alice'), mine = deviceId(), phone = deviceId();
         const identity = await publishKeys(alice);
         expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
         const bearer = bearerFor(alice.id, 'android');
-        expect((await read(await announce(bearer, phone, { identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
+        expect((await read(await announce(bearer, phone, {}, undefined, alice.key))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
         const view = (await read(await request(`/api/devices/${alice.username}`, 'GET', alice.cookie))).body;
         expect(view.devices.find((row: any) => row.primary).id).toBe(mine);
     });
@@ -492,7 +523,8 @@ describe('migrations', () => {
             `);
             const now = Date.now();
             for (const [id, name] of [['u1', 'alice'], ['u2', 'bob'], ['u3', 'carol']]) old.query('INSERT INTO users VALUES (?, ?, ?)').run(id, name, now);
-            old.query('INSERT INTO identity_keys VALUES (?, ?, ?, ?)').run('u1', 'D'.repeat(43), 'S'.repeat(43), now);
+            const migratedKey = aik();
+            old.query('INSERT INTO identity_keys VALUES (?, ?, ?, ?)').run('u1', 'D'.repeat(43), migratedKey.pub, now);
             old.query("INSERT INTO sessions VALUES ('t1', 'u1', ?, 'web')").run(now + 1e9);
             for (let index = 0; index < 3; index++) old.query('INSERT INTO mailbox VALUES (?, ?, ?, ?, ?)').run(`m${index}${'x'.repeat(20)}`, index < 2 ? 'u1' : 'u2', 'u3', new Uint8Array([index]), now + index);
             old.exec(`PRAGMA user_version = ${version}`);
@@ -504,7 +536,7 @@ describe('migrations', () => {
             const inbox = db.query('SELECT i.id, i.recipient_id, d.state, d.is_primary FROM device_inbox i JOIN devices d ON d.id = i.device_id ORDER BY i.created_at').all() as any[];
             expect(inbox.map(row => [row.id.slice(0, 2), row.recipient_id, row.state, row.is_primary])).toEqual([['m0', 'u1', 'placeholder', 1], ['m1', 'u1', 'placeholder', 1], ['m2', 'u2', 'placeholder', 1]]);
             expect(db.query("SELECT device_id FROM sessions WHERE token_hash = 't1'").get()).toEqual({ device_id: null });
-            expect(db.query("SELECT sign FROM identity_keys WHERE user_id = 'u1'").get()).toEqual({ sign: 'S'.repeat(43) }); // safety numbers unchanged
+            expect(db.query("SELECT sign FROM identity_keys WHERE user_id = 'u1'").get()).toEqual({ sign: migratedKey.pub }); // safety numbers unchanged
             db.close();
             // Opening again changes nothing.
             const again = openDatabase(dir);
@@ -517,7 +549,7 @@ describe('migrations', () => {
                 const bearer = migrated.accounts!.testing.bearer('u1', 'android'), phone = deviceId();
                 const call = (path: string, body: unknown) => fetch(new URL(path, migrated.server.url), { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: JSON.stringify(body) });
                 const { challenge } = await (await call('/api/devices/challenge', {})).json() as any, key = aik();
-                const announced = await call('/api/devices/announce', { deviceId: phone, deviceKey: key.pub, challenge, signature: signBytes(key, F.bindBytes('u1', phone, challenge)), identity: { dh: 'D'.repeat(43), sign: 'S'.repeat(43) } });
+                const announced = await call('/api/devices/announce', { deviceId: phone, deviceKey: key.pub, challenge, signature: signBytes(key, F.bindBytes('u1', phone, challenge)), identityProof: signBytes(migratedKey, F.claimBytes('u1', phone, challenge)) });
                 expect(((await announced.json()) as any).primary).toBe(true);
                 const url = new URL('/api/events', migrated.server.url); url.protocol = 'ws:';
                 const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${bearer}` } } as any);

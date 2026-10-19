@@ -20,7 +20,7 @@ import 'package:ed25519_edwards/ed25519_edwards.dart' as ed;
 
 const maxDevices = 16;
 const _maxVersion = 2147483647;
-const _listLabel = 'webrtc-bun-devicelist-v1', _certLabel = 'webrtc-bun-devicecert-v1', _bindLabel = 'webrtc-bun-devicebind-v1';
+const _listLabel = 'webrtc-bun-devicelist-v1', _certLabel = 'webrtc-bun-devicecert-v1', _bindLabel = 'webrtc-bun-devicebind-v1', _claimLabel = 'webrtc-bun-deviceclaim-v1';
 final _userId = RegExp(r'^[A-Za-z0-9_-]{1,64}$');
 final _deviceId = RegExp(r'^[A-Za-z0-9_-]{22}$');
 final _hash = RegExp(r'^[A-Za-z0-9_-]{43}$');
@@ -250,6 +250,19 @@ Uint8List bindBytes(String userId, String deviceId, String challenge) {
   if (!_hash.hasMatch(challenge)) _fail('Invalid device challenge');
   return (_Writer()
         ..text16(_bindLabel)
+        ..text16(userId)
+        ..text16(deviceId)
+        ..bytes8(unb64(challenge)))
+      .done();
+}
+
+/// What the account identity key signs to claim the account's messaging inbox (devices.js `claimBytes`).
+/// The app never signs these itself: chatcore's `prove_identity` builds and signs them inside the core.
+Uint8List claimBytes(String userId, String deviceId, String challenge) {
+  if (!_userId.hasMatch(userId) || !_deviceId.hasMatch(deviceId)) _fail('Invalid identity claim');
+  if (!_hash.hasMatch(challenge)) _fail('Invalid device challenge');
+  return (_Writer()
+        ..text16(_claimLabel)
         ..text16(userId)
         ..text16(deviceId)
         ..bytes8(unb64(challenge)))

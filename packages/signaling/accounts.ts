@@ -208,8 +208,8 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         } catch { return json({ error: `At most ${MAX_PREKEYS} one-time prekeys may wait on the server.` }, 400); }
         // A new identity voids lists signed by the old one (and announces 'devices' to the account and its contacts).
         if (changed) devices.identityChanged(user.id);
-        // The uploading session holds the identity: its device takes the messaging inbox unless a signed list names a primary.
-        devices.keysUploaded(user);
+        // A new identity (first or changed) moves the messaging inbox to the uploading session's device.
+        devices.keysUploaded(user, changed || !existing);
         // Contacts re-check this identity; a change shows them a security-code notice. ('keys' is kept for one
         // release for clients that predate the 'devices' event.)
         if (changed || !existing) for (const contact of mutualIds(user.id)) notify(contact, { type: 'keys', id: user.id });

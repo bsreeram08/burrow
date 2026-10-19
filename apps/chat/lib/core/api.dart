@@ -148,20 +148,20 @@ class Api {
   Future<String> deviceChallenge() async => (await call('/api/devices/challenge', method: 'POST', body: const {}))['challenge'] as String;
 
   /// Binds this session to [deviceId], proving possession of its device key ([signature] over
-  /// `bindBytes(userId, deviceId, challenge)`; [deviceKey] registers a new device). With [identity] (only
-  /// when it is the account's published identity, i.e. this device holds the keys) the device takes the
-  /// account's messaging inbox, unless a signed device list names another primary. Returns the server's
-  /// `{deviceId, state, primary}`.
+  /// `bindBytes(userId, deviceId, challenge)`; [deviceKey] registers a new device). With [identityProof]
+  /// (the published identity key's signature over the claim bytes for the same challenge) the device takes
+  /// the account's messaging inbox, unless a signed device list names another primary. Returns the
+  /// server's `{deviceId, state, primary}`.
   Future<Map<String, dynamic>> announceDevice(
     String deviceId, {
     required String deviceKey,
     required String challenge,
     required String signature,
-    Map<String, dynamic>? identity,
+    String? identityProof,
   }) => call(
     '/api/devices/announce',
     method: 'POST',
-    body: {'deviceId': deviceId, 'deviceKey': deviceKey, 'challenge': challenge, 'signature': signature, 'identity': ?identity},
+    body: {'deviceId': deviceId, 'deviceKey': deviceKey, 'challenge': challenge, 'signature': signature, 'identityProof': ?identityProof},
   );
 
   /// A contact's (or our own) served device list: `{userId, identity, list, signature, certs}`.

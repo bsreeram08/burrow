@@ -6,7 +6,7 @@
 //! values never outlive a call (they are loaded from storage each time), so no caller can merge, join or
 //! process around the gates, and a failed call rolls its storage changes back.
 #![cfg_attr(not(all(feature = "mls", feature = "ds")), allow(dead_code, unused_imports))]
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -176,6 +176,30 @@ pub enum Submit {
 struct Staged {
     changes: Vec<Change>,
     extra: Vec<Write>,
+    /// A commit changes the membership: the group's gate entry is dropped when it is persisted.
+    regate: Option<String>,
+}
+
+/// What a passed gate was based on. The entry is only reused while every user's pin (including "blocked" or
+/// "unknown", as the directory reports it) and this device's certificate are exactly what they were; a pin that
+/// was changed, removed or blocked in the store makes the next gated call validate the whole group again.
+struct Verified {
+    cert: Option<DeviceCert>,
+    pins: Vec<(String, Option<[u8; 32]>)>,
+}
+
+impl Verified {
+    fn of(cert: Option<DeviceCert>, directory: &mut dyn Directory, certs: &[(LeafNodeIndex, DeviceCert)]) -> Result<Self> {
+        let users: std::collections::BTreeSet<&str> = certs.iter().map(|(_, c)| c.user_id.as_str()).collect();
+        Ok(Self { cert, pins: Self::read(directory, users.into_iter())? })
+    }
+    fn read<'a>(directory: &mut dyn Directory, users: impl Iterator<Item = &'a str>) -> Result<Vec<(String, Option<[u8; 32]>)>> {
+        users.map(|user| Ok((user.to_string(), directory.aik(user)?))).collect()
+    }
+    fn still_holds(&self, cert: Option<&DeviceCert>, directory: &mut dyn Directory) -> Result<bool> {
+        if self.cert.as_ref() != cert { return Ok(false); }
+        Ok(Self::read(directory, self.pins.iter().map(|(user, _)| user.as_str()))? == self.pins)
+    }
 }
 
 const MAX_PENDING: usize = 256;
@@ -190,7 +214,7 @@ pub struct Groups {
     /// External-join commits waiting for the DS (group id → staged state).
     external: BTreeMap<String, Staged>,
     /// Groups that passed whole-group validation in this process (the load gate); see [`Groups::gate`].
-    verified: HashSet<String>,
+    verified: HashMap<String, Verified>,
     /// Set when a store write failed: the in-memory state ran ahead of disk, so the owner must reload.
     stale: bool,
     /// Rows and bytes the last flush wrote (benchmarks).
@@ -202,7 +226,7 @@ impl Groups {
     pub fn load(store: &mut dyn Store, ns: &'static str) -> Result<Self> {
         let (map, persist) = Persist::load(store, ns)?;
         let provider = Provider { crypto: RustCrypto::default(), storage: MlsStorage { values: std::sync::RwLock::new(Rows::from_map(map)) } };
-        Ok(Self { ns, provider, persist, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 0, external: BTreeMap::new(), verified: HashSet::new(), stale: false, last_written: Written::default() })
+        Ok(Self { ns, provider, persist, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 0, external: BTreeMap::new(), verified: HashMap::new(), stale: false, last_written: Written::default() })
     }
     pub fn is_stale(&self) -> bool { self.stale }
 
@@ -271,16 +295,20 @@ impl Groups {
     /// that fails stays unusable (the others are unaffected) until its pins or state are repaired.
     fn gate(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<()> {
         let key = group_text(group);
-        if self.verified.contains(&key) { return Ok(()); }
         let cert = Self::device(store)?;
-        let mls_group = Self::load_group(&self.provider, group)?;
         let mut directory = Self::client_directory(store, &cert);
+        if let Some(seen) = self.verified.get(&key) {
+            if seen.still_holds(Some(&cert), &mut directory)? { return Ok(()); }
+            self.verified.remove(&key);
+        }
+        let mls_group = Self::load_group(&self.provider, group)?;
         let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory)?;
         if mls_group.is_active() {
             let own = certs.iter().find(|(index, _)| *index == mls_group.own_leaf_index()).ok_or_else(|| invalid("this device's leaf is missing from its group"))?;
             if own.1 != cert { return Err(invalid("this device's leaf does not match its certificate")); }
         }
-        self.verified.insert(key);
+        let seen = Verified::of(Some(cert.clone()), &mut directory, &certs)?;
+        self.verified.insert(key, seen);
         Ok(())
     }
 
@@ -475,7 +503,7 @@ impl Groups {
             extra.push(Write::Delete(pending_key(group)));
             Ok(())
         })?;
-        self.verified.insert(group_text(group));
+        self.verified.remove(&group_text(group));
         self.group_view(store, group)
     }
 
@@ -531,7 +559,7 @@ impl Groups {
             let group = staged.into_group(provider).map_err(mls)?;
             Ok(group.group_id().clone())
         })?;
-        self.verified.insert(group_text(&group));
+        self.verified.remove(&group_text(&group));
         self.group_view(store, &group)
     }
 
@@ -585,7 +613,7 @@ impl Groups {
         match result {
             Ok((outgoing, group)) => {
                 let changes = self.rows().stage();
-                self.external.insert(group_text(&group), Staged { changes, extra: Vec::new() });
+                self.external.insert(group_text(&group), Staged { changes, extra: Vec::new(), regate: None });
                 Ok(outgoing)
             }
             Err(error) => { self.rows().rollback(); Err(error) }
@@ -640,7 +668,7 @@ impl Groups {
             let mls_group = Self::load_group(&self.provider, group)?;
             let roles = validate_context(mls_group.extensions())?;
             let sender = Self::member_view(&mls_group, &roles, mls_group.own_leaf_index()).ok_or_else(|| invalid("own leaf missing"))?;
-            let id = self.stash(Staged { changes: Vec::new(), extra: Vec::new() });
+            let id = self.stash(Staged { changes: Vec::new(), extra: Vec::new(), regate: None });
             return Ok(Processed { pending_id: id, kind: "own".into(), plaintext: None, sender, epoch: mls_group.epoch().as_u64(), digest: Some(message_digest) });
         }
         let result = (|| -> Result<(Processed, Vec<Write>)> {
@@ -690,7 +718,8 @@ impl Groups {
         match result {
             Ok((mut processed, extra)) => {
                 let changes = self.rows().stage();
-                processed.pending_id = self.stash(Staged { changes, extra });
+                let regate = (processed.kind != "application").then(|| group_text(group));
+                processed.pending_id = self.stash(Staged { changes, extra, regate });
                 Ok(processed)
             }
             Err(error) => { self.rows().rollback(); Err(error) }
@@ -716,6 +745,7 @@ impl Groups {
         self.pending_order.retain(|id| id != pending_id);
         if !self.rows().apply_staged(&staged.changes) { return Err(ChatError::transient("group state changed; process the message again")); }
         let changes = self.rows().take_changes();
+        if let Some(group) = &staged.regate { self.verified.remove(group); }
         self.flush(store, &changes, staged.extra)
     }
 
@@ -762,18 +792,21 @@ impl Ds {
             let public = ds_bootstrap(provider, &info, &tree, &mut directory)?;
             Ok(json!({ "groupId": group_text(public.group_id()), "epoch": public.group_context().epoch().as_u64() }))
         })?;
-        if let Some(id) = value.get("groupId").and_then(Value::as_str) { self.groups.verified.insert(id.to_string()); }
         Ok(value)
     }
 
     /// Once per group per process: the stored public state must still pass whole-group validation.
     fn gate(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<()> {
         let key = group_text(group);
-        if self.groups.verified.contains(&key) { return Ok(()); }
-        let public = Self::public(&self.groups.provider, group)?;
         let mut directory = Groups::ds_directory(store);
-        validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
-        self.groups.verified.insert(key);
+        if let Some(seen) = self.groups.verified.get(&key) {
+            if seen.still_holds(None, &mut directory)? { return Ok(()); }
+            self.groups.verified.remove(&key);
+        }
+        let public = Self::public(&self.groups.provider, group)?;
+        let (_, certs) = validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
+        let seen = Verified::of(None, &mut directory, &certs)?;
+        self.groups.verified.insert(key, seen);
         Ok(())
     }
 
@@ -787,11 +820,15 @@ impl Ds {
         let bytes = unb64(message, "message")?;
         bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
         self.gate(store, group)?;
-        self.groups.run(store, |provider, store, _extra| {
+        let before = self.epoch(group)?;
+        let verdict = self.groups.run(store, |provider, store, _extra| {
             let public = Self::public(provider, group)?;
             let mut directory = Groups::ds_directory(store);
             ds_submit(provider, public, &bytes, &mut directory)
-        })
+        })?;
+        // A sequenced commit may have added users whose pins the entry doesn't cover.
+        if matches!(verdict, Submit::Accepted { epoch, .. } if epoch != before) { self.groups.verified.remove(&group_text(group)); }
+        Ok(verdict)
     }
 
     /// The group's whole public state (to keep before sequencing a commit; restore if members report poison).
@@ -829,7 +866,6 @@ impl Ds {
             validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
             Ok(json!({ "groupId": group_text(group), "epoch": public.group_context().epoch().as_u64() }))
         })?;
-        self.groups.verified.insert(group_text(group));
         Ok(value)
     }
 

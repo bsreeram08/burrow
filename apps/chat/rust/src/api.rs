@@ -101,6 +101,10 @@ pub fn session_info(contact_id: String) -> Result<Option<SessionInfo>> {
     Ok(core::session_info(contact_id)?.map(|value| SessionInfo { sid: value.sid, started_at: value.started_at }))
 }
 pub fn reset_identity() -> Result<()> { Ok(core::reset_identity()?) }
+
+/// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
+/// domain-separated bytes itself, so this is never a general signing oracle.
+pub fn prove_identity(user_id: String, device_id: String, challenge: String) -> Result<String> { Ok(core::prove_identity(user_id, device_id, challenge)?) }
 #[frb(sync)]
 pub fn rotation_interval(mine: u64, theirs: u64) -> u64 { core::rotation_interval(mine, theirs) }
 

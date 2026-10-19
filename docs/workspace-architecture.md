@@ -92,6 +92,14 @@ The user accepted the recommended answers to the open questions (§9):
 - **Migrating existing users (later, not in M0):** the WASM core can't read signal.js's store (different layout; AIK signing key is a non-extractable CryptoKey). Plan: when M1 registers devices, a browser on signal.js keeps its AIK in WebCrypto (signing via JS, as §2.2 already requires) and exports everything else — sessions, pins, prekeys, claims, wrapped X25519 bytes — into the core's store in one step behind a marker, then switches backend. Until then, turning the flag on for an existing account behaves like a new device (the active-device banner offers "Use this device instead").
 - **Tests:** interop matrix now covers every direction between signal.js, native and WASM (878 checks; the WASM party is rebuilt from its persisted journal after every call); `tests/browser/webkit-wasm.mjs` (WebKit + Chromium: stable identity across reloads, every IndexedDB value sealed, decrypt after reload, two tabs → one leader + handover); `CORE=wasm node tests/browser/accounts.mjs` runs the whole accounts suite on the WASM core; both modes end by switching cores through the confirmed Settings flow; `tests/unit/core-backend.test.ts` proves a link can't switch the core.
 
+### M1 as built (`feat/devices`)
+See [devices.md](devices.md). This is the device registry with numbered migrations, and the AIK-signed DeviceList and DeviceCert (canonical bytes shared by server, web and app). Labels and platforms are sealed per entry under a key derived from a deterministic AIK signature. Clients pin and refuse rollback, equivocation, forks, revoked devices and bad certificates. There is a per-device inbox (the populated `mailbox` migrates into placeholder devices), `sessions.device_id`, and the `devices` frame.
+
+Deviations from §1:
+- **No server-side label.** `devices.label` doesn't exist: labels live only, sealed, inside the list. `devices.platform` is the session's client kind, which the server already knew.
+- **Claims.** Native apps and the WASM core can't sign lists until M2. They claim the inbox by announcing the published identity, and a signed list outranks a claim.
+- **No `caps` column yet.**
+
 ## 5. Slack features
 Payload types inside MLS: `message` (text, thread, mentions, attachments, markdown), `edit` (sender only), `delete` (sender or admin), `reaction`, `pin`, `topic`/`settings`, `receipt` (DMs only), `poll`/`vote`, `command`, `bot.manifest`, `history.share`, `burn`, `typing` (ephemeral). Validated in Rust so web and apps behave identically.
 - Message store v2 (100k messages, threads index, migration from v1). A per-user **self group** syncs read state, mutes, drafts and accepted security codes between your own devices.

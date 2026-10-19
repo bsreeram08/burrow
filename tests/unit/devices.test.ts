@@ -39,6 +39,7 @@ describe('device list format', () => {
         // Pinned digest of that vector, so any change to the format shows up here and in docs/devices.md.
         expect(createHash('sha256').update(expected).digest('hex')).toBe('31f9b6f38de5a0d6180afcf54233e7272add9dd22c49e86e40fa3a7c48e938e6');
         expect(createHash('sha256').update(F.certBytes(F.certFor('user_1', list.devices[0]))).digest('hex')).toBe('5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea');
+        expect(createHash('sha256').update(F.bindBytes('user_1', 'a'.repeat(22), 'A'.repeat(43))).digest('hex')).toBe('e11ceff09f689bbea340eef1c1fcc013f3fff12ff1167b7d44d664fbf5101b18');
         // Key order of the JSON object does not matter; the canonical bytes do.
         const reordered = { devices: list.devices.map(device => ({ meta: device.meta, addedAt: device.addedAt, deviceId: device.deviceId })), prevHash: list.prevHash, version: 2, userId: 'user_1', v: 1 };
         expect(Buffer.from(F.listBytes(reordered)).equals(Buffer.from(F.listBytes(list)))).toBe(true);
@@ -117,15 +118,40 @@ describe('device list format', () => {
 });
 
 let dataDir: string, app: ReturnType<typeof startSignaling>;
-beforeEach(async () => { dataDir = await mkdtemp(join(tmpdir(), 'devices-')); app = startSignaling({ adminToken: 'devices-test-admin-secret-0000000000000000', origin, port: 0, dataDir }); });
+beforeEach(async () => { owners.clear(); deviceKeys.clear(); bound.clear(); dataDir = await mkdtemp(join(tmpdir(), 'devices-')); app = startSignaling({ adminToken: 'devices-test-admin-secret-0000000000000000', origin, port: 0, dataDir }); });
 afterEach(async () => { await app.stop(); await rm(dataDir, { recursive: true, force: true }); });
 const request = (path: string, method: string, cookie: string, body?: unknown) => fetch(new URL(path, app.server.url), {
     method, headers: { 'Content-Type': 'application/json', Cookie: cookie, ...(method !== 'GET' ? { Origin: origin } : {}) }, body: body === undefined ? undefined : JSON.stringify(body),
 });
 const read = async (response: Response) => ({ status: response.status, body: await response.json() as any });
+// Which account each session (cookie or bearer token) belongs to, and each device's own key.
+const owners = new Map<string, string>(), deviceKeys = new Map<string, Aik>(), bound = new Set<string>();
 function account(name: string) {
     const created = app.accounts!.testing.createUser(name), key = aik();
-    return { ...created, key, cookie: app.accounts!.testing.cookie(created.id), session: () => app.accounts!.testing.cookie(created.id) };
+    const session = () => { const cookie = app.accounts!.testing.cookie(created.id); owners.set(cookie, created.id); return cookie; };
+    return { ...created, key, cookie: session(), session };
+}
+/** A native session (bearer token) of an account. */
+function bearerFor(userId: string, client: string) { const token = app.accounts!.testing.bearer(userId, client); owners.set(token, userId); return token; }
+/** POST from a web session (cookie) or a native one (bearer token). */
+const post = (auth: string, path: string, body: unknown) => owners.has(auth) && auth.includes('=') ? request(path, 'POST', auth, body) : native(path, 'POST', auth, body);
+/**
+ * Binds a session to a device the way clients do: a fresh challenge signed with the device's own key
+ * (created on first use of an id). `key` overrides the key that signs, to test impersonation.
+ */
+async function announce(auth: string, id: string, extra: Record<string, unknown> = {}, key?: Aik) {
+    const userId = owners.get(auth)!;
+    const { challenge } = (await read(await post(auth, '/api/devices/challenge', {}))).body;
+    if (!deviceKeys.has(id)) deviceKeys.set(id, aik());
+    const signer = key ?? deviceKeys.get(id)!;
+    const response = await post(auth, '/api/devices/announce', { deviceId: id, deviceKey: signer.pub, challenge, signature: signBytes(signer, F.bindBytes(userId, id, challenge)), ...extra });
+    if (response.status === 200) bound.add(auth);
+    return response;
+}
+/** PUT /api/devices/list from a session, which (like the web client) first binds itself to the publishing device. */
+async function publish(cookie: string, body: Record<string, any>) {
+    if (!bound.has(cookie) && typeof body.deviceId === 'string') await announce(cookie, body.deviceId);
+    return request('/api/devices/list', 'PUT', cookie, body);
 }
 async function publishKeys(user: ReturnType<typeof account>, cookie = user.cookie) {
     const prekey = randomBytes(32).toString('base64url'), identity = { dh: randomBytes(32).toString('base64url'), sign: user.key.pub };
@@ -153,23 +179,27 @@ function events(cookie: string, bearer?: string) {
 describe('device registry', () => {
     test('the identity-key holder publishes list v1; lists only move forward and only from the primary', async () => {
         const alice = account('alice'), mine = deviceId();
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(409); // keys first
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(409); // keys first
         await publishKeys(alice);
         const v1 = signed(alice.key, listOf(alice.id, 1, '', [mine]));
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, signature: signBytes(aik(), F.listBytes(v1.list)), deviceId: mine })).status).toBe(403); // wrong key
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: deviceId() })).status).toBe(400); // publisher not in the list
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: mine })).status).toBe(409); // replay of v1
+        expect((await publish(alice.cookie, { ...v1, signature: signBytes(aik(), F.listBytes(v1.list)), deviceId: mine })).status).toBe(403); // wrong key
+        expect((await publish(alice.cookie, { ...v1, deviceId: deviceId() })).status).toBe(400); // publisher not in the list
+        expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(409); // replay of v1
         const view = (await read(await request(`/api/devices/${alice.username}`, 'GET', alice.cookie))).body;
         expect(view.list).toEqual(v1.list);
         expect(view.devices).toEqual([expect.objectContaining({ id: mine, state: 'listed', primary: true, current: true })]);
         const second = deviceId(), hash1 = hashOf(v1.list);
-        // A list that does not chain to the current one, and one from another session of the same account, are refused.
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, 'A'.repeat(43), [mine, second])), deviceId: mine })).status).toBe(409);
+        // A list that does not chain to the current one, and one from another session of the same account, are refused:
+        // an unbound session, and one bound to another device.
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, 'A'.repeat(43), [mine, second])), deviceId: mine })).status).toBe(409);
         expect((await request('/api/devices/list', 'PUT', alice.session(), { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(403);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(200);
+        const other = alice.session();
+        expect((await announce(other, second)).status).toBe(200);
+        expect((await request('/api/devices/list', 'PUT', other, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(403);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(200);
         // A replay of an older version after v2 is refused too.
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: mine })).status).toBe(409);
+        expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(409);
     });
     test('lists are bound to the session account, exactly the next version, and never revive a revoked device', async () => {
         const alice = account('alice'), bob = account('bob'), mine = deviceId(), gone = deviceId(), goneCookie = alice.session();
@@ -179,27 +209,27 @@ describe('device registry', () => {
         expect((await request('/api/devices/list', 'PUT', bob.cookie, { ...forAlice, deviceId: mine })).status).toBe(400);
         // A list naming bob but signed with alice's key fails bob's stored identity key.
         expect((await request('/api/devices/list', 'PUT', bob.cookie, { ...signed(alice.key, listOf(bob.id, 1, '', [deviceId()])), deviceId: deviceId() })).status).toBe(403);
-        await request('/api/devices/announce', 'POST', goneCookie, { deviceId: gone, platform: 'web' });
+        await announce(goneCookie, gone);
         const v1 = signed(alice.key, listOf(alice.id, 1, '', [mine, gone]));
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
         // Skipping a version, or the same version with other content, is refused.
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 3, hashOf(v1.list), [mine])), deviceId: mine })).status).toBe(409);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(409);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 3, hashOf(v1.list), [mine])), deviceId: mine })).status).toBe(409);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(409);
         // A listed device cannot remove itself; the primary drops it with v2 (a tombstone stays).
         expect((await request(`/api/devices/${gone}`, 'DELETE', goneCookie, {})).status).toBe(403);
         const v2 = signed(alice.key, listOf(alice.id, 2, hashOf(v1.list), [mine]));
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v2, deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...v2, deviceId: mine })).status).toBe(200);
         expect((await request('/api/me', 'GET', goneCookie)).status).toBe(401);
         const v3 = signed(alice.key, listOf(alice.id, 3, hashOf(v2.list), [mine, gone]));
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v3, deviceId: mine })).status).toBe(409);
-        expect((await request('/api/devices/announce', 'POST', alice.session(), { deviceId: gone, platform: 'web' })).status).toBe(409);
+        expect((await publish(alice.cookie, { ...v3, deviceId: mine })).status).toBe(409);
+        expect((await announce(alice.session(), gone)).status).toBe(409);
     });
     test('a pending device may remove only itself; it cannot remove the primary or another account\'s device', async () => {
         const alice = account('alice'), bob = account('bob'), mine = deviceId(), pending = deviceId(), pendingCookie = alice.session(), bobDevice = deviceId();
         await publishKeys(alice); await publishKeys(bob);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
-        expect((await request('/api/devices/list', 'PUT', bob.cookie, { ...signed(bob.key, listOf(bob.id, 1, '', [bobDevice])), deviceId: bobDevice })).status).toBe(200);
-        await request('/api/devices/announce', 'POST', pendingCookie, { deviceId: pending, platform: 'web' });
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        expect((await publish(bob.cookie, { ...signed(bob.key, listOf(bob.id, 1, '', [bobDevice])), deviceId: bobDevice })).status).toBe(200);
+        await announce(pendingCookie, pending);
         expect((await request(`/api/devices/${mine}`, 'DELETE', pendingCookie, {})).status).toBe(403);
         expect((await request(`/api/devices/${bobDevice}`, 'DELETE', alice.cookie, {})).status).toBe(404);
         expect((await request(`/api/devices/${pending}`, 'DELETE', pendingCookie, {})).status).toBe(200);
@@ -209,18 +239,18 @@ describe('device registry', () => {
     test('device ids belong to one account, and an account has at most 16 devices', async () => {
         const alice = account('alice'), bob = account('bob'), aliceDevice = deviceId();
         await publishKeys(alice); await publishKeys(bob);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [aliceDevice])), deviceId: aliceDevice })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [aliceDevice])), deviceId: aliceDevice })).status).toBe(200);
         const bobDevice = deviceId();
-        expect((await request('/api/devices/list', 'PUT', bob.cookie, { ...signed(bob.key, listOf(bob.id, 1, '', [bobDevice, aliceDevice])), deviceId: bobDevice })).status).toBe(409);
-        expect((await request('/api/devices/announce', 'POST', bob.cookie, { deviceId: aliceDevice, platform: 'web' })).status).toBe(409);
-        for (let index = 0; index < 15; index++) expect((await request('/api/devices/announce', 'POST', alice.session(), { deviceId: deviceId(), platform: 'web' })).status).toBe(200);
-        expect((await request('/api/devices/announce', 'POST', alice.session(), { deviceId: deviceId(), platform: 'web' })).status).toBe(429);
+        expect((await publish(bob.cookie, { ...signed(bob.key, listOf(bob.id, 1, '', [bobDevice, aliceDevice])), deviceId: bobDevice })).status).toBe(409);
+        expect((await announce(bob.cookie, aliceDevice)).status).toBe(409);
+        for (let index = 0; index < 15; index++) expect((await announce(alice.session(), deviceId())).status).toBe(200);
+        expect((await announce(alice.session(), deviceId())).status).toBe(429);
     });
     test('contacts see only the signed list; strangers see nothing', async () => {
         const alice = account('alice'), bob = account('bob'), carol = account('carol'), mine = deviceId();
         await publishKeys(alice); await befriend(alice, bob);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine, label: 'A'.repeat(40) })).status).toBe(200);
-        await request('/api/devices/announce', 'POST', alice.session(), { deviceId: deviceId(), platform: 'web' });
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine, label: 'A'.repeat(40) })).status).toBe(200);
+        await announce(alice.session(), deviceId());
         const seen = (await read(await request(`/api/devices/${alice.username}`, 'GET', bob.cookie))).body;
         expect(Object.keys(seen).sort()).toEqual(['certs', 'identity', 'list', 'signature', 'userId']);
         expect((await F.verifyView({ userId: alice.id, aikSign: alice.key.pub, ...seen })).ok).toBe(true);
@@ -229,8 +259,8 @@ describe('device registry', () => {
     test('the primary removes a pending device: its sessions end and its stream closes; others cannot remove', async () => {
         const alice = account('alice'), mine = deviceId(), other = deviceId(), otherCookie = alice.session();
         await publishKeys(alice);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
-        expect((await request('/api/devices/announce', 'POST', otherCookie, { deviceId: other, platform: 'web' })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        expect((await announce(otherCookie, other)).status).toBe(200);
         const stream = events(otherCookie); await stream.opened;
         expect((await request(`/api/devices/${mine}`, 'DELETE', otherCookie, {})).status).toBe(403);
         expect((await request(`/api/devices/${mine}`, 'DELETE', alice.cookie, {})).status).toBe(400); // not itself
@@ -243,9 +273,9 @@ describe('device registry', () => {
     test('removing a listed device needs the next signed list without it', async () => {
         const alice = account('alice'), mine = deviceId(), other = deviceId(), otherCookie = alice.session();
         await publishKeys(alice);
-        await request('/api/devices/announce', 'POST', otherCookie, { deviceId: other, platform: 'android' });
+        await announce(otherCookie, other);
         const v1 = signed(alice.key, { ...listOf(alice.id, 1, '', [mine, other]), devices: [mine, other].sort().map(id => ({ deviceId: id, addedAt: 5, meta: '' })) });
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(200);
         expect((await request(`/api/devices/${other}`, 'DELETE', alice.cookie, {})).status).toBe(400);
         const v2 = signed(alice.key, { ...listOf(alice.id, 2, hashOf(v1.list), [mine]), devices: [{ deviceId: mine, addedAt: 5, meta: '' }] });
         expect((await read(await request(`/api/devices/${other}`, 'DELETE', alice.cookie, v2))).body.revoked).toEqual([other]);
@@ -256,14 +286,14 @@ describe('device registry', () => {
         await publishKeys(alice); await befriend(alice, bob);
         const early = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
         expect(early.status).toBe(201);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
         const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
         expect(db.query('SELECT device_id FROM device_inbox WHERE id = ?').get(early.body.id)).toEqual({ device_id: mine });
         expect((db.query("SELECT COUNT(*) AS count FROM devices WHERE state = 'placeholder'").get() as any).count).toBe(0);
         db.close();
         // A pending (non-key-holding) browser does not read the primary's inbox; the primary does.
         const pendingCookie = alice.session();
-        await request('/api/devices/announce', 'POST', pendingCookie, { deviceId: deviceId(), platform: 'web' });
+        await announce(pendingCookie, deviceId());
         const pending = events(pendingCookie); await pending.opened; await pending.next('hello');
         const primary = events(alice.cookie); await primary.opened;
         expect((await primary.next('envelope')).id).toBe(early.body.id);
@@ -273,7 +303,7 @@ describe('device registry', () => {
     test('before any list is published, every signed-in device reads the placeholder inbox (pre-M1 behaviour)', async () => {
         const alice = account('alice'), bob = account('bob'), pendingCookie = alice.session();
         await publishKeys(alice); await befriend(alice, bob);
-        await request('/api/devices/announce', 'POST', pendingCookie, { deviceId: deviceId(), platform: 'web' });
+        await announce(pendingCookie, deviceId());
         const sent = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
         const stream = events(pendingCookie); await stream.opened;
         expect((await stream.next('envelope')).id).toBe(sent.body.id);
@@ -282,7 +312,7 @@ describe('device registry', () => {
     test('a new identity voids the old lists; the new key holder starts again at version 1', async () => {
         const alice = account('alice'), bob = account('bob'), mine = deviceId();
         await publishKeys(alice); await befriend(alice, bob);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
         const watch = events(bob.cookie); await watch.opened;
         const newcomer = account('alice2'); // only for a fresh key pair
         const fresh = alice.session(), next = deviceId();
@@ -290,8 +320,8 @@ describe('device registry', () => {
         expect(await watch.next('devices')).toEqual({ type: 'devices', id: alice.id });
         const view = (await read(await request(`/api/devices/${alice.username}`, 'GET', alice.cookie))).body;
         expect(view.list).toBeNull();
-        expect((await request('/api/devices/list', 'PUT', fresh, { ...signed(newcomer.key, listOf(alice.id, 2, 'A'.repeat(43), [next])), deviceId: next })).status).toBe(409);
-        expect((await request('/api/devices/list', 'PUT', fresh, { ...signed(newcomer.key, listOf(alice.id, 1, '', [next])), deviceId: next })).status).toBe(200);
+        expect((await publish(fresh, { ...signed(newcomer.key, listOf(alice.id, 2, 'A'.repeat(43), [next])), deviceId: next })).status).toBe(409);
+        expect((await publish(fresh, { ...signed(newcomer.key, listOf(alice.id, 1, '', [next])), deviceId: next })).status).toBe(200);
         watch.socket.close();
     });
 });
@@ -301,11 +331,11 @@ describe('messaging device and per-device delivery', () => {
         const alice = account('alice'), bob = account('bob'), phone = deviceId(), laptop = deviceId(), laptopCookie = alice.session();
         const identity = await publishKeys(alice); await befriend(alice, bob);
         const early = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
-        const bearer = app.accounts!.testing.bearer(alice.id, 'ios');
+        const bearer = bearerFor(alice.id, 'ios');
         // A wrong identity is just a pending device; the published one moves messaging (and the waiting envelope) there.
-        expect((await read(await native('/api/devices/announce', 'POST', bearer, { deviceId: phone, identity: { ...identity, dh: 'A'.repeat(43) } }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
-        expect((await read(await native('/api/devices/announce', 'POST', bearer, { deviceId: phone, identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: true });
-        expect((await request('/api/devices/announce', 'POST', laptopCookie, { deviceId: laptop })).status).toBe(200);
+        expect((await read(await announce(bearer, phone, { identity: { ...identity, dh: 'A'.repeat(43) } }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
+        expect((await read(await announce(bearer, phone, { identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: true });
+        expect((await announce(laptopCookie, laptop)).status).toBe(200);
         const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
         expect(db.query('SELECT device_id FROM device_inbox WHERE id = ?').get(early.body.id)).toEqual({ device_id: phone });
         expect(db.query('SELECT platform FROM devices WHERE id = ?').get(phone)).toEqual({ platform: 'ios' });
@@ -336,25 +366,93 @@ describe('messaging device and per-device delivery', () => {
     test('a signed list outranks a claim: the listed primary keeps the inbox', async () => {
         const alice = account('alice'), mine = deviceId(), phone = deviceId();
         const identity = await publishKeys(alice);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
-        const bearer = app.accounts!.testing.bearer(alice.id, 'android');
-        expect((await read(await native('/api/devices/announce', 'POST', bearer, { deviceId: phone, identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        const bearer = bearerFor(alice.id, 'android');
+        expect((await read(await announce(bearer, phone, { identity }))).body).toEqual({ deviceId: phone, state: 'pending', primary: false });
         const view = (await read(await request(`/api/devices/${alice.username}`, 'GET', alice.cookie))).body;
         expect(view.devices.find((row: any) => row.primary).id).toBe(mine);
     });
     test('taking over with new keys moves the inbox to the uploading device', async () => {
         const alice = account('alice'), bob = account('bob'), mine = deviceId(), phone = deviceId();
         await publishKeys(alice); await befriend(alice, bob);
-        expect((await request('/api/devices/list', 'PUT', alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
         const waiting = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
         const phoneCookie = alice.session();
-        expect((await request('/api/devices/announce', 'POST', phoneCookie, { deviceId: phone })).status).toBe(200);
+        expect((await announce(phoneCookie, phone)).status).toBe(200);
         await publishKeys({ ...alice, key: aik() }, phoneCookie); // a new identity from the phone's session
         const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
         expect(db.query('SELECT device_id FROM device_inbox WHERE id = ?').get(waiting.body.id)).toEqual({ device_id: phone });
         expect(db.query('SELECT state, is_primary FROM devices WHERE id = ?').get(phone)).toEqual({ state: 'pending', is_primary: 1 });
         expect(db.query('SELECT state, is_primary FROM devices WHERE id = ?').get(mine)).toEqual({ state: 'pending', is_primary: 0 });
         db.close();
+    });
+});
+
+describe('binding a session to a device needs proof of possession', () => {
+    test("a second session cannot become the primary by announcing its id; the real device (signed in again) can", async () => {
+        const alice = account('alice'), bob = account('bob'), mine = deviceId();
+        await publishKeys(alice); await befriend(alice, bob);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        const intruder = alice.session();
+        // No challenge, a replayed challenge, another key, and a proof made for another account: all refused.
+        expect((await request('/api/devices/announce', 'POST', intruder, { deviceId: mine, deviceKey: aik().pub, challenge: 'A'.repeat(43), signature: 'A'.repeat(86) })).status).toBe(401);
+        expect((await announce(intruder, mine, {}, aik())).status).toBe(403);
+        const { challenge } = (await read(await request('/api/devices/challenge', 'POST', intruder, {}))).body;
+        const key = deviceKeys.get(mine)!;
+        expect((await request('/api/devices/announce', 'POST', intruder, { deviceId: mine, challenge, signature: signBytes(key, F.bindBytes(bob.id, mine, challenge)) })).status).toBe(403);
+        expect((await request('/api/devices/announce', 'POST', intruder, { deviceId: mine, challenge, signature: signBytes(key, F.bindBytes(alice.id, mine, challenge)) })).status).toBe(401); // spent
+        // The intruder is still unbound: no inbox, no list changes, and the primary keeps its inbox.
+        const sent = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
+        const stream = events(intruder); await stream.opened; await stream.next('hello');
+        await expect(stream.next('envelope')).rejects.toThrow('timeout');
+        stream.socket.close();
+        expect((await request(`/api/devices/${deviceId()}`, 'DELETE', intruder, {})).status).toBe(403);
+        // The same browser, signed in again, proves it holds the device key and gets its inbox back.
+        const again = alice.session();
+        expect((await read(await announce(again, mine))).body).toEqual({ deviceId: mine, state: 'listed', primary: true });
+        const back = events(again); await back.opened;
+        expect((await back.next('envelope')).id).toBe(sent.body.id);
+        back.socket.close();
+    });
+    test('overlapping challenges of one session are each usable once (tabs, reconnects)', async () => {
+        const alice = account('alice'), id = deviceId(), key = aik();
+        const ask = async () => (await read(await request('/api/devices/challenge', 'POST', alice.cookie, {}))).body.challenge as string;
+        const [first, second] = [await ask(), await ask()];
+        const bind = (challenge: string) => request('/api/devices/announce', 'POST', alice.cookie, { deviceId: id, deviceKey: key.pub, challenge, signature: signBytes(key, F.bindBytes(alice.id, id, challenge)) });
+        expect((await bind(second)).status).toBe(200);
+        expect((await bind(first)).status).toBe(200);
+        expect((await bind(first)).status).toBe(401);
+    });
+    test('an unbound session of a listed account gets no envelopes and cannot acknowledge any', async () => {
+        const alice = account('alice'), bob = account('bob'), mine = deviceId();
+        await publishKeys(alice); await befriend(alice, bob);
+        expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(200);
+        const sent = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
+        // A legacy native app (never announces) and a fresh browser session: no fallback to the primary's inbox.
+        const legacy = events('', bearerFor(alice.id, 'android')), fresh = events(alice.session());
+        await legacy.opened; await fresh.opened; await legacy.next('hello'); await fresh.next('hello');
+        await expect(legacy.next('envelope')).rejects.toThrow('timeout');
+        await expect(fresh.next('envelope')).rejects.toThrow('timeout');
+        fresh.socket.send(JSON.stringify({ type: 'ack', id: sent.body.id }));
+        await Bun.sleep(50);
+        const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
+        expect(db.query('SELECT device_id FROM device_inbox WHERE id = ?').get(sent.body.id)).toEqual({ device_id: mine });
+        db.close();
+        legacy.socket.close(); fresh.socket.close();
+    });
+    test('legacy state: while the primary is a placeholder, an unbound session (an old app) still gets its mail', async () => {
+        const alice = account('alice'), bob = account('bob');
+        await publishKeys(alice); await befriend(alice, bob);
+        const sent = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(64).toString('base64url') }));
+        const legacy = events('', bearerFor(alice.id, 'ios')); await legacy.opened;
+        const delivered = await legacy.next('envelope');
+        expect(delivered.id).toBe(sent.body.id);
+        legacy.socket.send(JSON.stringify({ type: 'ack', id: sent.body.id }));
+        await Bun.sleep(50);
+        const db = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
+        expect(db.query('SELECT 1 FROM device_inbox WHERE id = ?').get(sent.body.id)).toBeNull();
+        db.close();
+        legacy.socket.close();
     });
 });
 
@@ -405,7 +503,9 @@ describe('migrations', () => {
             const migrated = startSignaling({ adminToken: 'devices-test-admin-secret-0000000000000000', origin, port: 0, dataDir: dir });
             try {
                 const bearer = migrated.accounts!.testing.bearer('u1', 'android'), phone = deviceId();
-                const announced = await fetch(new URL('/api/devices/announce', migrated.server.url), { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: JSON.stringify({ deviceId: phone, identity: { dh: 'D'.repeat(43), sign: 'S'.repeat(43) } }) });
+                const call = (path: string, body: unknown) => fetch(new URL(path, migrated.server.url), { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: JSON.stringify(body) });
+                const { challenge } = await (await call('/api/devices/challenge', {})).json() as any, key = aik();
+                const announced = await call('/api/devices/announce', { deviceId: phone, deviceKey: key.pub, challenge, signature: signBytes(key, F.bindBytes('u1', phone, challenge)), identity: { dh: 'D'.repeat(43), sign: 'S'.repeat(43) } });
                 expect(((await announced.json()) as any).primary).toBe(true);
                 const url = new URL('/api/events', migrated.server.url); url.protocol = 'ws:';
                 const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${bearer}` } } as any);

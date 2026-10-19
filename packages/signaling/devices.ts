@@ -11,10 +11,13 @@ type Format = {
     MAX_DEVICES: number; PLATFORMS: readonly string[];
     validateList(list: unknown): DeviceList; listBytes(list: DeviceList): Uint8Array;
     certBytes(cert: object): Uint8Array; certFor(userId: string, device: DeviceEntry): object;
+    bindBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
 };
 const Format = (globalThis as any).DeviceFormat as Format;
 export const MAX_DEVICES = Format.MAX_DEVICES;
-const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/;
+const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/, KEY = /^[A-Za-z0-9_-]{43}$/;
+/** A bind challenge is single use, for one session, and short lived. */
+const CHALLENGE_LIFETIME = 2 * 60 * 1000, MAX_CHALLENGES = 10000, MAX_SESSION_CHALLENGES = 4;
 /** The caller: a signed-in session. `client` is 'web' or the native platform it signed in with. */
 type Caller = { id: string; session: string; client: string };
 
@@ -28,9 +31,12 @@ type Deps = {
     mutualIds(userId: string): string[];
     /** Called after sessions were deleted: forget their push tokens and close their streams. */
     sessionsEnded(userId: string, sessions: string[]): void;
+    /** A session was bound or an inbox moved: deliver what now waits for the user's open streams. */
+    inboxChanged(userId: string): void;
 };
 
-function aikVerify(aikSign: string, bytes: Uint8Array, signature: unknown) {
+/** Ed25519 verification of a base64url signature under a base64url public key (the AIK or a device key). */
+function ed25519Verify(aikSign: string, bytes: Uint8Array, signature: unknown) {
     if (typeof signature !== 'string' || !SIG.test(signature)) return false;
     try { return verify(null, bytes, createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: aikSign }, format: 'jwk' }), Buffer.from(signature, 'base64url')); }
     catch { return false; }
@@ -52,14 +58,15 @@ export function createDevices(deps: Deps) {
         return id;
     }
     /**
-     * Where a stream's envelopes come from: its session's device, or (legacy and native clients) the primary.
-     * Until a key holder has published a list, the primary is a placeholder and the server cannot tell which
-     * signed-in device holds the keys (native apps and the WebAssembly core do not publish lists yet), so every
-     * device reads the placeholder's inbox as before M1; the inactive ones never acknowledge what they cannot read.
+     * Where a stream's envelopes come from: its session's own device inbox, or none for an unbound session.
+     * Legacy state only: while the primary is a placeholder (a migrated account no device has claimed yet),
+     * the server cannot tell which signed-in device holds the keys, so every session reads the placeholder's
+     * inbox as before M1; the inactive ones never acknowledge what they cannot read. Once a device holds
+     * messaging (claimed or listed), an unbound session gets nothing until it binds with proof of possession.
      */
-    function inboxFor(userId: string, session: string) {
+    function inboxFor(userId: string, session: string): string | null {
         const own = sessionDevice(session), main = primary(userId);
-        if (!own || own === main) return main;
+        if (own === main) return main;
         const state = db.query<{ state: string }, [string]>('SELECT state FROM devices WHERE id = ?').get(main)?.state;
         return state === 'placeholder' ? main : own;
     }
@@ -107,11 +114,11 @@ export function createDevices(deps: Deps) {
         try { list = Format.validateList(body?.list); } catch (error: any) { return [400, { error: error.message || 'Invalid device list' }]; }
         if (list.userId !== user.id) return [400, { error: 'This list names another account.' }];
         const bytes = Format.listBytes(list);
-        if (!aikVerify(aik, bytes, body!.signature)) return [403, { error: 'The list is not signed by this account\'s identity key.' }];
+        if (!ed25519Verify(aik, bytes, body!.signature)) return [403, { error: 'The list is not signed by this account\'s identity key.' }];
         const certs: Record<string, string> = {};
         for (const device of list.devices) {
             const signature = body!.certs?.[device.deviceId];
-            if (!aikVerify(aik, Format.certBytes(Format.certFor(user.id, device)), signature)) return [403, { error: `Invalid certificate for device ${device.deviceId}.` }];
+            if (!ed25519Verify(aik, Format.certBytes(Format.certFor(user.id, device)), signature)) return [403, { error: `Invalid certificate for device ${device.deviceId}.` }];
             certs[device.deviceId] = signature;
         }
         const deviceId = body!.deviceId;
@@ -126,8 +133,8 @@ export function createDevices(deps: Deps) {
             const current = db.query<{ id: string }, [string]>("SELECT id FROM devices WHERE user_id = ? AND is_primary = 1 AND state = 'listed'").get(user.id);
             if (!current || sessionDevice(user.session) !== current.id || deviceId !== current.id) return [403, { error: 'Only the primary device can change the device list.' }];
         } else if (list.version !== 1) return [409, { error: 'The first device list is version 1.', version: 0 }];
-        const bound = sessionDevice(user.session);
-        if (bound && bound !== deviceId) return [409, { error: 'This session belongs to another device.' }];
+        // The publisher must have bound its session to its device with proof of possession (announce).
+        if (sessionDevice(user.session) !== deviceId) return [409, { error: 'Announce this device before publishing a list.' }];
         // A device id is the account's own: never one of another account's devices.
         for (const device of list.devices) {
             const owner = db.query<{ user_id: string; state: string }, [string]>('SELECT user_id, state FROM devices WHERE id = ?').get(device.deviceId);
@@ -150,12 +157,12 @@ export function createDevices(deps: Deps) {
                 db.query('UPDATE device_inbox SET device_id = ? WHERE device_id = ?').run(deviceId, previous.id);
                 if (previous.state === 'placeholder') db.query('DELETE FROM devices WHERE id = ?').run(previous.id);
             }
-            db.query('UPDATE sessions SET device_id = ? WHERE token_hash = ?').run(deviceId, user.session);
             db.query('INSERT OR REPLACE INTO device_lists (user_id, aik_sign, version, hash, list, signature, certs, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
                 .run(user.id, aik, list.version, digest(bytes), JSON.stringify(list), body!.signature, JSON.stringify(certs), now());
         })();
         revoke(user.id, dropped);
         announceChange(user.id);
+        deps.inboxChanged(user.id);
         return [200, { version: list.version, revoked: dropped }];
     }
 
@@ -181,25 +188,53 @@ export function createDevices(deps: Deps) {
     /** After PUT /api/keys: the session that uploaded the identity holds it, so its device may claim messaging. */
     function keysUploaded(user: Caller) {
         const id = sessionDevice(user.session);
-        if (id && claim(user.id, id)) deps.notify(user.id, { type: 'devices', id: user.id });
+        if (id && claim(user.id, id)) { deps.notify(user.id, { type: 'devices', id: user.id }); deps.inboxChanged(user.id); }
+    }
+
+    // Outstanding bind challenges by session hash: a few each (tabs and retries may overlap), oldest dropped.
+    const challenges = new Map<string, { value: string; expiresAt: number }[]>();
+    /** A fresh single-use challenge for this session to sign with its device key (announce). */
+    function challenge(user: Caller): [number, object] {
+        for (const [key, list] of challenges) { const live = list.filter(item => item.expiresAt > now()); if (live.length) challenges.set(key, live); else challenges.delete(key); }
+        if (challenges.size >= MAX_CHALLENGES && !challenges.has(user.session)) return [503, { error: 'Busy, try again' }];
+        const value = randomBytes(32).toString('base64url');
+        challenges.set(user.session, [...(challenges.get(user.session) ?? []), { value, expiresAt: now() + CHALLENGE_LIFETIME }].slice(-MAX_SESSION_CHALLENGES));
+        return [200, { challenge: value }];
+    }
+    /** Spends one of this session's outstanding challenges; false if it was never issued, expired or used. */
+    function spend(session: string, value: unknown) {
+        const list = challenges.get(session) ?? [], index = list.findIndex(item => item.value === value);
+        if (index < 0) return false;
+        const [item] = list.splice(index, 1);
+        if (!list.length) challenges.delete(session);
+        return item!.expiresAt > now();
     }
 
     /**
-     * A signed-in device makes itself known and binds its session to a device id. It shows up as pending for
-     * the owner until a signed list names it. `identity`, when it matches the published identity, says this
-     * device holds the account keys: it then takes the messaging inbox (claim) unless a signed list says otherwise.
+     * A signed-in device makes itself known and binds its session to a device id, proving possession of that
+     * device's key: `signature` is the device key's signature over bindBytes(userId, deviceId, challenge) for
+     * this session's single-use challenge. A new id registers `deviceKey`; an existing id is bound only with
+     * its registered key, so another session of the account (or a stolen cookie) cannot become that device.
+     * It shows up as pending for the owner until a signed list names it. `identity`, when it matches the
+     * published identity, says this device holds the account keys: it then takes the messaging inbox (claim)
+     * unless a signed list says otherwise.
      */
     function announce(user: Caller, body: Record<string, any> | null): [number, object] {
-        const deviceId = body?.deviceId, identity = body?.identity;
+        const deviceId = body?.deviceId, identity = body?.identity, nonce = body?.challenge;
         if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || (identity !== undefined && (typeof identity?.dh !== 'string' || typeof identity?.sign !== 'string'))) return [400, { error: 'Invalid device' }];
+        // The challenge is spent by any attempt that names it, right or wrong.
+        if (typeof nonce !== 'string' || !spend(user.session, nonce)) return [401, { error: 'The device challenge expired. Ask for a new one.' }];
         const bound = sessionDevice(user.session);
         if (bound && bound !== deviceId) return [409, { error: 'This session belongs to another device.' }];
-        const existing = db.query<{ user_id: string; state: string }, [string]>('SELECT user_id, state FROM devices WHERE id = ?').get(deviceId);
-        if (existing && (existing.user_id !== user.id || existing.state === 'revoked')) return [409, { error: 'That device id cannot be used.' }];
+        const existing = db.query<{ user_id: string; state: string; sig_key: string | null }, [string]>('SELECT user_id, state, sig_key FROM devices WHERE id = ?').get(deviceId);
+        if (existing && (existing.user_id !== user.id || existing.state === 'revoked' || existing.state === 'placeholder' || !existing.sig_key)) return [409, { error: 'That device id cannot be used.' }];
+        const key = existing ? existing.sig_key! : body!.deviceKey;
+        if (typeof key !== 'string' || !KEY.test(key)) return [400, { error: 'Invalid device key' }];
+        if (!ed25519Verify(key, Format.bindBytes(user.id, deviceId, nonce), body!.signature)) return [403, { error: 'This session could not prove it is that device.' }];
         if (!existing && live(user.id).filter(row => row.state !== 'placeholder').length >= MAX_DEVICES) return [429, { error: `At most ${MAX_DEVICES} devices per account. Remove one in Settings → Devices.` }];
         const platform = Format.PLATFORMS.includes(user.client) ? user.client : 'unknown';
         db.transaction(() => {
-            if (!existing) db.query("INSERT INTO devices (id, user_id, platform, state, created_at, last_seen_at) VALUES (?, ?, ?, 'pending', ?, ?)").run(deviceId, user.id, platform, now(), now());
+            if (!existing) db.query("INSERT INTO devices (id, user_id, platform, state, sig_key, created_at, last_seen_at) VALUES (?, ?, ?, 'pending', ?, ?, ?)").run(deviceId, user.id, platform, key, now(), now());
             else db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), deviceId);
             db.query('UPDATE sessions SET device_id = ? WHERE token_hash = ?').run(deviceId, user.session);
         })();
@@ -207,6 +242,7 @@ export function createDevices(deps: Deps) {
         const holder = Boolean(identity && published && published.dh === identity.dh && published.sign === identity.sign);
         const claimed = holder && claim(user.id, deviceId);
         if (!existing || claimed) deps.notify(user.id, { type: 'devices', id: user.id });
+        deps.inboxChanged(user.id); // This session now reads its device's inbox.
         const row = db.query<{ state: string; is_primary: number }, [string]>('SELECT state, is_primary FROM devices WHERE id = ?').get(deviceId)!;
         return [200, { deviceId, state: row.state, primary: Boolean(row.is_primary) }];
     }
@@ -252,6 +288,6 @@ export function createDevices(deps: Deps) {
 
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, announce, keysUploaded, view, remove, identityChanged, touch, sessionDevice };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, identityChanged, touch, sessionDevice };
 }
 export type Devices = ReturnType<typeof createDevices>;

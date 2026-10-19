@@ -50,6 +50,7 @@ void main() {
       };
       expect(hash.sha256.convert(listBytes(list)).toString(), '31f9b6f38de5a0d6180afcf54233e7272add9dd22c49e86e40fa3a7c48e938e6');
       expect(hash.sha256.convert(certBytes('user_1', (list['devices'] as List).first as Map)).toString(), '5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea');
+      expect(hash.sha256.convert(bindBytes('user_1', 'a' * 22, 'A' * 43)).toString(), 'e11ceff09f689bbea340eef1c1fcc013f3fff12ff1167b7d44d664fbf5101b18');
     });
 
     test('non-canonical or malformed lists are refused', () {
@@ -123,6 +124,7 @@ void main() {
         final path = request.url.path;
         if (path == '/api/keys/count') return http.Response(jsonEncode({'oneTimePreKeys': 50, 'signedPreKeyId': 1, 'identity': serverIdentity}), 200);
         if (path == '/api/keys') return http.Response('{}', 200);
+        if (path == '/api/devices/challenge') return http.Response(jsonEncode({'challenge': 'A' * 43}), 200);
         if (path == '/api/devices/announce') {
           announced.add(jsonDecode(request.body) as Map<String, dynamic>);
           return http.Response(jsonEncode({'deviceId': announced.last['deviceId'], 'state': 'pending', 'primary': true}), 200);
@@ -155,16 +157,23 @@ void main() {
       final prefs = MemoryDevicePrefs();
       final messenger = await start(prefs);
       expect(await messenger.checkActive(), isTrue);
-      expect(announced.single, {'deviceId': messenger.deviceId, 'identity': {'dh': 'me-dh', 'sign': 'me-sign'}});
-      expect(prefs.deviceId(me.id), messenger.deviceId);
-      expect((await start(prefs)).deviceId, messenger.deviceId);
+      final device = await messenger.device(), body = announced.single;
+      expect(body['deviceId'], device.deviceId);
+      expect(body['identity'], {'dh': 'me-dh', 'sign': 'me-sign'});
+      expect(body['challenge'], 'A' * 43);
+      // Proof of possession: the device key signed this session's challenge for this account and device.
+      expect(verifyBytes(body['deviceKey'] as String, bindBytes(me.id, device.deviceId, 'A' * 43), body['signature']), isTrue);
+      // The same install keeps its id and key.
+      final again = await (await start(prefs)).device();
+      expect([again.deviceId, again.publicKey], [device.deviceId, device.publicKey]);
     });
 
     test('a device that does not hold the keys announces without an identity and stays inactive', () async {
       serverIdentity = {'dh': 'other-dh', 'sign': 'other-sign'};
       final messenger = await start(MemoryDevicePrefs());
       expect(await messenger.checkActive(), isFalse);
-      expect(announced.single.keys, ['deviceId']);
+      expect(announced.single.containsKey('identity'), isFalse);
+      expect(announced.single.keys, containsAll(['deviceId', 'deviceKey', 'challenge', 'signature']));
     });
 
     test("a contact's list is pinned; a rollback or a server-injected device is reported", () async {

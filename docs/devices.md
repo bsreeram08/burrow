@@ -41,9 +41,14 @@ The web client pins in `localStorage['device-pins-v1:<userId>']`. The app pins i
   - **Uniqueness.** At most one live primary per account.
 - **`device_lists`** stores the latest list verbatim, with its hash, signature, certificates and the AIK that signed it.
 - **Accepting a list.** The server accepts only the exact next version, chained to the stored hash and sent from the primary's session (or version 1 under a new AIK). Devices the list drops are revoked: their sessions end, streams close with 4401, push tokens and inbox rows are removed.
-- **`sessions.device_id`** binds each session to one device.
+- **`sessions.device_id`** binds each session to one device, only with proof of possession.
+  - **Device key.** Each device has its own Ed25519 key (`devices.sig_key`). The browser keeps a non-extractable one in IndexedDB beside its id; the app keeps the seed in the Keychain / Keystore.
+  - **Binding.** `POST /api/devices/challenge` returns a single-use challenge for the session. The device signs `webrtc-bun-devicebind-v1 ‖ userId ‖ deviceId ‖ challenge` and sends it to `announce`. A new id registers its key; an existing id binds only with its registered key. Knowing a device id, or holding another session of the account, is never enough to become that device.
+  - **Unbindable ids.** Placeholders, revoked devices and listed devices the server never saw announce (no key) can't be bound.
+  - **Publishing.** A list is accepted only from a session already bound to the publishing device.
 - **`device_inbox`** replaces `mailbox`.
-  - **Routing.** Envelopes go to the account's messaging device (the primary). Acks delete rows only in the stream's own device inbox.
+  - **Routing.** Envelopes go to the account's messaging device (the primary). A stream reads its session's own device inbox, and acks delete rows only there.
+  - **Unbound sessions** (legacy apps, a session that hasn't announced yet) read nothing once the account has a messaging device. Only while the primary is still a placeholder (migrated, unclaimed) does every session read the placeholder's inbox, as before M1; inactive clients never acknowledge it. Binding or claiming delivers what waits at once.
   - **Ephemeral envelopes** (typing) still go to every open stream of every device.
   - **Limits.** The size, per-sender and 30-day limits are unchanged.
 - **Which device is the messaging device?** A placeholder created by the migration or on first need, until one of these happens:

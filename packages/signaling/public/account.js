@@ -147,13 +147,9 @@
   // it signs the device list (AIK-signed, versioned, hash-chained) that contacts and the server go by.
   let deviceWarning = '', deviceNotice = '', deviceView = null;
   const Devices = window.DeviceFormat;
-  function localDeviceId() {
-    const key = `device-id-v1:${me.id}`;
-    let id = null;
-    try { id = localStorage.getItem(key); } catch {}
-    if (!id || !/^[A-Za-z0-9_-]{22}$/.test(id)) { id = Devices.newDeviceId(); try { localStorage.setItem(key, id); } catch {} }
-    return id;
-  }
+  // This browser's device id and its own non-extractable Ed25519 device key (devices.js), per account.
+  const localDevice = () => Devices.deviceKey(me.id);
+
   // Highest verified list per account (own and contacts): a list may only move forward, never back or sideways.
   const readPins = () => { try { return JSON.parse(localStorage.getItem(`device-pins-v1:${me.id}`) || '{}') || {}; } catch { return {}; } };
   const writePins = pins => { try { localStorage.setItem(`device-pins-v1:${me.id}`, JSON.stringify(pins)); } catch {} };
@@ -186,12 +182,17 @@
    * Binds this browser's session to its device id. A browser that does not hold the keys shows up as pending in
    * the owner's Settings → Devices; one that holds the published identity says so and gets the messaging inbox.
    */
-  let announced = '';
-  async function announceDevice(identity) {
+  let announced = '', announcing = Promise.resolve();
+  // One at a time: publishKeys runs from sign-in and from every reconnect.
+  function announceDevice(identity) { const run = announcing.then(() => announceDeviceNow(identity)); announcing = run.catch(() => {}); return run; }
+  async function announceDeviceNow(identity) {
     if (!me || !Devices) return;
     const key = `${me.id}|${identity ? identity.sign : ''}`;
     if (announced === key) return;
-    await api('/api/devices/announce', 'POST', identity ? { deviceId: localDeviceId(), identity } : { deviceId: localDeviceId() });
+    // Proof of possession: the device key signs this session's single-use challenge.
+    const device = await localDevice(), { challenge } = await api('/api/devices/challenge', 'POST', {});
+    const signature = await device.sign(Devices.bindBytes(me.id, device.deviceId, challenge));
+    await api('/api/devices/announce', 'POST', { deviceId: device.deviceId, deviceKey: device.publicKey, challenge, signature, ...(identity ? { identity } : {}) });
     announced = key;
   }
   /** On the identity-key holder: verify the served list against our own key and pins, and publish the next one if this device is missing. */
@@ -200,7 +201,7 @@
   function syncDevices() { const run = syncing.then(syncDevicesNow); syncing = run.catch(() => {}); return run; }
   async function syncDevicesNow() {
     if (!me || !box || inactive || !Devices || backendName === 'wasm') return; // The WebAssembly core cannot sign with the identity key yet (M2).
-    const id = localDeviceId(), own = (await box.prekeys()).identity;
+    const id = (await localDevice()).deviceId, own = (await box.prekeys()).identity;
     const view = await api(`/api/devices/${me.username}`);
     if (!view.identity || view.identity.sign !== own.sign || view.identity.dh !== own.dh) return; // Not the key holder: publishKeys decides.
     const pins = readPins(), pin = pins[me.id];

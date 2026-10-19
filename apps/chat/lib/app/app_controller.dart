@@ -105,16 +105,18 @@ class SharedRotationPrefs implements RotationPrefs {
   }
 }
 
-/// This device's id per account and contacts' pinned device lists (account.js `device-id-v1`, `device-pins-v1`).
+/// This install's device id and key per account, and contacts' pinned device lists (account.js `device-pins-v1`).
 final devicePrefsProvider = Provider<Future<DevicePrefs> Function()>((ref) => () async => SharedDevicePrefs(await SharedPreferences.getInstance()));
 
 class SharedDevicePrefs implements DevicePrefs {
   SharedDevicePrefs(this._prefs);
   final SharedPreferences _prefs;
+  // The device key seed sits in the Keychain / Android Keystore, like the session token.
+  static const _secure = FlutterSecureStorage();
   @override
-  String? deviceId(String userId) => _prefs.getString('device-id-v1:$userId');
+  Future<String?> readDevice(String userId) => _secure.read(key: 'device-key-v1:$userId');
   @override
-  void setDeviceId(String userId, String id) => _prefs.setString('device-id-v1:$userId', id);
+  Future<void> writeDevice(String userId, String value) => _secure.write(key: 'device-key-v1:$userId', value: value);
   @override
   DevicePin? pin(String userId, String contactId) {
     final raw = _prefs.getString('device-pin-v1:$userId:$contactId');

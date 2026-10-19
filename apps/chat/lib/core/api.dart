@@ -142,6 +142,16 @@ class Api {
   }
 
   Future<void> uploadKeys(Map<String, dynamic> upload) => call('/api/keys', method: 'PUT', body: upload);
+
+  // ---- Devices (docs/devices.md) ----
+  /// Binds this session to [deviceId]. With [identity] (only when it is the account's published identity,
+  /// i.e. this device holds the keys) the device takes the account's messaging inbox, unless a signed
+  /// device list names another primary. Returns the server's `{deviceId, state, primary}`.
+  Future<Map<String, dynamic>> announceDevice(String deviceId, {Map<String, dynamic>? identity}) =>
+      call('/api/devices/announce', method: 'POST', body: {'deviceId': deviceId, 'identity': ?identity});
+
+  /// A contact's (or our own) served device list: `{userId, identity, list, signature, certs}`.
+  Future<Map<String, dynamic>> devices(String username) => call('/api/devices/$username');
   Future<String> bundleJson(String username) async => jsonEncode(await call('/api/keys/$username'));
   Future<Map<String, dynamic>> publishedIdentity(String username) async =>
       (await call('/api/keys/$username/identity'))['identity'] as Map<String, dynamic>;

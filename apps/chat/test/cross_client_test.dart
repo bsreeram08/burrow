@@ -13,6 +13,7 @@ import 'package:image/image.dart' as img;
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
+import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
 import 'package:private_chat/messaging/attachments.dart';
@@ -92,8 +93,9 @@ void main() {
     describe = () async => 'messages: ${[for (final m in await messages()) '${m.direction.name} ${m.status.name} "${m.body}"']}\nnotices: $notices';
 
     // 1. Keys: this device is the active one for the account.
+    // It announced its device with the published identity, so the server routes the account's inbox to it.
     expect(await messenger.checkActive(), isTrue);
-    await signal('ready');
+    await signal('ready', messenger.deviceId);
 
     // 2. Web → app: the web client opens the session (X3DH from signal.js, decrypted by the Rust core).
     await waitFor('sent-1');
@@ -153,6 +155,11 @@ void main() {
     await messenger.typingChanged(web, on: true);
     await signal('app-rich', jsonEncode({'target': theirs.id, 'ours': ours.id, 'image': sha(png), 'file': sha(file)}));
     await waitFor('app-rich-ok');
+
+    // 3b. Devices: the web's signed device list verifies against the identity pinned for it, and is pinned.
+    DeviceCheck? devices;
+    await until(() async => (devices = await messenger.verifyContactDevices(web))?.ok ?? false, "web's device list verifies: ${devices?.reason}");
+    expect(devices!.version, greaterThanOrEqualTo(1));
 
     // 4. Safety numbers: the web compares its 60 digits with ours.
     final safety = await crypto.safety(me.username, web.id!, web.username);

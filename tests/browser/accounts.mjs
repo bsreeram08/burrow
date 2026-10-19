@@ -118,8 +118,8 @@ try {
   if (serverBytes().includes(marker)) throw new Error('Plaintext reached the server database');
   step('message sent while bob was signed out arrived decrypted after he signed in; the server database never held the text');
 
-  // Reordered and duplicated envelopes: hold two posts, deliver them backwards and twice.
-  await alice.evaluate(() => { const real = window.fetch; window.__held = []; window.__real = real; window.fetch = (url, init) => window.__hold && url === '/api/messages' ? (window.__held.push(init.body), Promise.resolve(new Response(JSON.stringify({ id: 'held', createdAt: Date.now() }), { status: 201, headers: { 'Content-Type': 'application/json' } }))) : real(url, init); window.__hold = true; });
+  // Reordered and duplicated envelopes: hold two posts, deliver them backwards and twice (typing hints are ephemeral and pass).
+  await alice.evaluate(() => { const real = window.fetch; window.__held = []; window.__real = real; window.fetch = (url, init) => window.__hold && url === '/api/messages' && !JSON.parse(init.body).ephemeral ? (window.__held.push(init.body), Promise.resolve(new Response(JSON.stringify({ id: 'held', createdAt: Date.now() }), { status: 201, headers: { 'Content-Type': 'application/json' } }))) : real(url, init); window.__hold = true; });
   for (const text of ['order-one', 'order-two']) { await alice.fill('#chat-input', text); await alice.click('#chat-send'); }
   await alice.waitForFunction(() => window.__held.length === 2, null, { timeout: 10000 });
   await alice.evaluate(async () => { window.__hold = false; for (const body of [window.__held[1], window.__held[0], window.__held[0], window.__held[1]]) await window.__real('/api/messages', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }); });

@@ -10,6 +10,9 @@
   <script src="/core.js" defer></script>
   <script src="/vendor/simplewebauthn-browser.js" defer></script>
   <script src="/emoji.js" defer></script>
+  <script src="/markdown.js" defer></script>
+  <script src="/files.js" defer></script>
+  <script src="/palette.js" defer></script>
   <script src="/commands.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/theme.js" defer></script>
@@ -22,10 +25,11 @@
     <button id="conv-back" class="icon-button" type="button" aria-label="Back to chats"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg></button>
     <span id="conv-avatar" class="avatar" aria-hidden="true"></span>
     <div class="conv-title"><strong id="conv-name"></strong><small id="conv-presence"></small></div>
+    <button id="conv-search" class="icon-button" type="button" aria-label="Search and commands" aria-keyshortcuts="Control+K Meta+K"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>
     <button id="conv-voice" class="icon-button" type="button" aria-label="Voice call"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></button>
     <button id="conv-video" class="icon-button" type="button" aria-label="Video call"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></button>
     <details id="conv-menu" class="menu"><summary aria-label="Conversation options"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></summary>
-      <div class="menu-panel"><button id="conv-safety" type="button">Security code</button><button id="conv-rotate" type="button">Reset secure session</button><button id="conv-theme" type="button">Chat theme</button><button id="conv-burn" class="danger-text" type="button" disabled>Burn conversation</button><button id="conv-remove" class="danger-text" type="button">Remove contact</button></div></details>
+      <div class="menu-panel"><button id="conv-find" type="button">Find in conversation</button><button id="conv-safety" type="button">Security code</button><button id="conv-rotate" type="button">Reset secure session</button><button id="conv-theme" type="button">Chat theme</button><button id="conv-burn" class="danger-text" type="button" disabled>Burn conversation</button><button id="conv-remove" class="danger-text" type="button">Remove contact</button></div></details>
   </header>
   <div id="key-banner" class="key-banner" role="alert" hidden>
     <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg>
@@ -70,6 +74,7 @@
   <section id="chats" class="chats" aria-labelledby="chats-title">
     <header class="chats-head">
       <div><h1 id="chats-title">Chats</h1><small id="me-name"></small></div>
+      <button id="chats-search" class="icon-button" type="button" aria-label="Search and commands" aria-keyshortcuts="Control+K Meta+K"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>
       <details id="account-menu" class="menu"><summary aria-label="Account options"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></summary>
         <div class="menu-panel">
           <button id="invite-create" type="button">Invite someone</button>
@@ -98,7 +103,7 @@
     </div>
     <p id="chats-status" role="status" aria-live="polite"></p>
     <ul id="contact-list" aria-label="Chats"></ul>
-    <p id="contacts-empty" class="empty">No contacts yet. Add someone by username, or invite them from the ⋯ menu.</p>
+    <p id="contacts-empty" class="empty">Your chats appear here. Add someone by their username above, or invite them from the ⋯ menu.</p>
   </section>
 
   <p class="guest-divider">Or join with a one-time call link</p>
@@ -157,7 +162,9 @@
 
   <div id="theme-dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="theme-title" hidden><div class="dialog-card theme-card">
     <h2 id="theme-title">Theme</h2><p id="theme-note" class="note"></p>
-    <h3 id="theme-presets-label">Theme</h3><div id="theme-presets" class="swatches" role="radiogroup" aria-labelledby="theme-presets-label"></div>
+    <h3 id="theme-families-label">Theme</h3><div id="theme-families" class="swatches" role="radiogroup" aria-labelledby="theme-families-label"></div>
+    <div id="theme-mode" class="segmented" role="radiogroup" aria-label="Light or dark"><button type="button" role="radio" data-mode="system">System</button><button type="button" role="radio" data-mode="light">Light</button><button type="button" role="radio" data-mode="dark">Dark</button></div>
+    <h3 id="theme-presets-label">More themes</h3><div id="theme-presets" class="swatches" role="radiogroup" aria-labelledby="theme-presets-label"></div>
     <h3>Accent</h3><div class="accent-row"><label for="theme-accent" class="sr-only">Accent colour</label><input id="theme-accent" type="color" value="#a1efce"><span class="note">Bubbles, ticks and buttons follow it, kept readable.</span><button id="theme-accent-reset" class="link" type="button" hidden>Reset</button></div>
     <h3 id="theme-walls-label">Wallpaper</h3><div id="theme-walls" class="walls" role="radiogroup" aria-labelledby="theme-walls-label"></div>
     <div class="dialog-actions"><button id="theme-done" class="primary" type="button">Done</button></div>
@@ -199,16 +206,55 @@
       <label for="history-select" class="sr-only">Conversation</label><select id="history-select"><option value="">No conversations yet</option></select>
       <button id="chat-close" class="icon-button call-only" type="button" aria-label="Close messages"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
+    <div id="find-bar" class="find-bar" role="search" hidden>
+      <label for="find-input" class="sr-only">Find in conversation</label><input id="find-input" type="search" autocomplete="off" placeholder="Find in conversation">
+      <span id="find-count" class="find-count" aria-live="polite"></span>
+      <button id="find-prev" class="icon-button" type="button" aria-label="Previous match"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 15l-6-6-6 6"/></svg></button>
+      <button id="find-next" class="icon-button" type="button" aria-label="Next match"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></button>
+      <button id="find-close" class="icon-button" type="button" aria-label="Close find"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
     <ol id="chat-log" aria-label="Messages" aria-live="polite" aria-relevant="additions text"></ol>
+    <div id="typing" class="typing" aria-live="polite" hidden><span id="typing-text"></span><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>
+    <button id="jump-newest" class="jump" type="button" aria-label="Jump to newest message" hidden><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12l7 7 7-7"/></svg><span id="jump-count" class="badge" hidden></span></button>
+    <div id="msg-actions" class="msg-actions" role="toolbar" aria-label="Message actions" hidden></div>
+    <div id="emoji-picker" class="emoji-picker" role="dialog" aria-label="Choose a reaction" hidden>
+      <label for="emoji-search" class="sr-only">Search emoji</label><input id="emoji-search" type="search" autocomplete="off" placeholder="Search emoji">
+      <div id="emoji-grid" class="emoji-grid" aria-label="Emoji"></div>
+    </div>
     <p id="chat-status" role="status" aria-live="polite">Open an invitation to send messages. Saved history is available on this device.</p>
-    <form id="chat-form" class="composer">
+    <div id="compose-context" class="compose-context" hidden>
+      <div id="compose-quote" class="compose-quote" hidden><span class="compose-label" id="compose-label"></span><span id="compose-preview" class="compose-preview"></span><button id="compose-cancel" class="icon-button" type="button" aria-label="Cancel"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+      <div id="compose-link" class="compose-link" hidden><img id="compose-link-thumb" alt="" hidden><span class="compose-link-text"><strong id="compose-link-title"></strong><small id="compose-link-site"></small></span><button id="compose-link-remove" class="icon-button" type="button" aria-label="Remove link preview"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    </div>
+    <form id="chat-form" class="composer" data-empty="true">
       <ul id="cmd-popup" class="cmd-popup" role="listbox" aria-label="Suggestions" hidden></ul>
+      <div id="record-bar" class="record-bar" hidden>
+        <button id="record-cancel" class="icon-button" type="button" aria-label="Cancel recording"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+        <span class="record-dot" aria-hidden="true"></span><span id="record-time" class="record-time" role="timer">0:00</span>
+        <span class="record-meter" aria-hidden="true"><span id="record-level"></span></span>
+        <span class="sr-only" role="status">Recording a voice message. Press Escape to cancel.</span>
+        <button id="record-send" class="send" type="button" aria-label="Send voice message"><svg class="icon plane" viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></button>
+      </div>
+      <button id="attach" class="attach rich-only" type="button" aria-label="Attach a photo, video or file"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></button>
+      <input id="attach-input" type="file" multiple hidden>
       <label for="disappear" class="timer" title="Disappearing messages"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="13" r="8"/><path d="M9 2h6"/><path class="hand" d="M12 13V8.5"/></svg><span class="sr-only">Disappear after</span>
         <select id="disappear"><option value="off">Off</option><option value="3600000">1h</option><option value="86400000">24h</option><option value="604800000">7d</option></select></label>
       <label for="chat-input" class="sr-only">Message</label><textarea id="chat-input" rows="1" maxlength="4096" placeholder="Message" disabled></textarea>
+      <button id="voice-record" class="send voice-button rich-only" type="button" aria-label="Record a voice message"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="2" width="6" height="12" rx="3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></button>
       <button id="chat-send" class="send" type="submit" disabled aria-label="Send message"><svg class="icon plane" viewBox="0 0 24 24" aria-hidden="true"><path d="M22 2L11 13"/><path d="M22 2l-7 20-4-9-9-4 20-7z"/></svg></button>
     </form>
   </section>
+
+  <div id="lightbox" class="lightbox" role="dialog" aria-modal="true" aria-labelledby="lightbox-name" hidden>
+    <div class="lightbox-bar"><span id="lightbox-name"></span><a id="lightbox-save" class="link" download>Save</a><button id="lightbox-close" class="icon-button" type="button" aria-label="Close"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <div id="lightbox-stage" class="lightbox-stage"><img id="lightbox-img" alt=""></div>
+  </div>
+
+  <div id="palette" class="dialog palette" role="dialog" aria-modal="true" aria-label="Search and commands" hidden><div class="dialog-card palette-card">
+    <input id="palette-input" type="text" role="combobox" aria-expanded="true" aria-controls="palette-list" aria-autocomplete="list" autocomplete="off" spellcheck="false" placeholder="Jump to a chat or run a command" aria-label="Search chats and commands">
+    <ul id="palette-list" class="palette-list" role="listbox" aria-label="Results"></ul>
+    <p id="palette-empty" class="note" hidden>Nothing matches. Try a name, or words like “theme” or “settings”.</p>
+  </div></div>
 
   <details id="settings" class="card settings backup-section"><summary>Settings</summary>
     <button id="settings-close" class="icon-button session-only" type="button" aria-label="Close settings"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
@@ -233,6 +279,13 @@
         <button id="core-backend-switch" type="button">Use the experimental encryption core</button>
       </div>
     </div>
+    <div class="account-only">
+      <h3>Messages</h3>
+      <label class="toggle"><input id="pref-read-receipts" type="checkbox" checked> Send read receipts</label>
+      <p class="note">When this is off, people won't see when you've read their messages, and you won't see when they've read yours.</p>
+      <label class="toggle"><input id="pref-link-previews" type="checkbox" checked> Generate link previews</label>
+      <p class="note">Your device asks this server to fetch a page's title and picture when you paste a link. The people you message never fetch it.</p>
+    </div>
     <div class="account-only emoji-settings">
       <h3>Custom emoji</h3>
       <p class="note">Shared with everyone on this server. Messages only carry <code>:name:</code>; each person's app shows the image.</p>
@@ -246,6 +299,15 @@
     <h3>Appearance</h3>
     <p>Themes, accent colour and chat wallpaper. Stored on this device only.</p>
     <button id="theme-app" type="button">Theme and wallpaper</button>
+    <fieldset class="segmented-field"><legend>Text size</legend><div class="segmented">
+      <label><input type="radio" name="appearance-size" value="s"><span>S</span></label><label><input type="radio" name="appearance-size" value="m" checked><span>M</span></label><label><input type="radio" name="appearance-size" value="l"><span>L</span></label><label><input type="radio" name="appearance-size" value="xl"><span>XL</span></label>
+    </div></fieldset>
+    <fieldset class="segmented-field"><legend>Spacing</legend><div class="segmented">
+      <label><input type="radio" name="appearance-density" value="comfortable" checked><span>Comfortable</span></label><label><input type="radio" name="appearance-density" value="compact"><span>Compact</span></label>
+    </div><p class="note">The room between messages and between chats in the list. It grows with the text size.</p></fieldset>
+    <fieldset class="segmented-field account-only"><legend>Chat list</legend><div class="segmented">
+      <label><input type="radio" name="appearance-list" value="detailed" checked><span>Detailed</span></label><label><input type="radio" name="appearance-list" value="compact"><span>Compact</span></label>
+    </div><p class="note">Detailed shows each chat with its picture, the time and the last message. Compact fits one line per chat.</p></fieldset>
     <h3>Encrypted backup</h3>
     <p>Download an encrypted copy of your messages, keep it in Google Drive or anywhere you like, and restore it on another phone with the same password.</p>
     <label for="backup-password">Backup password</label><input id="backup-password" type="password" autocomplete="off" minlength="12" placeholder="At least 12 characters">

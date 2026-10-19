@@ -1,11 +1,12 @@
-//! The MLS engine (MLS.md §4): device setup, KeyPackages, groups, commits, messages, and the delivery-service
+//! The MLS engine (API.md, "Groups over MLS"): device setup, KeyPackages, groups, commits, messages, and the delivery-service
 //! (DS) validator. One [`Groups`] serves one namespace of the account store: `mls` for this device's groups,
 //! `mlsds` for a delivery service's public (secret-free) group state.
 //!
-//! Every entry point that changes group state runs the gate MLS.md §4 lists for it. `MlsGroup` / `PublicGroup`
+//! Every entry point that changes group state runs the gate listed in API.md for it. `MlsGroup` / `PublicGroup`
 //! values never outlive a call (they are loaded from storage each time), so no caller can merge, join or
 //! process around the gates, and a failed call rolls its storage changes back.
-use std::collections::{BTreeMap, VecDeque};
+#![cfg_attr(not(all(feature = "mls", feature = "ds")), allow(dead_code, unused_imports))]
+use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -179,6 +180,8 @@ pub struct Groups {
     next_pending: u64,
     /// External-join commits waiting for the DS (group id → staged state).
     external: BTreeMap<String, Staged>,
+    /// Groups that passed whole-group validation in this process (the load gate); see [`Groups::gate`].
+    verified: HashSet<String>,
     /// Set when a store write failed: the in-memory state ran ahead of disk, so the owner must reload.
     stale: bool,
     /// Rows and bytes the last flush wrote (benchmarks).
@@ -190,7 +193,7 @@ impl Groups {
     pub fn load(store: &mut dyn Store, ns: &'static str) -> Result<Self> {
         let (map, persist) = Persist::load(store, ns)?;
         let provider = Provider { crypto: RustCrypto::default(), storage: MlsStorage { values: std::sync::RwLock::new(Rows::from_map(map)) } };
-        Ok(Self { ns, provider, persist, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 0, external: BTreeMap::new(), stale: false, last_written: Written::default() })
+        Ok(Self { ns, provider, persist, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 0, external: BTreeMap::new(), verified: HashSet::new(), stale: false, last_written: Written::default() })
     }
     pub fn is_stale(&self) -> bool { self.stale }
 
@@ -228,6 +231,15 @@ impl Groups {
         }
     }
 
+    #[cfg(feature = "ds")]
+    fn ds_directory(store: &mut dyn Store) -> StoreDirectory<'_> { StoreDirectory { store, prefix: "mlsdsx:pin:", own: None } }
+
+    pub fn namespace(&self) -> &str { self.ns }
+    pub fn row_count(&self) -> usize { self.rows().len() }
+}
+
+#[cfg(feature = "mls")]
+impl Groups {
     // ---------- This device ----------
 
     fn device(store: &mut dyn Store) -> Result<DeviceCert> {
@@ -245,7 +257,23 @@ impl Groups {
     fn client_directory<'a>(store: &'a mut dyn Store, own: &DeviceCert) -> StoreDirectory<'a> {
         StoreDirectory { store, prefix: "peer:", own: key32(&own.aik_sign).map(|aik| (own.user_id.clone(), aik)) }
     }
-    fn ds_directory(store: &mut dyn Store) -> StoreDirectory<'_> { StoreDirectory { store, prefix: "mlsdsx:pin:", own: None } }
+    /// The load gate, once per group per process (and again after a restore): the stored group must still pass
+    /// whole-group validation under today's pins, and this device's own leaf must still be this device. A group
+    /// that fails stays unusable (the others are unaffected) until its pins or state are repaired.
+    fn gate(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<()> {
+        let key = group_text(group);
+        if self.verified.contains(&key) { return Ok(()); }
+        let cert = Self::device(store)?;
+        let mls_group = Self::load_group(&self.provider, group)?;
+        let mut directory = Self::client_directory(store, &cert);
+        let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory)?;
+        if mls_group.is_active() {
+            let own = certs.iter().find(|(index, _)| *index == mls_group.own_leaf_index()).ok_or_else(|| invalid("this device's leaf is missing from its group"))?;
+            if own.1 != cert { return Err(invalid("this device's leaf does not match its certificate")); }
+        }
+        self.verified.insert(key);
+        Ok(())
+    }
 
     /// The leaf signature key this device will use (created once). For signing the certificate outside the
     /// core (web AIK in WebCrypto): sign [`DeviceCert::tbs`] and pass the result to [`Groups::set_device_cert`].
@@ -262,13 +290,12 @@ impl Groups {
     }
 
     /// Installs this device's certificate (signed elsewhere). It must name the prepared leaf key and verify under
-    /// its own account key; that key becomes this device's own pin.
-    pub fn set_device_cert(&mut self, store: &mut dyn Store, cert_json: &str) -> Result<DeviceCert> {
+    /// `aik`, this core's own account key (the caller passes the pinned identity, never the certificate's claim).
+    pub fn set_device_cert(&mut self, store: &mut dyn Store, cert_json: &str, aik: &[u8; 32]) -> Result<DeviceCert> {
         let cert = DeviceCert::decode(cert_json.as_bytes())?;
         let leaf = self.device_leaf(store)?;
         if cert.leaf_sig_key != leaf { return Err(invalid("certificate names another leaf key")); }
-        let aik = key32(&cert.aik_sign).ok_or_else(|| invalid("malformed account key"))?;
-        cert.verify(&aik, &key32(&leaf).ok_or_else(|| invalid("malformed leaf key"))?)?;
+        cert.verify(aik, &key32(&leaf).ok_or_else(|| invalid("malformed leaf key"))?)?;
         if let Some(existing) = store.get(DEVICE)? {
             let existing = serde_json::from_value::<DeviceRecord>(existing).map_err(ChatError::storage)?.cert;
             if existing.user_id != cert.user_id || existing.device_id != cert.device_id { return Err(invalid("this device already has another group identity")); }
@@ -286,7 +313,7 @@ impl Groups {
         }
         let leaf = key32(&self.device_leaf(store)?).ok_or_else(|| ChatError::storage("malformed leaf key"))?;
         let cert = DeviceCert::issue(aik, user_id, device_id, platform, &leaf, issued_at)?;
-        self.set_device_cert(store, &String::from_utf8(cert.encode()).expect("utf8"))
+        self.set_device_cert(store, &String::from_utf8(cert.encode()).expect("utf8"), &aik.verifying_key().to_bytes())
     }
 
     /// KeyPackages for the server (MLS messages, base64url). Their private keys stay here until a Welcome uses them.
@@ -347,6 +374,17 @@ impl Groups {
         self.build_commit(store, group, adds, removes, roles, update, true)
     }
 
+    /// Raw OpenMLS access as this device, for tests that play a malicious member: runs `work` with the provider,
+    /// this device's signer and certificate, then discards every in-memory change it made.
+    #[cfg(test)]
+    pub(crate) fn scratch<T>(&mut self, store: &mut dyn Store, work: impl FnOnce(&Provider, &SignatureKeyPair, &DeviceCert) -> T) -> T {
+        let cert = Self::device(store).expect("device");
+        let signer = Self::signer(&self.provider, &cert).expect("signer");
+        let out = work(&self.provider, &signer, &cert);
+        self.rows().rollback();
+        out
+    }
+
     /// A commit that skips this device's own policy check: tests use it to play a malicious member.
     #[cfg(test)]
     pub(crate) fn commit_unchecked(&mut self, store: &mut dyn Store, group: &GroupId, adds: &[String], removes: &[(String, Option<String>)], roles: Option<&Roles>, update: bool) -> Result<Outgoing> {
@@ -356,6 +394,7 @@ impl Groups {
     #[allow(clippy::too_many_arguments)]
     fn build_commit(&mut self, store: &mut dyn Store, group: &GroupId, adds: &[String], removes: &[(String, Option<String>)], roles: Option<&Roles>, update: bool, check: bool) -> Result<Outgoing> {
         let cert = Self::device(store)?;
+        self.gate(store, group)?;
         if check && adds.len() + removes.len() > limits::MAX_PROPOSALS { return Err(invalid("too many changes in one commit")); }
         self.run(store, |provider, store, extra| {
             let mut mls_group = Self::load_group(provider, group)?;
@@ -406,20 +445,28 @@ impl Groups {
     pub fn merge_own(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<GroupView> {
         let cert = Self::device(store)?;
         let external = self.external.remove(&group_text(group));
+        if external.is_none() { self.gate(store, group)?; }
         self.run(store, |provider, store, extra| {
             if let Some(staged) = &external {
                 let applied = provider.storage.values.write().map_err(|_| ChatError::storage("lock"))?.apply_staged(&staged.changes);
                 if !applied { return Err(ChatError::transient("group state changed; join again")); }
             }
             let mut mls_group = Self::load_group(provider, group)?;
-            let staged = mls_group.pending_commit().ok_or_else(|| invalid("no pending commit"))?;
-            let sender = if external.is_some() { Sender::NewMemberCommit } else { Sender::Member(mls_group.own_leaf_index()) };
             let mut directory = Self::client_directory(store, &cert);
-            validate_staged(mls_group.extensions(), mls_group.members(), &sender, staged, &mut directory)?;
+            if external.is_some() {
+                // OpenMLS merges an external commit when it builds it, and join_external already ran the shared
+                // validator on it; the DS accepting it makes it final. Last gate: the state we now hold.
+                let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory)?;
+                if !certs.iter().any(|(index, c)| *index == mls_group.own_leaf_index() && c == &cert) { return Err(invalid("this device's leaf does not match its certificate")); }
+                return Ok(());
+            }
+            let staged = mls_group.pending_commit().ok_or_else(|| invalid("no pending commit"))?;
+            validate_staged(mls_group.extensions(), mls_group.members(), &Sender::Member(mls_group.own_leaf_index()), staged, &mut directory)?;
             mls_group.merge_pending_commit(provider).map_err(mls)?;
             extra.push(Write::Delete(pending_key(group)));
             Ok(())
         })?;
+        self.verified.insert(group_text(group));
         self.group_view(store, group)
     }
 
@@ -439,19 +486,23 @@ impl Groups {
 
     pub fn group_view(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<GroupView> {
         let cert = Self::device(store)?;
+        self.gate(store, group)?;
         let provider = &self.provider;
         let mls_group = Self::load_group(provider, group)?;
         Self::view(provider, &mls_group, &Self::signer(provider, &cert)?)
     }
 
     pub fn members(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<Vec<MemberView>> {
+        self.gate(store, group)?;
         let mls_group = Self::load_group(&self.provider, group)?;
         let roles = validate_context(mls_group.extensions())?;
-        let _ = store;
         Ok(mls_group.members().filter_map(|m| cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform })).collect())
     }
 
-    pub fn roles(&mut self, group: &GroupId) -> Result<Roles> { validate_context(Self::load_group(&self.provider, group)?.extensions()) }
+    pub fn roles(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<Roles> {
+        self.gate(store, group)?;
+        validate_context(Self::load_group(&self.provider, group)?.extensions())
+    }
 
     /// Joins from a Welcome and the (post-commit) ratchet tree, after checking every member's certificate,
     /// the roles and the size.
@@ -469,12 +520,19 @@ impl Groups {
             let group = staged.into_group(provider).map_err(mls)?;
             Ok(group.group_id().clone())
         })?;
+        self.verified.insert(group_text(&group));
         self.group_view(store, &group)
     }
 
     /// External commit: public-channel self-join, this user's new device, or resync. Returns the commit for the
     /// DS; the group is kept (in memory) until [`Groups::merge_own`] after the DS accepts it.
-    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> {
+    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, true) }
+
+    /// An external join that skips this device's own policy check: tests use it to play a malicious joiner.
+    #[cfg(test)]
+    pub(crate) fn join_external_unchecked(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, false) }
+
+    fn external_commit(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, check: bool) -> Result<Outgoing> {
         if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
         let cert = Self::device(store)?;
         let (info_bytes, tree_bytes) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
@@ -504,10 +562,12 @@ impl Groups {
                 .map_err(mls)?;
             let commit = tls(bundle.commit())?;
             // Our own external commit through the exact DS/client validator, against the pre-join public state.
-            let scratch = Provider::default();
-            let mut directory = Self::client_directory(store, &cert);
-            let before = ds_bootstrap(&scratch, &info_bytes, &tree_bytes, &mut directory)?;
-            ds_check(&scratch, &before, &commit, &mut directory)?;
+            if check {
+                let scratch = Provider::default();
+                let mut directory = Self::client_directory(store, &cert);
+                let before = ds_bootstrap(&scratch, &info_bytes, &tree_bytes, &mut directory)?;
+                ds_check(&scratch, &before, &commit, &mut directory)?;
+            }
             let epoch = joined.epoch().as_u64().saturating_sub(1);
             Ok((Outgoing { group_id: group_text(&group), commit: b64(&commit), welcome: None, digest: digest(&commit), epoch }, group))
         })();
@@ -523,6 +583,8 @@ impl Groups {
 
     /// Drops this device's copy of a group (before a resync external join, or after leaving).
     pub fn forget_group(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<()> {
+        self.verified.remove(&group_text(group));
+        self.external.remove(&group_text(group));
         self.run(store, |provider, _store, extra| {
             let mut mls_group = Self::load_group(provider, group)?;
             mls_group.delete(provider.storage()).map_err(mls)?;
@@ -531,10 +593,11 @@ impl Groups {
         })
     }
 
-    /// Encrypts an application payload (MLS.md §5) for the group's current epoch.
+    /// Encrypts an application payload (API.md §5) for the group's current epoch.
     pub fn encrypt(&mut self, store: &mut dyn Store, group: &GroupId, plaintext: &str) -> Result<String> {
         bounded("plaintext", plaintext.as_bytes(), limits::MAX_PLAINTEXT_BYTES)?;
         let cert = Self::device(store)?;
+        self.gate(store, group)?;
         self.run(store, |provider, _store, _extra| {
             let mut mls_group = Self::load_group(provider, group)?;
             let signer = Self::signer(provider, &cert)?;
@@ -557,6 +620,7 @@ impl Groups {
         let bytes = unb64(message, "message")?;
         bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
         let cert = Self::device(store)?;
+        self.gate(store, group)?;
         let message_digest = digest(&bytes);
         let own_pending = store.get(&pending_key(group))?.and_then(|v| v.get("digest").and_then(Value::as_str).map(str::to_string));
         if own_pending.as_deref() == Some(message_digest.as_str()) {
@@ -649,46 +713,87 @@ impl Groups {
         self.pending_order.retain(|id| id != pending_id);
     }
 
-    // ---------- Delivery service (namespace `mlsds`) ----------
+}
+
+/// The delivery service's validator over public (secret-free) group state, namespace `mlsds`. It runs the exact
+/// code members run (`validate_staged`) against the pre-commit state, so a commit it sequences is a commit every
+/// member accepts (poison commits aside: see [`Ds::snapshot`]).
+#[cfg(feature = "ds")]
+pub struct Ds {
+    groups: Groups,
+}
+
+#[cfg(feature = "ds")]
+impl Ds {
+    /// Loads the DS namespace from the store.
+    pub fn new(store: &mut dyn Store) -> Result<Self> { Ok(Self { groups: Groups::load(store, "mlsds")? }) }
+    pub fn is_stale(&self) -> bool { self.groups.is_stale() }
+    pub fn row_count(&self) -> usize { self.groups.row_count() }
+    pub fn last_written(&self) -> Written { self.groups.last_written }
 
     /// Records the account key the device registry holds for a user (M1). The DS validates against these.
-    pub fn ds_pin(&mut self, store: &mut dyn Store, user_id: &str, aik: &str) -> Result<()> {
+    /// A pin never changes silently: re-pinning a different key is refused.
+    pub fn pin(&mut self, store: &mut dyn Store, user_id: &str, aik: &str) -> Result<()> {
         if !super::cert::canonical_id(user_id) || key32(aik).is_none() { return Err(invalid("invalid user id or account key")); }
-        store.put(&format!("mlsdsx:pin:{user_id}"), json!({ "aik": aik }))
+        let key = format!("mlsdsx:pin:{user_id}");
+        if let Some(existing) = store.get(&key)? {
+            if existing.get("aik").and_then(Value::as_str) != Some(aik) { return Err(invalid("this user is already pinned to another account key")); }
+            return Ok(());
+        }
+        store.put(&key, json!({ "aik": aik }))
     }
 
     /// Starts tracking a group from the creator's GroupInfo and tree (validated like a Welcome).
-    pub fn ds_create(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Value> {
+    pub fn create(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Value> {
         let (info, tree) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
-        self.run(store, |provider, store, _extra| {
-            let mut directory = Self::ds_directory(store);
+        let value = self.groups.run(store, |provider, store, _extra| {
+            let mut directory = Groups::ds_directory(store);
             let public = ds_bootstrap(provider, &info, &tree, &mut directory)?;
             Ok(json!({ "groupId": group_text(public.group_id()), "epoch": public.group_context().epoch().as_u64() }))
-        })
+        })?;
+        if let Some(id) = value.get("groupId").and_then(Value::as_str) { self.groups.verified.insert(id.to_string()); }
+        Ok(value)
+    }
+
+    /// Once per group per process: the stored public state must still pass whole-group validation.
+    fn gate(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<()> {
+        let key = group_text(group);
+        if self.groups.verified.contains(&key) { return Ok(()); }
+        let public = Self::public(&self.groups.provider, group)?;
+        let mut directory = Groups::ds_directory(store);
+        validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
+        self.groups.verified.insert(key);
+        Ok(())
+    }
+
+    fn public(provider: &Provider, group: &GroupId) -> Result<PublicGroup> {
+        PublicGroup::load(provider.storage(), group).map_err(|_| ChatError::storage("group state unreadable"))?.ok_or_else(|| ChatError::coded("unknown-group", "unknown group"))
     }
 
     /// Sequences one message: commits must target the current epoch and pass the shared validator (then the
     /// public state advances); application messages must target the current epoch. Standalone proposals refused.
-    pub fn ds_submit(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Submit> {
+    pub fn submit(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Submit> {
         let bytes = unb64(message, "message")?;
-        self.run(store, |provider, store, _extra| {
-            let public = PublicGroup::load(provider.storage(), group).map_err(|_| ChatError::storage("group state unreadable"))?.ok_or_else(|| ChatError::coded("unknown-group", "unknown group"))?;
-            let mut directory = Self::ds_directory(store);
+        bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
+        self.gate(store, group)?;
+        self.groups.run(store, |provider, store, _extra| {
+            let public = Self::public(provider, group)?;
+            let mut directory = Groups::ds_directory(store);
             ds_submit(provider, public, &bytes, &mut directory)
         })
     }
 
     /// The group's whole public state (to keep before sequencing a commit; restore if members report poison).
-    pub fn ds_snapshot(&mut self, group: &GroupId) -> Result<String> {
+    pub fn snapshot(&mut self, group: &GroupId) -> Result<String> {
         let tag = group_tag(group);
-        let rows = self.rows().entries(|key| super::persist::group_tag_of_key(key).as_deref() == Some(tag.as_str()));
+        let rows = self.groups.rows().entries(|key| super::persist::group_tag_of_key(key).as_deref() == Some(tag.as_str()));
         if rows.is_empty() { return Err(ChatError::coded("unknown-group", "unknown group")); }
         let list: Vec<Value> = rows.iter().map(|(k, v)| json!([b64(k), b64(v)])).collect();
         Ok(b64(serde_json::to_string(&json!({ "v": 1, "group": group_text(group), "rows": list })).expect("json").as_bytes()))
     }
 
     /// Replaces the group's public state with a snapshot (poison-commit rollback), after validating it.
-    pub fn ds_restore(&mut self, store: &mut dyn Store, group: &GroupId, snapshot: &str) -> Result<Value> {
+    pub fn restore(&mut self, store: &mut dyn Store, group: &GroupId, snapshot: &str) -> Result<Value> {
         let bytes = unb64(snapshot, "snapshot")?;
         let value: Value = serde_json::from_slice(&bytes).map_err(|_| invalid("malformed snapshot"))?;
         if value.get("v").and_then(Value::as_u64) != Some(1) || value.get("group").and_then(Value::as_str) != Some(group_text(group).as_str()) { return Err(invalid("snapshot of another group")); }
@@ -701,31 +806,25 @@ impl Groups {
             if super::persist::group_tag_of_key(&key).as_deref() != Some(tag.as_str()) { return Err(invalid("snapshot row of another group")); }
             entries.push((key, val));
         }
-        self.run(store, |provider, store, _extra| {
+        self.groups.verified.remove(&group_text(group));
+        let value = self.groups.run(store, |provider, store, _extra| {
             {
                 let mut rows = provider.storage.values.write().map_err(|_| ChatError::storage("lock"))?;
                 for (key, _) in rows.entries(|key| super::persist::group_tag_of_key(key).as_deref() == Some(tag.as_str())) { rows.remove(&key); }
                 for (key, val) in entries { rows.insert(key, val); }
             }
-            let public = PublicGroup::load(provider.storage(), group).map_err(|_| invalid("snapshot unreadable"))?.ok_or_else(|| invalid("empty snapshot"))?;
-            let mut directory = Self::ds_directory(store);
+            let public = Self::public(provider, group).map_err(|_| invalid("snapshot unreadable"))?;
+            let mut directory = Groups::ds_directory(store);
             validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
             Ok(json!({ "groupId": group_text(group), "epoch": public.group_context().epoch().as_u64() }))
-        })
+        })?;
+        self.groups.verified.insert(group_text(group));
+        Ok(value)
     }
 
-    pub fn ds_epoch(&mut self, group: &GroupId) -> Result<u64> {
-        let public = PublicGroup::load(self.provider.storage(), group).map_err(|_| ChatError::storage("group state unreadable"))?.ok_or_else(|| ChatError::coded("unknown-group", "unknown group"))?;
-        Ok(public.group_context().epoch().as_u64())
-    }
+    pub fn epoch(&mut self, group: &GroupId) -> Result<u64> { Ok(Self::public(&self.groups.provider, group)?.group_context().epoch().as_u64()) }
 
-    pub fn ds_tree(&mut self, group: &GroupId) -> Result<String> {
-        let public = PublicGroup::load(self.provider.storage(), group).map_err(|_| ChatError::storage("group state unreadable"))?.ok_or_else(|| ChatError::coded("unknown-group", "unknown group"))?;
-        Ok(b64(&tls(&public.export_ratchet_tree())?))
-    }
-
-    pub fn namespace(&self) -> &str { self.ns }
-    pub fn row_count(&self) -> usize { self.rows().len() }
+    pub fn tree(&mut self, group: &GroupId) -> Result<String> { Ok(b64(&tls(&Self::public(&self.groups.provider, group)?.export_ratchet_tree())?)) }
 }
 
 /// DS bootstrap: a PublicGroup from a GroupInfo and tree, validated like a Welcome (certificates, roles, size).

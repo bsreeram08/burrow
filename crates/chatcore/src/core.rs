@@ -118,8 +118,10 @@ pub struct Core {
     pending_order: VecDeque<String>,
     next_pending: u64,
     /// This device's MLS groups and, on a delivery service, the public group state (loaded on first use).
+    #[cfg(feature = "mls")]
     mls: Option<crate::mls::engine::Groups>,
-    mls_ds: Option<crate::mls::engine::Groups>,
+    #[cfg(feature = "ds")]
+    mls_ds: Option<crate::mls::engine::Ds>,
 }
 
 fn same_identity(a: &IdentityPub, b: &IdentityPub) -> bool { a.dh == b.dh && a.sign == b.sign }
@@ -151,7 +153,12 @@ fn only(record: SessionRecord, sid: &str) -> SessionRecord {
 impl Core {
     pub fn new(store: Box<dyn Store>) -> Self {
         let may_create_identity = store.allows_new_identity();
-        Self { store, may_create_identity, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 1, mls: None, mls_ds: None }
+        Self { store, may_create_identity, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 1,
+            #[cfg(feature = "mls")]
+            mls: None,
+            #[cfg(feature = "ds")]
+            mls_ds: None,
+        }
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&mut self, key: &str) -> Result<Option<T>> {
@@ -425,17 +432,20 @@ impl Core {
 
     /// This device's MLS groups (namespace `mls`) with the store they persist to. Reloaded from the store after a
     /// failed write, so memory never runs ahead of disk.
+    #[cfg(feature = "mls")]
     pub fn groups(&mut self) -> Result<(&mut crate::mls::engine::Groups, &mut dyn Store)> {
         if self.mls.as_ref().is_none_or(|groups| groups.is_stale()) { self.mls = Some(crate::mls::engine::Groups::load(self.store.as_mut(), "mls")?); }
         Ok((self.mls.as_mut().expect("loaded"), self.store.as_mut()))
     }
 
     /// Delivery-service group state (namespace `mlsds`: public state only, no secrets).
-    pub fn ds_groups(&mut self) -> Result<(&mut crate::mls::engine::Groups, &mut dyn Store)> {
-        if self.mls_ds.as_ref().is_none_or(|groups| groups.is_stale()) { self.mls_ds = Some(crate::mls::engine::Groups::load(self.store.as_mut(), "mlsds")?); }
+    #[cfg(feature = "ds")]
+    pub fn ds(&mut self) -> Result<(&mut crate::mls::engine::Ds, &mut dyn Store)> {
+        if self.mls_ds.as_ref().is_none_or(|ds| ds.is_stale()) { self.mls_ds = Some(crate::mls::engine::Ds::new(self.store.as_mut())?); }
         Ok((self.mls_ds.as_mut().expect("loaded"), self.store.as_mut()))
     }
 
     /// The account identity key (AIK) that certifies this user's devices.
+    #[cfg(feature = "mls")]
     pub fn account_signing_key(&mut self) -> Result<ed25519_dalek::SigningKey> { Ok(ed25519_dalek::SigningKey::from_bytes(&self.identity()?.sign.0)) }
 }

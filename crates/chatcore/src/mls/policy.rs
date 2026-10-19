@@ -1,4 +1,4 @@
-//! The one validator (MLS.md §3). Clients run it before merging any commit (their own or received) and the
+//! The one validator (API.md, "Policy"). Clients run it before merging any commit (their own or received) and the
 //! delivery service runs the same code before sequencing one, so a commit the server accepts is a commit every
 //! member accepts (a disagreement would fork the group). Everything it reads is public: the pre-commit group
 //! context and members, the commit, and pinned account keys.
@@ -80,7 +80,9 @@ impl Roles {
     pub fn is_admin(&self, user: &str) -> bool { self.admins.iter().any(|a| a == user) }
 }
 
-pub fn capabilities() -> Capabilities { Capabilities::builder().extensions(vec![ExtensionType::Unknown(ROLES_EXT)]).build() }
+/// What every leaf and KeyPackage advertises: the roles extension, and last-resort KeyPackages (a KeyPackage's
+/// own extensions must be listed here, or the adder's validation refuses it).
+pub fn capabilities() -> Capabilities { Capabilities::builder().extensions(vec![ExtensionType::Unknown(ROLES_EXT), ExtensionType::LastResort]).build() }
 
 pub fn group_extensions(roles: &Roles) -> Result<Extensions<GroupContext>> {
     let required = RequiredCapabilitiesExtension::new(&[ExtensionType::Unknown(ROLES_EXT)], &[], &[]);
@@ -121,7 +123,7 @@ pub fn validate_group_state(extensions: &Extensions<GroupContext>, members: impl
     Ok((roles, certs))
 }
 
-/// The commit validator. Rules (MLS.md §3):
+/// The commit validator. Rules (API.md, "Policy"):
 /// - every introduced or changed leaf carries a valid certificate; updates keep the same user and device;
 /// - only inline Add / Remove / Update / GroupContextExtensions / ExternalInit, at most 128, within 1,000 leaves;
 /// - Add of a new user: admin or an open group (DM: only its two users, never a third);

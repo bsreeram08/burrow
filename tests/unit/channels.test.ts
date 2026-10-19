@@ -721,3 +721,81 @@ suite('poison commits', () => {
         expect((await report(w.c1, message.body.seq, message.body.digest)).status).toBe(409);
     });
 });
+
+suite('review fixes', () => {
+    test('a dismissed report cannot freeze the channel again, and one device cannot keep reporting', async () => {
+        const w = await populated();
+        const honest = await w.a1.commit(w.channel, { update: true });
+        const { seq, digest } = honest.body;
+        expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
+        const dismiss = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'dismiss', seq, digest, signature: w.a2.resolution(w.channel, 'dismiss', seq, digest) });
+        expect(dismiss.status).toBe(200);
+        // The same commit is not reportable any more...
+        expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(409);
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(409);
+        expect(one('SELECT prev_state, frozen_seq FROM channels WHERE id = ?', w.channel)).toEqual({ prev_state: null, frozen_seq: null });
+        // ...and a new commit can be reported by that device only once a minute.
+        for (const device of [w.a2, w.b1, w.b2, w.c1]) await device.sync(w.channel);
+        const next = await w.a1.commit(w.channel, { update: true });
+        const again = await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: next.body.seq, digest: next.body.digest });
+        expect(again.status).toBe(429);
+        advance(61_000);
+        expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: next.body.seq, digest: next.body.digest })).status).toBe(202);
+    });
+
+    test('a device that left the signed list is owed nothing over the stream, and loses its place', async () => {
+        const w = await populated();
+        run('INSERT INTO mls_welcomes (id, device_id, channel_id, sender_id, epoch, seq, welcome, tree, created_at) VALUES (?, ?, ?, ?, 1, 1, x\'00\', x\'00\', ?)', 'E'.repeat(22), w.c1.deviceId, w.channel, w.alice.id, clock);
+        await w.b1.send(w.channel, 'secret');
+        run("UPDATE devices SET state = 'pending' WHERE id = ?", w.c1.deviceId);
+        const watch = w.c1.events(); await watch.opened; await watch.next('hello');
+        await w.b1.send(w.channel, 'more');
+        await Bun.sleep(150);
+        expect(watch.pending('group')).toEqual([]);
+        expect(watch.pending('welcome')).toEqual([]);
+        // Its frames are ignored too, and its rows are gone.
+        watch.send({ type: 'cursor', channel: w.channel, seq: 3 });
+        watch.send({ type: 'ack', id: 'E'.repeat(22) });
+        await Bun.sleep(100);
+        expect(rows('SELECT 1 FROM channel_members WHERE device_id = ?', w.c1.deviceId)).toEqual([]);
+        expect(rows('SELECT 1 FROM mls_welcomes WHERE device_id = ?', w.c1.deviceId)).toEqual([]);
+        watch.socket.close();
+        // A device that never reconnects is cleaned by the sweep.
+        run("UPDATE devices SET state = 'pending' WHERE id = ?", w.b2.deviceId);
+        run('INSERT INTO mls_welcomes (id, device_id, channel_id, sender_id, epoch, seq, welcome, tree, created_at) VALUES (?, ?, ?, ?, 1, 1, x\'00\', x\'00\', ?)', 'F'.repeat(22), w.b2.deviceId, w.channel, w.alice.id, clock);
+        app.channels!.sweep(true);
+        expect(rows('SELECT 1 FROM channel_members WHERE device_id = ?', w.b2.deviceId)).toEqual([]);
+        expect(rows('SELECT 1 FROM mls_welcomes WHERE device_id = ?', w.b2.deviceId)).toEqual([]);
+        // And the log no longer waits for it.
+        for (const device of [w.a1, w.a2, w.b1]) await device.sync(w.channel);
+        expect(rows('SELECT seq FROM group_log WHERE channel_id = ?', w.channel)).toEqual([]);
+    });
+
+    test('a device that joins late reads nothing from before it joined, whatever it asks for', async () => {
+        const w = await populated();
+        await w.b1.send(w.channel, 'before you');
+        await w.a1.send(w.channel, 'also before');
+        const a3 = enroll(ctx, w.alice, w.a1.client.sibling(), 'windows');
+        pinAll([w.a1, w.b1, w.c1, a3]);
+        expect((await a3.joinExternal(w.channel)).status).toBe(201);
+        const joined = one('SELECT joined_seq FROM channel_members WHERE device_id = ?', a3.deviceId).joined_seq;
+        expect(joined).toBe(4);
+        const page = await a3.must('GET', `/api/channels/${w.channel}/log?after=0`);
+        expect(page.entries).toEqual([]);
+        expect(page.gap).toBe(false);
+        // Entries sent afterwards are readable from any lower position.
+        await w.c1.sync(w.channel);
+        expect((await w.c1.send(w.channel, 'after you')).status).toBe(201);
+        const later = await a3.must('GET', `/api/channels/${w.channel}/log?after=0`);
+        expect(later.entries.map((entry: any) => entry.seq)).toEqual([5]);
+        expect(await a3.sync(w.channel)).toEqual(['after you']);
+        // The stream starts at the join point too, even though the older entries are still in the log for others.
+        const lagging = rows('SELECT seq FROM group_log WHERE channel_id = ?', w.channel).map(row => row.seq);
+        expect(lagging.some(seq => seq < joined)).toBe(true); // b1/c1 haven't read them all
+        run('UPDATE channel_members SET cursor = 0 WHERE device_id = ?', a3.deviceId);
+        const watch = a3.events(); await watch.opened;
+        const frame = await watch.next('group');
+        expect(frame.seq).toBeGreaterThan(joined);
+        watch.socket.close();
+    });
+});

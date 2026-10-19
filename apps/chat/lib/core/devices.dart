@@ -20,7 +20,7 @@ import 'package:ed25519_edwards/ed25519_edwards.dart' as ed;
 
 const maxDevices = 16;
 const _maxVersion = 2147483647;
-const _listLabel = 'webrtc-bun-devicelist-v1', _certLabel = 'webrtc-bun-devicecert-v1';
+const _listLabel = 'webrtc-bun-devicelist-v1', _certLabel = 'webrtc-bun-devicecert-v1', _bindLabel = 'webrtc-bun-devicebind-v1';
 final _userId = RegExp(r'^[A-Za-z0-9_-]{1,64}$');
 final _deviceId = RegExp(r'^[A-Za-z0-9_-]{22}$');
 final _hash = RegExp(r'^[A-Za-z0-9_-]{43}$');
@@ -243,32 +243,64 @@ DeviceCheck verifyView({
   }
 }
 
-/// This app's device id per account and the pinned lists of its contacts (SharedPreferences in the app).
+/// What a device signs with its own key to bind a session to its id (devices.js `bindBytes`): the
+/// server's single-use challenge for this session, the account and the device.
+Uint8List bindBytes(String userId, String deviceId, String challenge) {
+  if (!_userId.hasMatch(userId) || !_deviceId.hasMatch(deviceId)) _fail('Invalid device binding');
+  if (!_hash.hasMatch(challenge)) _fail('Invalid device challenge');
+  return (_Writer()
+        ..text16(_bindLabel)
+        ..text16(userId)
+        ..text16(deviceId)
+        ..bytes8(unb64(challenge)))
+      .done();
+}
+
+/// This app's device on one account: its id and its own Ed25519 device key, which proves to the server
+/// that a session is this device (never just knowing the id).
+class LocalDevice {
+  LocalDevice._(this.deviceId, this._key);
+  final String deviceId;
+  final ed.PrivateKey _key;
+  String get publicKey => b64(ed.public(_key).bytes);
+  String sign(Uint8List bytes) => b64(ed.sign(_key, bytes));
+}
+
+/// Device ids and keys (secure storage in the app) and contacts' pinned device lists (SharedPreferences).
 abstract class DevicePrefs {
-  String? deviceId(String userId);
-  void setDeviceId(String userId, String id);
+  /// `{"deviceId": ..., "seed": ...}` for this account on this install, or null.
+  Future<String?> readDevice(String userId);
+  Future<void> writeDevice(String userId, String value);
   DevicePin? pin(String userId, String contactId);
   void setPin(String userId, String contactId, DevicePin pin);
 }
 
 class MemoryDevicePrefs implements DevicePrefs {
-  final Map<String, String> ids = {};
+  final Map<String, String> devices = {};
   final Map<String, DevicePin> pins = {};
   @override
-  String? deviceId(String userId) => ids[userId];
+  Future<String?> readDevice(String userId) async => devices[userId];
   @override
-  void setDeviceId(String userId, String id) => ids[userId] = id;
+  Future<void> writeDevice(String userId, String value) async => devices[userId] = value;
   @override
   DevicePin? pin(String userId, String contactId) => pins['$userId:$contactId'];
   @override
   void setPin(String userId, String contactId, DevicePin pin) => pins['$userId:$contactId'] = pin;
 }
 
-/// This device's id for an account, created on first use.
-String localDeviceId(DevicePrefs prefs, String userId) {
-  final existing = prefs.deviceId(userId);
-  if (existing != null && _deviceId.hasMatch(existing)) return existing;
-  final id = newDeviceId();
-  prefs.setDeviceId(userId, id);
-  return id;
+/// This install's device for an account, created on first use. The id and key live and die together:
+/// an install that lost either starts as a new device.
+Future<LocalDevice> localDevice(DevicePrefs prefs, String userId, [Random? random]) async {
+  try {
+    final stored = jsonDecode(await prefs.readDevice(userId) ?? 'null');
+    if (stored is Map && stored['deviceId'] is String && _deviceId.hasMatch(stored['deviceId'] as String) && stored['seed'] is String) {
+      final seed = unb64(stored['seed'] as String);
+      if (seed.length == 32) return LocalDevice._(stored['deviceId'] as String, ed.newKeyFromSeed(seed));
+    }
+  } catch (_) {}
+  final source = random ?? Random.secure();
+  final seed = Uint8List.fromList(List<int>.generate(32, (_) => source.nextInt(256)));
+  final id = newDeviceId(source);
+  await prefs.writeDevice(userId, jsonEncode({'deviceId': id, 'seed': b64(seed)}));
+  return LocalDevice._(id, ed.newKeyFromSeed(seed));
 }

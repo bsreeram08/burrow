@@ -34,9 +34,10 @@ const MIGRATIONS: ((db: Database) => void)[] = [
             -- native apps), 'pending' (signed in, not in the signed list), 'listed' (named by the signed list),
             -- 'revoked'. platform is the signed-in session's client kind (already known from sign-in); labels and
             -- platforms as the account describes them are sealed inside the signed list (device_lists.list).
+            -- sig_key is the device's own Ed25519 key: binding a session to an existing device needs its signature.
             CREATE TABLE devices (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 platform TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('placeholder', 'pending', 'listed', 'revoked')),
-                is_primary INTEGER NOT NULL DEFAULT 0, cert TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER);
+                is_primary INTEGER NOT NULL DEFAULT 0, sig_key TEXT, cert TEXT, created_at INTEGER NOT NULL, last_seen_at INTEGER, revoked_at INTEGER);
             CREATE INDEX devices_user ON devices (user_id, state);
             -- At most one live primary (the device holding the account identity key) per account.
             CREATE UNIQUE INDEX devices_primary ON devices (user_id) WHERE is_primary = 1 AND state != 'revoked';

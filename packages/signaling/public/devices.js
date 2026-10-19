@@ -15,7 +15,8 @@
   const USER_ID = /^[A-Za-z0-9_-]{1,64}$/, DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, HASH = /^[A-Za-z0-9_-]{43}$/, KEY = /^[A-Za-z0-9_-]{43}$/, SIG = /^[A-Za-z0-9_-]{86}$/;
   // Sealed metadata: 12-byte IV, at least the 16-byte tag, at most 512 bytes in all.
   const META = /^[A-Za-z0-9_-]{38,683}$/, META_MAX_LABEL = 64;
-  const LIST_LABEL = 'webrtc-bun-devicelist-v1', CERT_LABEL = 'webrtc-bun-devicecert-v1', META_LABEL = 'webrtc-bun-devicemeta-v1';
+  const LIST_LABEL = 'webrtc-bun-devicelist-v1', CERT_LABEL = 'webrtc-bun-devicecert-v1', META_LABEL = 'webrtc-bun-devicemeta-v1', BIND_LABEL = 'webrtc-bun-devicebind-v1';
+  const CHALLENGE = /^[A-Za-z0-9_-]{43}$/;
   const encoder = new TextEncoder();
 
   function b64(bytes) {
@@ -88,6 +89,16 @@
     validateCert(cert);
     return writer().text16(CERT_LABEL).text16(cert.userId).text16(cert.deviceId).bytes8(cert.leafSigKey ? unb64(cert.leafSigKey) : new Uint8Array()).u64(cert.issuedAt).done();
   }
+  /**
+   * What a device signs with its own device key to bind a session to its id: the server's single-use
+   * challenge for this session, the account and the device. Proof of possession, so knowing a device id
+   * (or holding another session of the account) is never enough to become that device.
+   */
+  function bindBytes(userId, deviceId, challenge) {
+    if (typeof userId !== 'string' || !USER_ID.test(userId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid device binding');
+    if (typeof challenge !== 'string' || !CHALLENGE.test(challenge)) fail('Invalid device challenge');
+    return writer().text16(BIND_LABEL).text16(userId).text16(deviceId).bytes8(unb64(challenge)).done();
+  }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -157,6 +168,35 @@
       return exact(value, ['label', 'platform']) && typeof value.label === 'string' && PLATFORMS.includes(value.platform) ? value : null;
     } catch { return null; }
   }
+  // ---------- Browser-only: this browser's device key ----------
+  // Each browser keeps, per account, its device id with a non-extractable Ed25519 key (WebKit persists
+  // Ed25519 CryptoKeys, as it does the identity signing key). The id and key live and die together: a browser
+  // that lost either starts as a new device.
+  const deviceKeys = new Map();
+  function deviceKey(userId) {
+    if (deviceKeys.has(userId)) return deviceKeys.get(userId);
+    const opened = new Promise((resolve, reject) => {
+      const request = indexedDB.open('webrtc-bun-device-key-v1', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('kv');
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => resolve(request.result);
+    }).then(async db => {
+      const read = () => new Promise(done => { const get = db.transaction('kv').objectStore('kv').get(userId); get.onsuccess = () => done(get.result); get.onerror = () => done(null); });
+      let record = await read();
+      if (!(record?.privateKey instanceof CryptoKey) || !DEVICE_ID.test(record.deviceId || '') || !KEY.test(record.publicKey || '')) {
+        const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+        const fresh = { deviceId: newDeviceId(), privateKey: pair.privateKey, publicKey: b64(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey))) };
+        // put() replaces a broken record; two tabs racing settle on whichever wrote last, re-read below.
+        await new Promise(done => { const tx = db.transaction('kv', 'readwrite'); tx.objectStore('kv').put(fresh, userId); tx.oncomplete = tx.onerror = tx.onabort = done; });
+        record = await read();
+        if (!(record?.privateKey instanceof CryptoKey)) throw new Error('This browser cannot keep a device key');
+      }
+      return { deviceId: record.deviceId, publicKey: record.publicKey, sign: async bytes => b64(new Uint8Array(await crypto.subtle.sign('Ed25519', record.privateKey, bytes))) };
+    });
+    deviceKeys.set(userId, opened);
+    opened.catch(() => deviceKeys.delete(userId));
+    return opened;
+  }
   function describeThisDevice() {
     const agent = typeof navigator !== 'undefined' ? navigator.userAgent : '';
     const browserName = /Edg\//.test(agent) ? 'Edge' : /Firefox\//.test(agent) ? 'Firefox' : /Chrome\//.test(agent) ? 'Chrome' : /Safari\//.test(agent) ? 'Safari' : 'Browser';
@@ -164,5 +204,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

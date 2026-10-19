@@ -95,7 +95,7 @@ void main() {
     // 1. Keys: this device is the active one for the account.
     // It announced its device with the published identity, so the server routes the account's inbox to it.
     expect(await messenger.checkActive(), isTrue);
-    await signal('ready', messenger.deviceId);
+    await signal('ready', (await messenger.device()).deviceId);
 
     // 2. Web → app: the web client opens the session (X3DH from signal.js, decrypted by the Rust core).
     await waitFor('sent-1');
@@ -157,9 +157,9 @@ void main() {
     await waitFor('app-rich-ok');
 
     // 3b. Devices: the web's signed device list verifies against the identity pinned for it, and is pinned.
-    DeviceCheck? devices;
-    await until(() async => (devices = await messenger.verifyContactDevices(web))?.ok ?? false, "web's device list verifies: ${devices?.reason}");
-    expect(devices!.version, greaterThanOrEqualTo(1));
+    var devices = const DeviceCheck.failed('none');
+    await until(() async => (devices = await messenger.verifyContactDevices(web) ?? devices).ok, "web's device list verifies");
+    expect(devices.version, greaterThanOrEqualTo(1));
 
     // 4. Safety numbers: the web compares its 60 digits with ours.
     final safety = await crypto.safety(me.username, web.id!, web.username);

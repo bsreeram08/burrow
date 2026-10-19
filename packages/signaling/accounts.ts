@@ -96,6 +96,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     const devices = createDevices({
         db, now, notify: (userId, event) => notify(userId, event), mutualIds: id => mutualIds(id),
         sessionsEnded(userId, sessions) { for (const session of sessions) push?.forgetSession(session); closeDeadStreams(userId); },
+        inboxChanged(userId) { for (const socket of listeners.get(userId) ?? []) pump(socket); },
     });
     /** A fresh session token; only its hash is stored. Web sessions become a cookie, native ones a bearer token. */
     function startSession(userId: string, client = 'web') {
@@ -221,6 +222,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         if (sent.size >= INFLIGHT || socket.readyState !== 1) return;
         // Envelopes are addressed to devices; a stream reads its own device's inbox (legacy clients: the primary's).
         const device = devices.inboxFor(userId, session);
+        if (!device) return; // An unbound session of an account whose messaging device is known: nothing for it.
         const rows = db.query<{ id: string; sender_id: string; username: string; envelope: Uint8Array; created_at: number }, [string, number]>(
             'SELECT m.id, m.sender_id, u.username, m.envelope, m.created_at FROM device_inbox m JOIN users u ON u.id = m.sender_id WHERE m.device_id = ? AND m.created_at > ? ORDER BY m.created_at, m.id LIMIT 128').all(device, now() - MAILBOX_TTL);
         for (const row of rows) {
@@ -410,8 +412,10 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 return json({ status: 'removed' });
             }
         }
-        if (path.startsWith('/api/devices') && request.method !== 'GET' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
+        // Challenges are exempt (each announce needs one; they are bounded per session in devices.ts).
+        if (path.startsWith('/api/devices') && request.method !== 'GET' && path !== '/api/devices/challenge' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
         if (path === '/api/devices/list' && request.method === 'PUT') { const [status, result] = devices.publish(user, await readBody(request)); return json(result, status); }
+        if (path === '/api/devices/challenge' && request.method === 'POST') { const [status, result] = devices.challenge(user); return json(result, status); }
         if (path === '/api/devices/announce' && request.method === 'POST') { const [status, result] = devices.announce(user, await readBody(request)); return json(result, status); }
         const devicesMatch = /^\/api\/devices\/(?:([a-z0-9_]{3,20})|([A-Za-z0-9_-]{22}))$/.exec(path);
         if (devicesMatch?.[1] && request.method === 'GET') {
@@ -553,7 +557,8 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 }
                 if (!message || message.type !== 'ack' || Object.keys(message).length !== 2 || typeof message.id !== 'string' || !MESSAGE_ID.test(message.id)) { socket.close(1008, 'Invalid event message'); return; }
                 // Only envelopes in this stream's own device inbox can be deleted.
-                db.query('DELETE FROM device_inbox WHERE id = ? AND device_id = ?').run(message.id, devices.inboxFor(socket.data.userId, socket.data.session));
+                const device = devices.inboxFor(socket.data.userId, socket.data.session);
+                if (device) db.query('DELETE FROM device_inbox WHERE id = ? AND device_id = ?').run(message.id, device);
                 socket.data.sent.delete(message.id);
                 pump(socket);
             },

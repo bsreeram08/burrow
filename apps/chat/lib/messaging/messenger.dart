@@ -137,14 +137,23 @@ class Messenger {
     _activeChanges.add(value);
   }
 
-  /// This device's id for the account (docs/devices.md), created on first use.
-  String get deviceId => localDeviceId(devices, me.id);
+  /// This install's device for the account (docs/devices.md): its id and device key, created on first use.
+  Future<LocalDevice> device() => _device ??= localDevice(devices, me.id);
+  Future<LocalDevice>? _device;
 
-  /// Binds this session to [deviceId]; with our identity (only when it is the published one) the device
-  /// takes the account's messaging inbox. Best effort: a server without devices still delivers as before.
+  /// Binds this session to our device, signing the server's challenge with the device key; with our
+  /// identity (only when it is the published one) the device takes the account's messaging inbox.
+  /// Best effort: a server without devices still delivers as before.
   Future<void> _announce(Identity? identity) async {
     try {
-      await api.announceDevice(deviceId, identity: identity?.toJson());
+      final local = await device(), challenge = await api.deviceChallenge();
+      await api.announceDevice(
+        local.deviceId,
+        deviceKey: local.publicKey,
+        challenge: challenge,
+        signature: local.sign(bindBytes(me.id, local.deviceId, challenge)),
+        identity: identity?.toJson(),
+      );
     } catch (_) {}
   }
 

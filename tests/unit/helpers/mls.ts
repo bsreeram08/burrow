@@ -16,8 +16,10 @@ export const id = () => randomBytes(16).toString('base64url');
 type CoreClass = new (rows: string, existed: boolean) => { call(command: string): string };
 
 function run(command: string, args: string[], env: Record<string, string> = {}) {
-    const result = Bun.spawnSync([command, ...args], { env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe' });
-    return { ok: result.exitCode === 0, out: result.stdout.toString(), err: result.stderr.toString() };
+    try {
+        const result = Bun.spawnSync([command, ...args], { env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe' });
+        return { ok: result.exitCode === 0, out: result.stdout.toString(), err: result.stderr.toString() };
+    } catch (error: any) { return { ok: false, out: '', err: String(error?.message ?? error) }; } // The tool isn't installed.
 }
 
 /** The client core, or null (with the reason) when the Rust toolchain isn't available: those tests are skipped. */

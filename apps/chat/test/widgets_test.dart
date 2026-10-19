@@ -24,8 +24,8 @@ Widget host(Widget child) => MaterialApp(theme: tokens.material(), home: Scaffol
 
 void main() {
   group('conversation', () {
-    Widget view(List<ChatMessage> messages, {bool blocked = false, Future<void> Function(String, Duration?)? onSend}) => host(
-      ConversationView(tokens: tokens, wallpaper: 'dots', messages: messages, peerName: 'alice', blocked: blocked, onSend: onSend ?? (_, _) async {}),
+    Widget view(List<ChatMessage> messages, {bool blocked = false, Future<void> Function(Draft)? onSend}) => host(
+      ConversationView(tokens: tokens, wallpaper: 'dots', messages: messages, peerName: 'alice', blocked: blocked, onSend: onSend ?? (_) async {}),
     );
 
     testWidgets('ticks animate only when a status changes, never for history on open', (tester) async {
@@ -58,7 +58,7 @@ void main() {
 
     testWidgets('a changed security code shows the banner and blocks sending until reviewed', (tester) async {
       final sent = <String>[];
-      await tester.pumpWidget(view(const [], blocked: true, onSend: (text, _) async => sent.add(text)));
+      await tester.pumpWidget(view(const [], blocked: true, onSend: (draft) async => sent.add(draft.text)));
       expect(find.byKey(const Key('key-banner')), findsOneWidget);
       expect(find.textContaining('Sending is paused'), findsOneWidget);
       await tester.enterText(find.byKey(const Key('composer')), 'secret');
@@ -68,7 +68,7 @@ void main() {
       expect(sent, isEmpty);
       expect(tester.widget<IconButton>(find.byKey(const Key('send'))).onPressed, isNull);
 
-      await tester.pumpWidget(view(const [], onSend: (text, _) async => sent.add(text)));
+      await tester.pumpWidget(view(const [], onSend: (draft) async => sent.add(draft.text)));
       expect(find.byKey(const Key('key-banner')), findsNothing);
       await tester.enterText(find.byKey(const Key('composer')), 'hello');
       await tester.tap(find.byKey(const Key('send')));

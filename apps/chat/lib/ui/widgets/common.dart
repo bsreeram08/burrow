@@ -9,12 +9,15 @@ String clock(int ms) {
 void showSnack(BuildContext context, String text) =>
     ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(content: Text(text), behavior: SnackBarBehavior.floating));
 
-/// Initial-letter avatar with an optional presence dot.
+/// Initial-letter avatar with an optional presence dot. [color] tints it (the person's name colour);
+/// [square] draws it as a rounded square (Mono).
 class Avatar extends StatelessWidget {
-  const Avatar({super.key, required this.name, this.online, this.size = 48});
+  const Avatar({super.key, required this.name, this.online, this.size = 48, this.square = false, this.color});
   final String name;
   final bool? online;
   final double size;
+  final bool square;
+  final Color? color;
 
   @override
   Widget build(BuildContext context) {
@@ -25,12 +28,18 @@ class Avatar extends StatelessWidget {
       child: Stack(
         clipBehavior: Clip.none,
         children: [
-          CircleAvatar(
-            radius: size / 2,
-            backgroundColor: scheme.primary.withValues(alpha: .16),
+          Container(
+            width: size,
+            height: size,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: (color ?? scheme.primary).withValues(alpha: .16),
+              shape: square ? BoxShape.rectangle : BoxShape.circle,
+              borderRadius: square ? BorderRadius.circular(size * .18) : null,
+            ),
             child: Text(
-              name.isEmpty ? '?' : name[0].toUpperCase(),
-              style: TextStyle(color: scheme.primary, fontWeight: FontWeight.w800, fontSize: size * .4),
+              name.isEmpty ? '?' : name.characters.first.toUpperCase(),
+              style: TextStyle(color: color ?? scheme.primary, fontWeight: FontWeight.w800, fontSize: size * .4),
             ),
           ),
           if (online != null)

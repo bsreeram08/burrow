@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:sqflite/sqflite.dart';
 
@@ -24,7 +25,7 @@ class MessageStore {
     final db = await factory.openDatabase(
       path,
       options: OpenDatabaseOptions(
-        version: 1,
+        version: schemaVersion,
         onCreate: (db, _) async {
           await db.execute('''
             CREATE TABLE messages (
@@ -32,10 +33,24 @@ class MessageStore {
               created_at INTEGER NOT NULL, status TEXT NOT NULL, expires_at INTEGER,
               PRIMARY KEY (conversation_id, id))''');
           await db.execute('CREATE INDEX messages_by_time ON messages (conversation_id, created_at)');
+          await _addPhase1Columns(db);
+        },
+        // Additive only: every existing row keeps its content and reads back with the new parts absent.
+        onUpgrade: (db, from, _) async {
+          if (from < 2) await _addPhase1Columns(db);
         },
       ),
     );
     return MessageStore(db, now: now);
+  }
+
+  /// v2 (phase 1): reply, attachment, link preview, the latest edit and reactions, each as nullable columns.
+  static const schemaVersion = 2;
+
+  static Future<void> _addPhase1Columns(DatabaseExecutor db) async {
+    for (final column in ['reply_to TEXT', 'attachment TEXT', 'link TEXT', 'edited_text TEXT', 'edited_at INTEGER', 'reactions TEXT']) {
+      await db.execute('ALTER TABLE messages ADD COLUMN $column');
+    }
   }
 
   Future<void> close() async {
@@ -68,7 +83,16 @@ class MessageStore {
       if (previous != null && !previous.sameContent(message)) {
         throw const StoreException('A duplicate message has conflicting content or expiration.', code: 'conflict');
       }
-      final next = previous?.status == MessageStatus.delivered ? message.withStatus(MessageStatus.delivered) : message;
+      // Keep what happened after the first write: a later status, the latest edit, reactions.
+      var next = message;
+      if (previous != null) {
+        next = next.copyWith(
+          status: statusRank(previous.status) > statusRank(message.status) ? previous.status : null,
+          editedText: previous.editedText,
+          editedAt: previous.editedAt,
+          reactions: previous.reactions.isEmpty ? null : previous.reactions,
+        );
+      }
       await tx.insert('messages', next.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
       return next;
     });
@@ -83,15 +107,19 @@ class MessageStore {
     ChatMessage message;
     try {
       final expiresAt = payload['expiresAt'];
+      final text = payload['text']! as String;
       message = validate(
         ChatMessage(
           id: payload['id']! as String,
           conversationId: conversationId,
           direction: Direction.incoming,
-          text: payload['text']! as String,
+          text: text,
           createdAt: payload['createdAt']! as int,
           status: MessageStatus.delivered,
           expiresAt: expiresAt as int?,
+          replyTo: payload.containsKey('replyTo') ? ReplyTo.fromJson(payload['replyTo']) : null,
+          attachment: payload.containsKey('attachment') ? Attachment.fromJson(payload['attachment']) : null,
+          link: payload.containsKey('link') ? LinkPreview.fromJson(payload['link'], text) : null,
         ),
       );
     } on StoreException {
@@ -122,20 +150,74 @@ class MessageStore {
   }
 
   /// A late receipt or send completion never recreates cleared content, never
-  /// downgrades `delivered`, and never turns restored history back into a queue.
+  /// downgrades (queued < sent < delivered < read), and never turns restored history back into a queue.
   Future<bool> setStatus(String conversationId, String id, MessageStatus status) async {
+    final changed = await _db.transaction((tx) => _advance(tx, conversationId, id, status));
+    if (changed) _changes.add(conversationId);
+    return changed;
+  }
+
+  Future<bool> _advance(DatabaseExecutor tx, String conversationId, String id, MessageStatus status, {Direction? only}) async {
+    final previous = await _get(tx, conversationId, id.toLowerCase());
+    if (previous == null || (only != null && previous.direction != only)) return false;
+    if (previous.status == MessageStatus.uncertain && (status == MessageStatus.queued || status == MessageStatus.sent)) return false;
+    if (statusRank(status) <= statusRank(previous.status)) return false;
+    await tx.update('messages', {'status': status.name}, where: 'conversation_id = ? AND id = ?', whereArgs: [conversationId, previous.id]);
+    return true;
+  }
+
+  /// Marks [ids] read, touching only records in [direction]: the peer's `read` for our outgoing
+  /// messages, or our own reading of incoming ones. Returns the ids that changed.
+  Future<List<String>> markRead(String conversationId, Iterable<String> ids, {required Direction direction}) async {
     final changed = await _db.transaction((tx) async {
-      final previous = await _get(tx, conversationId, id.toLowerCase());
+      final out = <String>[];
+      for (final id in ids) {
+        if (await _advance(tx, conversationId, id, MessageStatus.read, only: direction)) out.add(id.toLowerCase());
+      }
+      return out;
+    });
+    if (changed.isNotEmpty) _changes.add(conversationId);
+    return changed;
+  }
+
+  /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.
+  Future<bool> react(String conversationId, String target, {required String who, required String emoji, required bool on}) async {
+    if (!Reactions.people.contains(who) || !isReactionEmoji(emoji)) throw const StoreException('Invalid reaction.', code: 'invalid');
+    final changed = await _db.transaction((tx) async {
+      final previous = await _get(tx, conversationId, target.toLowerCase());
       if (previous == null) return false;
-      if (previous.status == MessageStatus.uncertain && (status == MessageStatus.queued || status == MessageStatus.sent)) return false;
-      final next = previous.status == MessageStatus.delivered ? MessageStatus.delivered : status;
-      if (next == previous.status) return false;
-      await tx.update('messages', {'status': next.name}, where: 'conversation_id = ? AND id = ?', whereArgs: [conversationId, previous.id]);
+      final next = previous.reactions.toggle(who, emoji, on);
+      if (next == null) return false;
+      await tx.update(
+        'messages',
+        {'reactions': next.isEmpty ? null : jsonEncode(next.toJson())},
+        where: 'conversation_id = ? AND id = ?',
+        whereArgs: [conversationId, previous.id],
+      );
       return true;
     });
     if (changed) _changes.add(conversationId);
     return changed;
   }
+
+  /// Applies an edit by the message's [author] only, last [editedAt] wins. Unknown targets, someone
+  /// else's message, attachments' text and older edits are ignored (false); bad text is `invalid`.
+  Future<bool> edit(String conversationId, String target, {required String text, required int editedAt, required Direction author}) async {
+    if (!validTime(editedAt)) throw const StoreException('Invalid edit.', code: 'invalid');
+    final changed = await _db.transaction((tx) async {
+      final previous = await _get(tx, conversationId, target.toLowerCase());
+      if (previous == null || previous.direction != author || previous.attachment != null) return false;
+      if (!validText(text, hasAttachment: false)) throw const StoreException('Invalid edit.', code: 'invalid');
+      if (previous.editedAt != null && previous.editedAt! >= editedAt) return false;
+      final next = validate(previous.copyWith(editedText: text, editedAt: editedAt));
+      await tx.update('messages', next.toRow(), where: 'conversation_id = ? AND id = ?', whereArgs: [conversationId, previous.id]);
+      return true;
+    });
+    if (changed) _changes.add(conversationId);
+    return changed;
+  }
+
+  Future<ChatMessage?> get(String conversationId, String id) => _get(_db, conversationId, id.toLowerCase());
 
   /// Oldest first.
   Future<List<ChatMessage>> list(String conversationId) async {

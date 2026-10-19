@@ -6,8 +6,8 @@ import '../../store/message.dart';
 
 /// Delivery ticks that animate only when the status changes, never on first
 /// build (opening a conversation draws history still). sent: one check draws
-/// in; delivered: the second draws in and both take the accent color; queued:
-/// a small rotating clock. Respects reduced motion.
+/// in; delivered: the second draws in; read: both take the accent colour;
+/// queued: a small rotating clock. Respects reduced motion.
 class Ticks extends StatefulWidget {
   const Ticks({super.key, required this.status, required this.color, required this.readColor});
   final MessageStatus status;
@@ -65,6 +65,7 @@ class TicksState extends State<Ticks> with TickerProviderStateMixin {
       MessageStatus.queued => 'Queued on this device',
       MessageStatus.sent => 'Sent',
       MessageStatus.delivered => 'Delivered',
+      MessageStatus.read => 'Read',
       MessageStatus.uncertain => 'Delivery unconfirmed',
     };
     return Semantics(
@@ -79,7 +80,7 @@ class TicksState extends State<Ticks> with TickerProviderStateMixin {
               status: widget.status,
               progress: Curves.easeOut.transform(draw.value),
               spin: spin.value,
-              color: widget.status == MessageStatus.delivered ? widget.readColor : widget.color,
+              color: widget.status == MessageStatus.read ? widget.readColor : widget.color,
             ),
           ),
         ),
@@ -120,7 +121,7 @@ class _TickPainter extends CustomPainter {
       }
     }
 
-    if (status == MessageStatus.delivered) {
+    if (status == MessageStatus.delivered || status == MessageStatus.read) {
       drawPartial(check(0), 1);
       drawPartial(check(6), progress);
     } else {

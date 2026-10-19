@@ -166,8 +166,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             TREE_LABEL,
-            &serde_json::to_vec(&group_id).unwrap(),
-            serde_json::to_vec(&tree).unwrap(),
+            &serde_json::to_vec(&group_id)?,
+            serde_json::to_vec(&tree)?,
         )
     }
 
@@ -179,9 +179,9 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         group_id: &GroupId,
         interim_transcript_hash: &InterimTranscriptHash,
     ) -> Result<(), Self::Error> {
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(INTERIM_TRANSCRIPT_HASH_LABEL, group_id);
-        let value = serde_json::to_vec(&interim_transcript_hash).unwrap();
+        let value = serde_json::to_vec(&interim_transcript_hash)?;
 
         values.insert(key, value);
         Ok(())
@@ -195,9 +195,9 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         group_id: &GroupId,
         group_context: &GroupContext,
     ) -> Result<(), Self::Error> {
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(GROUP_CONTEXT_LABEL, group_id);
-        let value = serde_json::to_vec(&group_context).unwrap();
+        let value = serde_json::to_vec(&group_context)?;
 
         values.insert(key, value);
         Ok(())
@@ -211,9 +211,9 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         group_id: &GroupId,
         confirmation_tag: &ConfirmationTag,
     ) -> Result<(), Self::Error> {
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(CONFIRMATION_TAG_LABEL, group_id);
-        let value = serde_json::to_vec(&confirmation_tag).unwrap();
+        let value = serde_json::to_vec(&confirmation_tag)?;
 
         values.insert(key, value);
         Ok(())
@@ -227,10 +227,10 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         public_key: &SignaturePublicKey,
         signature_key_pair: &SignatureKeyPair,
     ) -> Result<(), Self::Error> {
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let key =
             build_key::<CURRENT_VERSION, &SignaturePublicKey>(SIGNATURE_KEY_PAIR_LABEL, public_key);
-        let value = serde_json::to_vec(&signature_key_pair).unwrap();
+        let value = serde_json::to_vec(&signature_key_pair)?;
 
         values.insert(key, value);
         Ok(())
@@ -262,7 +262,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
                 let key = (group_id, &proposal_ref);
                 let key = serde_json::to_vec(&key)?;
 
-                let proposal = self.read(QUEUED_PROPOSAL_LABEL, &key)?.unwrap();
+                let proposal = self.read(QUEUED_PROPOSAL_LABEL, &key)?.ok_or(MlsStorageError::SerializationError)?;
                 Ok((proposal_ref, proposal))
             })
             .collect::<Result<Vec<_>, _>>()
@@ -275,13 +275,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<TreeSync>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(TREE_LABEL, group_id);
 
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -293,13 +293,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<GroupContext>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(GROUP_CONTEXT_LABEL, group_id);
 
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -311,13 +311,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<InterimTranscriptHash>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(INTERIM_TRANSCRIPT_HASH_LABEL, group_id);
 
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -329,13 +329,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<ConfirmationTag>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(CONFIRMATION_TAG_LABEL, group_id);
 
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -347,7 +347,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         public_key: &SignaturePublicKey,
     ) -> Result<Option<SignatureKeyPair>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
 
         let key =
             build_key::<CURRENT_VERSION, &SignaturePublicKey>(SIGNATURE_KEY_PAIR_LABEL, public_key);
@@ -355,7 +355,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -368,13 +368,10 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         hash_ref: &HashReference,
         key_package: &KeyPackage,
     ) -> Result<(), Self::Error> {
-        let key = serde_json::to_vec(&hash_ref).unwrap();
-        let value = serde_json::to_vec(&key_package).unwrap();
+        let key = serde_json::to_vec(&hash_ref)?;
+        let value = serde_json::to_vec(&key_package)?;
 
         self.write::<CURRENT_VERSION>(KEY_PACKAGE_LABEL, &key, value)
-            .unwrap();
-
-        Ok(())
     }
 
     fn write_psk<
@@ -387,8 +384,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             PSK_LABEL,
-            &serde_json::to_vec(&psk_id).unwrap(),
-            serde_json::to_vec(&psk).unwrap(),
+            &serde_json::to_vec(&psk_id)?,
+            serde_json::to_vec(&psk)?,
         )
     }
 
@@ -402,8 +399,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             ENCRYPTION_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key).unwrap(),
-            serde_json::to_vec(key_pair).unwrap(),
+            &serde_json::to_vec(public_key)?,
+            serde_json::to_vec(key_pair)?,
         )
     }
 
@@ -414,7 +411,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         hash_ref: &KeyPackageRef,
     ) -> Result<Option<KeyPackage>, Self::Error> {
-        let key = serde_json::to_vec(&hash_ref).unwrap();
+        let key = serde_json::to_vec(&hash_ref)?;
         self.read(KEY_PACKAGE_LABEL, &key)
     }
 
@@ -422,7 +419,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         psk_id: &PskId,
     ) -> Result<Option<PskBundle>, Self::Error> {
-        self.read(PSK_LABEL, &serde_json::to_vec(&psk_id).unwrap())
+        self.read(PSK_LABEL, &serde_json::to_vec(&psk_id)?)
     }
 
     fn encryption_key_pair<
@@ -434,7 +431,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<Option<HpkeKeyPair>, Self::Error> {
         self.read(
             ENCRYPTION_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key).unwrap(),
+            &serde_json::to_vec(public_key)?,
         )
     }
 
@@ -446,7 +443,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             SIGNATURE_KEY_PAIR_LABEL,
-            &serde_json::to_vec(public_key).unwrap(),
+            &serde_json::to_vec(public_key)?,
         )
     }
 
@@ -456,7 +453,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             ENCRYPTION_KEY_PAIR_LABEL,
-            &serde_json::to_vec(&public_key).unwrap(),
+            &serde_json::to_vec(&public_key)?,
         )
     }
 
@@ -673,12 +670,12 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         let key = epoch_key_pairs_id(group_id, epoch, leaf_index)?;
         let storage_key = build_key_from_vec::<CURRENT_VERSION>(EPOCH_KEY_PAIRS_LABEL, key);
 
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let value = values.get(&storage_key);
 
 
         if let Some(value) = value {
-            return Ok(serde_json::from_slice(value).unwrap());
+            return Ok(serde_json::from_slice(value)?);
         }
 
         Ok(vec![])
@@ -707,7 +704,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         // Get all proposal refs for this group.
         let proposal_refs: Vec<ProposalRef> =
             self.read_list(PROPOSAL_QUEUE_REFS_LABEL, &serde_json::to_vec(group_id)?)?;
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         for proposal_ref in proposal_refs {
             // Delete all proposals.
             let key = serde_json::to_vec(&(group_id, proposal_ref))?;
@@ -728,7 +725,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<MlsGroupJoinConfig>, Self::Error> {
-        self.read(JOIN_CONFIG_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.read(JOIN_CONFIG_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn write_mls_join_config<
@@ -739,8 +736,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         group_id: &GroupId,
         config: &MlsGroupJoinConfig,
     ) -> Result<(), Self::Error> {
-        let key = serde_json::to_vec(group_id).unwrap();
-        let value = serde_json::to_vec(config).unwrap();
+        let key = serde_json::to_vec(group_id)?;
+        let value = serde_json::to_vec(config)?;
 
         self.write::<CURRENT_VERSION>(JOIN_CONFIG_LABEL, &key, value)
     }
@@ -752,7 +749,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Vec<LeafNode>, Self::Error> {
-        self.read_list(OWN_LEAF_NODES_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.read_list(OWN_LEAF_NODES_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn append_own_leaf_node<
@@ -772,21 +769,21 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete::<CURRENT_VERSION>(OWN_LEAF_NODES_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.delete::<CURRENT_VERSION>(OWN_LEAF_NODES_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn delete_group_config<GroupId: traits::GroupId<CURRENT_VERSION>>(
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete::<CURRENT_VERSION>(JOIN_CONFIG_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.delete::<CURRENT_VERSION>(JOIN_CONFIG_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn delete_tree<GroupId: traits::GroupId<CURRENT_VERSION>>(
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete::<CURRENT_VERSION>(TREE_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.delete::<CURRENT_VERSION>(TREE_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn delete_confirmation_tag<GroupId: traits::GroupId<CURRENT_VERSION>>(
@@ -795,7 +792,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             CONFIRMATION_TAG_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
+            &serde_json::to_vec(group_id)?,
         )
     }
 
@@ -803,7 +800,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<(), Self::Error> {
-        self.delete::<CURRENT_VERSION>(GROUP_CONTEXT_LABEL, &serde_json::to_vec(group_id).unwrap())
+        self.delete::<CURRENT_VERSION>(GROUP_CONTEXT_LABEL, &serde_json::to_vec(group_id)?)
     }
 
     fn delete_interim_transcript_hash<GroupId: traits::GroupId<CURRENT_VERSION>>(
@@ -812,7 +809,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             INTERIM_TRANSCRIPT_HASH_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
+            &serde_json::to_vec(group_id)?,
         )
     }
 
@@ -824,12 +821,12 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         group_id: &GroupId,
         proposal_ref: &ProposalRef,
     ) -> Result<(), Self::Error> {
-        let key = serde_json::to_vec(group_id).unwrap();
-        let value = serde_json::to_vec(proposal_ref).unwrap();
+        let key = serde_json::to_vec(group_id)?;
+        let value = serde_json::to_vec(proposal_ref)?;
 
         self.remove_item::<CURRENT_VERSION>(PROPOSAL_QUEUE_REFS_LABEL, &key, value)?;
 
-        let key = serde_json::to_vec(&(group_id, proposal_ref)).unwrap();
+        let key = serde_json::to_vec(&(group_id, proposal_ref))?;
         self.delete::<CURRENT_VERSION>(QUEUED_PROPOSAL_LABEL, &key)
     }
 
@@ -844,8 +841,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             APPLICATION_EXPORT_TREE_LABEL,
-            &serde_json::to_vec(&group_id).unwrap(),
-            serde_json::to_vec(&application_export_tree).unwrap(),
+            &serde_json::to_vec(&group_id)?,
+            serde_json::to_vec(&application_export_tree)?,
         )
     }
 
@@ -857,13 +854,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<ApplicationExportTree>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(APPLICATION_EXPORT_TREE_LABEL, group_id);
 
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        let value = serde_json::from_slice(value).unwrap();
+        let value = serde_json::from_slice(value)?;
 
         Ok(value)
     }
@@ -878,7 +875,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             APPLICATION_EXPORT_TREE_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
+            &serde_json::to_vec(group_id)?,
         )
     }
 
@@ -893,8 +890,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             VC_EMULATION_EPOCH_STATE_LABEL,
-            &serde_json::to_vec(epoch_id).unwrap(),
-            serde_json::to_vec(vc_emulation_epoch_state).unwrap(),
+            &serde_json::to_vec(epoch_id)?,
+            serde_json::to_vec(vc_emulation_epoch_state)?,
         )
     }
 
@@ -906,12 +903,12 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         epoch_id: &EpochId,
     ) -> Result<Option<VcEmulationEpochState>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &EpochId>(VC_EMULATION_EPOCH_STATE_LABEL, epoch_id);
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(value).unwrap())
+        Ok(serde_json::from_slice(value)?)
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -922,7 +919,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         let serialized_epoch_id = serde_json::to_vec(epoch_id)?;
         // Hold the write lock across the liveness check and the deletion so a
         // material stored concurrently cannot be orphaned.
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let referenced = values
             .iter()
             .any(|(key, value)| is_epoch_tag(key) && value == &serialized_epoch_id);
@@ -951,8 +948,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             VC_EMULATION_BINDING_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
-            serde_json::to_vec(bindings).unwrap(),
+            &serde_json::to_vec(group_id)?,
+            serde_json::to_vec(bindings)?,
         )
     }
 
@@ -964,12 +961,12 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<VcEmulationBindings>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &GroupId>(VC_EMULATION_BINDING_LABEL, group_id);
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(value).unwrap())
+        Ok(serde_json::from_slice(value)?)
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -979,7 +976,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             VC_EMULATION_BINDING_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
+            &serde_json::to_vec(group_id)?,
         )
     }
 
@@ -994,8 +991,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             REGISTERED_VC_EMULATION_EPOCH_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
-            serde_json::to_vec(registered).unwrap(),
+            &serde_json::to_vec(group_id)?,
+            serde_json::to_vec(registered)?,
         )
     }
 
@@ -1007,13 +1004,13 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         group_id: &GroupId,
     ) -> Result<Option<RegisteredVcEmulationEpoch>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key =
             build_key::<CURRENT_VERSION, &GroupId>(REGISTERED_VC_EMULATION_EPOCH_LABEL, group_id);
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(value).unwrap())
+        Ok(serde_json::from_slice(value)?)
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -1023,7 +1020,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.delete::<CURRENT_VERSION>(
             REGISTERED_VC_EMULATION_EPOCH_LABEL,
-            &serde_json::to_vec(group_id).unwrap(),
+            &serde_json::to_vec(group_id)?,
         )
     }
 
@@ -1038,8 +1035,8 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
     ) -> Result<(), Self::Error> {
         self.write::<CURRENT_VERSION>(
             VC_OPERATION_TREE_LABEL,
-            &serde_json::to_vec(epoch_id).unwrap(),
-            serde_json::to_vec(vc_operation_tree).unwrap(),
+            &serde_json::to_vec(epoch_id)?,
+            serde_json::to_vec(vc_operation_tree)?,
         )
     }
 
@@ -1051,12 +1048,12 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         epoch_id: &EpochId,
     ) -> Result<Option<VcOperationTree>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &EpochId>(VC_OPERATION_TREE_LABEL, epoch_id);
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(value).unwrap())
+        Ok(serde_json::from_slice(value)?)
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -1075,7 +1072,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         // Take the write lock once so the advanced tree and all materials are
         // written together. A reader cannot observe an advanced tree without
         // the materials it produced.
-        let mut values = self.values.write().unwrap();
+        let mut values = self.values.write().map_err(|_| MlsStorageError::Poisoned)?;
         let tree_key = build_key_from_vec::<CURRENT_VERSION>(
             VC_OPERATION_TREE_LABEL,
             serialized_epoch_id.clone(),
@@ -1105,7 +1102,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         &self,
         hash_ref: &KeyPackageRef,
     ) -> Result<Option<RetainedKeyPackageMaterial>, Self::Error> {
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let key = build_key::<CURRENT_VERSION, &KeyPackageRef>(
             RETAINED_KEY_PACKAGE_MATERIAL_LABEL,
             hash_ref,
@@ -1113,7 +1110,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         let Some(value) = values.get(&key) else {
             return Ok(None);
         };
-        Ok(serde_json::from_slice(value).unwrap())
+        Ok(serde_json::from_slice(value)?)
     }
 
     #[cfg(feature = "virtual-clients-draft")]
@@ -1122,7 +1119,7 @@ impl StorageProvider<CURRENT_VERSION> for MlsStorage {
         epoch_id: &EpochId,
     ) -> Result<bool, Self::Error> {
         let serialized_epoch_id = serde_json::to_vec(epoch_id)?;
-        let values = self.values.read().unwrap();
+        let values = self.values.read().map_err(|_| MlsStorageError::Poisoned)?;
         let referenced = values
             .iter()
             .any(|(key, value)| is_epoch_tag(key) && value == &serialized_epoch_id);
@@ -1158,7 +1155,8 @@ fn is_epoch_tag(storage_key: &[u8]) -> bool {
 
 /// Build a key with version and label.
 fn build_key<const V: u16, K: Serialize>(label: &[u8], key: K) -> Vec<u8> {
-    build_key_from_vec::<V>(label, serde_json::to_vec(&key).unwrap())
+    // Keys are OpenMLS's own plain data (ids, hashes): serializing them cannot fail.
+    build_key_from_vec::<V>(label, serde_json::to_vec(&key).expect("storage keys serialize"))
 }
 
 fn epoch_key_pairs_id(

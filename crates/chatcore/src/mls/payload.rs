@@ -1,4 +1,4 @@
-//! Application payload v2 (architecture §5; MLS.md §5): the JSON inside an MLS application message. Validated
+//! Application payload v2 (architecture §5): the JSON inside an MLS application message. Validated
 //! here, in Rust, so the web app and the native apps accept and reject exactly the same payloads. Every payload is
 //! an object with exactly the fields of its type (unknown fields rejected). Errors carry the existing
 //! disposition codes: `invalid` (acknowledge and discard with a notice).

@@ -1,4 +1,4 @@
-//! Device certificates (crates/chatcore/MLS.md §1, architecture §2.2): an MLS `BasicCredential` whose identity
+//! Device certificates (docs/workspace-architecture.md §2): an MLS `BasicCredential` whose identity
 //! is a DeviceCert, signed by the account identity key (AIK, the Ed25519 half of today's `{dh, sign}` identity).
 //! Every leaf that enters or changes in a group must carry a certificate that verifies under the AIK pinned for
 //! its user and names that leaf's own signature key.

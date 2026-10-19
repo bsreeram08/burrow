@@ -1,4 +1,4 @@
-//! Groups over MLS (RFC 9420, OpenMLS 0.9): see crates/chatcore/MLS.md for the protocol this implements.
+//! Groups over MLS (RFC 9420, OpenMLS 0.9): see API.md for the protocol this implements.
 use openmls::prelude::Ciphersuite;
 use sha2::{Digest, Sha256};
 
@@ -11,7 +11,7 @@ pub mod persist;
 pub mod policy;
 mod rows;
 mod storage;
-#[cfg(test)]
+#[cfg(all(test, feature = "mls", feature = "ds"))]
 mod tests;
 
 pub const CS: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;

@@ -456,6 +456,18 @@ describe('binding a session to a device needs proof of possession', () => {
     });
 });
 
+describe('bind challenges are bounded', () => {
+    test('one account cannot exhaust challenges: per-account rate limit, and a cap on sessions holding them', async () => {
+        const alice = account('alice'), bob = account('bob');
+        const statuses: number[] = [];
+        for (let i = 0; i < 40; i++) statuses.push((await request('/api/devices/challenge', 'POST', alice.cookie, {})).status);
+        expect(statuses.slice(0, 30).every(status => status === 200)).toBe(true);
+        expect(statuses.slice(30)).toContain(429);
+        // Another account is unaffected.
+        expect((await request('/api/devices/challenge', 'POST', bob.cookie, {})).status).toBe(200);
+    });
+});
+
 describe('migrations', () => {
     // 0: production before numbering; 1: a v1 (numbered, pre-M1) database. Both hold waiting mail and sessions.
     test.each([0, 1])('a populated pre-M1 database (user_version %d) migrates once: mailbox → device inboxes, sessions gain devices', async version => {

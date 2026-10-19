@@ -80,6 +80,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     // Each registration pushes a nonce to the claimed device, so one account may not trigger many per second.
     const allowRegister = requestLimiter({ perSource: 5, global: 200 });
     const allowDevices = requestLimiter({ perSource: 20, global: 400 });
+    const allowChallenges = requestLimiter({ perSource: 30, global: 2000 }); // Sign-in and reconnect bursts, per account.
 
     const userByName = (username: string) => db.query<User, [string]>('SELECT id, username FROM users WHERE username = ?').get(username);
     const inviteUsable = (code: string) => Boolean(db.query('SELECT 1 FROM invites WHERE code_hash = ? AND used_by IS NULL AND expires_at > ?').get(hash(code), now()));
@@ -413,7 +414,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             }
         }
         // Challenges are exempt (each announce needs one; they are bounded per session in devices.ts).
-        if (path.startsWith('/api/devices') && request.method !== 'GET' && path !== '/api/devices/challenge' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
+        if (path === '/api/devices/challenge' ? !allowChallenges(user.id) : path.startsWith('/api/devices') && request.method !== 'GET' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
         if (path === '/api/devices/list' && request.method === 'PUT') { const [status, result] = devices.publish(user, await readBody(request)); return json(result, status); }
         if (path === '/api/devices/challenge' && request.method === 'POST') { const [status, result] = devices.challenge(user); return json(result, status); }
         if (path === '/api/devices/announce' && request.method === 'POST') { const [status, result] = devices.announce(user, await readBody(request)); return json(result, status); }

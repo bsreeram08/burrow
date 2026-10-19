@@ -63,6 +63,47 @@ const MIGRATIONS: ((db: Database) => void)[] = [
         }
         db.exec('DROP TABLE mailbox');
     },
+    // 3 (M3): the MLS delivery service: validator state, KeyPackages, channels, per-device membership and cursors,
+    // the group log, Welcomes, and DMs. See mls-ds.ts and channels.ts.
+    db => {
+        db.exec(`
+            -- The validator's public state (the wasm core's journal), keyed exactly as the core keys it.
+            CREATE TABLE mls_ds_rows (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+            -- One-time KeyPackages (at most 100 per device) and one last-resort one, each bound to a listed device.
+            CREATE TABLE mls_key_packages (id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, kp TEXT NOT NULL UNIQUE, last_resort INTEGER NOT NULL,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE INDEX mls_kp_device ON mls_key_packages (device_id, last_resort, created_at);
+            CREATE UNIQUE INDEX mls_kp_last_resort ON mls_key_packages (device_id) WHERE last_resort = 1;
+            CREATE INDEX mls_kp_expiry ON mls_key_packages (expires_at);
+            -- id is the MLS group id. epoch/seq: the group's epoch and the position of its last log entry.
+            -- prev_state is the validator's public state before the latest sequenced commit (the poison rollback).
+            CREATE TABLE channels (id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('public', 'private', 'dm', 'group_dm', 'self')),
+                name TEXT, creator_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, epoch INTEGER NOT NULL, seq INTEGER NOT NULL DEFAULT 0,
+                group_info TEXT, group_info_epoch INTEGER, prev_state TEXT, prev_epoch INTEGER,
+                frozen_seq INTEGER, frozen_digest TEXT, frozen_by TEXT, frozen_at INTEGER, created_at INTEGER NOT NULL);
+            -- A mirror of the MLS tree for fan-out (authoritative roles live inside MLS): one row per member device.
+            CREATE TABLE channel_members (channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+                device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                admin INTEGER NOT NULL DEFAULT 0, cursor INTEGER NOT NULL DEFAULT 0, joined_seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (channel_id, device_id));
+            CREATE INDEX channel_members_device ON channel_members (device_id);
+            CREATE INDEX channel_members_user ON channel_members (user_id, channel_id);
+            -- Devices a rolled-back poison commit's author may no longer use in this channel.
+            CREATE TABLE channel_bans (channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE, device_id TEXT NOT NULL, banned_at INTEGER NOT NULL, PRIMARY KEY (channel_id, device_id));
+            CREATE TABLE dm_pairs (user_a TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, user_b TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                channel_id TEXT NOT NULL UNIQUE REFERENCES channels(id) ON DELETE CASCADE, PRIMARY KEY (user_a, user_b));
+            CREATE TABLE group_log (channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE, seq INTEGER NOT NULL, epoch INTEGER NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('commit', 'app')), sender_user TEXT NOT NULL, sender_device TEXT NOT NULL, digest TEXT NOT NULL,
+                message BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (channel_id, seq));
+            CREATE INDEX group_log_age ON group_log (created_at);
+            -- The per-device Welcome inbox (large, opaque blobs: kept apart from 1:1 envelopes).
+            CREATE TABLE mls_welcomes (id TEXT PRIMARY KEY, device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                channel_id TEXT NOT NULL REFERENCES channels(id) ON DELETE CASCADE, sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                epoch INTEGER NOT NULL, seq INTEGER NOT NULL, welcome BLOB NOT NULL, tree BLOB NOT NULL, created_at INTEGER NOT NULL);
+            CREATE INDEX mls_welcomes_device ON mls_welcomes (device_id, created_at);
+            CREATE INDEX mls_welcomes_channel ON mls_welcomes (channel_id, seq);
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

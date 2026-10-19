@@ -1,6 +1,8 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { verifyCore } from './core-manifest';
+import { createChannels, type Channels } from './channels';
+import { createDsCore, createKeyPackages } from './mls-ds';
 import type { ServerWebSocket } from 'bun';
 import { packetBudget } from '../stun-server/native/server';
 import { requestLimiter, requestSource } from './rate-limit';
@@ -60,6 +62,8 @@ export type SignalingOptions = {
     allowTestFlags?: boolean;
     /** Directory of the WebAssembly core (tests point this at tampered copies); verified like the default. */
     coreDir?: string;
+    /** Directory of the delivery service's validator core (packages/signaling/ds-core); verified at startup. */
+    dsCoreDir?: string;
 };
 export type NativeApps = { appleAppIds?: string[]; androidPackage?: string; androidCertSha256?: string[]; androidApkKeyHashes?: string[] };
 
@@ -99,6 +103,9 @@ export function startSignaling(options: SignalingOptions) {
     const origin = new URL(options.origin);
     // The WebAssembly core is verified once, before serving anything: a missing, extra or altered file stops startup.
     const coreFiles = verifyCore(options.coreDir ?? fileURLToPath(new URL('./public/core', import.meta.url)));
+    // The MLS delivery service's validator is verified the same way, before anything is served.
+    const dsDir = options.dsCoreDir ?? fileURLToPath(new URL('./ds-core', import.meta.url));
+    verifyCore(dsDir);
     const testFlags = Boolean(options.allowTestFlags) && ['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname);
     if (origin.origin !== options.origin || !['http:', 'https:'].includes(origin.protocol)) throw new Error('PUBLIC_ORIGIN must be an exact HTTP(S) origin');
     if (origin.protocol !== 'https:' && !['localhost', '127.0.0.1', '[::1]'].includes(origin.hostname)) throw new Error('Public deployments require HTTPS');
@@ -172,6 +179,13 @@ export function startSignaling(options: SignalingOptions) {
     } });
     const emoji: Emoji | undefined = db && options.dataDir ? createEmoji({ db, dataDir: options.dataDir, origin: options.origin, now, adminToken: options.adminToken, fetcher: options.emojiFetcher, resolver: options.emojiResolver, importHosts: options.emojiImportHosts }) : undefined;
     const blobs: Blobs | undefined = db && options.dataDir ? createBlobs({ db, dataDir: options.dataDir, origin: options.origin, now, budget: options.blobBudget }) : undefined;
+    let channels: Channels | undefined;
+    if (db && accounts && options.dataDir) {
+        const ds = createDsCore({ db, dir: dsDir });
+        const directory = { db, now, ds, eligible: accounts.devices.eligible, sessionDevice: accounts.devices.sessionDevice, aikOf: accounts.devices.aikOf, mutual: accounts.mutual, notify: accounts.notify };
+        channels = createChannels({ ...directory, origin: options.origin, keyPackages: createKeyPackages(directory), sigKey: accounts.devices.sigKey, userByName: accounts.userByName, streams: accounts.streams as any, pumpUser: accounts.pumpUser });
+        accounts.attach(channels);
+    }
     const unfurl = createUnfurl({ resolver: options.unfurlResolver, transport: options.unfurlTransport });
     const server = Bun.serve({
         hostname: options.hostname ?? '127.0.0.1', port: options.port ?? 3000,
@@ -183,7 +197,8 @@ export function startSignaling(options: SignalingOptions) {
             // Body limits are enforced on what is actually read: a body needs an exact Content-Length (no chunked
             // transfer, which could run past a declared length), at most 128 KiB everywhere except emoji and attachments.
             if (request.method !== 'GET' && request.method !== 'HEAD' && (request.body || request.headers.has('transfer-encoding'))) {
-                const declared = request.headers.get('content-length'), cap = url.pathname === '/api/emoji' ? 786432 : url.pathname === '/api/blobs' ? BLOB_MAX : 131072;
+                const declared = request.headers.get('content-length'), cap = url.pathname === '/api/emoji' ? 786432 : url.pathname === '/api/blobs' ? BLOB_MAX
+                    : url.pathname === '/api/channels' ? 262144 : /^\/api\/channels\/[A-Za-z0-9_-]{22}\/commits$/.test(url.pathname) ? 8 * 1024 * 1024 : 131072;
                 if (request.headers.has('transfer-encoding') || !declared || !/^\d{1,9}$/.test(declared)) return json({ error: 'Content-Length required' }, 411);
                 if (Number(declared) > cap) return json({ error: 'Request too large' }, 413);
             }
@@ -222,6 +237,7 @@ export function startSignaling(options: SignalingOptions) {
             if (!allowRequest(source)) return json({ error: 'Rate limited' }, 429);
             if (emoji && accounts && /^\/api\/emoji(\/|$)/.test(url.pathname)) return emoji.handle(request, url, accounts.sessionUser(request), source);
             if (blobs && accounts && /^\/api\/blobs(\/|$)/.test(url.pathname)) return blobs.handle(request, url, accounts.sessionUser(request));
+            if (channels && accounts && /^\/api\/(mls|channels)(\/|$)/.test(url.pathname)) return channels.handle(request, url, accounts.sessionUser(request));
             if (accounts && /^\/api\/unfurl(\/|$)/.test(url.pathname)) return unfurl.handle(request, url, accounts.sessionUser(request));
             if (url.pathname.startsWith('/api/')) return accounts ? accounts.handle(request, url, server, source) : json({ error: 'Not found' }, 404);
             const roomMatch = /^\/rooms\/([A-Za-z0-9_-]{43})(\/ice)?$/.exec(url.pathname);
@@ -328,7 +344,7 @@ export function startSignaling(options: SignalingOptions) {
     });
     const timer = setInterval(sweep, 1000);
     timer.unref();
-    return { server, accounts, blobs, stop() { clearInterval(timer); rooms.clear(); return server.stop(true); } };
+    return { server, accounts, blobs, channels, stop() { clearInterval(timer); rooms.clear(); return server.stop(true); } };
 }
 
 if (import.meta.main) {

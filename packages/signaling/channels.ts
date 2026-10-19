@@ -15,7 +15,7 @@ type Kind = typeof KINDS[number];
 const MAX_USERS: Record<Kind, number> = { dm: 2, group_dm: 9, private: 500, public: 1000, self: 1 };
 const MAX_LEAVES: Record<Kind, number> = { dm: 16, group_dm: 64, private: 1000, public: 1000, self: 16 };
 export const LOG_TTL = 30 * 86400000, WELCOME_TTL = 30 * 86400000, MAX_BACKLOG = 10000, MAX_WELCOMES_PER_DEVICE = 100, WELCOME_COPY_BUDGET = 64 * 1024 * 1024;
-const COMMIT_MAX = 8 * 1024 * 1024, SMALL_MAX = 131072, INFLIGHT = 32, INLINE_MAX = 48 * 1024, PAGE = 50, PAGE_BYTES = 2 * 1024 * 1024, SWEEP_EVERY = 60000;
+const COMMIT_MAX = 8 * 1024 * 1024, SMALL_MAX = 131072, INFLIGHT = 32, INLINE_MAX = 48 * 1024, PAGE = 50, PAGE_BYTES = 2 * 1024 * 1024, SWEEP_EVERY = 60000, REPORT_INTERVAL = 60000;
 const ID = /^[A-Za-z0-9_-]{22}$/, B64 = /^[A-Za-z0-9_-]+$/, DIGEST = /^[0-9a-f]{64}$/, SIG = /^[A-Za-z0-9_-]{86}$/;
 const NAME = /^[\p{L}\p{N}_\- ]{1,64}$/u;
 const GROUP_INFO_B64_MAX = 87382, WELCOME_B64_MAX = Math.ceil(4 * 1024 * 1024 * 4 / 3), COMMIT_B64_MAX = Math.ceil(1024 * 1024 * 4 / 3) + 4, APP_B64_MAX = Math.ceil(64 * 1024 * 4 / 3) + 4;
@@ -63,6 +63,7 @@ export function createChannels(deps: Deps) {
     const { db, now } = deps;
     const allowCreate = requestLimiter({ perSource: 10, global: 200 }), allowMessage = requestLimiter({ perSource: 30, global: 2000 }), allowCommit = requestLimiter({ perSource: 15, global: 300 });
     const allowRead = requestLimiter({ perSource: 40, global: 1000 }), allowCursor = requestLimiter({ perSource: 100, global: 4000 }), allowPoison = requestLimiter({ perSource: 10, global: 100 });
+    const lastFreeze = new Map<string, number>();
     const allowJoin = requestLimiter({ perSource: 3, global: 100 }), allowInfo = requestLimiter({ perSource: 10, global: 200 });
 
     const channelRow = (id: string) => db.query<Row, [string]>('SELECT * FROM channels WHERE id = ?').get(id);
@@ -103,7 +104,7 @@ export function createChannels(deps: Deps) {
                 db.query('INSERT INTO channel_members (channel_id, device_id, user_id, admin, cursor, joined_seq) VALUES (?, ?, ?, ?, ?, ?)').run(channel.id, member.deviceId, member.userId, member.admin ? 1 : 0, seq, seq);
             } else {
                 const row = old.get(member.deviceId)!;
-                db.query('UPDATE channel_members SET admin = ?, cursor = ? WHERE channel_id = ? AND device_id = ?').run(member.admin ? 1 : 0, Math.min(row.cursor, seq), channel.id, member.deviceId);
+                db.query('UPDATE channel_members SET admin = ?, cursor = ?, joined_seq = ? WHERE channel_id = ? AND device_id = ?').run(member.admin ? 1 : 0, Math.min(row.cursor, seq), Math.min(row.joined_seq, seq), channel.id, member.deviceId);
             }
         }
         const removed = [...old.values()].filter(row => !keep.has(row.device_id)).map(row => ({ userId: row.user_id, deviceId: row.device_id }));
@@ -287,8 +288,10 @@ export function createChannels(deps: Deps) {
         if (!member) return json({ error: 'No such channel.' }, 404);
         if (!allowRead(user.id)) return json({ error: 'Rate limited' }, 429);
         const raw = url.searchParams.get('after');
-        const after = raw === null ? member.cursor : /^\d{1,12}$/.test(raw) ? Number(raw) : -1;
-        if (after < 0) return json({ error: 'Invalid cursor' }, 400);
+        const requested = raw === null ? member.cursor : /^\d{1,12}$/.test(raw) ? Number(raw) : -1;
+        if (requested < 0) return json({ error: 'Invalid cursor' }, 400);
+        // A device reads only what was sequenced after it joined, whatever it asks for.
+        const after = Math.max(requested, member.joined_seq);
         const rows = db.query<any, [string, number, number]>(`SELECT ${LOG_COLUMNS} FROM group_log WHERE channel_id = ? AND seq > ? ORDER BY seq LIMIT ?`).all(channelId, after, PAGE);
         const entries: object[] = [];
         let bytes = 0;
@@ -420,6 +423,11 @@ export function createChannels(deps: Deps) {
         // Only the latest commit: anything older was accepted by members that built on it.
         if (!entry || entry.kind !== 'commit' || entry.digest !== body.digest || body.seq !== channel.seq || channel.prev_state === null) return json({ error: 'That is not the latest sequenced commit.' }, 409);
         if (entry.sender_device === deviceId) return json({ error: 'A commit\'s author cannot report it.' }, 403);
+        // One freeze per reporting device per channel per minute, so reports can't keep a channel down.
+        const key = `${channelId}:${deviceId}`;
+        if (now() - (lastFreeze.get(key) ?? -Infinity) < REPORT_INTERVAL) return json({ error: 'Too many reports from this device. Try again later.' }, 429);
+        lastFreeze.set(key, now());
+        if (lastFreeze.size > 10000) for (const [k, at] of lastFreeze) if (now() - at >= REPORT_INTERVAL) lastFreeze.delete(k);
         db.query('UPDATE channels SET frozen_seq = ?, frozen_digest = ?, frozen_by = ?, frozen_at = ? WHERE id = ?').run(body.seq, body.digest, deviceId!, now(), channelId);
         for (const admin of usersOf(members(channelId).filter(row => row.admin))) deps.notify(admin, { type: 'channel', id: channelId, change: 'frozen', seq: body.seq, digest: body.digest });
         return json({ frozen: true }, 202);
@@ -440,7 +448,8 @@ export function createChannels(deps: Deps) {
         const key = deps.sigKey(deviceId!);
         if (!key || !ed25519Verify(key, resolveBytes(channelId, body.action, body.seq, body.digest), body.signature)) return json({ error: 'The resolution is not signed by this device.' }, 403);
         if (body.action === 'dismiss') {
-            db.query('UPDATE channels SET frozen_seq = NULL, frozen_digest = NULL, frozen_by = NULL, frozen_at = NULL WHERE id = ?').run(channelId);
+            // The dismissed commit can't be reported again: the rollback state it needed is dropped with the report.
+            db.query('UPDATE channels SET frozen_seq = NULL, frozen_digest = NULL, frozen_by = NULL, frozen_at = NULL, prev_state = NULL, prev_epoch = NULL WHERE id = ?').run(channelId);
             for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'thawed' });
             for (const id of usersOf(members(channelId))) deps.pumpUser(id);
             return json({ resolved: 'dismiss' });
@@ -474,12 +483,20 @@ export function createChannels(deps: Deps) {
 
     // ---------- Fan-out ----------
 
+    /** A device that is no longer eligible holds no place in any channel and has no Welcomes waiting. */
+    function dropDevice(deviceId: string) {
+        db.query('DELETE FROM channel_members WHERE device_id = ?').run(deviceId);
+        db.query('DELETE FROM mls_welcomes WHERE device_id = ?').run(deviceId);
+    }
+
     /** Sends a stream's device what it has not been sent: Welcomes, then each channel's log from its cursor. */
     function pump(socket: ServerWebSocket<GroupConnection>) {
         const { session, sent, groups } = socket.data;
         if (socket.readyState !== 1) return;
         const deviceId = deps.sessionDevice(session);
         if (!deviceId) return;
+        // The same gate as the HTTP paths: a device that left the signed list (or was revoked) is owed nothing.
+        if (!deps.eligible(socket.data.userId, deviceId)) { dropDevice(deviceId); return; }
         const room = () => sent.size < INFLIGHT && socket.getBufferedAmount() <= 16384;
         if (!room()) return;
         for (const row of db.query<any, [string, number]>('SELECT id, channel_id, sender_id, epoch, seq, LENGTH(welcome) + LENGTH(tree) AS size, created_at FROM mls_welcomes WHERE device_id = ? AND created_at > ? ORDER BY created_at, id LIMIT 16').all(deviceId, now() - WELCOME_TTL)) {
@@ -492,9 +509,9 @@ export function createChannels(deps: Deps) {
                 welcome: full ? Buffer.from(full.welcome).toString('base64url') : null, tree: full ? Buffer.from(full.tree).toString('base64url') : null, ...(inline ? {} : { large: true }) }));
         }
         for (const member of db.query<Member & { frozen_seq: number | null }, [string]>("SELECT m.*, c.frozen_seq FROM channel_members m JOIN channels c ON c.id = m.channel_id WHERE m.device_id = ?").all(deviceId)) {
-            let from = Math.max(member.cursor, groups.get(member.channel_id) ?? 0);
+            let from = Math.max(member.cursor, member.joined_seq, groups.get(member.channel_id) ?? 0);
             const oldest = db.query<{ seq: number | null }, [string]>('SELECT MIN(seq) AS seq FROM group_log WHERE channel_id = ?').get(member.channel_id)!.seq;
-            if (oldest !== null && oldest > from + 1 && from === member.cursor) {
+            if (oldest !== null && oldest > from + 1 && from === Math.max(member.cursor, member.joined_seq)) {
                 // The log was trimmed past this device (30 days): tell it once; it resyncs with an external join.
                 socket.send(JSON.stringify({ type: 'channel', id: member.channel_id, change: 'gap', oldest }));
                 groups.set(member.channel_id, oldest - 1); from = oldest - 1;
@@ -512,13 +529,14 @@ export function createChannels(deps: Deps) {
     /** A `cursor` frame: this stream's device has processed the channel up to `seq`. */
     function cursorFrame(socket: ServerWebSocket<GroupConnection>, message: { channel: string; seq: number }) {
         const deviceId = deps.sessionDevice(socket.data.session);
-        if (deviceId && ID.test(message.channel)) setCursor({ id: socket.data.userId }, deviceId, message.channel, message.seq);
+        if (!deviceId || !deps.eligible(socket.data.userId, deviceId)) return;
+        if (ID.test(message.channel)) setCursor({ id: socket.data.userId }, deviceId, message.channel, message.seq);
         pump(socket);
     }
     /** An `ack` frame for a Welcome: the device has stored it. */
     function ackWelcome(socket: ServerWebSocket<GroupConnection>, id: string) {
         const deviceId = deps.sessionDevice(socket.data.session);
-        if (deviceId) db.query('DELETE FROM mls_welcomes WHERE id = ? AND device_id = ?').run(id, deviceId);
+        if (deviceId && deps.eligible(socket.data.userId, deviceId)) db.query('DELETE FROM mls_welcomes WHERE id = ? AND device_id = ?').run(id, deviceId);
     }
 
     // ---------- Retention ----------
@@ -530,7 +548,8 @@ export function createChannels(deps: Deps) {
         lastSweep = now();
         db.transaction(() => {
             // A revoked device no longer holds a place in anyone's retention.
-            db.query("DELETE FROM channel_members WHERE device_id IN (SELECT id FROM devices WHERE state = 'revoked')").run();
+            const held = db.query<{ device_id: string; user_id: string }, []>('SELECT DISTINCT device_id, user_id FROM channel_members UNION SELECT device_id, (SELECT user_id FROM devices WHERE id = device_id) FROM mls_welcomes').all();
+            for (const { device_id, user_id } of held) if (!deps.eligible(user_id, device_id)) dropDevice(device_id);
             db.query('DELETE FROM mls_welcomes WHERE created_at <= ?').run(now() - WELCOME_TTL);
             // The log lives 30 days at most, read or not; a frozen commit waits for its resolution.
             db.query('DELETE FROM group_log WHERE created_at <= ? AND (SELECT frozen_seq FROM channels WHERE id = group_log.channel_id) IS NULL').run(now() - LOG_TTL);

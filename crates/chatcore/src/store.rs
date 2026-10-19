@@ -17,6 +17,8 @@ pub trait Store: Send {
     fn put(&mut self, key: &str, value: Value) -> Result<()> { self.batch(vec![Write::Put(key.to_string(), value)]) }
     fn delete(&mut self, key: &str) -> Result<()> { self.batch(vec![Write::Delete(key.to_string())]) }
     fn delete_prefix(&mut self, prefix: &str) -> Result<()>;
+    /// Every row whose key starts with `prefix`, in key order.
+    fn scan(&mut self, prefix: &str) -> Result<Vec<(String, Value)>>;
     /// All writes apply atomically or not at all.
     fn batch(&mut self, writes: Vec<Write>) -> Result<()>;
     /// Whether a missing identity may be created on first use. False for a key database that existed
@@ -38,6 +40,9 @@ pub struct MemoryStore {
 
 impl Store for MemoryStore {
     fn get(&mut self, key: &str) -> Result<Option<Value>> { Ok(self.map.get(key).cloned()) }
+    fn scan(&mut self, prefix: &str) -> Result<Vec<(String, Value)>> {
+        Ok(self.map.range(prefix.to_string()..).take_while(|(key, _)| key.starts_with(prefix)).map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
     fn delete_prefix(&mut self, prefix: &str) -> Result<()> {
         if self.fail_writes > 0 { self.fail_writes -= 1; return Err(ChatError::storage("injected failure")); }
         self.map.retain(|key, _| !key.starts_with(prefix));
@@ -90,6 +95,9 @@ impl JournaledStore {
 
 impl Store for JournaledStore {
     fn get(&mut self, key: &str) -> Result<Option<Value>> { Ok(self.map.get(key).cloned()) }
+    fn scan(&mut self, prefix: &str) -> Result<Vec<(String, Value)>> {
+        Ok(self.map.range(prefix.to_string()..).take_while(|(key, _)| key.starts_with(prefix)).map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
     fn delete_prefix(&mut self, prefix: &str) -> Result<()> {
         let keys: Vec<String> = self.map.range(prefix.to_string()..).take_while(|(key, _)| key.starts_with(prefix)).map(|(key, _)| key.clone()).collect();
         for key in keys {

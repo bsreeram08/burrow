@@ -181,6 +181,15 @@ impl Store for SqliteStore {
             .map_err(ChatError::storage)?;
         text.map(|text| self.unseal(key, &text)).transpose()
     }
+    fn scan(&mut self, prefix: &str) -> Result<Vec<(String, Value)>> {
+        let upper = format!("{prefix}\u{ffff}");
+        let rows: Vec<(String, String)> = {
+            let mut statement = self.connection.prepare("SELECT key, value FROM kv WHERE key >= ?1 AND key <= ?2 AND key <> ?3 ORDER BY key").map_err(ChatError::storage)?;
+            let rows = statement.query_map(params![prefix, upper, MARKER], |row| Ok((row.get(0)?, row.get(1)?))).map_err(ChatError::storage)?;
+            rows.collect::<std::result::Result<_, _>>().map_err(ChatError::storage)?
+        };
+        rows.into_iter().filter(|(key, _)| key.starts_with(prefix)).map(|(key, text)| self.unseal(&key, &text).map(|value| (key, value))).collect()
+    }
     fn delete_prefix(&mut self, prefix: &str) -> Result<()> {
         // Same range as IDBKeyRange.bound(prefix, prefix + '￿').
         let upper = format!("{prefix}\u{ffff}");

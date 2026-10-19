@@ -37,6 +37,7 @@ sealed class AccountEvent {
           fromUsername: (m['from'] as Map)['username'] as String,
           envelope: m['envelope'] as String,
           createdAt: m['createdAt'] as int,
+          ephemeral: m['ephemeral'] == true,
         ),
         _ => null,
       };
@@ -83,8 +84,18 @@ class Incoming extends AccountEvent {
 }
 
 class EnvelopeEvent extends AccountEvent {
-  const EnvelopeEvent({required this.id, required this.fromId, required this.fromUsername, required this.envelope, required this.createdAt});
+  const EnvelopeEvent({
+    required this.id,
+    required this.fromId,
+    required this.fromUsername,
+    required this.envelope,
+    required this.createdAt,
+    this.ephemeral = false,
+  });
   final String id;
+
+  /// Live-only delivery (typing): never stored by the server, never acknowledged.
+  final bool ephemeral;
   final String fromId;
   final String fromUsername;
   final String envelope;

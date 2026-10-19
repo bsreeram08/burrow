@@ -10,6 +10,7 @@ import 'push/push_service.dart';
 import 'theme/theme_prefs.dart';
 import 'ui/call_screen.dart';
 import 'ui/chat_list_screen.dart';
+import 'ui/command_palette.dart';
 import 'ui/conversation_screen.dart';
 import 'ui/incoming_call.dart';
 import 'ui/welcome_screen.dart';
@@ -58,7 +59,7 @@ class PrivateChatApp extends ConsumerStatefulWidget {
   ConsumerState<PrivateChatApp> createState() => _PrivateChatAppState();
 }
 
-class _PrivateChatAppState extends ConsumerState<PrivateChatApp> {
+class _PrivateChatAppState extends ConsumerState<PrivateChatApp> with WidgetsBindingObserver {
   final _subscriptions = <StreamSubscription<Object?>>[];
   PushService? _push;
   String? _callkitAccepted;
@@ -67,6 +68,7 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     unawaited(ref.read(themePrefsProvider.notifier).load(null));
     unawaited(ref.read(appProvider.notifier).restore());
     unawaited(_checkVersion());
@@ -122,7 +124,11 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> {
   }
 
   @override
+  void didChangePlatformBrightness() => ref.read(platformBrightnessProvider.notifier).set(WidgetsBinding.instance.platformDispatcher.platformBrightness);
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     for (final s in _subscriptions) {
       s.cancel();
     }
@@ -132,7 +138,9 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> {
   @override
   Widget build(BuildContext context) {
     final router = ref.watch(routerProvider);
-    final tokens = ref.watch(themePrefsProvider).tokens();
+    final prefs = ref.watch(themePrefsProvider);
+    final tokens = prefs.tokens(null, ref.watch(platformBrightnessProvider));
+    final textScale = prefs.display.textSize.scale;
     ref.listen(appProvider.select((s) => s.phase), (_, phase) {
       if (phase == AuthPhase.signedIn) _startPush();
     });
@@ -148,40 +156,68 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> {
         final ring = ref.watch(appProvider.select((s) => s.incoming));
         final inactive = ref.watch(appProvider.select((s) => s.inactiveDevice));
         final locked = ref.watch(appProvider.select((s) => s.keysLocked));
-        return Stack(
-          children: [
-            child ?? const SizedBox.shrink(),
-            if (inactive && !locked) const Positioned(left: 0, right: 0, bottom: 0, child: InactiveDeviceBanner()),
-            if (locked) const Positioned(left: 0, right: 0, bottom: 0, child: KeysLockedBanner()),
-            if (_updateRequired)
-              const Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: Material(
-                  color: Color(0xFF3D321A),
-                  child: SafeArea(top: false, child: Padding(padding: EdgeInsets.all(14), child: Text('Update required: this app version is too old for the server.', style: TextStyle(color: Color(0xFFF2C14E))))),
-                ),
+        final media = MediaQuery.of(context);
+        return PaletteShortcut(
+          navigatorContext: () => router.routerDelegate.navigatorKey.currentContext,
+          child: Stack(
+            children: [
+              MediaQuery(
+                // Text size (S/M/L/XL) multiplies the system's own text scaling.
+                data: media.copyWith(textScaler: _ScaledText(media.textScaler, textScale)),
+                child: child ?? const SizedBox.shrink(),
               ),
-            if (ring != null)
-              Positioned.fill(
-                child: IncomingCallCard(
-                  caller: ring.contact.username,
-                  video: ring.kind == 'video',
-                  onDecline: ref.read(appProvider.notifier).decline,
-                  onAccept: ({required audioOnly}) async {
-                    await ref.read(appProvider.notifier).accept(audioOnly: audioOnly);
-                    unawaited(router.push('/call'));
-                  },
+              if (inactive && !locked) const Positioned(left: 0, right: 0, bottom: 0, child: InactiveDeviceBanner()),
+              if (locked) const Positioned(left: 0, right: 0, bottom: 0, child: KeysLockedBanner()),
+              if (_updateRequired)
+                const Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 0,
+                  child: Material(
+                    color: Color(0xFF3D321A),
+                    child: SafeArea(
+                      top: false,
+                      child: Padding(
+                        padding: EdgeInsets.all(14),
+                        child: Text('Update required: this app version is too old for the server.', style: TextStyle(color: Color(0xFFF2C14E))),
+                      ),
+                    ),
+                  ),
                 ),
-              ),
-          ],
+              if (ring != null)
+                Positioned.fill(
+                  child: IncomingCallCard(
+                    caller: ring.contact.username,
+                    video: ring.kind == 'video',
+                    onDecline: ref.read(appProvider.notifier).decline,
+                    onAccept: ({required audioOnly}) async {
+                      await ref.read(appProvider.notifier).accept(audioOnly: audioOnly);
+                      unawaited(router.push('/call'));
+                    },
+                  ),
+                ),
+            ],
+          ),
         );
       },
     );
   }
 }
 
+class _ScaledText extends TextScaler {
+  const _ScaledText(this.base, this.factor);
+  final TextScaler base;
+  final double factor;
+  @override
+  double scale(double fontSize) => base.scale(fontSize) * factor;
+  @override
+  // ignore: deprecated_member_use
+  double get textScaleFactor => base.textScaleFactor * factor;
+  @override
+  bool operator ==(Object other) => other is _ScaledText && other.base == base && other.factor == factor;
+  @override
+  int get hashCode => Object.hash(base, factor);
+}
 
 /// Shown while another device or browser holds this account's encryption keys.
 class InactiveDeviceBanner extends ConsumerWidget {
@@ -196,10 +232,7 @@ class InactiveDeviceBanner extends ConsumerWidget {
         child: Row(
           children: [
             const Expanded(
-              child: Text(
-                'Encrypted messaging for this account is active on another device or browser.',
-                style: TextStyle(color: Color(0xFFF2C14E)),
-              ),
+              child: Text('Encrypted messaging for this account is active on another device or browser.', style: TextStyle(color: Color(0xFFF2C14E))),
             ),
             const SizedBox(width: 8),
             FilledButton(

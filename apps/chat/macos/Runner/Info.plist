@@ -31,6 +31,6 @@
 	<key>NSCameraUsageDescription</key>
 	<string>Video calls use your camera only after you start or accept a call.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Calls use your microphone only after you start or accept a call.</string>
+	<string>Calls and voice messages use your microphone only while you are in a call or recording.</string>
 </dict>
 </plist>

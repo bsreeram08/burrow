@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:uuid/uuid.dart';
 
@@ -10,6 +10,15 @@ import '../crypto/chat_crypto.dart';
 import '../store/disposition.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
+import 'payload.dart';
+
+/// Read receipts: at most one `read` per contact per 2 s.
+const readIntervalMs = 2000;
+
+/// Typing: `on:true` at most every 4 s; a received one older than 15 s is dropped; shown for 6 s.
+const typingThrottleMs = 4000;
+const typingFreshMs = 15000;
+const typingHideMs = 6000;
 
 /// End-to-end encrypted contact messaging over the server mailbox. Port of the
 /// web client's account.js receive/send path: decrypt, validate, store, then
@@ -54,7 +63,15 @@ class Messenger {
     required this.ack,
     this.viewing,
     RotationPrefs? rotation,
-  }) : rotation = rotation ?? MemoryRotationPrefs();
+    bool Function()? readReceipts,
+    int Function()? now,
+  }) : rotation = rotation ?? MemoryRotationPrefs(),
+       readReceipts = readReceipts ?? (() => true),
+       _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
+
+  /// "Send read receipts" (default on). Off: none are sent and others' are not shown.
+  final bool Function() readReceipts;
+  final int Function() _now;
 
   /// Chat key rotation settings (account.js `rotation-*`).
   final RotationPrefs rotation;
@@ -73,6 +90,7 @@ class Messenger {
   final _notices = StreamController<String>.broadcast();
   final _unread = StreamController<Map<String, int>>.broadcast();
   final _identity = StreamController<String>.broadcast();
+  final _typing = StreamController<Set<String>>.broadcast();
   final Map<String, int> unread = {};
   final Map<String, int> _attempts = {};
   final Set<String> flagged = {};
@@ -85,6 +103,10 @@ class Messenger {
 
   /// A contact's security code changed (contact id).
   Stream<String> get identityChanges => _identity.stream;
+
+  /// Contact ids currently typing to us.
+  Stream<Set<String>> get typingChanges => _typing.stream;
+  Set<String> get typing => _typingTimers.keys.toSet();
 
   String conversationWith(String contactId) => pairId(me.id, contactId);
 
@@ -142,6 +164,7 @@ class Messenger {
   Future<void> _receive(EnvelopeEvent event) async {
     // Inactive: neither process nor acknowledge; the active device will. Locked keys: neither, until recovery.
     if (!active || keysLocked) return;
+    if (event.ephemeral) return _receiveEphemeral(event);
     final conversationId = conversationWith(event.fromId);
     String? failureCode;
     var failed = false;
@@ -159,11 +182,17 @@ class Messenger {
         }
         if (published != decrypted.identity) throw const CryptoException('Identity mismatch', code: 'mismatch');
       }
-      final payload = _checkPayload(decrypted.plaintextJson);
+      final Map<String, Object?> payload;
+      try {
+        payload = checkPayload(decrypted.plaintextJson);
+      } on PayloadException {
+        throw const CryptoException('Invalid message', code: 'invalid');
+      }
       final safety = await crypto.safety(me.username, event.fromId, event.fromUsername);
       final untrusted = decrypted.identityChanged || (safety?.blocked ?? false);
       if (decrypted.identityChanged) _identity.add(event.fromId);
-      // An unaccepted new identity may deliver (flagged) messages, but may not burn history or fake receipts.
+      // An unaccepted new identity may deliver (flagged) messages, but may not burn history, fake receipts,
+      // react, edit or mark anything read.
       if (!untrusted || payload['type'] == 'message') {
         switch (payload['type']) {
           case 'rotate':
@@ -176,15 +205,28 @@ class Messenger {
           case 'burn':
             await store.removeConversation(conversationId);
             burned = true;
+          case 'react':
+            await store.react(conversationId, payload['target'] as String, who: 'peer', emoji: payload['emoji'] as String, on: payload['on'] as bool);
+          case 'edit':
+            // Only the author edits: the target must be a message we received from this sender.
+            // A future editedAt is clamped (as on the web) so one edit can't outrank every later one.
+            final editedAt = math.min(payload['editedAt'] as int, _now() + clockSkewMs);
+            await store.edit(conversationId, payload['target'] as String, text: payload['text'] as String, editedAt: editedAt, author: Direction.incoming);
+          case 'read':
+            if (readReceipts()) await store.markRead(conversationId, (payload['ids'] as List).cast<String>(), direction: Direction.outgoing);
+          case 'typing':
+            break; // Typing travels only as an ephemeral envelope; a stored one is stale.
           default:
             if (await store.receive(conversationId, payload) == ReceiveResult.stored) {
               if (untrusted) flagged.add((payload['id'] as String).toLowerCase());
               if (viewing?.call() != event.fromId) unread[event.fromId] = (unread[event.fromId] ?? 0) + 1;
               receipt = payload['id'] as String;
+              _setTyping(event.fromId, false);
             }
         }
       }
       await crypto.commit(decrypted.commitId, rotate: rotated);
+      _confirmed.add(event.fromId);
     } on CryptoException catch (error) {
       if (error.keysLocked) {
         // Never count or acknowledge this: the message is fine, our key database isn't.
@@ -228,24 +270,35 @@ class Messenger {
     }
   }
 
-  /// Shape only; content is validated by [MessageStore.receive].
-  Map<String, Object?> _checkPayload(String json) {
-    Object? decoded;
+  /// Live-only envelopes carry typing and nothing else. They are never acknowledged (the server keeps
+  /// nothing to delete) and any failure is dropped silently: a lost typing hint is harmless.
+  Future<void> _receiveEphemeral(EnvelopeEvent event) async {
     try {
-      decoded = jsonDecode(json);
-    } catch (_) {
-      throw const CryptoException('Invalid message', code: 'invalid');
-    }
-    if (decoded is! Map<String, dynamic> || decoded['v'] != 1 || decoded['id'] is! String || !uuidPattern.hasMatch(decoded['id'] as String)) {
-      throw const CryptoException('Invalid message', code: 'invalid');
-    }
-    final type = decoded['type'], size = decoded.length;
-    final ok = ((type == 'receipt' || type == 'burn') && size == 3) ||
-        (type == 'message' && size == 6) ||
-        (type == 'rotate' && size == 4 && (decoded['reason'] == 'manual' || decoded['reason'] == 'scheduled')) ||
-        (type == 'policy' && size == 4 && decoded['rotateEveryMs'] is int && (decoded['rotateEveryMs'] as int) >= 0);
-    if (!ok) throw const CryptoException('Invalid message', code: 'invalid');
-    return decoded;
+      final decrypted = await crypto.decryptFrom(event.fromId, event.envelope);
+      // A new identity never arrives on a live-only envelope; a session must already exist.
+      if (decrypted.identity != null || decrypted.identityChanged) {
+        await crypto.abort(decrypted.commitId);
+        return;
+      }
+      Map<String, Object?>? payload;
+      try {
+        payload = checkPayload(decrypted.plaintextJson);
+      } on PayloadException {
+        payload = null;
+      }
+      await crypto.commit(decrypted.commitId, rotate: false);
+      if (payload == null || payload['type'] != 'typing') return;
+      final safety = await crypto.safety(me.username, event.fromId, event.fromUsername);
+      if (safety?.blocked ?? false) return;
+      final on = payload['on'] as bool, at = payload['at'] as int;
+      if (on && (_now() - at).abs() > typingFreshMs) return;
+      _setTyping(event.fromId, on);
+    } on CryptoException catch (error) {
+      if (error.keysLocked) {
+        keysLocked = true;
+        _lockedChanges.add(true);
+      }
+    } catch (_) {}
   }
 
   void markRead(String contactId) {
@@ -253,26 +306,153 @@ class Messenger {
   }
 
   // ---------- Sending ----------
-  /// Stores a new outgoing message as queued and starts delivery.
-  Future<ChatMessage> send(Contact contact, String text, {Duration? disappearAfter}) async {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final message = await store.put(
+  /// Stores a new outgoing message as queued and starts delivery. A link preview is kept only while its
+  /// URL is still in the text; the whole payload must fit the 16 KB envelope budget.
+  Future<ChatMessage> send(
+    Contact contact,
+    String text, {
+    Duration? disappearAfter,
+    ReplyTo? replyTo,
+    Attachment? attachment,
+    LinkPreview? link,
+    String? id,
+  }) async {
+    final now = _now();
+    final candidate = validate(
       ChatMessage(
-        id: const Uuid().v4(),
+        id: id ?? const Uuid().v4(),
         conversationId: conversationWith(contact.id!),
         direction: Direction.outgoing,
         text: text,
         createdAt: now,
         status: MessageStatus.queued,
         expiresAt: disappearAfter == null ? null : now + disappearAfter.inMilliseconds,
+        replyTo: replyTo,
+        attachment: attachment,
+        link: link != null && text.contains(link.url) ? link : null,
       ),
     );
+    encodePayload(candidate.toPayload());
+    final message = await store.put(candidate);
     unawaited(flush());
     return message;
   }
 
+  void _requireActive() {
+    if (!active || keysLocked) throw const CryptoException('Encrypted messaging for this account is active on another device or browser.');
+  }
+
+  /// Adds or removes our reaction: stored here at once, then sent. Reverted if it can't be sent.
+  Future<void> react(Contact contact, ChatMessage target, String emoji, {required bool on}) async {
+    _requireActive();
+    final conversationId = conversationWith(contact.id!);
+    if (!await store.react(conversationId, target.id, who: 'me', emoji: emoji, on: on)) return;
+    try {
+      await _sendControl(contact, {'v': 1, 'type': 'react', 'id': const Uuid().v4(), 'target': target.id, 'emoji': emoji, 'on': on});
+    } catch (_) {
+      await store.react(conversationId, target.id, who: 'me', emoji: emoji, on: !on);
+      rethrow;
+    }
+  }
+
+  /// Edits one of our sent text messages. Queued messages can't be edited yet (the peer doesn't have them).
+  Future<void> edit(Contact contact, ChatMessage target, String text) async {
+    _requireActive();
+    if (!target.outgoing || target.attachment != null || target.status == MessageStatus.queued) {
+      throw const StoreException('Only your own sent text messages can be edited.');
+    }
+    if (!validText(text, hasAttachment: false)) throw const StoreException('A message can be up to 4,096 bytes and not empty.');
+    final editedAt = math.max(_now(), (target.editedAt ?? 0) + 1);
+    final payload = {'v': 1, 'type': 'edit', 'id': const Uuid().v4(), 'target': target.id, 'text': text, 'editedAt': editedAt};
+    encodePayload(payload);
+    await _sendControl(contact, payload);
+    await store.edit(conversationWith(contact.id!), target.id, text: text, editedAt: editedAt, author: Direction.outgoing);
+  }
+
+  // ---------- Read receipts ----------
+  final Map<String, Set<String>> _toRead = {};
+  final Map<String, int> _lastReadSent = {};
+  final Map<String, Timer> _readTimers = {};
+
+  /// The conversation with [contact] is visible and focused and shows these incoming messages.
+  /// Batched: at most one `read` per 2 s per contact, ≤ 100 ids each. With receipts off, they are
+  /// marked read here and nothing is sent.
+  void displayed(Contact contact, Iterable<ChatMessage> messages) {
+    final ids = [for (final m in messages) if (!m.outgoing && m.status == MessageStatus.delivered) m.id];
+    if (ids.isEmpty || _disposed) return;
+    (_toRead[contact.id!] ??= {}).addAll(ids);
+    _scheduleRead(contact);
+  }
+
+  void _scheduleRead(Contact contact) {
+    final id = contact.id!;
+    if (_readTimers[id]?.isActive ?? false) return;
+    final wait = math.max(0, readIntervalMs - (_now() - (_lastReadSent[id] ?? 0)));
+    _readTimers[id] = Timer(Duration(milliseconds: wait), () => unawaited(_sendRead(contact)));
+  }
+
+  Future<void> _sendRead(Contact contact) async {
+    final id = contact.id!;
+    final pending = _toRead[id];
+    if (pending == null || pending.isEmpty || _disposed) return;
+    final batch = pending.take(maxReadIds).toList();
+    pending.removeAll(batch);
+    _lastReadSent[id] = _now();
+    final conversationId = conversationWith(id);
+    try {
+      final changed = await store.markRead(conversationId, batch, direction: Direction.incoming);
+      if (changed.isNotEmpty && readReceipts() && active && !keysLocked) {
+        await _sendControl(contact, {'v': 1, 'type': 'read', 'id': const Uuid().v4(), 'ids': changed});
+      }
+    } catch (_) {
+      // A receipt is a courtesy: never retry into a loop. The messages stay marked here.
+    }
+    if (pending.isNotEmpty) _scheduleRead(contact);
+  }
+
+  // ---------- Typing ----------
+  final Map<String, Timer> _typingTimers = {};
+  final Map<String, int> _typingSentAt = {};
+  final Set<String> _typingOn = {};
+
+  /// Contacts we have received from on the current session: their side holds it, so a live-only
+  /// envelope can never be a session's first message (X3DH initial messages are claimed once).
+  final Set<String> _confirmed = {};
+
+  void _setTyping(String contactId, bool on) {
+    final had = _typingTimers.remove(contactId);
+    had?.cancel();
+    if (on) _typingTimers[contactId] = Timer(const Duration(milliseconds: typingHideMs), () => _setTyping(contactId, false));
+    if ((had != null) != on || on) {
+      if (!_typing.isClosed) _typing.add(typing);
+    }
+  }
+
+  /// The composer has text ([on]) or was sent, cleared or left. `on:true` is throttled to one per 4 s;
+  /// `on:false` goes only after an `on:true`. Live-only, so sent only while the contact is online and an
+  /// established session exists (each dropped envelope still advances the sending chain).
+  Future<void> typingChanged(Contact contact, {required bool on}) async {
+    final id = contact.id!;
+    if (!active || keysLocked || _disposed) return;
+    final now = _now();
+    if (on) {
+      if (now - (_typingSentAt[id] ?? 0) < typingThrottleMs) return;
+    } else if (!_typingOn.contains(id)) {
+      return;
+    }
+    if (!contact.online || !_confirmed.contains(id) || await crypto.sessionInfo(id) == null) return;
+    final safety = await crypto.safety(me.username, id, contact.username);
+    if (safety?.blocked ?? false) return;
+    on ? _typingSentAt[id] = now : _typingSentAt.remove(id);
+    on ? _typingOn.add(id) : _typingOn.remove(id);
+    try {
+      final result = await crypto.encryptTo(id, encodePayload({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now, 'on': on}));
+      if (result is Encrypted) await api.postEnvelope(contact.username, result.envelope, ephemeral: true);
+    } catch (_) {}
+  }
+
   Future<void> _sendControl(Contact contact, Map<String, Object?> payload) async {
-    final json = jsonEncode(payload);
+    final json = encodePayload(payload);
     var result = await crypto.encryptTo(contact.id!, json);
     if (result is NeedsBundle) result = await crypto.encryptTo(contact.id!, json, bundleJson: await api.bundleJson(contact.username));
     switch (result) {
@@ -308,14 +488,7 @@ class Messenger {
               await _tellPolicy(contact);
               prepared = true;
             }
-            await _sendControl(contact, {
-              'v': 1,
-              'type': 'message',
-              'id': record.id,
-              'text': record.text,
-              'createdAt': record.createdAt,
-              'expiresAt': record.expiresAt,
-            });
+            await _sendControl(contact, record.toPayload());
             await store.setStatus(conversationId, record.id, MessageStatus.sent);
           } catch (error) {
             if (error is CryptoException && error.code == 'identity-blocked') {
@@ -371,6 +544,7 @@ class Messenger {
   Future<void> resetSession(Contact contact, {String reason = 'manual'}) async {
     if (!active) throw const CryptoException('Encrypted messaging for this account is active on another device or browser.');
     await crypto.rotate(contact.id!);
+    _confirmed.remove(contact.id);
     await _sendControl(contact, {'v': 1, 'type': 'rotate', 'id': const Uuid().v4(), 'reason': reason});
     _notices.add(reason == 'manual' ? '🔄 Secure session reset by you' : '🔄 Keys rotated on schedule');
     await _tellPolicy(contact);
@@ -408,6 +582,7 @@ class Messenger {
   /// Settings → Security: new identity keys for this device (explicit only). Contacts see a code change.
   Future<void> regenerateIdentity() async {
     await crypto.resetIdentity();
+    _confirmed.clear();
     rotation.clearTold();
     await takeOver();
   }
@@ -415,6 +590,10 @@ class Messenger {
   Future<void> dispose() async {
     _disposed = true;
     _retryTimer?.cancel();
+    for (final t in [..._readTimers.values, ..._typingTimers.values]) {
+      t.cancel();
+    }
+    await _typing.close();
     await _notices.close();
     await _unread.close();
     await _identity.close();

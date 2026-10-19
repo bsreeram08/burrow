@@ -79,7 +79,7 @@ Future<void> _seed(MessageStore store) async {
   );
   await add(alice, Direction.incoming, 'did the new build land?', 600000, MessageStatus.delivered);
   await add(alice, Direction.outgoing, 'yep — native app, same encryption as the web one', 540000, MessageStatus.delivered);
-  await add(alice, Direction.incoming, 'and the calls?', 480000, MessageStatus.delivered);
+  await add(alice, Direction.incoming, 'and the calls? **all** of them, even `video`?', 480000, MessageStatus.delivered);
   await add(alice, Direction.outgoing, 'CallKit on iPhone, full-screen ring on Android', 420000, MessageStatus.delivered);
   await add(alice, Direction.incoming, 'nice. this one disappears in an hour 👀', 300000, MessageStatus.delivered, expires: 3600000);
   await add(alice, Direction.outgoing, 'compare the security code before we go further', 120000, MessageStatus.sent);
@@ -87,6 +87,8 @@ Future<void> _seed(MessageStore store) async {
   await add(bob, Direction.incoming, 'call me when you are free', 7200000, MessageStatus.delivered);
   await add(bob, Direction.incoming, 'it rings even if the app is closed?', 7100000, MessageStatus.delivered);
   await add(elliot, Direction.incoming, 'hello friend.', 86400000, MessageStatus.delivered);
+  await store.react(alice, '00000000-0000-4000-8000-000000000002', who: 'peer', emoji: '❤️', on: true);
+  await store.react(alice, '00000000-0000-4000-8000-000000000002', who: 'me', emoji: '❤️', on: true);
 }
 
 Future<void> main() async {

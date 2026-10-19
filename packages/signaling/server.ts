@@ -9,6 +9,9 @@ import { createAccounts, openDatabase, type Accounts, type EventsConnection } fr
 import { createPush, type PushSend } from './push';
 import { nativeSenderFromEnv, type NativePlatform, type NativeSend } from './native-push';
 import { createEmoji, type Emoji, type Fetcher, type Resolver } from './emoji';
+import { BLOB_MAX, createBlobs, type Blobs } from './blobs';
+import { createUnfurl } from './unfurl';
+import type { Resolver as UnfurlResolver, Transport } from './safe-fetch';
 
 type Participant = { digest: string; socket?: ServerWebSocket<Connection> };
 type Room = { id: string; expiresAt: number; participants: Participant[]; sessionId?: string; pair?: string[]; kind?: string };
@@ -47,6 +50,11 @@ export type SignalingOptions = {
     emojiImportHosts?: string[];
     emojiFetcher?: Fetcher;
     emojiResolver?: Resolver;
+    /** Link preview test hooks: DNS answers and the HTTPS exchange (the address checks still apply). */
+    unfurlResolver?: UnfurlResolver;
+    unfurlTransport?: Transport;
+    /** Server-wide limit on stored attachment bytes (BLOB_BUDGET_BYTES); 20 GiB by default. */
+    blobBudget?: number;
     /** Test-only switches for the browser suites (e.g. choosing the encryption core). Honoured only on a
      *  loopback origin, so a production server can never expose them even if misconfigured. */
     allowTestFlags?: boolean;
@@ -120,6 +128,7 @@ export function startSignaling(options: SignalingOptions) {
     function sweep() {
         for (const room of rooms.values()) if (room.expiresAt <= now()) remove(room);
         accounts?.sweep();
+        blobs?.sweep();
     }
     function issue(participant: Participant) { const next = token(); participant.digest = digest(next); return next; }
     let accounts: Accounts | undefined;
@@ -162,16 +171,19 @@ export function startSignaling(options: SignalingOptions) {
         },
     } });
     const emoji: Emoji | undefined = db && options.dataDir ? createEmoji({ db, dataDir: options.dataDir, origin: options.origin, now, adminToken: options.adminToken, fetcher: options.emojiFetcher, resolver: options.emojiResolver, importHosts: options.emojiImportHosts }) : undefined;
+    const blobs: Blobs | undefined = db && options.dataDir ? createBlobs({ db, dataDir: options.dataDir, origin: options.origin, now, budget: options.blobBudget }) : undefined;
+    const unfurl = createUnfurl({ resolver: options.unfurlResolver, transport: options.unfurlTransport });
     const server = Bun.serve({
         hostname: options.hostname ?? '127.0.0.1', port: options.port ?? 3000,
-        // Custom emoji uploads (512 KB images as base64) are the one larger body; everything else keeps 128 KiB.
-        maxRequestBodySize: 786432,
+        // Encrypted attachments (25 MiB) and custom emoji (512 KB as base64) are the larger bodies; everything else
+        // keeps 128 KiB, checked per path below.
+        maxRequestBodySize: BLOB_MAX,
         fetch(request, server) {
             const url = new URL(request.url);
             // Body limits are enforced on what is actually read: a body needs an exact Content-Length (no chunked
-            // transfer, which could run past a declared length), at most 128 KiB everywhere except an emoji upload.
+            // transfer, which could run past a declared length), at most 128 KiB everywhere except emoji and attachments.
             if (request.method !== 'GET' && request.method !== 'HEAD' && (request.body || request.headers.has('transfer-encoding'))) {
-                const declared = request.headers.get('content-length'), cap = url.pathname === '/api/emoji' ? 786432 : 131072;
+                const declared = request.headers.get('content-length'), cap = url.pathname === '/api/emoji' ? 786432 : url.pathname === '/api/blobs' ? BLOB_MAX : 131072;
                 if (request.headers.has('transfer-encoding') || !declared || !/^\d{1,9}$/.test(declared)) return json({ error: 'Content-Length required' }, 411);
                 if (Number(declared) > cap) return json({ error: 'Request too large' }, 413);
             }
@@ -185,7 +197,7 @@ export function startSignaling(options: SignalingOptions) {
             const source = requestSource(server.requestIP(request)?.address, request.headers, options.trustProxy);
             const requestOrigin = request.headers.get('origin');
             if (requestOrigin && requestOrigin !== options.origin) return json({ error: 'Origin denied' }, 403);
-            if (request.method === 'GET' && ['/', '/app.js', '/account.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/chat-store.js', '/signal.js', '/verify.js', '/core.js', '/core-worker.js', '/vendor/simplewebauthn-browser.js', '/style.css', '/install.js', '/sw.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(url.pathname)) {
+            if (request.method === 'GET' && ['/', '/app.js', '/account.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/chat-store.js', '/signal.js', '/verify.js', '/markdown.js', '/files.js', '/palette.js', '/core.js', '/core-worker.js', '/vendor/simplewebauthn-browser.js', '/style.css', '/install.js', '/sw.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(url.pathname)) {
                 const path = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
                 return new Response(Bun.file(new URL(`./public/${path}`, import.meta.url)), { headers: {
                     'Content-Security-Policy': PAGE_CSP,
@@ -209,6 +221,8 @@ export function startSignaling(options: SignalingOptions) {
             // router would otherwise spend the shared per-IP budget before their first API call.
             if (!allowRequest(source)) return json({ error: 'Rate limited' }, 429);
             if (emoji && accounts && /^\/api\/emoji(\/|$)/.test(url.pathname)) return emoji.handle(request, url, accounts.sessionUser(request), source);
+            if (blobs && accounts && /^\/api\/blobs(\/|$)/.test(url.pathname)) return blobs.handle(request, url, accounts.sessionUser(request));
+            if (accounts && /^\/api\/unfurl(\/|$)/.test(url.pathname)) return unfurl.handle(request, url, accounts.sessionUser(request));
             if (url.pathname.startsWith('/api/')) return accounts ? accounts.handle(request, url, server, source) : json({ error: 'Not found' }, 404);
             const roomMatch = /^\/rooms\/([A-Za-z0-9_-]{43})(\/ice)?$/.exec(url.pathname);
             if (roomMatch && (roomMatch[2] && request.method === 'GET' || !roomMatch[2] && request.method === 'DELETE')) {
@@ -314,13 +328,13 @@ export function startSignaling(options: SignalingOptions) {
     });
     const timer = setInterval(sweep, 1000);
     timer.unref();
-    return { server, accounts, stop() { clearInterval(timer); rooms.clear(); return server.stop(true); } };
+    return { server, accounts, blobs, stop() { clearInterval(timer); rooms.clear(); return server.stop(true); } };
 }
 
 if (import.meta.main) {
     const rawPort = process.env.PORT ?? '3000';
     if (!/^\d+$/.test(rawPort) || Number(rawPort) < 1 || Number(rawPort) > 65535) throw new Error('PORT must be 1–65535');
-    const app = startSignaling({ adminToken: process.env.ADMIN_TOKEN ?? '', origin: process.env.PUBLIC_ORIGIN ?? 'http://localhost:3000', hostname: process.env.HOST ?? '127.0.0.1', port: Number(rawPort), turnSecret: process.env.TURN_SECRET, turnUrls: process.env.TURN_URLS?.split(',').map(value => value.trim()).filter(Boolean), relayOnly: process.env.RELAY_ONLY === 'true', trustProxy: process.env.TRUST_PROXY === 'true', allowTestFlags: process.env.ALLOW_TEST_FLAGS === '1', emojiImportHosts: process.env.EMOJI_IMPORT_HOSTS?.split(',').map(value => value.trim()).filter(Boolean), dataDir: process.env.ACCOUNTS === 'off' ? undefined : process.env.DATA_DIR || 'data', apps: nativeApps(), nativePush: nativeSenderFromEnv() });
+    const app = startSignaling({ adminToken: process.env.ADMIN_TOKEN ?? '', origin: process.env.PUBLIC_ORIGIN ?? 'http://localhost:3000', hostname: process.env.HOST ?? '127.0.0.1', port: Number(rawPort), turnSecret: process.env.TURN_SECRET, turnUrls: process.env.TURN_URLS?.split(',').map(value => value.trim()).filter(Boolean), relayOnly: process.env.RELAY_ONLY === 'true', trustProxy: process.env.TRUST_PROXY === 'true', allowTestFlags: process.env.ALLOW_TEST_FLAGS === '1', blobBudget: process.env.BLOB_BUDGET_BYTES ? Number(process.env.BLOB_BUDGET_BYTES) : undefined, emojiImportHosts: process.env.EMOJI_IMPORT_HOSTS?.split(',').map(value => value.trim()).filter(Boolean), dataDir: process.env.ACCOUNTS === 'off' ? undefined : process.env.DATA_DIR || 'data', apps: nativeApps(), nativePush: nativeSenderFromEnv() });
     console.log(`Signaling listening on ${app.server.url}`);
     for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, async () => { await app.stop(); process.exit(0); });
 }

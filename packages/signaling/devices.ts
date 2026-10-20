@@ -14,7 +14,7 @@ type Format = {
     bindBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
     claimBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
 };
-const Format = (globalThis as any).DeviceFormat as Format & { successionBytes(record: object): Uint8Array; startBytes(deviceId: string, platform: string, deviceKey: string): Uint8Array; linkClaimBytes(linkId: string, deviceId: string, claim: string): Uint8Array };
+const Format = (globalThis as any).DeviceFormat as Format & { successionBytes(record: object): Uint8Array; startBytes(deviceId: string, platform: string, deviceKey: string): Uint8Array; linkClaimBytes(linkId: string, deviceId: string, claim: string): Uint8Array; recertBytes(userId: string, deviceId: string, platform: string, leafSigKey: string): Uint8Array; mlsCertBytes(userId: string, deviceId: string, platform: string, leafSigKey: string, aikSign: string, issuedAt: number): Uint8Array };
 export { Format };
 export const MAX_DEVICES = Format.MAX_DEVICES;
 const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/, KEY = /^[A-Za-z0-9_-]{43}$/;
@@ -317,6 +317,61 @@ export function createDevices(deps: Deps) {
         return [201, { seq: (count.max ?? 0) + 1 }];
     }
 
+    // ---------- Companion certificates after a transfer (docs/m5-linking.md §5.2.2) ----------
+    // A relay for public values only: a listed device asks the primary for an MLS certificate for its own leaf key, the
+    // primary answers. The request is signed by the device's registered key so neither the server nor anyone else can
+    // make the primary certify a leaf key the device did not name; the primary checks that signature again itself.
+    const canonicalKey = (value: unknown) => typeof value === 'string' && KEY.test(value) && Buffer.from(value, 'base64url').length === 32 && Buffer.from(value, 'base64url').toString('base64url') === value;
+    const isPrimaryDevice = (user: Caller) => { const mine = sessionDevice(user.session); return Boolean(mine && db.query('SELECT 1 FROM devices WHERE id = ? AND user_id = ? AND is_primary = 1 AND state = ?').get(mine, user.id, 'listed')); };
+    /** A listed device (not the primary) asks for a certificate for its own leaf key. Replaces its earlier request. */
+    function recertRequest(user: Caller, body: Record<string, any> | null): [number, object] {
+        const device = sessionDevice(user.session);
+        if (!device || !eligible(user.id, device)) return [403, { error: 'Only a listed device of the account can ask.' }];
+        const key = sigKey(device);
+        if (!body || !Format.PLATFORMS.includes(body.platform) || !canonicalKey(body.leafSigKey) || !key) return [400, { error: 'Invalid certificate request' }];
+        let bytes: Uint8Array;
+        try { bytes = Format.recertBytes(user.id, device, body.platform, body.leafSigKey); } catch { return [400, { error: 'Invalid certificate request' }]; }
+        if (!ed25519Verify(key, bytes, body.signature)) return [403, { error: 'The request is not signed by this device\'s key.' }];
+        db.query('INSERT OR REPLACE INTO recert_requests (device_id, user_id, platform, leaf_sig_key, signature, cert, created_at) VALUES (?, ?, ?, ?, ?, NULL, ?)').run(device, user.id, body.platform, body.leafSigKey, body.signature, now());
+        deps.notify(user.id, { type: 'recert', id: user.id, deviceId: device });
+        return [201, { status: 'requested' }];
+    }
+    /** The primary lists the requests that still wait, with each device's registered key so it can check the signature itself. */
+    function recertPending(user: Caller): [number, object] {
+        if (!isPrimaryDevice(user)) return [403, { error: 'Only the primary device answers.' }];
+        const rows = db.query<{ device_id: string; platform: string; leaf_sig_key: string; signature: string }, [string]>('SELECT device_id, platform, leaf_sig_key, signature FROM recert_requests WHERE user_id = ? AND cert IS NULL ORDER BY created_at').all(user.id);
+        return [200, { requests: rows.filter(row => eligible(user.id, row.device_id)).map(row => ({ deviceId: row.device_id, platform: row.platform, leafSigKey: row.leaf_sig_key, signature: row.signature, deviceKey: sigKey(row.device_id) })) }];
+    }
+    /** The primary answers with a certificate for exactly the leaf key that was asked about, signed by the current identity key. */
+    function recertAnswer(user: Caller, deviceId: string, body: Record<string, any> | null): [number, object] {
+        if (!isPrimaryDevice(user)) return [403, { error: 'Only the primary device answers.' }];
+        const request = DEVICE_ID.test(deviceId) ? db.query<{ platform: string; leaf_sig_key: string }, [string, string]>('SELECT platform, leaf_sig_key FROM recert_requests WHERE device_id = ? AND user_id = ?').get(deviceId, user.id) : null;
+        if (!request) return [404, { error: 'No request from that device.' }];
+        const aik = aikOf(user.id);
+        let cert: any;
+        try { cert = JSON.parse(String(body?.cert)); } catch { return [400, { error: 'Invalid certificate' }]; }
+        if (!cert || typeof cert !== 'object' || cert.userId !== user.id || cert.deviceId !== deviceId || cert.platform !== request.platform || cert.leafSigKey !== request.leaf_sig_key || cert.aikSign !== aik || !Number.isSafeInteger(cert.issuedAt)) return [400, { error: 'The certificate does not match the request.' }];
+        let bytes: Uint8Array;
+        try { bytes = Format.mlsCertBytes(cert.userId, cert.deviceId, cert.platform, cert.leafSigKey, cert.aikSign, cert.issuedAt); } catch { return [400, { error: 'Invalid certificate' }]; }
+        if (!ed25519Verify(aik!, bytes, cert.sig)) return [403, { error: 'The certificate is not signed by the current identity key.' }];
+        db.query('UPDATE recert_requests SET cert = ? WHERE device_id = ?').run(JSON.stringify(cert), deviceId);
+        deps.notify(user.id, { type: 'recert', id: user.id, deviceId, answered: true });
+        return [201, { status: 'answered' }];
+    }
+    /** A device reads the answer to its own request. */
+    function recertMine(user: Caller): [number, object] {
+        const device = sessionDevice(user.session);
+        const row = device ? db.query<{ cert: string | null }, [string]>('SELECT cert FROM recert_requests WHERE device_id = ?').get(device) : null;
+        if (!row) return [404, { error: 'No request.' }];
+        return [200, { cert: row.cert }];
+    }
+    /** A device drops its request once it installed the certificate. */
+    function recertDone(user: Caller): [number, object] {
+        const device = sessionDevice(user.session);
+        if (device) db.query('DELETE FROM recert_requests WHERE device_id = ?').run(device);
+        return [200, { status: 'done' }];
+    }
+
     /** The served view of an account's devices. Contacts see only the signed list; the owner also sees pending devices and when each was last seen. */
     function view(owner: { id: string }, viewer: Caller) {
         const stored = db.query<{ list: string; signature: string; certs: string }, [string]>('SELECT list, signature, certs FROM device_lists WHERE user_id = ?').get(owner.id);
@@ -374,6 +429,6 @@ export function createDevices(deps: Deps) {
 
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, identityChanged, identityChange, touch, sessionDevice, eligible, sigKey, aikOf };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, recertRequest, recertPending, recertAnswer, recertMine, recertDone, identityChanged, identityChange, touch, sessionDevice, eligible, sigKey, aikOf };
 }
 export type Devices = ReturnType<typeof createDevices>;

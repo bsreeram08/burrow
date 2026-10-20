@@ -132,6 +132,14 @@ const MIGRATIONS: ((db: Database) => void)[] = [
             CREATE TABLE identity_changes (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, aik TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL);
         `);
     },
+    // 6: after a primary transfer each companion asks the new primary for a certificate under the new account key.
+    db => {
+        db.exec(`
+            CREATE TABLE recert_requests (device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL, leaf_sig_key TEXT NOT NULL, signature TEXT NOT NULL, cert TEXT, created_at INTEGER NOT NULL);
+            CREATE INDEX recert_requests_user ON recert_requests (user_id);
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

@@ -138,6 +138,14 @@
     if (typeof linkId !== 'string' || !DEVICE_ID.test(linkId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid link claim');
     return writer().text16('webrtc-bun-linkclaim-v1').text16(linkId).text16(deviceId).bytes8(key32(claim)).done();
   }
+  /**
+   * What a listed device's key signs to ask the new primary for an MLS certificate under the new account key after a
+   * primary transfer (m5 §5.2.2): its id, platform and MLS leaf key. It can name only its own leaf.
+   */
+  function recertBytes(userId, deviceId, platform, leafSigKey) {
+    if (typeof userId !== 'string' || !USER_ID.test(userId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || !PLATFORM_OK(platform)) fail('Invalid certificate request');
+    return writer().text16('webrtc-bun-recert-v1').text16(userId).text16(deviceId).text16(platform).bytes8(key32(leafSigKey)).done();
+  }
   /** The record the old account key signs to hand over to a new one (primary transfer): keeps contacts' verification. */
   function successionBytes(record) {
     if (!exact(record, ['v', 'userId', 'oldSign', 'newSign', 'newDh', 'at']) || record.v !== 1 || typeof record.userId !== 'string' || !USER_ID.test(record.userId) || !timestamp(record.at)) fail('Invalid succession record');
@@ -293,5 +301,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, recertBytes, successionBytes, verifySuccession, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

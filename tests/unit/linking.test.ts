@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
+import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -562,5 +562,67 @@ suite('primary transfer relay (purpose: transfer)', () => {
         const signature = b64(sign(null, F.linkClaimBytes(linkId, c.deviceId, claim), c.key));
         expect((await call('POST', `/api/link/${linkId}/claim`, { body: { claim, signature } })).status).toBe(409);
         expect((await call('GET', '/api/me', { cookie: cCookie })).body.user.id).toBe(alice.id);
+    });
+});
+
+suite('companion certificates after a transfer (m5 §5.2.2)', () => {
+    /** A listed companion with its own session and a fresh core (its device key is `n.key`). */
+    async function listedCompanion(alice: Primary) {
+        const c = newcomer('linux');
+        run("INSERT INTO devices (id, user_id, platform, state, is_primary, sig_key, created_at) VALUES (?, ?, 'linux', 'listed', 0, ?, ?)", c.deviceId, alice.id, c.deviceKey, clock);
+        const next = { v: 1, userId: alice.id, version: alice.list.version + 1, prevHash: sha(F.listBytes(alice.list)), devices: [...alice.list.devices, { deviceId: c.deviceId, addedAt: clock, meta: '' }].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
+        const signed = alice.client.call({ cmd: 'signDeviceList', userId: alice.id, published: alice.identity.sign, list: next });
+        expect((await call('PUT', '/api/devices/list', { body: { list: next, signature: signed.signature, certs: signed.certs, deviceId: alice.deviceId }, cookie: alice.cookie })).status).toBe(200);
+        alice.list = next;
+        const cookie = app.accounts!.testing.cookie(alice.id);
+        run('UPDATE sessions SET device_id = ? WHERE token_hash = ?', c.deviceId, createHash('sha256').update(cookie.split('=')[1]!).digest('hex'));
+        return { c, cookie, leaf: c.client.call({ cmd: 'mlsDeviceLeaf' }) as string };
+    }
+    const request = (c: Newcomer, userId: string, leaf: string, platform = 'linux') => ({ platform, leafSigKey: leaf, signature: b64(sign(null, F.recertBytes(userId, c.deviceId, platform, leaf), c.key)) });
+
+    test('a companion asks for a certificate for its own leaf, the primary answers it, and nobody else can ask, read or answer', async () => {
+        await start();
+        const alice = account('alice'), bob = account('bob');
+        const { c, cookie, leaf } = await listedCompanion(alice);
+
+        // Only a listed device asks, only for itself, signed by its registered key.
+        expect((await call('PUT', '/api/devices/recert', { body: request(c, alice.id, leaf) })).status).toBe(401);
+        const stranger = newcomer('linux');
+        expect((await call('PUT', '/api/devices/recert', { body: request(stranger, alice.id, leaf), cookie })).status).toBe(403); // another device's signature
+        expect((await call('PUT', '/api/devices/recert', { body: { ...request(c, alice.id, leaf), leafSigKey: b64(randomBytes(32)) }, cookie })).status).toBe(403); // names a leaf it did not sign
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: 'short', signature: 'A'.repeat(86) }, cookie })).status).toBe(400);
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'toaster', leafSigKey: leaf, signature: 'A'.repeat(86) }, cookie })).status).toBe(400);
+        expect((await call('PUT', '/api/devices/recert', { body: request(c, bob.id, leaf), cookie })).status).toBe(403); // signed for another account
+        expect((await call('PUT', '/api/devices/recert', { body: request(c, alice.id, leaf), cookie })).status).toBe(201);
+
+        // Only the primary lists and answers; the list carries what it needs to check the signature itself.
+        expect((await call('GET', '/api/devices/recert', { cookie })).status).toBe(403);
+        expect((await call('GET', '/api/devices/recert', { cookie: bob.cookie })).body.requests).toEqual([]);
+        const pending = await call('GET', '/api/devices/recert', { cookie: alice.cookie });
+        expect(pending.body.requests).toEqual([{ deviceId: c.deviceId, platform: 'linux', leafSigKey: leaf, signature: expect.any(String), deviceKey: c.deviceKey }]);
+        const asked = pending.body.requests[0];
+        expect(verify(null, F.recertBytes(alice.id, c.deviceId, asked.platform, asked.leafSigKey), createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: asked.deviceKey }, format: 'jwk' }), Buffer.from(asked.signature, 'base64url'))).toBe(true);
+
+        // The certificate must be for exactly that request and signed by the account's current identity key.
+        const good = alice.client.call({ cmd: 'signDeviceCert', userId: alice.id, deviceId: c.deviceId, platform: 'linux', leafSigKey: leaf, issuedAt: clock, now: clock });
+        const other = account('carol');
+        const forged = JSON.stringify({ ...JSON.parse(good), aikSign: other.identity.sign });
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: good }, cookie })).status).toBe(403); // not the primary
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: good }, cookie: bob.cookie })).status).toBe(404);
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: forged }, cookie: alice.cookie })).status).toBe(400); // wrong aikSign
+        const wrongLeaf = alice.client.call({ cmd: 'signDeviceCert', userId: alice.id, deviceId: c.deviceId, platform: 'linux', leafSigKey: b64(randomBytes(32)), issuedAt: clock, now: clock });
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: wrongLeaf }, cookie: alice.cookie })).status).toBe(400);
+        const tampered = JSON.stringify({ ...JSON.parse(good), issuedAt: clock + 1 });
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: tampered }, cookie: alice.cookie })).status).toBe(403);
+        expect((await call('GET', '/api/devices/recert/mine', { cookie })).body).toEqual({ cert: null });
+        expect((await call('PUT', `/api/devices/recert/${c.deviceId}`, { body: { cert: good }, cookie: alice.cookie })).status).toBe(201);
+
+        // The companion reads it, installs it (the core verifies it under the account key and its own leaf), and is done.
+        const mine = await call('GET', '/api/devices/recert/mine', { cookie });
+        expect(mine.body.cert).toBe(JSON.stringify(JSON.parse(good)));
+        c.client.call({ cmd: 'companionSetup', userId: alice.id, identity: alice.identity, cert: mine.body.cert });
+        expect((await call('GET', '/api/devices/recert', { cookie: alice.cookie })).body.requests).toEqual([]);
+        expect((await call('DELETE', '/api/devices/recert', { cookie })).status).toBe(200);
+        expect((await call('GET', '/api/devices/recert/mine', { cookie })).status).toBe(404);
     });
 });

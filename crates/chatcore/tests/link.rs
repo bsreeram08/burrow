@@ -400,3 +400,33 @@ fn a_companion_with_its_key_outside_the_core_adopts_a_signed_succession_and_inst
     let previous = w.new.store_mut().get("own-previous").unwrap().unwrap();
     assert_eq!(previous, json!([{ "sign": w.identity.sign, "until": 9_000 }]));
 }
+
+#[test]
+fn a_third_companion_follows_the_chain_without_a_certificate_and_installs_the_new_primarys_when_it_arrives() {
+    let mut w = pair();
+    let (link, now) = (id(), 5_000u64);
+    let qr = w.new.link_qr(&link, now).unwrap();
+    let accepted = w.primary.link_accept(&qr, now).unwrap();
+    w.new.link_complete(&link, &accepted.eph, now).unwrap();
+    let device = id();
+    let leaf = { let (groups, store) = w.new.groups().unwrap(); groups.device_leaf(store).unwrap() };
+    w.primary.sign_device_list(&w.user, &w.identity.sign, &list_json(&w.user, 1, "", &[&device]), None).unwrap();
+    let old_cert = w.primary.sign_device_cert(&w.user, &device, "web", &leaf, now, now).unwrap();
+    w.new.companion_setup(&w.user, &w.identity, &old_cert).unwrap();
+
+    // Another core becomes the primary: the old primary signs the record, the new one publishes list v1 naming the companion.
+    let mut np = core();
+    let next = np.identity().unwrap().public;
+    let signed = w.primary.sign_succession(&w.user, &w.identity.sign, &next.sign, &next.dh, 9_000).unwrap();
+    let (record, signature) = record_of(&signed);
+    np.sign_device_list(&w.user, &next.sign, &list_json(&w.user, 1, "", &[&device]), None).unwrap();
+
+    // The companion adopts the chain with no certificate yet: still the old one, the old key remembered.
+    assert_eq!(w.new.adopt_succession(&w.user, &record, &signature, None).unwrap(), next);
+    // It asked N for a certificate for its leaf; N signs one under the new key, and only that certificate installs.
+    let fresh = np.sign_device_cert(&w.user, &device, "web", &leaf, 9_500, 9_500).unwrap();
+    assert!(w.new.companion_setup(&w.user, &w.identity, &fresh).is_err(), "not under the account key it pinned before");
+    let installed = w.new.companion_setup(&w.user, &next, &fresh).unwrap();
+    assert_eq!((installed.aik_sign.as_str(), installed.issued_at), (next.sign.as_str(), 9_500));
+    assert_eq!(w.new.public_identity().unwrap(), next);
+}

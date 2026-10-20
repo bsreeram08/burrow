@@ -423,6 +423,14 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         // Challenges are exempt (each announce needs one; they are bounded per session in devices.ts).
         if (path === '/api/devices/challenge' ? !allowChallenges(user.id) : path.startsWith('/api/devices') && request.method !== 'GET' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
         if (path === '/api/devices/succession' && request.method === 'PUT') { const [status, result] = devices.putSuccession(user, await readBody(request)); return json(result, status); }
+        if (path === '/api/devices/recert') {
+            if (request.method === 'PUT') { const [status, result] = devices.recertRequest(user, await readBody(request)); return json(result, status); }
+            if (request.method === 'GET') { const [status, result] = devices.recertPending(user); return json(result, status); }
+            if (request.method === 'DELETE') { const [status, result] = devices.recertDone(user); return json(result, status); }
+        }
+        if (path === '/api/devices/recert/mine' && request.method === 'GET') { const [status, result] = devices.recertMine(user); return json(result, status); }
+        const recertMatch = /^\/api\/devices\/recert\/([A-Za-z0-9_-]{22})$/.exec(path);
+        if (recertMatch && request.method === 'PUT') { const [status, result] = devices.recertAnswer(user, recertMatch[1]!, await readBody(request)); return json(result, status); }
         const revokeMatch = /^\/api\/devices\/([A-Za-z0-9_-]{22})\/revoke$/.exec(path);
         if (revokeMatch && request.method === 'POST') { const [status, result] = devices.revokeAny(user, revokeMatch[1]!); return json(result, status); }
         if (path === '/api/devices/list' && request.method === 'PUT') { const [status, result] = devices.publish(user, await readBody(request)); return json(result, status); }

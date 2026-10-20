@@ -70,7 +70,7 @@ Names of `group_dm` and `private` channels exist only in `meta`. Members come fr
 Per channel, one queue processes everything in `seq` order: `group` frames when `seq` is the next one and `message` is present, otherwise `GET /api/channels/:id/log?after=<local cursor>` pages. For each entry:
 
 1. `from.deviceId` is this device: skip it, except a commit while `mlsPending` is set, which goes to `mlsReceive` (it merges our own commit).
-2. Otherwise `mlsReceive { group, message, commit: false }`, then:
+2. Otherwise `mlsReceive { group, message, commit: false, expect }` with `expect` `'application'` for a log entry of kind `app` and `'commit'` for `commit` (the core refuses a message that is the other kind), then:
    - `application`: parse the payload, store it (§10), then `mlsCommitReceived`. A payload that fails validation is acknowledged and dropped (`mlsCommitReceived` all the same, so the key is spent).
    - `commit`: `mlsCommitReceived`; refresh members; write a system line for joins and removals ("alice added bob", "carol left", "dave joined").
    - `removed`: `mlsCommitReceived`; the channel becomes read-only ("You were removed from #design"); stop processing it.

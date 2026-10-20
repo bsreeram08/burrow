@@ -276,6 +276,42 @@ Future<MlsCommitCheck> mlsCommitAuthor({
   message: message,
 );
 
+/// Signs a frozen-channel resolution (`rollback` or `dismiss`) with this device's MLS leaf key over the
+/// `webrtc-bun-mlsresolve-leaf-v1` bytes; nothing else is ever signed this way.
+Future<String> mlsSignResolution({
+  required String groupId,
+  required String action,
+  required BigInt seq,
+  required String digest,
+  required String author,
+}) => RustLib.instance.api.crateApiMlsSignResolution(
+  groupId: groupId,
+  action: action,
+  seq: seq,
+  digest: digest,
+  author: author,
+);
+
+/// Verifies a resolution signed by device `by`, which must be an admin device in this device's own tree.
+/// Returns the signer (`user_id`, `device_id`); `auth` for a bad signature, `invalid` otherwise.
+Future<MlsRemoval> mlsVerifyResolution({
+  required String groupId,
+  required String action,
+  required BigInt seq,
+  required String digest,
+  required String author,
+  required String by,
+  required String signature,
+}) => RustLib.instance.api.crateApiMlsVerifyResolution(
+  groupId: groupId,
+  action: action,
+  seq: seq,
+  digest: digest,
+  author: author,
+  by: by,
+  signature: signature,
+);
+
 Future<void> mlsReceiveCommit({required String pendingId}) =>
     RustLib.instance.api.crateApiMlsReceiveCommit(pendingId: pendingId);
 

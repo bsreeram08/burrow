@@ -23,6 +23,9 @@ class FakeDs {
   /// Tests: a different identity than the account's real one, as if its keys changed.
   final Map<String, Map<String, String>> identityOverride = {};
 
+  /// Tests: replace the admin's leaf signature in `rolled-back` (a server forging the notice).
+  String? forgeRollback;
+
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
 
@@ -232,6 +235,7 @@ class FakeDs {
         final frozenEntry = channel.log.where((e) => e['seq'] == channel.frozen!['seq']).firstOrNull;
         final sender = (frozenEntry?['from'] as Map?)?['deviceId'];
         final author = body['author'] as String? ?? '';
+        if (body['action'] == 'rollback' && body['leafSignature'] is! String) return _error('Invalid resolution', 400);
         if (author.isNotEmpty && author != sender) return _error('That is not the commit\'s author.', 409);
         channel.resolved.add(body['action']! as String);
         final rolled = {'seq': channel.frozen!['seq'], 'digest': channel.frozen!['digest']};
@@ -250,7 +254,9 @@ class FakeDs {
           }
         }
         for (final u in channel.users) {
-          if (body['action'] == 'rollback') _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String));
+          if (body['action'] == 'rollback') {
+            _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String, action: 'rollback', author: author, by: deviceId, signature: (forgeRollback ?? body['leafSignature']) as String));
+          }
           _notifyUser(u, ChannelEvent(id: channel.id, change: 'thawed'));
         }
         return _json({'resolved': body['action'], if (body['action'] == 'rollback' && author.isNotEmpty) 'removeDevice': sender});

@@ -244,6 +244,21 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
+  Future<String> signResolution(String groupId, {required String action, required int seq, required String digest, required String author}) async {
+    _group(groupId);
+    return 'res:$deviceId:$groupId:$action:$seq:$digest:$author';
+  }
+
+  @override
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) async {
+    final g = _group(groupId);
+    if (signature != 'res:$by:$groupId:$action:$seq:$digest:$author') throw const CryptoException('bad resolution signature', code: 'auth');
+    final member = g.members.where((m) => m['deviceId'] == by).firstOrNull;
+    if (member == null || !g.roles.isAdmin(member['userId']! as String)) throw const CryptoException('not an admin device', code: 'invalid');
+    return member['userId']! as String;
+  }
+
+  @override
   Future<void> receiveCommit(String pendingId) async {
     final pending = _pendingReceives.remove(pendingId) ?? (throw const CryptoException('no such pending message', code: 'invalid'));
     _groups[pending.groupId] = pending.next;

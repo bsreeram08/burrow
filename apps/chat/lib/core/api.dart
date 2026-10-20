@@ -254,8 +254,10 @@ class Api {
   }
 
   /// An admin device resolves a frozen channel; [signature] is its device key over [resolveBytes].
-  Future<Map<String, dynamic>> resolveChannel(String id, {required String action, required int seq, required String digest, required String author, required String signature}) =>
-      call('/api/channels/$id/resolve', method: 'POST', body: {'action': action, 'seq': seq, 'digest': digest, 'author': author, 'signature': signature});
+  /// A rollback also carries [leafSignature], the resolution signed with this device's MLS leaf key, which the
+  /// server passes on to members in `rolled-back`.
+  Future<Map<String, dynamic>> resolveChannel(String id, {required String action, required int seq, required String digest, required String author, required String signature, String? leafSignature}) =>
+      call('/api/channels/$id/resolve', method: 'POST', body: {'action': action, 'seq': seq, 'digest': digest, 'author': author, 'signature': signature, 'leafSignature': ?leafSignature});
 
   // ---- Encrypted blobs and link previews ----
   Map<String, String> get _auth => {if (token != null) 'Authorization': 'Bearer $token'};

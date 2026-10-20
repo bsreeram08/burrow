@@ -259,7 +259,68 @@ void main() {
     }
     expect((await bob.crypto.roles(group.id)).isAdmin(carol.user.id), isTrue, reason: 'the change was made again');
     expect({for (final m in await bob.crypto.members(group.id)) m.userId}, {alice.user.id, bob.user.id, carol.user.id});
-    expect((await alice.store.list(group.id)).any((m) => m.system && m.text.contains('made again')), isTrue);
+    expect((await alice.store.list(group.id)).any((m) => m.system && m.text.contains('undone and redone')), isTrue);
+    expect(bob.sync.tagRollbacks(alice.crypto.deviceId), hasLength(1));
+
+    // Two more damaged commits from the same device: the second rollback is still plain; the third frozen one
+    // offers (never performs) removing that device.
+    Future<FrozenCheck> damaged(List<String> admins) async {
+      await until(() => ds.channels[group.id]!.members.values.every((m) => m.cursor == ds.channels[group.id]!.seq), 'caught up again');
+      bob.crypto.tagFailFrom = alice.crypto.deviceId;
+      carol.crypto.tagFailFrom = alice.crypto.deviceId;
+      await alice.sync.setAdmins(group.id, admins);
+      await until(() => ds.channels[group.id]!.frozen != null, 'reported again');
+      for (var i = 0; i < 100 && (await bob.store.group(group.id))?.frozen == null; i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      final c = await bob.sync.checkFrozen(group.id);
+      bob.crypto.tagFailFrom = null;
+      carol.crypto.tagFailFrom = null;
+      return c;
+    }
+
+    final second = await damaged([alice.user.id, bob.user.id]);
+    expect(second.escalation, isFalse);
+    await expectLater(bob.sync.resolve(group.id, rollback: true, removeAuthor: true), throwsA(isA<StoreException>()));
+    await bob.sync.resolve(group.id, rollback: true);
+    expect({for (final m in await bob.crypto.members(group.id)) m.userId}, contains(alice.user.id), reason: 'never removed automatically');
+    for (var i = 0; i < 300 && ds.channels[group.id]!.frozen == null && !(await bob.crypto.roles(group.id)).admins.every((a) => a != carol.user.id); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    final third = await damaged([alice.user.id, bob.user.id, carol.user.id]);
+    expect(third.escalation, isTrue);
+    expect(third.check?.blame, isNull, reason: 'still not blamed: the removal is the admin\'s explicit choice');
+    await bob.sync.resolve(group.id, rollback: true, removeAuthor: true);
+    for (var i = 0; i < 200 && (await bob.crypto.members(group.id)).any((m) => m.deviceId == alice.crypto.deviceId); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect({for (final m in await bob.crypto.members(group.id)) m.deviceId}, isNot(contains(alice.crypto.deviceId)));
+  });
+
+  test('a rolled-back notice the admin did not sign is ignored: no rejoin, no redo', () async {
+    final carol = await Party.join(ds, 'carol');
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id, carol.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id]);
+    await until(() => ds.channels[group.id]!.members.values.every((m) => m.cursor == ds.channels[group.id]!.seq), 'everyone caught up');
+    for (var i = 0; i < 50 && !(await bob.crypto.roles(group.id)).isAdmin(bob.user.id); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    final notices = <String>[];
+    alice.sync.notices.listen(notices.add);
+    bob.crypto.tagFailFrom = alice.crypto.deviceId;
+    carol.crypto.tagFailFrom = alice.crypto.deviceId;
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id, carol.user.id]);
+    await until(() => ds.channels[group.id]!.frozen != null, 'reported');
+    for (var i = 0; i < 100 && (await bob.store.group(group.id))?.frozen == null; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    ds.forgeRollback = 'forged';
+    await bob.sync.resolve(group.id, rollback: true);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    expect(notices.any((n) => n.contains('could not be verified')), isTrue);
+    expect((await alice.store.list(group.id)).any((m) => m.text.contains('undone and redone')), isFalse);
   });
 
   test('only an authenticated member whose signed content is invalid is ever blamed', () {

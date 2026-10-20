@@ -41,7 +41,7 @@
     <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg>
     <span id="group-banner-text"></span>
     <button id="group-review" type="button" hidden>Review</button><button id="group-rejoin" type="button" hidden>Rejoin</button>
-    <button id="group-dismiss" type="button" hidden>Dismiss</button><button id="group-rollback" class="danger" type="button" hidden>Roll back</button>
+    <button id="group-dismiss" type="button" hidden>Dismiss</button><button id="group-rollback" class="danger" type="button" hidden>Roll back</button><button id="group-remove-author" class="danger" type="button" hidden>Remove their device</button>
   </div>
 
   <div class="topbar session-only">
@@ -266,6 +266,12 @@
     <h2 id="group-leave-title">Leave this conversation?</h2>
     <p>You stop receiving its messages. What's already on this device stays. If you're its only admin, the person who joined earliest becomes one.</p>
     <div class="dialog-actions"><button id="group-leave-cancel" type="button">Stay</button><button id="group-leave-yes" class="danger" type="button">Leave</button></div>
+  </div></div>
+
+  <div id="group-remove-confirm" class="dialog" role="alertdialog" aria-labelledby="group-remove-title" hidden><div class="dialog-card">
+    <h2 id="group-remove-title">Remove that device?</h2>
+    <p id="group-remove-text"></p>
+    <div class="dialog-actions"><button id="group-remove-cancel" type="button">Keep it</button><button id="group-remove-yes" class="danger" type="button">Roll back and remove</button></div>
   </div></div>
 
   <div id="pin-review" class="dialog" role="dialog" aria-modal="true" aria-labelledby="pin-review-title" hidden><div class="dialog-card">

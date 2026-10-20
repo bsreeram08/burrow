@@ -408,6 +408,8 @@
   /** Processes one log entry. Returns 'stop' when the channel can't go past it now. */
   async function processEntry(id, entry) {
     const ch = channels.get(id);
+    // Our last commit can only be redone (§7) until the group has moved past it.
+    if (entry.kind === 'commit' && ch.lastCommit && entry.seq > ch.lastCommit.seq) { delete ch.lastCommit; save(); }
     if (entry.from.deviceId === deviceId) {
       // Our own: application messages are already stored; a commit is merged here only if it was left pending.
       if (entry.kind === 'commit' && await run({ cmd: 'mlsPending', group: id }).catch(() => null)) await run({ cmd: 'mlsReceive', group: id, message: entry.message, expect: 'commit' }).catch(() => {});
@@ -556,7 +558,7 @@
     else if (message.change === 'thawed') { if (ch?.status === 'frozen') { ch.status = 'active'; delete ch.frozen; save(); paint(id); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); } }
     // `remove-needed` is not acted on: a frame alone never makes this device remove anyone. The device to remove
     // comes from this device's own signed rollback (resolve() below).
-    else if (message.change === 'rolled-back') { if (ch && Number.isSafeInteger(message.seq)) rolledBack(id, message.seq, message.digest); }
+    else if (message.change === 'rolled-back') { if (ch) rolledBack(id, message); }
     else if (message.change === 'gap') { if (usable(ch)) enqueue(id, () => resyncInner(id)).catch(error => failed(id, error)); }
   }
   function onEphemeral(message) {
@@ -636,7 +638,7 @@
         await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
         await describe(id, `commit:${result.body.seq}:${result.body.digest}`, me.id, false, before, rolesBefore);
         // Kept until the next commit: if an admin rolls this one back, this device makes the same change again.
-        channels.get(id).lastCommit = { seq: result.body.seq, digest: result.body.digest, removes: change.removes || null, roles: change.roles || null, update: Boolean(change.update), adds: [...new Set(claimed.map(item => item.userId))] };
+        channels.get(id).lastCommit = { seq: result.body.seq, digest: result.body.digest, epoch: out.epoch, removes: change.removes || null, roles: change.roles || null, update: Boolean(change.update), adds: [...new Set(claimed.map(item => item.userId))] };
         save();
         return result.body;
       }
@@ -657,18 +659,21 @@
   }
   /** Adds every listed device of each person; `mine`: also this account's other devices (when creating). */
   async function addPeople(id, users, mine = false) {
+    let unreachable = [];
+    await enqueue(id, async () => { unreachable = await addInner(id, users, mine); });
+    return unreachable;
+  }
+  /** The add path (inside the channel's queue): pins, fresh KeyPackages, one commit, then the name and topic. */
+  async function addInner(id, users, mine = false) {
     await ensurePins(users);
     const { keyPackages } = await claim(mine ? [...users, me.id] : users);
     const reachable = new Set(keyPackages.map(item => item.userId));
-    const unreachable = users.filter(user => !reachable.has(user));
     const fresh = keyPackages.filter(item => !(item.userId === me.id && item.deviceId === deviceId));
     if (fresh.some(item => item.userId !== me.id)) {
-      await enqueue(id, async () => {
-        await commitInner(id, {}, fresh);
-        await sendMetaInner(id);
-      });
+      await commitInner(id, {}, fresh);
+      await sendMetaInner(id);
     }
-    return unreachable;
+    return users.filter(user => !reachable.has(user));
   }
   async function sendMetaInner(id) {
     const ch = channels.get(id);
@@ -750,26 +755,36 @@
     paintHeader(); ctx.render();
   }
   const hex = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  const digestOf = async message => hex(await crypto.subtle.digest('SHA-256', unb64(message)));
   const unb64 = text => Uint8Array.from(atob(text.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
   /**
    * An admin rolled a commit back. If it was ours, this device had already merged it: rejoin at the restored epoch
    * and make the same change again (§7). Anyone else's copy never merged it (every member rejected it).
    */
-  function rolledBack(id, seq, digest) {
+  function rolledBack(id, notice) {
     const ch = channels.get(id), mine = ch?.lastCommit;
-    if (!mine || mine.seq !== seq || mine.digest !== digest) return;
-    delete ch.lastCommit; save();
+    if (!mine || notice.action !== 'rollback' || notice.seq !== mine.seq || notice.digest !== mine.digest) return;
     enqueue(id, async () => {
+      if (ch.lastCommit !== mine) return; // A later commit superseded it meanwhile.
+      // The notice alone proves nothing (the server sends it): an admin of this group, as this device's own copy of
+      // the group knows it, must have signed this exact resolution with its leaf key...
+      try {
+        await run({ cmd: 'mlsVerifyResolution', group: id, action: 'rollback', seq: notice.seq, digest: notice.digest, author: typeof notice.author === 'string' ? notice.author : '', by: notice.by, signature: notice.signature });
+      } catch { return; }
+      // ...and the channel must really be back before our commit: at its epoch, without it in the log.
+      const info = await call(`/api/channels/${id}`);
+      if (info.status !== 200 || info.body.epoch !== mine.epoch) return;
+      const log = await call(`/api/channels/${id}/log?after=${mine.seq - 1}`);
+      if (log.status !== 200) return;
+      for (const entry of log.body.entries) if (entry.kind === 'commit' && await digestOf(entry.message) === mine.digest) return;
+      delete ch.lastCommit; save();
       for (let attempt = 0; ; attempt++) {
         try { await resyncInner(id); break; }
         catch (error) { if (attempt >= 4) throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
       }
-      if (mine.adds.length) {
-        const users = mine.adds.filter(user => user !== me.id);
-        const { keyPackages } = await claim(users);
-        if (keyPackages.length) await commitInner(id, {}, keyPackages);
-      } else await commitInner(id, { removes: mine.removes || undefined, roles: mine.roles || undefined, update: mine.update });
-      await note(id, `redo:${seq}`, 'An admin undid a change you made that other devices couldn\'t read. It was made again.');
+      if (mine.adds.length) await addInner(id, mine.adds.filter(user => user !== me.id));
+      else await commitInner(id, { removes: mine.removes || undefined, roles: mine.roles || undefined, update: mine.update });
+      await note(id, `redo:${mine.seq}`, 'Your change was undone and redone: an admin rolled it back because other devices couldn\'t read it, and it was made again.');
     }).catch(error => failed(id, error));
   }
   async function thawIfResolved(id) {
@@ -777,6 +792,23 @@
     if (info.status !== 200 || info.body.frozen || ch?.status !== 'frozen') return;
     onChannel({ id, change: 'thawed' });
   }
+  // Rollbacks for damage outside the author's signature never blame the author (§7), but an insider could keep
+  // freezing the group that way. This admin device counts them per author device; from the second within 24 hours
+  // it offers (never performs) removing that device, as an explicit, confirmed and signed removal.
+  const TAG_WINDOW = 86400000, tagKey = () => `tag-rollbacks-v1:${instance}`;
+  function tagRollbacks(device) {
+    let all = {};
+    try { all = JSON.parse(localStorage.getItem(tagKey()) || '{}') || {}; } catch {}
+    return (all[device] || []).filter(at => Date.now() - at < TAG_WINDOW);
+  }
+  function recordTagRollback(device) {
+    let all = {};
+    try { all = JSON.parse(localStorage.getItem(tagKey()) || '{}') || {}; } catch {}
+    all[device] = [...tagRollbacks(device), Date.now()].slice(-20);
+    try { localStorage.setItem(tagKey(), JSON.stringify(all)); } catch {}
+  }
+  /** Whether this frozen commit's author may be removed by an explicit admin decision despite a tag-only failure. */
+  const escalation = check => Boolean(check?.state === 'fails' && check.blame === 'tag' && check.authenticated && ID.test(check.author || '') && tagRollbacks(check.author).length >= 2);
   /** A reported commit froze the channel. Record it and, on an admin device, check it before offering a verdict. */
   function setFrozen(id, frozen) {
     const ch = channels.get(id);
@@ -803,7 +835,7 @@
       // `author`: the commit's author device, `authenticated` when this device's own tree verified its signature.
       // `blame`: 'signed-content' when what the author signed is itself invalid (only then is the author removed);
       // 'tag' when the failure lies outside the signature, which the server could have caused in transit.
-      let state = 'unknown', author = null, authenticated = false, blame = 'tag';
+      let state = 'unknown', author = null, authorUser = null, authenticated = false, blame = 'tag';
       try {
         const result = await call(`/api/channels/${id}/log?after=${frozen.seq - 1}`);
         const entry = result.status === 200 ? result.body.entries.find(item => item.seq === frozen.seq) : null;
@@ -813,7 +845,7 @@
           try {
             const checked = await run({ cmd: 'mlsCommitAuthor', group: id, message: entry.message });
             authenticated = checked.authenticated === true && ID.test(checked.author?.deviceId || '');
-            if (authenticated) author = checked.author.deviceId;
+            if (authenticated) { author = checked.author.deviceId; authorUser = checked.author.userId; }
             blame = authenticated && checked.class === 'signed-content' ? 'signed-content' : 'tag';
           } catch {}
         }
@@ -830,21 +862,26 @@
           if (processed) await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {});
         }
       } catch { state = 'unknown'; }
-      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state, author, authenticated, blame }; save(); paint(id); }
+      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state, author, authorUser, authenticated, blame }; save(); paint(id); }
     }).catch(() => {});
   }
-  async function resolve(id, action) {
+  async function resolve(id, action, { remove = false } = {}) {
     const ch = channels.get(id);
     if (!ch?.frozen) return;
     const check = ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check : null;
     if (action === 'rollback' && check?.state !== 'fails') throw new Error('this device did not find that change invalid, so it won\'t roll it back');
     if (action === 'dismiss' && (!check || check.state === 'checking')) throw new Error('still checking the change');
     // Named (and so removed) only when its author signed invalid content and this device authenticated that author.
-    const author = action === 'rollback' && check.blame === 'signed-content' && check.authenticated && ID.test(check.author || '') ? check.author : '';
+    // Or, for a repeated tag-only failure, when the admin explicitly chose to remove that device (never automatic).
+    const blamed = check?.blame === 'signed-content' && check.authenticated && ID.test(check.author || '');
+    if (remove && !escalation(check)) throw new Error('removing that device isn\'t offered for this change');
+    const author = action === 'rollback' && (blamed || remove) ? check.author : '';
+    const leafSignature = action === 'rollback' ? await run({ cmd: 'mlsSignResolution', group: id, action, seq: ch.frozen.seq, digest: ch.frozen.digest, author }) : undefined;
     const device = await window.DeviceFormat.deviceKey(me.id);
     // The signature names the author this device authenticated, so the server can't make it cut off someone else.
     const bytes = new TextEncoder().encode(`webrtc-bun-mlsresolve-v2\n${id}\n${action}\n${ch.frozen.seq}\n${ch.frozen.digest}\n${author}`);
-    const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, author, signature: await device.sign(bytes) });
+    const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, author, ...(leafSignature ? { leafSignature } : {}), signature: await device.sign(bytes) });
+    if (action === 'rollback' && !author && check.blame === 'tag' && check.authenticated && ID.test(check.author || '')) recordTagRollback(check.author);
     ch.status = 'active'; delete ch.frozen; delete ch.check; delete ch.rejected; save(); paint(id);
     // A rollback restores the epoch before the commit: publish its GroupInfo so devices can rejoin (the author's).
     if (action === 'rollback') enqueue(id, async () => { const view = await run({ cmd: 'mlsView', group: id }); await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo }); }).catch(() => {});
@@ -943,6 +980,9 @@
     $('group-banner-text').textContent = text;
     const deciding = ch?.status === 'frozen' && admin && ch.frozen;
     $('group-rollback').hidden = !(deciding && check === 'fails');
+    const escalate = deciding && escalation(ch.check);
+    $('group-remove-author').hidden = !escalate;
+    if (escalate) $('group-remove-author').textContent = `Remove ${nameOf(ch.check.authorUser)}'s device`;
     $('group-dismiss').hidden = !(deciding && check && check !== 'checking');
     $('group-review').hidden = ch?.status !== 'paused';
     $('group-rejoin').hidden = ch?.status !== 'broken';
@@ -1113,6 +1153,14 @@
     };
     $('receipt-close').onclick = () => { $('receipt-info').hidden = true; };
     $('group-rollback').onclick = () => resolve(currentId, 'rollback').catch(error => window.App.chatStatus(`Couldn't roll back: ${error.message}`));
+    $('group-remove-author').onclick = () => {
+      const ch = channels.get(currentId);
+      if (!escalation(ch?.check)) return;
+      $('group-remove-text').textContent = `${nameOf(ch.check.authorUser)}'s changes to this conversation arrived damaged ${tagRollbacks(ch.check.author).length + 1} times in a day. That can be their device, but also the network or the server, so nothing was blamed on them. Roll this one back and remove that device? They can be added again.`;
+      $('group-remove-confirm').hidden = false; $('group-remove-cancel').focus();
+    };
+    $('group-remove-cancel').onclick = () => { $('group-remove-confirm').hidden = true; };
+    $('group-remove-yes').onclick = () => { $('group-remove-confirm').hidden = true; resolve(currentId, 'rollback', { remove: true }).catch(error => window.App.chatStatus(`Couldn't remove it: ${error.message}`)); };
     $('group-dismiss').onclick = () => resolve(currentId, 'dismiss').catch(error => window.App.chatStatus(`Couldn't dismiss: ${error.message}`));
     $('group-rejoin').onclick = () => enqueue(currentId, () => resyncInner(currentId)).then(() => paint(currentId), error => window.App.chatStatus(`Couldn't rejoin: ${error.message}`));
     $('group-review').onclick = async () => {

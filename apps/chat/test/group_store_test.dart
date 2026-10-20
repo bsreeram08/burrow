@@ -76,10 +76,11 @@ void main() {
     // A v3 database: today's schema without the v4 columns.
     await (await MessageStore.open(databaseFactoryFfi, path, now: () => now)).close();
     final v3 = await databaseFactoryFfi.openDatabase(path);
-    for (final column in ['moved_at', 'dm_checked', 'peer']) {
+    for (final column in ['moved_at', 'dm_checked_peer', 'peer']) {
       await v3.execute('ALTER TABLE conversations DROP COLUMN $column');
     }
-    await v3.insert('conversations', {...GroupConversation(id: group, kind: GroupKindName.private, createdAt: now, name: 'design', cursor: 4).toRow()}..removeWhere((k, _) => ['peer', 'dm_checked', 'moved_at'].contains(k)));
+    await v3.execute('DROP TABLE bundle_names');
+    await v3.insert('conversations', {...GroupConversation(id: group, kind: GroupKindName.private, createdAt: now, name: 'design', cursor: 4).toRow()}..removeWhere((k, _) => ['peer', 'dm_checked_peer', 'moved_at'].contains(k)));
     await v3.setVersion(3);
     await v3.close();
 
@@ -88,7 +89,7 @@ void main() {
     expect((kept.name, kept.cursor, kept.peer, kept.dmChecked, kept.movedAt), ('design', 4, null, false, null));
     final dmGroup = 'D' * 22;
     await upgraded.putGroup(GroupConversation(id: dmGroup, kind: GroupKindName.dm, createdAt: now, peer: alice));
-    await upgraded.updateGroup(dmGroup, (g) => g.copyWith(dmChecked: true, movedAt: now));
+    await upgraded.updateGroup(dmGroup, (g) => g.copyWith(dmCheckedPeer: alice, movedAt: now));
     final moved = (await upgraded.group(dmGroup))!;
     expect((moved.kind, moved.peer, moved.dmChecked, moved.movedAt), (GroupKindName.dm, alice, true, now));
     // A 1:1 chat's move is a system line in that chat.
@@ -114,6 +115,31 @@ void main() {
     expect(list.firstWhere((m) => m.id == queued).status, MessageStatus.uncertain);
     expect(await store.queued(), isEmpty);
     expect((await store.list(group)).single.sender, alice);
+  });
+
+  test('channel names from a link bundle survive a restart and are used once', () async {
+    final dir = await Directory.systemTemp.createTemp('chat-names');
+    final path = p.join(dir.path, 'messages.db');
+    final first = await MessageStore.open(databaseFactoryFfi, path, now: () => now);
+    await first.putBundleNames({group: (name: 'Design', topic: 'Pixels')});
+    await first.close();
+    final again = await MessageStore.open(databaseFactoryFfi, path, now: () => now);
+    expect(await again.takeBundleName(group), (name: 'Design', topic: 'Pixels'));
+    expect(await again.takeBundleName(group), isNull);
+    await again.close();
+    await dir.delete(recursive: true);
+  });
+
+  test("a DM's peer is bound once and its check counts only for that peer", () async {
+    final id = 'D' * 22;
+    await store.putGroup(GroupConversation(id: id, kind: GroupKindName.dm, createdAt: now, peer: alice));
+    var g = (await store.updateGroup(id, (g) => g.copyWith(peer: bob, dmCheckedPeer: alice)))!;
+    expect((g.peer, g.dmChecked), (alice, true), reason: 'never rebound');
+    g = (await store.updateGroup(id, (g) => g.copyWith(dmCheckedPeer: bob)))!;
+    expect(g.dmChecked, isFalse, reason: 'a check for someone else is no check');
+    g = (await store.updateGroup(id, (g) => g.copyWith(dmCheckedPeer: alice)))!;
+    g = (await store.updateGroup(id, (g) => g.copyWith(clearDmCheck: true)))!;
+    expect((g.peer, g.dmChecked), (alice, false));
   });
 
   test('group records: create, update atomically, pin, unread, frozen, remove with history', () async {

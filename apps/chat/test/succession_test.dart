@@ -54,4 +54,27 @@ void main() {
     expect(await m2.followIdentity(bob, fresh, null), isFalse);
     expect((await c2.peer('bob-id'))!.blocked, isTrue);
   });
+
+  test('a pin waiting for review never starts a succession: a chain from the unaccepted key goes to review', () async {
+    final (messenger, crypto, notices) = await setUpMessenger();
+    const planted = Identity(dh: 'srv-dh', sign: 'srv-sign');
+    await crypto.notePeer(bob.id!, planted); // The server served another key: changed, blocked, not accepted.
+    final chain = [{'v': 1, 'userId': 'bob-id', 'oldSign': 'srv-sign', 'newSign': 'new-sign', 'newDh': 'new-dh', 'at': 1, 'signature': 's'}];
+    expect(await messenger.followIdentity(bob, fresh, chain), isFalse);
+    final pin = (await crypto.peer('bob-id'))!;
+    expect((pin.blocked, pin.verified), (true, false));
+    await Future<void>.delayed(Duration.zero);
+    expect(notices, isEmpty);
+  });
+
+  test('identity checks for one contact run one at a time: a second refresh sees the moved pin', () async {
+    final (messenger, crypto, notices) = await setUpMessenger();
+    final chain = [{'v': 1, 'userId': 'bob-id', 'oldSign': 'old-sign', 'newSign': 'new-sign', 'newDh': 'new-dh', 'at': 1, 'signature': 's'}];
+    final both = await Future.wait([messenger.followIdentity(bob, fresh, chain), messenger.followIdentity(bob, fresh, chain)]);
+    expect(both, [true, false], reason: 'the second ran after the first moved the pin');
+    final pin = (await crypto.peer('bob-id'))!;
+    expect((pin.identity, pin.verified, pin.blocked), (fresh, true, false));
+    await Future<void>.delayed(Duration.zero);
+    expect(notices, hasLength(1));
+  });
 }

@@ -32,6 +32,13 @@ class FakeDs {
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
 
+  /// join-info answers per channel.
+  final Map<String, int> joinInfos = {};
+
+  /// Tests: commits answered 409 `code: 'identity'` (a member's key doesn't match the record), and how many came.
+  bool identityConflict = false;
+  int commitsSeen = 0;
+
   /// 1:1 envelopes posted (`{to, envelope}`).
   final List<Map<String, Object?>> envelopes = [];
 
@@ -207,6 +214,8 @@ class FakeDs {
         if (channel.frozen != null) return _error('frozen', 423, {'frozen': channel.frozen});
         final message = body['message']! as String;
         final commit = _mls(message);
+        if (!external) commitsSeen++;
+        if (identityConflict && !external) return _error("A member's identity key does not match.", 409, {'code': 'identity', 'userId': userId});
         if (conflicts > 0 && !external) {
           conflicts--;
           return _error('The group moved on.', 409, {'epoch': channel.epoch, 'seq': channel.seq});
@@ -248,6 +257,7 @@ class FakeDs {
         _fanOut(channel, seq);
         return _json({'epoch': channel.epoch, 'seq': seq, 'digest': digest(message)}, 201);
       case ('join-info', 'GET'):
+        joinInfos[channel.id] = (joinInfos[channel.id] ?? 0) + 1;
         if (channel.groupInfo == null || channel.groupInfoEpoch != channel.epoch) return _error('between epochs', 409, {'epoch': channel.epoch});
         return _json({'epoch': channel.epoch, 'seq': channel.seq, 'groupInfo': channel.groupInfo, 'tree': 'tree'});
       case ('group-info', 'PUT'):

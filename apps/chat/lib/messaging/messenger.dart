@@ -948,10 +948,21 @@ class Messenger {
   /// A contact's served identity (m5 §5.3): when it differs from the pin and a signed succession chain from
   /// the pinned key reaches it, the pin moves with verification kept and a soft notice; otherwise recording it
   /// flags a security-code change for review, so nothing is ever trusted silently. Returns true on a succession.
-  Future<bool> followIdentity(Contact contact, Identity served, Object? succession) async {
+  /// One per contact at a time: a refresh and a succession never interleave their pin writes.
+  Future<bool> followIdentity(Contact contact, Identity served, Object? succession) {
+    final id = contact.id!;
+    final run = (_identityChecks[id] ?? Future<void>.value()).then((_) => _followIdentityNow(contact, served, succession));
+    _identityChecks[id] = run.then((_) {}, onError: (_) {});
+    return run;
+  }
+
+  final Map<String, Future<void>> _identityChecks = {};
+
+  Future<bool> _followIdentityNow(Contact contact, Identity served, Object? succession) async {
     final id = contact.id!;
     final pinned = await crypto.peer(id);
-    if (pinned != null && pinned.identity != served && !pinned.blocked && succession is List && succession.isNotEmpty) {
+    // Only from a code the user accepted: a pin still waiting for review may already be the server's own key.
+    if (pinned != null && pinned.identity != served && !pinned.blocked && !pinned.changed && succession is List && succession.isNotEmpty) {
       try {
         final moved = await crypto.acceptSuccession(id, [for (final r in succession) (r as Map).cast<String, dynamic>()]);
         if (moved.identity == served) {

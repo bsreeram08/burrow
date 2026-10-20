@@ -367,6 +367,7 @@ class AppController extends Notifier<AppState> {
     if (key != null) await prefs.writeDevice(setup.user.id, key);
     await prefs.writeDevice(_linkOwner, 'null'); // The next link starts with a new device.
     prefs.setPin(setup.user.id, setup.user.id, setup.pin);
+    await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:${setup.user.id}', setup.metaKey);
     await (await SharedPreferences.getInstance()).setString('linked-core-v1:${setup.user.id}', 'keys-link-${link.deviceId}');
     await _signedIn(setup.user, setup.token, linked: setup.bundle);
   }
@@ -448,7 +449,7 @@ class AppController extends Notifier<AppState> {
       ..add(m.activeChanges.listen((active) => state = state.copyWith(inactiveDevice: !active)))
       ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
       ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
-    if (linked != null) await installLinkBundle(linked, dbStore, sync);
+    if (linked != null) await installLinkBundle(linked, dbStore);
     state = state.copyWith(phase: AuthPhase.signedIn, user: user, companion: companion, clearNotice: true);
     await _loadGroups();
     unawaited(_checkActive());
@@ -510,8 +511,11 @@ class AppController extends Notifier<AppState> {
 
   /// The user confirmed on this primary: sign the account over, then continue here as a linked device.
   Future<void> finishHandOver(HandOver h) async {
-    await h.approve();
+    final userId = state.user?.id;
+    final metaKey = await h.approve();
+    if (userId != null) await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:$userId', metaKey);
     await _reopen();
+    await _recommitLeaves();
   }
 
   /// This linked device asks to become the primary: it shows a code for the primary to scan.
@@ -523,16 +527,30 @@ class AppController extends Notifier<AppState> {
   /// The primary confirmed: take the account over, then continue here as its primary.
   Future<void> finishTakeOver(TakeOver t) async {
     final m = messenger ?? (throw StateError('Not signed in'));
-    await t.run(m, platform: _api.client);
+    final prefs = await SharedPreferences.getInstance(), key = 'device-meta-key-v1:${m.me.id}';
+    final old = prefs.getString(key);
+    await t.run(m, platform: _api.client, oldMetaKey: old == null ? null : unb64(old));
+    await prefs.remove(key); // A primary derives its own label key.
     await _reopen();
+    await _recommitLeaves();
     unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+  }
+
+  /// After a succession this device's leaf carries a certificate under the new key: commit it in every group, so
+  /// nobody sees it as Previous (which blocks adding people, m5 §7).
+  Future<void> _recommitLeaves() async {
+    final g = groups, s = store;
+    if (g == null || s == null) return;
+    for (final c in await s.groups()) {
+      if (c.active) await g.sync.updateLeaf(c.id).catchError((_) {});
+    }
   }
 
   /// Linked devices following the account to a new key, and the primary certifying their leaves (§5.2.2).
   OwnSuccession? _ownSuccession() {
     final m = messenger, s = store, g = groups, user = state.user;
     if (m == null || s == null || g == null || user == null) return null;
-    return OwnSuccession(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), store: s, updateLeaf: g.sync.updateLeaf, me: user, platform: _api.client);
+    return OwnSuccession(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), store: s, updateLeaf: g.sync.updateLeaf, me: user, platform: _api.client, chat: _crypto, devices: m.devices, device: m.device);
   }
 
   Future<void> _followSuccession() async {
@@ -790,14 +808,11 @@ class AppController extends Notifier<AppState> {
 
   /// [shown]: the identity whose code the sheet showed. The decision applies only to that identity; if the
   /// pin changed again meanwhile the core refuses (`mismatch`) and nothing is accepted.
-  Future<void> reviewedKey(String contactId, {required bool verified, Identity? shown}) async {
-    if (shown != null) {
-      verified ? await _crypto.setVerifiedFor(contactId, true, shown) : await _crypto.acceptChangeFor(contactId, shown);
-    } else if (verified) {
-      await _crypto.setVerified(contactId, true);
-    } else {
-      await _crypto.acceptChange(contactId);
-    }
+  /// The user's decision binds to exactly the identity whose code was shown: if another key was pinned
+  /// meanwhile, the core refuses (`mismatch`) and that one goes to review.
+  Future<void> reviewedKey(String contactId, {required bool verified, required Identity? shown}) async {
+    if (shown == null) return; // Nothing pinned yet: nothing to accept.
+    verified ? await _crypto.setVerifiedFor(contactId, true, shown) : await _crypto.acceptChangeFor(contactId, shown);
     state = state.copyWith(keyChanged: {...state.keyChanged}..remove(contactId));
     unawaited(messenger?.flush());
     // Channels paused for this person's security code carry on.

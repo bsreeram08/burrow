@@ -183,6 +183,18 @@ void main() {
     await eventually(() async => ds.envelopes.length, (n) => n > before);
   });
 
+  test('before its check, a DM group delivers nothing and shows no typing', () async {
+    bob.mls.unpinned.add(alice.user.id); // Bob's core can't chain alice's leaves to a pin: mlsCheckDm fails.
+    final channel = await alice.groups.createDm(bob.contact);
+    await eventually(() => bob.store.group(channel!), (g) => g != null, 'bob joined from the Welcome');
+    expect((await bob.store.group(channel!))!.dmChecked, isFalse);
+    await alice.groups.typingChanged(channel, on: true);
+    await alice.groups.sendDm(channel, {'v': 1, 'type': 'message', 'id': const Uuid().v4(), 'text': 'unchecked', 'createdAt': DateTime.now().millisecondsSinceEpoch, 'expiresAt': null});
+    await Future<void>.delayed(const Duration(milliseconds: 100));
+    expect(bob.messenger.typing, isEmpty);
+    expect(await bob.chat(alice), isEmpty);
+  });
+
   test('both sides moving at once: the second create is refused (409) and its local group forgotten', () async {
     final first = await alice.groups.createDm(bob.contact);
     expect(first, isNotNull);

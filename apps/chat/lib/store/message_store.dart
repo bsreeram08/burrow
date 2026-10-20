@@ -62,8 +62,10 @@ class MessageStore {
 
   static Future<void> _addDmParts(DatabaseExecutor db) async {
     await db.execute('ALTER TABLE conversations ADD COLUMN peer TEXT');
-    await db.execute('ALTER TABLE conversations ADD COLUMN dm_checked INTEGER NOT NULL DEFAULT 0');
+    await db.execute('ALTER TABLE conversations ADD COLUMN dm_checked_peer TEXT');
     await db.execute('ALTER TABLE conversations ADD COLUMN moved_at INTEGER');
+    // Channel names and topics from a link bundle (m5 §3 step 3), until this device joins those channels.
+    await db.execute('CREATE TABLE bundle_names (id TEXT PRIMARY KEY, name TEXT NOT NULL, topic TEXT NOT NULL)');
   }
 
   static Future<void> _addGroupParts(DatabaseExecutor db) async {
@@ -290,6 +292,23 @@ class MessageStore {
     });
     if (added > 0) _changes.add(null);
     return added;
+  }
+
+  /// Remembers channel names and topics from a link bundle until this device joins those channels.
+  Future<void> putBundleNames(Map<String, ({String name, String topic})> names) async {
+    await _db.transaction((tx) async {
+      for (final e in names.entries) {
+        await tx.insert('bundle_names', {'id': e.key, 'name': e.value.name, 'topic': e.value.topic}, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  /// The bundle's name and topic for a channel this device is joining, once (then forgotten).
+  Future<({String name, String topic})?> takeBundleName(String id) async {
+    final rows = await _db.query('bundle_names', where: 'id = ?', whereArgs: [id]);
+    if (rows.isEmpty) return null;
+    await _db.delete('bundle_names', where: 'id = ?', whereArgs: [id]);
+    return (name: rows.single['name']! as String, topic: rows.single['topic']! as String);
   }
 
   /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.

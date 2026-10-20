@@ -184,10 +184,6 @@ class GroupSync {
   /// makes one itself.
   final bool companion;
 
-  /// Names and topics of channels from a link bundle (m5 §3 step 3), used when this device first joins them;
-  /// later `meta` overrides them. ponytail: kept in memory, so a join after a restart shows no name until meta.
-  final Map<String, ({String name, String topic})> bundleNames = {};
-
   /// The random 0–3 s wait before acting on our own revoked leaves, so devices don't all commit at once.
   Duration Function() removalJitter = () => Duration(milliseconds: math.Random().nextInt(3000));
   DeliveryHandler? onDelivery;
@@ -325,7 +321,7 @@ class GroupSync {
       if (error.keysLocked) rethrow;
       return false;
     }
-    await store.updateGroup(groupId, (g) => g.copyWith(dmChecked: true));
+    await store.updateGroup(groupId, (g) => g.peer == peer ? g.copyWith(dmCheckedPeer: peer) : g);
     return true;
   }
 
@@ -398,6 +394,7 @@ class GroupSync {
         accepted = await api.postCommit(groupId, out.commit, welcome: out.welcome, joiners: out.welcome == null ? null : joiners?.call());
       } on ApiException catch (error) {
         await crypto.clearOwn(groupId);
+        if (_identityConflict(error)) rethrow;
         if (error.status == 409 && attempt + 1 < commitAttempts) {
           await Future<void>.delayed(_backoff(attempt));
           await _catchUpNow(groupId);
@@ -775,7 +772,7 @@ class GroupSync {
     final info = await _channelInfo(event.channel);
     await store.putGroup(
       (known ?? GroupConversation(id: event.channel, kind: info.kind, createdAt: _now(), name: info.name ?? ''))
-          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, peer: known?.peer ?? info.peer, clearFrozen: true),
+          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, peer: info.peer, clearDmCheck: _otherPeer(known, info.peer), clearFrozen: true),
     );
     _dropWelcome(event.id);
     _changed(event.channel);
@@ -810,6 +807,9 @@ class GroupSync {
     }
   }
 
+  /// A server row naming another peer than the one a DM is bound to: the peer stays, its check is dropped.
+  static bool _otherPeer(GroupConversation? known, String? named) => known?.peer != null && named != null && named != known?.peer;
+
   /// The server's view of a channel; a DM channel names its other person (`peer: {id, username}`).
   Future<({GroupKindName kind, String? name, String? peer})> _channelInfo(String id) async {
     try {
@@ -837,11 +837,13 @@ class GroupSync {
     _notice('This device rejoined a group after missing part of its history.');
   }
 
-  Future<void> _externalJoin(String groupId) async {
+  /// With [checked] (a join-info the caller already inspected), exactly that GroupInfo is joined, once: a retry
+  /// must inspect again.
+  Future<void> _externalJoin(String groupId, {Map<String, dynamic>? checked}) async {
     for (var attempt = 0; ; attempt++) {
       final Map<String, dynamic> info;
       try {
-        info = await api.joinInfo(groupId);
+        info = checked ?? await api.joinInfo(groupId);
       } on ApiException catch (error) {
         // Between epochs (e.g. right after a rollback, before the admin uploads the restored GroupInfo): wait
         // for a member to publish it, 0.5, 1, 2, 4 s.
@@ -861,7 +863,8 @@ class GroupSync {
       } on ApiException catch (error) {
         await crypto.clearOwn(groupId);
         await crypto.forget(groupId).catchError((_) {});
-        if (error.status == 409 && attempt + 1 < commitAttempts) {
+        if (_identityConflict(error)) rethrow;
+        if (error.status == 409 && checked == null && attempt + 1 < commitAttempts) {
           await Future<void>.delayed(_backoff(attempt));
           continue;
         }
@@ -872,10 +875,11 @@ class GroupSync {
       final channel = await _channelInfo(groupId);
       final existing = await store.group(groupId);
       final seq = accepted['seq'] as int;
-      final named = bundleNames.remove(groupId);
+      // Names from a link bundle (m5 §3 step 3) for a first join; later `meta` overrides them.
+      final named = existing == null ? await store.takeBundleName(groupId) : null;
       await store.putGroup(
         (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? named?.name ?? '', topic: named?.topic ?? '', peer: channel.peer))
-            .copyWith(membership: Membership.active, cursor: seq, clearFrozen: true),
+            .copyWith(membership: Membership.active, cursor: seq, clearDmCheck: _otherPeer(existing, channel.peer), clearFrozen: true),
       );
       _reportCursor(groupId, seq);
       _changed(groupId);
@@ -1053,7 +1057,8 @@ class GroupSync {
         final known = await store.group(id);
         if (known?.membership == Membership.left) continue;
         try {
-          final info = await api.joinInfo(id);
+          // One join-info, inspected and then joined as is (409 "between epochs" is retried, not "not ours").
+          final info = await _joinInfo(id);
           final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
           // The served GroupInfo must be for this very channel.
           if (inspected.groupId != id) continue;
@@ -1061,7 +1066,7 @@ class GroupSync {
           if (!ours) continue;
           await _serial(id, () async {
             await ensureReady();
-            await _externalJoin(id);
+            await _externalJoin(id, checked: info);
             await _catchUpNow(id);
           });
           // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
@@ -1079,6 +1084,25 @@ class GroupSync {
       pending = failed;
     }
     return joined;
+  }
+
+  Future<Map<String, dynamic>> _joinInfo(String id) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await api.joinInfo(id);
+      } on ApiException catch (error) {
+        if (error.status != 409 || attempt + 1 >= commitAttempts) rethrow;
+        await Future<void>.delayed(commitBackoff(attempt));
+      }
+    }
+  }
+
+  /// A commit or join refused because a member's identity key doesn't match the server's record (409 `code:
+  /// 'identity'`): not a race. It needs a security-code review, so it is reported once and never retried.
+  bool _identityConflict(ApiException error) {
+    if (error.status != 409 || error.body['code'] != 'identity') return false;
+    _notice("A member's security code changed. Review it before changing this group.");
+    return true;
   }
 
   /// Why joining one of our own channels last failed (channel id → error), for diagnostics.

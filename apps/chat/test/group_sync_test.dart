@@ -394,12 +394,26 @@ void main() {
       alice2.crypto.staleDevices.add(alice.crypto.deviceId);
       expect(await alice2.sync.joinOwnChannels(), 0, reason: 'only a current leaf counts');
       alice2.crypto.staleDevices.clear();
+      final before = ds.joinInfos[group.id] ?? 0;
       expect(await alice2.sync.joinOwnChannels(), 1);
+      expect(ds.joinInfos[group.id], before + 1, reason: 'the GroupInfo inspected is the one joined: fetched once');
       expect(alice2.crypto.groups, contains(group.id));
       // Never a channel this device left.
       await alice2.store.updateGroup(group.id, (g) => g.copyWith(membership: Membership.left));
       ds.channels[group.id]!.members.remove(alice2.crypto.deviceId);
       expect(await alice2.sync.joinOwnChannels(), 0);
+    });
+
+    test("a commit refused for a member's changed identity key (409 code identity) is reported, never retried", () async {
+      final group = await alice.sync.create(GroupKindName.private);
+      final notices = <String>[];
+      alice.sync.notices.listen(notices.add);
+      ds.identityConflict = true;
+      ds.commitsSeen = 0;
+      await expectLater(alice.sync.add(group.id, [bob.user.id]), throwsA(isA<ApiException>()));
+      expect(ds.commitsSeen, 1);
+      await Future<void>.delayed(Duration.zero);
+      expect(notices.single, contains('security code changed'));
     });
   });
 }

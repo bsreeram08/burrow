@@ -31,7 +31,7 @@
       $('link-entry').hidden = false;
       const submit = async text => {
         $('link-code-submit').disabled = true; $('link-status').textContent = 'Checking…';
-        try { await onEntry(text.trim()); } catch (error) { $('link-status').textContent = error.message || 'That didn’t work. Check the code and try again.'; }
+        try { await onEntry(text.replace(/\s+/g, '')); } // Pasted or typed in groups: spaces never matter. catch (error) { $('link-status').textContent = error.message || 'That didn’t work. Check the code and try again.'; }
         finally { $('link-code-submit').disabled = false; }
       };
       $('link-code-form').onsubmit = event => { event.preventDefault(); const text = $('link-code-input').value; if (text.trim()) submit(text); };
@@ -50,11 +50,12 @@
     (entry ? $('link-code-input') : $('link-cancel')).focus();
     return {
       status: text => { if (active) $('link-status').textContent = text; },
-      /** Both screens show `numbers`: the user says whether they match. Resolves true or false. */
+      /** Both screens show the 6-digit code (shown "123 456", docs/m5-linking.md §1.2): does it match? Resolves true or false. */
       compare(numbers) {
         stopScan();
         for (const id of ['link-qr-box', 'link-entry', 'link-scan-box']) $(id).hidden = true;
-        $('link-sas').textContent = spaced(numbers); $('link-confirm').hidden = false; $('link-match').focus();
+        const digits = String(numbers).replace(/\s+/g, '');
+        $('link-sas').textContent = /^\d{6}$/.test(digits) ? `${digits.slice(0, 3)} ${digits.slice(3)}` : digits; $('link-confirm').hidden = false; $('link-match').focus();
         return new Promise(resolve => { $('link-match').onclick = () => { $('link-confirm').hidden = true; resolve(true); }; $('link-mismatch').onclick = () => { $('link-confirm').hidden = true; resolve(false); }; });
       },
       done(text) { stopScan(); for (const id of ['link-qr-box', 'link-entry', 'link-confirm', 'link-scan-box']) $(id).hidden = true; $('link-status').textContent = text; $('link-cancel').textContent = 'Done'; if (active) active.onCancel = null; },

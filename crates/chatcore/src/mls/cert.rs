@@ -127,16 +127,60 @@ impl DeviceCert {
 /// identity), or the delivery service's view of the device registry.
 pub trait Directory {
     fn aik(&mut self, user_id: &str) -> Result<Option<[u8; 32]>>;
+    /// Earlier account keys of the user that a signed succession record handed over from (oldest first), each valid
+    /// for certificates issued up to `until` (the record's time). Empty unless a succession was accepted.
+    fn previous(&mut self, _user_id: &str) -> Result<Vec<Predecessor>> { Ok(Vec::new()) }
 }
 
-/// Decodes and verifies the certificate of a credential/signature-key pair.
+/// An account key the user moved on from by a signed succession record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Predecessor {
+    pub aik: [u8; 32],
+    /// Unix milliseconds: certificates issued after this are not honoured under the old key.
+    pub until: u64,
+}
+
+/// How a leaf's certificate stands against what this directory has pinned for its user.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Standing {
+    /// Signed by the pinned key, or by a predecessor of it before the succession.
+    Current,
+    /// The user is pinned to another key and this certificate is not a predecessor's: a device of an identity the
+    /// user left (recovery, or a succession it was not covered by). It can be removed but can no longer act.
+    Stale,
+}
+
+/// Decodes and verifies the certificate of a credential/signature-key pair against the pinned key (strict: a stale
+/// certificate is an error here; use [`verify_standing`] where stale leaves are tolerated).
 pub fn verify_credential(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8]) -> Result<DeviceCert> {
+    match verify_standing(directory, credential, leaf_sig_key)? {
+        (cert, Standing::Current) => Ok(cert),
+        _ => Err(ChatError::coded("invalid", "device certificate: not signed by the pinned account key")),
+    }
+}
+
+/// Like [`verify_credential`], but a certificate that is well formed and signed by the key it names, for a user
+/// pinned to a different key, is `Stale` instead of an error. No pin at all, a bad signature or a leaf key that
+/// does not match is still an error.
+pub fn verify_standing(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8]) -> Result<(DeviceCert, Standing)> {
     let basic = BasicCredential::try_from(credential.clone()).map_err(|_| ChatError::coded("invalid", "not a basic credential"))?;
     let cert = DeviceCert::decode(basic.identity())?;
     // The message names the user so a client can pin them (docs/m4-groups.md §3) and retry.
     let aik = directory.aik(&cert.user_id)?.ok_or_else(|| ChatError::coded("invalid", &format!("no pinned account key for user {}", cert.user_id)))?;
-    cert.verify(&aik, leaf_sig_key)?;
-    Ok(cert)
+    let claimed = key32(&cert.aik_sign).ok_or_else(|| ChatError::coded("invalid", "malformed key"))?;
+    if claimed == aik {
+        cert.verify(&aik, leaf_sig_key)?;
+        return Ok((cert, Standing::Current));
+    }
+    // Moved on by a signed succession: certificates the old key issued before the succession stay good.
+    for earlier in directory.previous(&cert.user_id)? {
+        if earlier.aik == claimed && cert.issued_at <= earlier.until {
+            cert.verify(&earlier.aik, leaf_sig_key)?;
+            return Ok((cert, Standing::Current));
+        }
+    }
+    cert.verify(&claimed, leaf_sig_key)?;
+    Ok((cert, Standing::Stale))
 }
 
 /// Decodes a credential's certificate without verifying it (display only).

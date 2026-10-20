@@ -31,6 +31,8 @@ pub fn respond(core: &mut Core, command: &Value) -> Value {
     }
 }
 
+fn now(command: &Value) -> u64 { command.get("now").and_then(Value::as_u64).unwrap_or(0) }
+
 fn text(command: &Value, key: &str) -> Result<String, ChatError> {
     command.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| ChatError::transient(format!("missing {key}")))
 }
@@ -38,7 +40,7 @@ fn text(command: &Value, key: &str) -> Result<String, ChatError> {
 pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
     let cmd = text(command, "cmd")?;
     match cmd.as_str() {
-        "identity" => Ok(json!(core.identity()?.public)),
+        "identity" => Ok(json!(core.public_identity()?)),
         "prekeys" => {
             let now = command.get("now").and_then(Value::as_u64).unwrap_or(0);
             let max_age = command.get("maxAge").and_then(Value::as_u64);
@@ -105,6 +107,36 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
         }
         "sasCommitment" => Ok(json!(sas::commitment(&text(command, "nonce")?)?)),
         "sasCheck" => Ok(json!(sas::check_reveal(&text(command, "commitment")?, &text(command, "nonce")?))),
+        // Linked devices (docs/m5-linking.md): the link crypto, pins, succession.
+        "linkQr" => Ok(json!({ "qr": core.link_qr(&text(command, "linkId")?, now(command))? })),
+        "linkAccept" => Ok(json!(core.link_accept(&text(command, "qr")?, now(command))?)),
+        "linkComplete" => Ok(json!({ "code": core.link_complete(&text(command, "linkId")?, &text(command, "eph")?, now(command))? })),
+        "linkSeal" => Ok(json!(core.link_seal(&text(command, "linkId")?, &text(command, "plaintext")?, now(command))?)),
+        "linkOpen" => Ok(json!(core.link_open(&text(command, "linkId")?, &text(command, "data")?, now(command))?)),
+        // Short-code rendezvous (docs/m5-linking.md §1.7).
+        "linkCommit" => Ok(json!({ "commit": core.link_commit(&text(command, "linkId")?, &text(command, "deviceId")?, now(command))? })),
+        "linkReveal" => { let (eph, nonce) = core.link_reveal(&text(command, "linkId")?, &text(command, "eph")?, now(command))?; Ok(json!({ "eph": eph, "nonce": nonce })) }
+        "linkLookup" => Ok(json!({ "eph": core.link_lookup(&text(command, "linkId")?, &text(command, "deviceN")?, &text(command, "commit")?, &text(command, "deviceP")?, now(command))? })),
+        "linkOpenCommitment" => Ok(json!({ "code": core.link_open_commitment(&text(command, "linkId")?, &text(command, "eph")?, &text(command, "nonce")?, now(command))? })),
+        "linkCompleteCode" => Ok(json!({ "code": core.link_complete_code(&text(command, "linkId")?, &text(command, "eph")?, &text(command, "deviceP")?, now(command))? })),
+        "linkEnd" => { core.link_end(&text(command, "linkId")?)?; Ok(Value::Null) }
+        "exportPins" => Ok(json!(core.export_pins()?)),
+        "importPins" => {
+            let pins: Vec<crate::core::PinExport> = serde_json::from_value(command.get("pins").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid pins"))?;
+            Ok(json!(core.import_pins(&pins)?))
+        }
+        "successionStart" => Ok(json!(core.succession_start()?)),
+        "successionComplete" => Ok(json!(core.succession_complete(command.get("record").unwrap_or(&Value::Null), &text(command, "signature")?)?)),
+        "signSuccession" => Ok(core.sign_succession(&text(command, "userId")?, &text(command, "published")?, &text(command, "newSign")?, &text(command, "newDh")?, command.get("at").and_then(Value::as_u64).unwrap_or(0))?),
+        "retireIdentity" => {
+            let identity: IdentityPub = serde_json::from_value(command.get("identity").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid identity"))?;
+            core.retire_identity(&text(command, "userId")?, &identity, command.get("at").and_then(Value::as_u64).unwrap_or(0))?;
+            Ok(Value::Null)
+        }
+        "acceptSuccession" => {
+            let records = command.get("records").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "records must be a list"))?;
+            Ok(json!(core.accept_succession(&text(command, "contact")?, records)?))
+        }
         other => {
             #[cfg(any(feature = "mls", feature = "ds"))]
             if let Some(result) = crate::mls::commands::run(core, other, command) { return result; }

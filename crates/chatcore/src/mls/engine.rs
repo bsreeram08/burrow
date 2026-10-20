@@ -18,9 +18,9 @@ use openmls_rust_crypto::RustCrypto;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::cert::{cert_of, key32, DeviceCert, Directory};
+use super::cert::{cert_of, key32, verify_standing, DeviceCert, Directory, Predecessor, Standing};
 use super::persist::{tag_of_group_json, Persist, Written};
-use super::policy::{capabilities, group_extensions, validate_context, validate_group_state, validate_staged, Kind, Roles};
+use super::policy::{capabilities, group_extensions, validate_context, validate_group_state, validate_staged, Kind, Roles, Stale};
 use super::rows::{Change, Rows};
 use super::storage::MlsStorage;
 use super::{bounded, digest, limits, CS, ROLES_EXT};
@@ -85,6 +85,15 @@ impl Directory for StoreDirectory<'_> {
         if value.get("blocked").and_then(Value::as_bool) == Some(true) { return Ok(None); }
         let text = value.pointer("/identity/sign").or_else(|| value.get("aik")).and_then(Value::as_str);
         Ok(text.and_then(key32))
+    }
+    fn previous(&mut self, user_id: &str) -> Result<Vec<Predecessor>> {
+        // Our own account's earlier keys live in `own-previous`; everyone else's in their pin (`previous`).
+        let list = if self.own.as_ref().is_some_and(|(own, _)| own == user_id) { self.store.get("own-previous")? } else { self.store.get(&format!("{}{user_id}", self.prefix))?.and_then(|v| v.get("previous").cloned()) };
+        let Some(Value::Array(items)) = list else { return Ok(Vec::new()) };
+        Ok(items.iter().filter_map(|item| {
+            let text = item.get("sign").or_else(|| item.get("aik")).and_then(Value::as_str)?;
+            Some(Predecessor { aik: key32(text)?, until: item.get("until").and_then(Value::as_u64)? })
+        }).collect())
     }
 }
 
@@ -189,7 +198,9 @@ fn check_commit(provider: &Provider, group: &MlsGroup, protocol: ProtocolMessage
             let author = view(&sender, staged.update_path_leaf_node());
             let mut directory = Groups::client_directory(store, cert);
             let policy = validate_staged(group.extensions(), group.members(), &sender, &staged, &mut directory);
-            Ok(CommitCheck::new(true, policy.is_err(), author))
+            // A missing pin is this device's problem, not something the author signed: never blame them for it.
+            let blamed = policy.as_ref().is_err_and(|error| !error.message.starts_with("no pinned account key"));
+            Ok(CommitCheck::new(true, blamed, author))
         }
         // Staging happens after the signature has been checked: the author signed content that does not stage.
         Err(PublicProcessMessageError::InvalidCommit(_)) => Ok(CommitCheck::new(true, true, view(&claimed, None))),
@@ -248,6 +259,9 @@ pub struct MemberView {
     pub device_id: String,
     pub platform: String,
     pub admin: bool,
+    /// A device of an identity its user left (recovery, or a succession that did not cover it): it can be removed
+    /// but can no longer act. Only `members` computes this; other views leave it false.
+    pub stale: bool,
 }
 
 /// One received message, decrypted and authenticated but not yet persisted (two-phase receive).
@@ -407,7 +421,7 @@ impl Groups {
             self.verified.remove(&key);
         }
         let mls_group = Self::load_group(&self.provider, group)?;
-        let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory)?;
+        let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory, Stale::Any)?;
         if mls_group.is_active() {
             let own = certs.iter().find(|(index, _)| *index == mls_group.own_leaf_index()).ok_or_else(|| invalid("this device's leaf is missing from its group"))?;
             if own.1 != cert { return Err(invalid("this device's leaf does not match its certificate")); }
@@ -456,6 +470,50 @@ impl Groups {
         let leaf = key32(&self.device_leaf(store)?).ok_or_else(|| ChatError::storage("malformed leaf key"))?;
         let cert = DeviceCert::issue(aik, user_id, device_id, platform, &leaf, issued_at)?;
         self.set_device_cert(store, &String::from_utf8(cert.encode()).expect("utf8"), &aik.verifying_key().to_bytes())
+    }
+
+    /// Re-signs this device's certificate under `aik` for the same device and leaf key (a new primary after a
+    /// succession). The old certificate stays valid for others through the succession record until then.
+    pub fn recertify_device(&mut self, store: &mut dyn Store, platform: &str, issued_at: u64, aik: &SigningKey) -> Result<DeviceCert> {
+        let old = Self::device(store)?;
+        let leaf = key32(&old.leaf_sig_key).ok_or_else(|| ChatError::storage("malformed device record"))?;
+        let cert = DeviceCert::issue(aik, &old.user_id, &old.device_id, platform, &leaf, issued_at)?;
+        self.set_device_cert(store, &String::from_utf8(cert.encode()).expect("utf8"), &aik.verifying_key().to_bytes())
+    }
+
+    /// The members of a served GroupInfo and tree after the whole-group validation of a join (the GroupInfo's
+    /// signature, the tree against it, roles, every certificate under today's pins), without joining or storing
+    /// anything. Stale leaves are reported (`stale`), not refused, so a caller can decide: for linking, a device
+    /// should only join a group it can see holds a current leaf of its own account.
+    pub fn inspect_group(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Vec<MemberView>> {
+        let cert = Self::device(store)?;
+        let (info, tree) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
+        let scratch = Provider::default();
+        let mut directory = Self::client_directory(store, &cert);
+        let public = ds_bootstrap(&scratch, &info, &tree, &mut directory, Stale::Any)?;
+        let roles = validate_context(public.group_context().extensions())?;
+        Ok(public.members().filter_map(|m| {
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
+        }).collect())
+    }
+
+    /// A pointer to a DM group is acceptable only if the group is a DM of exactly this account and `peer`, and every
+    /// leaf in it is current under the pins (docs/m5-linking.md §8.3).
+    pub fn check_dm(&mut self, store: &mut dyn Store, group: &GroupId, peer: &str) -> Result<()> {
+        let cert = Self::device(store)?;
+        self.gate(store, group)?;
+        let mls_group = Self::load_group(&self.provider, group)?;
+        let roles = validate_context(mls_group.extensions())?;
+        let mut users = vec![cert.user_id.clone(), peer.to_string()];
+        users.sort();
+        if roles.kind != Kind::Dm || roles.dm.as_ref() != Some(&users) { return Err(invalid("that is not the DM of these two people")); }
+        let mut directory = Self::client_directory(store, &cert);
+        for member in mls_group.members() {
+            let (leaf, standing) = verify_standing(&mut directory, &member.credential, &member.signature_key)?;
+            if standing != Standing::Current || !users.contains(&leaf.user_id) { return Err(invalid("that DM holds a device that does not chain to these two accounts")); }
+        }
+        Ok(())
     }
 
     /// KeyPackages for the server (MLS messages, base64url). Their private keys stay here until a Welcome uses them.
@@ -598,7 +656,7 @@ impl Groups {
             if external.is_some() {
                 // OpenMLS merges an external commit when it builds it, and join_external already ran the shared
                 // validator on it; the DS accepting it makes it final. Last gate: the state we now hold.
-                let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory)?;
+                let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory, Stale::Any)?;
                 if !certs.iter().any(|(index, c)| *index == mls_group.own_leaf_index() && c == &cert) { return Err(invalid("this device's leaf does not match its certificate")); }
                 return Ok(());
             }
@@ -640,7 +698,12 @@ impl Groups {
         self.gate(store, group)?;
         let mls_group = Self::load_group(&self.provider, group)?;
         let roles = validate_context(mls_group.extensions())?;
-        Ok(mls_group.members().filter_map(|m| cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform })).collect())
+        let cert = Self::device(store)?;
+        let mut directory = Self::client_directory(store, &cert);
+        Ok(mls_group.members().filter_map(|m| {
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
+        }).collect())
     }
 
     pub fn roles(&mut self, store: &mut dyn Store, group: &GroupId) -> Result<Roles> {
@@ -660,7 +723,7 @@ impl Groups {
             let tree = RatchetTreeIn::tls_deserialize_exact(tree.as_slice()).map_err(|_| ChatError::malformed())?;
             let staged = StagedWelcome::new_from_welcome(provider, &join_config(), welcome, Some(tree)).map_err(mls)?;
             let mut directory = Self::client_directory(store, &cert);
-            validate_group_state(staged.group_context().extensions(), staged.members(), &mut directory)?;
+            validate_group_state(staged.group_context().extensions(), staged.members(), &mut directory, Stale::Reject)?;
             let group = staged.into_group(provider).map_err(mls)?;
             Ok(group.group_id().clone())
         })?;
@@ -709,7 +772,7 @@ impl Groups {
             if check {
                 let scratch = Provider::default();
                 let mut directory = Self::client_directory(store, &cert);
-                let before = ds_bootstrap(&scratch, &info_bytes, &tree_bytes, &mut directory)?;
+                let before = ds_bootstrap(&scratch, &info_bytes, &tree_bytes, &mut directory, Stale::Own(&cert.user_id))?;
                 ds_check(&scratch, &before, &commit, &mut directory)?;
             }
             let epoch = joined.epoch().as_u64().saturating_sub(1);
@@ -753,7 +816,7 @@ impl Groups {
     fn member_view(mls_group: &MlsGroup, roles: &Roles, index: LeafNodeIndex) -> Option<MemberView> {
         let member = mls_group.member_at(index)?;
         let cert = cert_of(&member.credential)?;
-        Some(MemberView { leaf: index.u32(), admin: roles.is_admin(&cert.user_id), user_id: cert.user_id, device_id: cert.device_id, platform: cert.platform })
+        Some(MemberView { leaf: index.u32(), admin: roles.is_admin(&cert.user_id), user_id: cert.user_id, device_id: cert.device_id, platform: cert.platform, stale: false })
     }
 
     /// Phase one of receiving a message from the group's log: authenticate, decrypt, validate (commits through
@@ -806,15 +869,18 @@ impl Groups {
     /// device's tree with a certificate that verifies under the pinned account key, its user must be an admin, and
     /// the signature must be its leaf key's over the bytes of [`Groups::sign_resolution`]. Changes nothing.
     #[allow(clippy::too_many_arguments)]
-    pub fn verify_resolution(&mut self, store: &mut dyn Store, group: &GroupId, action: &str, seq: u64, digest: &str, author: &str, by: &str, signature: &str) -> Result<ResolutionSigner> {
+    pub fn verify_resolution(&mut self, store: &mut dyn Store, group: &GroupId, action: &str, seq: u64, digest: &str, author: &str, by: &str, by_user: &str, signature: &str) -> Result<ResolutionSigner> {
         let bytes = resolution_bytes(group, action, seq, digest, author)?;
-        if !super::cert::canonical_id(by) { return Err(invalid("the signer is a device id")); }
+        if !super::cert::canonical_id(by) || !super::cert::canonical_id(by_user) { return Err(invalid("the signer is a user id and a device id")); }
         let signature: [u8; 64] = unb64(signature, "signature")?.try_into().map_err(|_| invalid("a signature is 64 bytes"))?;
         let cert = Self::device(store)?;
         self.gate(store, group)?;
         let mls_group = Self::load_group(&self.provider, group)?;
         let roles = validate_context(mls_group.extensions())?;
-        let member = mls_group.members().find(|m| cert_of(&m.credential).is_some_and(|c| c.device_id == by)).ok_or_else(|| invalid("that device is not in this group"))?;
+        // The signer is named by user and device, and must be exactly one leaf.
+        let mut matches = mls_group.members().filter(|m| cert_of(&m.credential).is_some_and(|c| c.device_id == by && c.user_id == by_user));
+        let member = matches.next().ok_or_else(|| invalid("that device is not in this group"))?;
+        if matches.next().is_some() { return Err(invalid("more than one device matches that signer")); }
         let mut directory = Self::client_directory(store, &cert);
         let signer = super::cert::verify_credential(&mut directory, &member.credential, &member.signature_key)?;
         if !roles.is_admin(&signer.user_id) { return Err(invalid("only an admin's device resolves a frozen channel")); }
@@ -864,6 +930,10 @@ impl Groups {
             match processed.into_content() {
                 ProcessedMessageContent::ApplicationMessage(app) => {
                     let sender = sender_view(&mls_group).ok_or_else(|| ChatError::coded("auth", "unknown sender"))?;
+                    // A device of an identity its user left may no longer speak for them (it may be the reason they left).
+                    let leaf = sender_index.and_then(|index| mls_group.member_at(index)).ok_or_else(|| ChatError::coded("auth", "unknown sender"))?;
+                    let mut directory = Self::client_directory(store, &cert);
+                    if verify_standing(&mut directory, &leaf.credential, &leaf.signature_key)?.1 == Standing::Stale { return Err(ChatError::coded("stale", "This device belongs to an identity its user left")); }
                     let text = String::from_utf8(app.into_bytes()).map_err(|_| ChatError::coded("invalid", "payload is not UTF-8"))?;
                     Ok((Processed { pending_id: String::new(), kind: "application".into(), plaintext: Some(text), sender, epoch: current, digest: None }, Vec::new()))
                 }
@@ -874,7 +944,7 @@ impl Groups {
                     let sender_kind = match sender_index { Some(i) => Sender::Member(i), None => Sender::NewMemberCommit };
                     let sender = match sender_index {
                         Some(_) => sender_view(&mls_group),
-                        None => staged.update_path_leaf_node().and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
+                        None => staged.update_path_leaf_node().and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale: false }),
                     };
                     let Some(sender) = sender else { return Err(Self::poisoned(provider, &mls_group, public_copy.expect("commit"), store, &cert, &message_digest, "unknown committer".into())) };
                     let policy = {
@@ -990,12 +1060,33 @@ impl Ds {
         store.put(&key, json!({ "aik": aik }))
     }
 
+    /// The registry's key for a user changed with no succession (recovery, or a takeover): the pin is replaced.
+    /// Certificates the old key signed become stale (removable, unable to act). Clients decide for themselves
+    /// whether to trust the new key; the DS only keeps validating against what the registry holds.
+    pub fn repin(&mut self, store: &mut dyn Store, user_id: &str, aik: &str) -> Result<()> {
+        if !super::cert::canonical_id(user_id) || key32(aik).is_none() { return Err(invalid("invalid user id or account key")); }
+        store.put(&format!("mlsdsx:pin:{user_id}"), json!({ "aik": aik }))
+    }
+
+    /// The registry's key moved on by signed succession records (oldest first, `{..., signature}`), starting at the
+    /// pinned key: the pin follows the chain and keeps each earlier key as a predecessor, so certificates issued
+    /// before each record stay valid.
+    pub fn succeed(&mut self, store: &mut dyn Store, user_id: &str, records: &[Value]) -> Result<()> {
+        let key = format!("mlsdsx:pin:{user_id}");
+        let pinned = store.get(&key)?.ok_or_else(|| invalid("that user has no pinned account key"))?;
+        let start = pinned.get("aik").and_then(Value::as_str).ok_or_else(|| ChatError::storage("malformed pin"))?.to_string();
+        let chain = crate::succession::follow(&start, user_id, records)?;
+        let mut previous = pinned.get("previous").cloned().unwrap_or_else(|| json!([]));
+        for record in &chain { previous.as_array_mut().expect("array").push(json!({ "aik": record.old_sign, "until": record.at })); }
+        store.put(&key, json!({ "aik": chain.last().expect("non-empty").new_sign, "previous": previous }))
+    }
+
     /// Starts tracking a group from the creator's GroupInfo and tree (validated like a Welcome).
     pub fn create(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Value> {
         let (info, tree) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
         let value = self.groups.run(store, |provider, store, _extra| {
             let mut directory = Groups::ds_directory(store);
-            let public = ds_bootstrap(provider, &info, &tree, &mut directory)?;
+            let public = ds_bootstrap(provider, &info, &tree, &mut directory, Stale::Reject)?;
             Ok(json!({ "groupId": group_text(public.group_id()), "epoch": public.group_context().epoch().as_u64() }))
         })?;
         Ok(value)
@@ -1010,7 +1101,7 @@ impl Ds {
             self.groups.verified.remove(&key);
         }
         let public = Self::public(&self.groups.provider, group)?;
-        let (_, certs) = validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
+        let (_, certs) = validate_group_state(public.group_context().extensions(), public.members(), &mut directory, Stale::Any)?;
         let seen = Verified::of(None, &mut directory, &certs)?;
         self.groups.verified.insert(key, seen);
         Ok(())
@@ -1073,7 +1164,7 @@ impl Ds {
             }
             let public = Self::public(provider, group).map_err(|_| invalid("snapshot unreadable"))?;
             let mut directory = Groups::ds_directory(store);
-            validate_group_state(public.group_context().extensions(), public.members(), &mut directory)?;
+            validate_group_state(public.group_context().extensions(), public.members(), &mut directory, Stale::Any)?;
             Ok(json!({ "groupId": group_text(group), "epoch": public.group_context().epoch().as_u64() }))
         })?;
         Ok(value)
@@ -1099,7 +1190,11 @@ impl Ds {
         self.gate(store, group)?;
         let public = Self::public(&self.groups.provider, group)?;
         let roles = validate_context(public.group_context().extensions())?;
-        let members = public.members().filter_map(|m| cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform })).collect();
+        let mut directory = Groups::ds_directory(store);
+        let members = public.members().filter_map(|m| {
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
+        }).collect();
         Ok(GroupMembers { epoch: public.group_context().epoch().as_u64(), roles, members })
     }
 
@@ -1109,14 +1204,14 @@ impl Ds {
 }
 
 /// DS bootstrap: a PublicGroup from a GroupInfo and tree, validated like a Welcome (certificates, roles, size).
-fn ds_bootstrap(provider: &Provider, info: &[u8], tree: &[u8], directory: &mut dyn Directory) -> Result<PublicGroup> {
+fn ds_bootstrap(provider: &Provider, info: &[u8], tree: &[u8], directory: &mut dyn Directory, stale: Stale) -> Result<PublicGroup> {
     bounded("group info", info, limits::MAX_GROUP_INFO_BYTES)?;
     bounded("ratchet tree", tree, limits::MAX_TREE_BYTES)?;
     let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(info).map_err(|_| ChatError::malformed())?.extract() else { return Err(invalid("not a GroupInfo")) };
     if PublicGroup::load(provider.storage(), info.group_id()).map_err(|_| ChatError::storage("group state unreadable"))?.is_some() { return Err(invalid("group already tracked")); }
     let tree = RatchetTreeIn::tls_deserialize_exact(tree).map_err(|_| ChatError::malformed())?;
     let (public, _) = PublicGroup::from_external(provider.crypto(), provider.storage(), tree, info, ProposalStore::new()).map_err(mls)?;
-    validate_group_state(public.group_context().extensions(), public.members(), directory)?;
+    validate_group_state(public.group_context().extensions(), public.members(), directory, stale)?;
     Ok(public)
 }
 

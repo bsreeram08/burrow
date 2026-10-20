@@ -8,11 +8,13 @@ pub mod commands;
 pub mod core;
 pub mod devicelist;
 pub mod error;
+pub mod link;
 #[cfg(any(feature = "mls", feature = "ds"))]
 pub mod mls;
 pub mod primitives;
 pub mod protocol;
 pub mod sas;
+pub mod succession;
 #[cfg(feature = "native")]
 mod sqlite;
 pub mod store;

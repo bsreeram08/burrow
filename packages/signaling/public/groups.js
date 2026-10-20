@@ -101,7 +101,14 @@
       navigator.locks.request(`groups:${me.id}`, () => { if (mine !== generation) return; starting = setup(mine); return new Promise(() => {}); });
     });
   }
+  /**
+   * A primary handing the account over (m5 §5.2) reads nothing more until it has stepped down and reloaded: the new
+   * primary's recertifying commits are under a key this store doesn't hold yet, and must not be reported as bad.
+   */
+  let held = false;
+  const hold = () => { held = true; };
   function stop() {
+    held = false;
     generation++; enabled = false; ctx = null; run = null; me = null; currentId = null; channels = new Map(); queues.clear(); pinned.clear();
     for (const timer of cursorTimers.values()) clearTimeout(timer);
     cursorTimers.clear(); typingFrom.clear();
@@ -126,6 +133,7 @@
         const sig = await ctx.signWithIdentity(F.mlsCertBytes(me.id, deviceId, 'web', leaf, aik, issuedAt));
         await run({ cmd: 'mlsSetDeviceCert', cert: F.mlsCertJson(me.id, deviceId, 'web', leaf, aik, issuedAt, sig), aik });
         try { localStorage.setItem(certified, '1'); } catch {}
+        certUnder(aik);
       }
       if (mine !== generation) return;
       const count = await call('/api/mls/keypackages');
@@ -160,14 +168,19 @@
    */
   async function adoptSuccession({ record, signature, cert, before }) {
     if (before) await run({ cmd: 'companionSetup', userId: me.id, identity: before.identity, cert: before.cert });
+    if (!certAik()) certUnder(record.oldSign); // Linked before this was recorded: our certificate is under the key we had.
     const identity = await run({ cmd: 'adoptSuccession', userId: me.id, record, signature, ...(cert ? { cert } : {}) });
-    if (cert) for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true;
+    if (cert) { certUnder(record.newSign); for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true; }
     persist();
     return identity;
   }
+  // The account key this device's MLS certificate is under: a companion whose account moved on asks for a new one (§5.2.2).
+  const certAik = () => { try { return localStorage.getItem(`mls-cert-aik-v1:${instance}`); } catch { return null; } };
+  const certUnder = aik => { try { localStorage.setItem(`mls-cert-aik-v1:${instance}`, aik); } catch {} };
   /** A companion's certificate under the account's new key arrived (m5 §5.2.2): install it, then recertify everywhere. */
   async function installCert(identity, cert) {
     await run({ cmd: 'companionSetup', userId: me.id, identity, cert });
+    certUnder(identity.sign);
     for (const [id, ch] of channels) if (!['left', 'removed'].includes(ch.status)) { ch.recertify = true; if (usable(ch)) recertify(id); }
     persist();
   }
@@ -517,6 +530,7 @@
   // ---------- Receiving (§6) ----------
   /** Frames from account.js's event stream. */
   function frame(message) {
+    if (held) return;
     if (!enabled) { if (message.type === 'devices') devicesChanged(); return; }
     if (message.type === 'group') onGroup(message);
     else if (message.type === 'welcome') enqueue('welcome', () => takeWelcome(message.id, message)).catch(() => {});
@@ -549,6 +563,7 @@
     return true;
   }
   async function syncInner(id) {
+    if (held) return;
     const ch = channels.get(id);
     for (let pages = 0; pages < 400 && usable(ch); pages++) {
       const result = await call(`/api/channels/${id}/log?after=${ch.cursor}`);
@@ -617,6 +632,10 @@
   }
   /** A rejected commit may only mean a pin moved (a changed key, a person met for the first time): check first. */
   async function pinsMoved(id, entry) {
+    // The author's account may have moved to a new key with a signed record (m5 §5): follow that first, so a
+    // recertifying commit that arrives before the 'devices'/'keys' frame isn't taken for a change, or reported.
+    const author = entry.from?.userId;
+    if (author === me.id ? await ctx.followOwnSuccession?.().catch(() => false) : await ctx.followContact?.(author).catch(() => false)) return true;
     const { problems, changed } = await ensurePins([entry.from.userId, ...memberIds(id), ...(await call(`/api/channels/${id}/members`).then(r => r.status === 200 ? r.body.members.map(m => m.userId) : [], () => []))], true);
     if (problems.length) { pause(id, problems[0]); return false; }
     return changed;
@@ -1431,7 +1450,7 @@
     dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked === peerId && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
     /** For a primary transfer (m5 §5): this store's name, its leaf key, its pins, and adopting the new account key. */
-    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown,
+    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown, certAik, hold,
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
     bundleChannels: () => [...channels].filter(([, ch]) => ['active', 'frozen', 'paused'].includes(ch.status) && ch.kind !== 'dm').map(([id, ch]) => ({ id, kind: ch.kind, name: ch.meta?.name || ch.serverName || null, topic: ch.meta?.topic || null })), sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,

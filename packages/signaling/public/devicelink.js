@@ -45,7 +45,17 @@
   const spacedCode = code => { const digits = String(code).replace(/\s+/g, ''); return `${digits.slice(0, 3)} ${digits.slice(3)}`; };
 
   // ---------- N: this browser joins an account ----------
-  async function linkThisBrowser() {
+  /** The short code (§1.7, no camera): ask which account first; only that account's primary can complete it. */
+  function linkByCode() {
+    window.Linking.open({
+      title: 'Link this browser', entry: { label: 'Your username', placeholder: 'username', submit: 'Next' },
+      hint: 'Without a camera, your primary device types a short code instead. Which account is this browser for?',
+      onEntry: async text => { const username = text.trim().toLowerCase(); if (!/^[a-z0-9_]{3,20}$/.test(username)) throw new Error('Type your username.'); linkThisBrowser(username); },
+      alt: { label: 'Use a QR code instead', run: () => linkThisBrowser() },
+    });
+  }
+  /** `username`: link with a short code (§1.7) to that account; otherwise with a QR. */
+  async function linkThisBrowser(username = null) {
     // Signed out (the usual case) or signed in on a device the account doesn't list yet.
     const owner = ctx?.me()?.id || '__link__';
     let open = true, linkId = null, claim = null;
@@ -54,17 +64,35 @@
       const deviceId = device.deviceId, instance = `link-${deviceId}`;
       const run = window.Core.groupStore(deviceId, instance);
       const signature = await device.sign(F().startBytes(deviceId, 'web', device.publicKey));
-      const start = await call('/api/link/start', 'POST', { purpose: 'link', deviceId, deviceKey: device.publicKey, platform: 'web', signature });
+      const start = await call('/api/link/start', 'POST', { purpose: 'link', ...(username ? { mode: 'code', username } : {}), deviceId, deviceKey: device.publicKey, platform: 'web', signature });
       ({ linkId, claim } = start);
       const deadline = Math.min(start.expiresAt || Infinity, Date.now() + LINK_TTL);
-      const { qr } = await run({ cmd: 'linkQr', linkId, now: Date.now() });
-      const shown = window.Linking.open({
-        title: 'Link this browser', qr, code: qr,
-        hint: 'On your primary device, open Settings → Devices → Link a new device. Scan this code there, or type the text under it.',
-        onCancel: () => { open = false; call(`/api/link/${linkId}`, 'DELETE', undefined, claim).catch(() => {}); run({ cmd: 'linkEnd', linkId }).catch(() => {}); },
-      });
+      const onCancel = () => { open = false; call(`/api/link/${linkId}`, 'DELETE', undefined, claim).catch(() => {}); run({ cmd: 'linkEnd', linkId }).catch(() => {}); };
+      let shown;
+      if (username) {
+        // Commit to our key before any primary's key exists, so a relay can't grind keys until the digits match.
+        const { commit } = await run({ cmd: 'linkCommit', linkId, deviceId, now: Date.now() });
+        await call(`/api/link/${linkId}/commit`, 'POST', { commit }, claim);
+        shown = window.Linking.open({
+          title: 'Link this browser', code: start.code, onCancel,
+          hint: `On ${username}’s primary device, open Settings → Devices → Link a new device and type this code. It works once, for 5 minutes.`,
+        });
+      } else {
+        const { qr } = await run({ cmd: 'linkQr', linkId, now: Date.now() });
+        shown = window.Linking.open({
+          title: 'Link this browser', qr, code: qr, onCancel,
+          hint: 'On your primary device, open Settings → Devices → Link a new device. Scan this code there, or type the text under it.',
+          alt: { label: 'Can’t scan? Use a short code', run: linkByCode },
+        });
+      }
       const offered = await until(async () => { const state = await call(`/api/link/${linkId}`, 'GET', undefined, claim); if (state.state === 'expired') throw new Error('The link expired. Start again on both devices.'); return state.state === 'offered' || state.state === 'granted' ? state : null; }, () => open, deadline);
-      const { code } = await run({ cmd: 'linkComplete', linkId, eph: offered.eph, now: Date.now() });
+      let code;
+      if (username) {
+        // Only now, with the primary's key fixed, open the commitment (one-shot: another key later burns the link).
+        const revealed = await run({ cmd: 'linkReveal', linkId, eph: offered.eph, now: Date.now() });
+        await call(`/api/link/${linkId}/reveal`, 'POST', revealed, claim);
+        ({ code } = await run({ cmd: 'linkCompleteCode', linkId, eph: offered.eph, deviceP: offered.offerDeviceId, now: Date.now() }));
+      } else ({ code } = await run({ cmd: 'linkComplete', linkId, eph: offered.eph, now: Date.now() }));
       // Say who we are, sealed: the primary shows this with the code before anyone signs anything.
       const leafSigKey = await run({ cmd: 'mlsDeviceLeaf' });
       const hello = { v: 1, type: 'hello', deviceId, platform: 'web', label: F().describeThisDevice(), leafSigKey, wantsHistory: true };
@@ -125,6 +153,7 @@
       pins[user.id] = check.pin; localStorage.setItem(`device-pins-v1:${user.id}`, JSON.stringify(pins));
       localStorage.setItem(`device-meta-key-v1:${user.id}`, grant.metaKey);
       localStorage.setItem(`mls-cert-v1:${instance}`, '1');
+      localStorage.setItem(`mls-cert-aik-v1:${instance}`, identity.sign);
     } catch {}
     if (Array.isArray(bundle.pins)) await run({ cmd: 'importPins', pins: bundle.pins }).catch(() => 0);
     // Names and topics of private channels exist only on devices: they arrive with the bundle (later `meta` wins).
@@ -151,10 +180,13 @@
       title: purpose === 'transfer' ? 'Make another device primary' : 'Link a new device', entry: true,
       hint: purpose === 'transfer'
         ? `On ${row ? 'that device' : 'the other device'}, open Settings → Devices and choose “Make this browser primary”. Scan the code it shows, or type the text under it.`
-        : 'On the new device, open this app and choose “Link to my other device”. Scan the code it shows, or type the text under it.',
+        : 'On the new device, open this app and choose “Link to my other device”. Scan the code it shows, or type the text (or the 8-character code) under it.',
       onEntry: async text => {
-        if (!text.startsWith('wb-link1.')) throw new Error('That isn’t a link code from this app. Check the text and try again.');
-        const accepted = await window.Groups.linkCore({ cmd: 'linkAccept', qr: text });
+        let accepted;
+        const short = text.toUpperCase().replace(/-/g, '');
+        if (purpose === 'link' && /^[ABCDEFGHJKMNPQRSTUVWXYZ2-9]{8}$/.test(short)) accepted = await lookUp(short);
+        else if (!text.startsWith('wb-link1.')) throw new Error('That isn’t a link code from this app. Check the text and try again.');
+        else accepted = await window.Groups.linkCore({ cmd: 'linkAccept', qr: text });
         linkId = accepted.linkId;
         // Once the account is signed over, the old primary must see the hand-over through: closing doesn't stop it.
         accept(ui, accepted, () => open || handedOver, purpose, () => { handedOver = true; }).catch(error => { if (!error.cancelled) ui.fail(error.message || 'Linking didn’t work. Start again on both devices.'); });
@@ -162,10 +194,23 @@
       onCancel: () => { open = false; if (linkId && !handedOver) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {}); } },
     });
   }
+  /** P, short code (§1.7): the server hands over the link the code names (once); our key answers its commitment. */
+  async function lookUp(code) {
+    const found = await call('/api/link/lookup', 'POST', { code }).catch(error => { throw new Error(error.status === 429 ? 'Too many wrong codes. Try again in a few minutes.' : 'No link with that code. Check it, or start again on the new device.'); });
+    const deviceP = (await F().deviceKey(ctx.me().id)).deviceId;
+    const { eph } = await window.Groups.linkCore({ cmd: 'linkLookup', linkId: found.linkId, deviceN: found.deviceId, commit: found.commit, deviceP });
+    return { linkId: found.linkId, eph, code: null };
+  }
   async function accept(ui, { linkId, eph, code }, live, purpose = 'link', handingOver = () => {}) {
     const deadline = Date.now() + LINK_TTL;
     const offer = await call(`/api/link/${linkId}/offer`, 'POST', { eph });
     if (offer.purpose !== purpose) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); throw new Error(purpose === 'link' ? 'That code is for making a device primary. Use “Make primary” next to that device.' : 'That code is for linking a new device. Use “Link a new device”.'); }
+    if (!code) {
+      // Short code: the new device opens its commitment only now; a key other than the committed one burns the link.
+      ui.status('Waiting for the new device…');
+      const reveal = await until(async () => (await call(`/api/link/${linkId}`)).reveal || null, live, deadline);
+      ({ code } = await window.Groups.linkCore({ cmd: 'linkOpenCommitment', linkId, eph: reveal.eph, nonce: reveal.nonce }));
+    }
     if (purpose === 'transfer') return handOver(ui, linkId, code, offer, live, deadline, handingOver);
     ui.status('Waiting for the new device…');
     let after = 0;
@@ -215,6 +260,7 @@
     ui.status('Handing over… keep this page open.');
     const { record, signature } = await ctx.signSuccession(request);
     handingOver();
+    window.Groups.hold();
     const sealed = await window.Groups.linkCore({ cmd: 'linkSeal', linkId, plaintext: JSON.stringify({ v: 1, type: 'succession', record, signature, leafSigKey: await window.Groups.leafKey() }) });
     await call(`/api/link/${linkId}/messages`, 'POST', { data: sealed });
     const demote = await next(() => true, deadline);

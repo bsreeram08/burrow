@@ -58,6 +58,14 @@ describe('link and succession bytes (shared vectors)', () => {
     expect(await F.successionFrom('user_1', null, served, chain)).toBeNull();
     expect(await F.successionFrom('user_1', { identity, verified: true, changed: false, blocked: false }, served, chain)).toHaveLength(1); // accepted: followed
   });
+  test('a transfer\'s new-chain marker counts only for its own key and only before that key\'s list is pinned', () => {
+    const marker = { aik: b64(1), keep: [{ deviceId: 'd'.repeat(22) }] };
+    expect(F.chainMarker(marker, b64(1), undefined)).toBe(marker);
+    expect(F.chainMarker(marker, b64(2), undefined)).toBeNull(); // replayed under another key
+    expect(F.chainMarker(marker, b64(1), { version: 1 })).toBeNull(); // the new key's list already has a pin
+    expect(F.chainMarker({ keep: [] }, b64(1), undefined)).toBeNull(); // an unbound (old-format) marker
+    expect(F.chainMarker(null, b64(1), undefined)).toBeNull();
+  });
   test('only devices our own verified list names are re-signed under a new key, with the platform from their sealed label', async () => {
     const { publicKey, privateKey } = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as unknown as CryptoKeyPair;
     const aikSign = Buffer.from(await crypto.subtle.exportKey('raw', publicKey)).toString('base64url');

@@ -298,9 +298,9 @@
   <div id="link-dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="link-title" hidden><div class="dialog-card device-link-card">
     <h2 id="link-title">Link a device</h2>
     <p id="link-hint" class="note"></p>
-    <div id="link-qr-box" class="device-link-qr-box" hidden><div id="link-qr" class="device-link-qr"></div><p class="note">Or type this code on the other device:</p><p id="link-code" class="device-link-code"></p></div>
+    <div id="link-qr-box" class="device-link-qr-box" hidden><div id="link-qr" class="device-link-qr"></div><p id="link-code-note" class="note">Or type this code on the other device:</p><p id="link-code" class="device-link-code"></p></div>
     <div id="link-entry" hidden>
-      <form id="link-code-form"><label for="link-code-input">Code from your other device</label>
+      <form id="link-code-form"><label id="link-code-label" for="link-code-input">Code from your other device</label>
         <input id="link-code-input" autocomplete="off" spellcheck="false" autocapitalize="characters" inputmode="text" placeholder="1234 5678 9012">
         <div class="dialog-actions"><button id="link-scan" type="button" hidden>Scan its code</button><button id="link-code-submit" class="primary" type="submit">Link</button></div></form>
       <div id="link-scan-box" hidden><video id="link-video" class="device-link-video" playsinline muted></video></div>
@@ -310,7 +310,7 @@
       <div class="dialog-actions"><button id="link-mismatch" class="danger" type="button">They don’t match</button><button id="link-match" class="primary" type="button">They match</button></div>
     </div>
     <p id="link-status" class="note" role="status" aria-live="polite"></p>
-    <div class="dialog-actions"><button id="link-cancel" type="button">Cancel</button></div>
+    <div class="dialog-actions"><button id="link-alt" class="link" type="button" hidden></button><button id="link-cancel" type="button">Cancel</button></div>
   </div></div>
 
   <div id="recovery" class="dialog" role="alertdialog" aria-labelledby="recovery-title" hidden><div class="dialog-card">

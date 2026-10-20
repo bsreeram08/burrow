@@ -217,7 +217,14 @@ abstract class ChatCrypto {
   /// (docs/devices.md). The core validates [list] (devices.js validateList), requires it to name [userId] and
   /// [publishedSign] (the identity the server publishes) to be its own key, and signs only the canonical bytes
   /// it builds itself.
-  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list);
+  /// [head] is the list the server serves now with its signature: the core remembers the last list it signed
+  /// or saw and signs only the next one, following [head] if it verifies under its own key.
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  });
 
   /// The seed of the key that seals device labels in the list ([deviceMetaKey]): the identity key's signature
   /// of the fixed devicemeta label and [userId] only. Secret; never sent anywhere.
@@ -233,6 +240,11 @@ abstract class ChatCrypto {
     String theirUsername,
   );
   Future<void> setVerified(String contactId, bool verified);
+
+  /// Accepts a changed code, or marks it verified, only if the pinned identity is still [shown] (the one the
+  /// user reviewed). Throws [CryptoException] code `mismatch` if it changed again meanwhile.
+  Future<void> acceptChangeFor(String contactId, Identity shown);
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown);
 
   /// The identity pinned for [contactId] (a contact, or a group member pinned on first use), or null.
   Future<PinnedPeer?> peer(String contactId);

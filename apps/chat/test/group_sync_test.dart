@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart' show sha256;
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
@@ -168,8 +170,13 @@ void main() {
       frozen = await alice.store.group(group.id);
     }
     expect(frozen!.frozen, isNotNull);
+    final check = await alice.sync.checkFrozen(group.id);
+    expect(check.verdict, FrozenVerdict.fails);
+    expect(check.author?.deviceId, bob.crypto.deviceId, reason: 'the author, authenticated on alice\'s device');
     await alice.sync.resolve(group.id, rollback: true);
     expect(ds.channels[group.id]!.resolved, ['rollback']);
+    // Exactly the authenticated author was removed afterwards.
+    expect((await alice.crypto.members(group.id)).any((m) => m.deviceId == bob.crypto.deviceId), isFalse);
     expect((await alice.store.group(group.id))!.frozen, isNull);
     await alice.sync.send(group.id, '{"thawed":true}');
     await until(() => carol.delivered.any((d) => d.plaintext == '{"thawed":true}'));
@@ -205,10 +212,14 @@ void main() {
     final last = channel.log.last;
     channel.frozen = {'seq': last['seq'], 'digest': FakeDs.digest(last['message']! as String)};
     await alice.store.updateGroup(group.id, (g) => g.copyWith(frozen: Frozen(seq: last['seq']! as int, digest: FakeDs.digest(last['message']! as String))));
-    expect(await alice.sync.checkFrozen(group.id), FrozenVerdict.ok);
+    expect((await alice.sync.checkFrozen(group.id)).verdict, FrozenVerdict.ok);
     await expectLater(alice.sync.resolve(group.id, rollback: true), throwsA(isA<StoreException>()));
     expect(channel.resolved, isEmpty, reason: 'nothing signed');
     await alice.sync.resolve(group.id, rollback: false);
     expect(channel.resolved, ['dismiss']);
+  });
+
+  test('resolve bytes v2 name the author (vector shared with channels.ts)', () {
+    expect(sha256.convert(resolveBytes('C' * 22, 'rollback', 7, 'd' * 64, 'a' * 22)).toString(), '15911786d65cec6da7b01ae0de4df45929815e2d0073cad52665c981f5710bd3');
   });
 }

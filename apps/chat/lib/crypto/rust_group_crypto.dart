@@ -110,6 +110,9 @@ class RustGroupCrypto implements GroupCrypto {
   });
 
   @override
+  Future<GroupMember> commitAuthor(String groupId, String message) => _call(() async => _member(await core.mlsCommitAuthor(groupId: groupId, message: message)));
+
+  @override
   Future<void> receiveCommit(String pendingId) => _call(() => core.mlsReceiveCommit(pendingId: pendingId));
 
   @override

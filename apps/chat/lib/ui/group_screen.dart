@@ -170,8 +170,8 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
       if (_verdictFor != frozen) {
         _verdictFor = frozen;
         _verdict = null;
-        unawaited(_groups?.sync.checkFrozen(widget.groupId).then((v) {
-          if (mounted && _verdictFor == frozen) setState(() => _verdict = v);
+        unawaited(_groups?.sync.checkFrozen(widget.groupId).then((check) {
+          if (mounted && _verdictFor == frozen) setState(() => _verdict = check.verdict);
         }));
       }
       final verdict = _verdict;

@@ -217,6 +217,18 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
+  Future<GroupMember> commitAuthor(String groupId, String message) async {
+    final g = _group(groupId);
+    final body = _decode(message);
+    if (body['t'] != 'commit' || body['g'] != groupId) throw const CryptoException('not a commit', code: 'malformed');
+    if (body['epoch'] != g.epoch) throw const CryptoException('that commit is not for the current epoch', code: 'invalid');
+    final from = (body['from']! as Map).cast<String, Object?>();
+    final known = g.members.any((m) => m['deviceId'] == from['deviceId']) || body['external'] == true;
+    if (!known) throw const CryptoException('that commit has no member author', code: 'invalid');
+    return GroupMember(leaf: 0, userId: from['userId']! as String, deviceId: from['deviceId']! as String, platform: from['platform']! as String, admin: g.roles.isAdmin(from['userId']! as String));
+  }
+
+  @override
   Future<void> receiveCommit(String pendingId) async {
     final pending = _pendingReceives.remove(pendingId) ?? (throw const CryptoException('no such pending message', code: 'invalid'));
     _groups[pending.groupId] = pending.next;

@@ -604,8 +604,12 @@ class AppController extends Notifier<AppState> {
     return (link: _api.base.replace(fragment: 'invite=${invite.code}').toString(), expiresAt: invite.expiresAt);
   }
 
-  Future<void> reviewedKey(String contactId, {required bool verified}) async {
-    if (verified) {
+  /// [shown]: the identity whose code the sheet showed. The decision applies only to that identity; if the
+  /// pin changed again meanwhile the core refuses (`mismatch`) and nothing is accepted.
+  Future<void> reviewedKey(String contactId, {required bool verified, Identity? shown}) async {
+    if (shown != null) {
+      verified ? await _crypto.setVerifiedFor(contactId, true, shown) : await _crypto.acceptChangeFor(contactId, shown);
+    } else if (verified) {
       await _crypto.setVerified(contactId, true);
     } else {
       await _crypto.acceptChange(contactId);

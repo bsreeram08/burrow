@@ -229,6 +229,9 @@ class FakeDs {
       case ('resolve', 'POST'):
         if (member == null || !member.admin) return _error('Only an admin device resolves a frozen channel.', 403);
         if (channel.frozen == null) return _error('not frozen', 409);
+        final frozenEntry = channel.log.where((e) => e['seq'] == channel.frozen!['seq']).firstOrNull;
+        final sender = (frozenEntry?['from'] as Map?)?['deviceId'];
+        if (body['author'] != sender) return _error('That is not the commit\'s author.', 409);
         channel.resolved.add(body['action']! as String);
         channel.frozen = null;
         if (body['action'] == 'rollback') {
@@ -247,7 +250,7 @@ class FakeDs {
         for (final u in channel.users) {
           _notifyUser(u, ChannelEvent(id: channel.id, change: 'thawed'));
         }
-        return _json({'resolved': body['action']});
+        return _json({'resolved': body['action'], if (body['action'] == 'rollback') 'removeDevice': sender});
     }
     return _error('Not found', 404);
   }

@@ -231,7 +231,10 @@ class Messenger {
         };
     final entries = [...keep, self]..sort((a, b) => (a['deviceId'] as String).compareTo(b['deviceId'] as String));
     final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': ((base?['version'] as int?) ?? 0) + 1, 'prevHash': baseHash ?? '', 'devices': entries};
-    final sig = await crypto.signDeviceList(me.id, own.sign, list);
+    final head = view['list'] is Map && view['signature'] is String
+        ? (list: (view['list'] as Map).cast<String, Object?>(), signature: view['signature'] as String)
+        : null;
+    final sig = await crypto.signDeviceList(me.id, own.sign, list, head: head);
     final certs = sig.certs;
     final signed = {'list': list, 'signature': sig.signature, 'certs': certs};
     await api.publishDeviceList(signed, id);

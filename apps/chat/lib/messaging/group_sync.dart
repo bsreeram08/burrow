@@ -26,9 +26,10 @@ const claimBatch = 16;
 /// A transient failure stops a channel's queue; it is retried on the next frame or after this.
 const retryAfter = Duration(seconds: 15);
 
-/// What an admin device signs to resolve a frozen channel (channels.ts `resolveBytes`).
-Uint8List resolveBytes(String channelId, String action, int seq, String digest) =>
-    Uint8List.fromList(utf8.encode('webrtc-bun-mlsresolve-v1\n$channelId\n$action\n$seq\n$digest'));
+/// What an admin device signs to resolve a frozen channel (channels.ts `resolveBytes`, v2): it names the
+/// commit's author as this device authenticated it.
+Uint8List resolveBytes(String channelId, String action, int seq, String digest, String author) =>
+    Uint8List.fromList(utf8.encode('webrtc-bun-mlsresolve-v2\n$channelId\n$action\n$seq\n$digest\n$author'));
 
 /// SHA-256 (hex) of a base64url MLS message: the delivery service's and the engine's commit digest.
 String messageDigest(String message) => sha256.convert(base64Url.decode(base64Url.normalize(message))).toString();
@@ -61,6 +62,15 @@ class LogEntry {
 
 /// An admin device's own verdict on the commit a channel is frozen on.
 enum FrozenVerdict { fails, ok, unknown }
+
+/// [checkFrozen]'s result: the verdict, the commit's author as authenticated here (if it could be), and the
+/// device the log says sent it (used only to name a dismissal's author when ours can't be authenticated).
+class FrozenCheck {
+  const FrozenCheck(this.verdict, {this.author, this.logged});
+  final FrozenVerdict verdict;
+  final GroupMember? author;
+  final String? logged;
+}
 
 /// A decrypted application message, handed to the payload layer to validate and store.
 class GroupDelivery {
@@ -397,6 +407,9 @@ class GroupSync {
       final deliver = onDelivery;
       try {
         if (deliver == null) throw StateError('no payload layer');
+        // Only typing travels live: any other application payload is aborted here, never delivered.
+        final payload = jsonDecode(processed.plaintext!);
+        if (payload is! Map || payload['type'] != 'typing') throw const FormatException('not typing');
         await deliver(GroupDelivery(group: group, sender: processed.sender, plaintext: processed.plaintext!, seq: 0, createdAt: event.createdAt, live: true));
       } catch (_) {
         await crypto.receiveAbort(processed.pendingId);
@@ -826,61 +839,85 @@ class GroupSync {
   final Set<String> _reported = {};
 
   /// An admin device's own check of the commit a channel is frozen on (m4-groups §7), before it may offer
-  /// Rollback: the logged entry at the reported seq must be a commit whose bytes hash to the reported digest.
-  /// [FrozenVerdict.fails]: this device reported it, or a trial receive rejects it as poison. [FrozenVerdict.ok]:
-  /// we built it, already merged it, or the trial accepts it (then aborted). Anything else is unknown.
-  Future<FrozenVerdict> checkFrozen(String groupId) => _serial(groupId, () async {
+  /// Rollback. The logged entry at the reported seq must be a commit whose bytes hash to the reported digest;
+  /// its author is authenticated here against this device's own tree ([GroupCrypto.commitAuthor]), never taken
+  /// from the server. [FrozenVerdict.fails] (this device reported it, or a trial receive rejects it as poison)
+  /// requires an authenticated author. [FrozenVerdict.ok]: we built it, already merged it, or the trial accepts it
+  /// (then aborted). Anything else is unknown.
+  Future<FrozenCheck> checkFrozen(String groupId) => _serial(groupId, () => _checkFrozenNow(groupId));
+
+  Future<FrozenCheck> _checkFrozenNow(String groupId) async {
     final group = await store.group(groupId);
     final frozen = group?.frozen;
-    if (group == null || frozen == null) return FrozenVerdict.unknown;
-    if (_reported.contains(frozen.digest)) return FrozenVerdict.fails;
-    if (group.cursor >= frozen.seq) return FrozenVerdict.ok;
+    if (group == null || frozen == null) return const FrozenCheck(FrozenVerdict.unknown);
+    LogEntry? entry;
     try {
       final log = await api.groupLog(groupId, after: frozen.seq - 1);
       final raw = (log['entries'] as List).cast<Map<String, dynamic>>().where((e) => e['seq'] == frozen.seq).firstOrNull;
-      if (raw == null) return FrozenVerdict.unknown;
-      final entry = LogEntry.fromJson(raw);
-      if (entry.kind != 'commit' || messageDigest(entry.message) != frozen.digest) return FrozenVerdict.unknown;
-      if (entry.fromDevice == (await device()).deviceId) return FrozenVerdict.ok;
-      try {
-        final trial = await crypto.receive(groupId, entry.message, expect: ProcessedKind.commit);
-        await crypto.receiveAbort(trial.pendingId);
-        return FrozenVerdict.ok;
-      } on CryptoException catch (error) {
-        return error.code == 'poison' ? FrozenVerdict.fails : FrozenVerdict.unknown;
-      }
+      if (raw != null) entry = LogEntry.fromJson(raw);
+    } catch (_) {}
+    if (entry == null || entry.kind != 'commit' || messageDigest(entry.message) != frozen.digest) return const FrozenCheck(FrozenVerdict.unknown);
+    GroupMember? author;
+    try {
+      author = await crypto.commitAuthor(groupId, entry.message);
+    } catch (_) {}
+    final logged = entry.fromDevice;
+    if (entry.fromDevice == (await device()).deviceId || group.cursor >= frozen.seq) return FrozenCheck(FrozenVerdict.ok, author: author, logged: logged);
+    if (_reported.contains(frozen.digest)) return FrozenCheck(author == null ? FrozenVerdict.unknown : FrozenVerdict.fails, author: author, logged: logged);
+    try {
+      final trial = await crypto.receive(groupId, entry.message, expect: ProcessedKind.commit);
+      await crypto.receiveAbort(trial.pendingId);
+      return FrozenCheck(FrozenVerdict.ok, author: author, logged: logged);
+    } on CryptoException catch (error) {
+      final fails = error.code == 'poison' && author != null;
+      return FrozenCheck(fails ? FrozenVerdict.fails : FrozenVerdict.unknown, author: author, logged: logged);
     } catch (_) {
-      return FrozenVerdict.unknown;
+      return FrozenCheck(FrozenVerdict.unknown, author: author, logged: logged);
     }
-  });
+  }
 
-  /// An admin's decision on a frozen channel: `rollback` (undo the change and remove its author's device)
-  /// or `dismiss` (keep it). Signed with this device's key. Rollback is signed only when this device's own
-  /// check says the commit fails ([checkFrozen]).
+  /// An admin's decision on a frozen channel: `rollback` (undo the change and remove its author's device) or
+  /// `dismiss` (keep it), signed with this device's key over the v2 bytes that name the author. Rollback is
+  /// signed only when this device's own check says the commit fails, and afterwards removes exactly the author
+  /// this device authenticated; if the server's answer names another device, nobody is removed.
   Future<void> resolve(String groupId, {required bool rollback}) async {
-    if (rollback && await checkFrozen(groupId) != FrozenVerdict.fails) {
-      throw const StoreException('This device could not confirm that change is bad, so it can only be dismissed.');
-    }
-    String? removeDevice;
+    GroupMember? remove0;
     await _serial(groupId, () async {
       final group = await store.group(groupId);
       final frozen = group?.frozen;
       if (group == null || frozen == null) return;
+      final check = await _checkFrozenNow(groupId);
+      if (rollback && (check.verdict != FrozenVerdict.fails || check.author == null)) {
+        throw const StoreException('This device could not confirm that change is bad, so it can only be dismissed.');
+      }
+      final author = rollback ? check.author!.deviceId : (check.author?.deviceId ?? check.logged);
+      if (author == null) throw const StoreException("This device couldn't find that change in the log. Try again in a moment.");
       final action = rollback ? 'rollback' : 'dismiss';
       final local = await device();
-      final answer = await api.resolveChannel(groupId, action: action, seq: frozen.seq, digest: frozen.digest, signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest)));
+      final answer = await api.resolveChannel(
+        groupId,
+        action: action,
+        seq: frozen.seq,
+        digest: frozen.digest,
+        author: author,
+        signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest, author)),
+      );
       await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
-      if (rollback) removeDevice = answer['removeDevice'] as String?;
+      if (rollback) {
+        final named = answer['removeDevice'];
+        if (named == check.author!.deviceId) {
+          remove0 = check.author;
+        } else {
+          _notice('The server named a different device to remove than the one this device identified, so nobody was removed.');
+        }
+      }
       // Kept, but this device rejected it: its copy can't follow the group any more, so it rejoins.
       if (!rollback && group.cursor < frozen.seq) await _resync(groupId);
       await _catchUpNow(groupId);
     });
-    // The rolled-back commit's author is still a leaf: remove exactly the device our signed answer named.
-    final gone = removeDevice;
-    if (gone != null) {
-      final member = (await crypto.members(groupId)).where((m) => m.deviceId == gone).firstOrNull;
-      if (member != null) await remove(groupId, member.userId, deviceId: gone);
-    }
+    // The rolled-back commit's author is still a leaf: remove exactly that device.
+    final gone = remove0;
+    if (gone != null) await remove(groupId, gone.userId, deviceId: gone.deviceId);
   }
 
   Future<void> dispose() async {

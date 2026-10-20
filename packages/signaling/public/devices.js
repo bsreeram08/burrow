@@ -192,6 +192,17 @@
     const base = await crypto.subtle.importKey('raw', seed, 'HKDF', false, ['deriveKey']);
     return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: encoder.encode(META_LABEL) }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   }
+  /**
+   * The same key as raw bytes, for a linked device (docs/m5-linking.md §1.4 grant `metaKey`): HKDF-SHA-256 of the
+   * identity key's signature, salt 32 zero bytes, info the label, 32 bytes. Only the identity-key holder can make it.
+   */
+  async function deviceMetaKeyBytes(userId, sign) {
+    const seed = await sign(writer().text16(META_LABEL).text16(userId).done());
+    const base = await crypto.subtle.importKey('raw', seed, 'HKDF', false, ['deriveBits']);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: encoder.encode(META_LABEL) }, base, 256));
+  }
+  /** A companion's label key from the bytes its primary sent (never extractable again). */
+  const metaKeyFromBytes = bytes => crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
   const metaAad = (userId, deviceId) => writer().text16(META_LABEL).text16(userId).text16(deviceId).done();
   /** Seals { label, platform } for one list entry; the AAD binds it to that account and device. */
   async function sealMeta(key, userId, deviceId, { label, platform }) {
@@ -248,5 +259,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

@@ -593,6 +593,9 @@ export function createChannels(deps: Deps) {
 
     /** A device that is no longer eligible holds no place in any channel and has no Welcomes waiting. */
     function dropDevice(deviceId: string) {
+        // Only a revoked or deleted device loses its place. One that is merely unlisted for now (an account identity change
+        // voids the list until the new key's list v1; docs/m5-linking.md §5.3) is withheld by the eligibility gate, not forgotten.
+        if (db.query("SELECT 1 FROM devices WHERE id = ? AND state != 'revoked'").get(deviceId)) return;
         db.query('DELETE FROM channel_members WHERE device_id = ?').run(deviceId);
         db.query('DELETE FROM mls_welcomes WHERE device_id = ?').run(deviceId);
     }

@@ -128,7 +128,7 @@ impl Dev {
     }
 
     pub fn join_external(&mut self, server: &mut Server, group: &str, info: &str) -> Result<Outgoing> {
-        let out = self.groups.join_external(&mut self.store, info, &server.tree(group))?;
+        let out = self.groups.join_external(&mut self.store, info, &server.tree(group), None)?;
         self.finish_external(server, group, out)
     }
 

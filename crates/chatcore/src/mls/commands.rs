@@ -145,7 +145,7 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
             "mlsClearOwn" => { groups.clear_own(store, &group()?)?; Ok(Value::Null) }
             "mlsPending" => ok(groups.pending_commit(store, &group()?)?),
             "mlsJoin" => ok(groups.join(store, &text(command, "welcome")?, &text(command, "tree")?)?),
-            "mlsJoinExternal" => ok(groups.join_external(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "mlsJoinExternal" => ok(groups.join_external(store, &text(command, "groupInfo")?, &text(command, "tree")?, command.get("group").and_then(Value::as_str))?),
             "mlsForget" => { groups.forget_group(store, &group()?)?; Ok(Value::Null) }
             "mlsEncrypt" => ok(groups.encrypt(store, &group()?, &text(command, "plaintext")?)?),
             "mlsReceive" => {

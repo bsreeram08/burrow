@@ -169,7 +169,7 @@ pub fn sign_device_cert(user_id: String, device_id: String, platform: String, le
 #[cfg(feature = "mls")]
 pub use crate::mls::cert::DeviceCert;
 #[cfg(feature = "mls")]
-pub use crate::mls::engine::{CommitCheck, Expect, ResolutionSigner, GroupView, MemberView, Outgoing, PendingCommit, Processed};
+pub use crate::mls::engine::{CommitCheck, Expect, GroupInspection, ResolutionSigner, GroupView, MemberView, Outgoing, PendingCommit, Processed};
 #[cfg(feature = "mls")]
 pub use crate::mls::payload::Context as PayloadContext;
 #[cfg(feature = "mls")]
@@ -258,7 +258,7 @@ pub fn mls_join(welcome: String, tree: String) -> Result<GroupView> { with_group
 
 /// External join (public channel, own new device, resync after `mls_forget_group`): submit the commit, then `mls_merge_own`.
 #[cfg(feature = "mls")]
-pub fn mls_join_external(group_info: String, tree: String) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree)) }
+pub fn mls_join_external(group_info: String, tree: String, group: Option<String>) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree, group.as_deref())) }
 
 #[cfg(feature = "mls")]
 pub fn mls_forget_group(group_id: String) -> Result<()> {
@@ -311,7 +311,7 @@ pub fn mls_group_view(group_id: String) -> Result<GroupView> {
 
 /// The members of a served GroupInfo/tree after the join validation, without joining (`stale` flags old identities).
 #[cfg(feature = "mls")]
-pub fn mls_inspect_group(group_info: String, tree: String) -> Result<Vec<MemberView>> { with_groups(|groups, store| groups.inspect_group(store, &group_info, &tree)) }
+pub fn mls_inspect_group(group_info: String, tree: String) -> Result<GroupInspection> { with_groups(|groups, store| groups.inspect_group(store, &group_info, &tree)) }
 
 /// Accepts a DM pointer's group only if it is the DM of this account and `peer` and every leaf chains to the pins.
 #[cfg(feature = "mls")]

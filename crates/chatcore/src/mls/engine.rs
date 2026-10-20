@@ -251,6 +251,14 @@ pub struct GroupView {
     pub tree: String,
 }
 
+/// What a GroupInfo and tree hold, checked without joining.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GroupInspection {
+    #[serde(rename = "groupId")]
+    pub group_id: String,
+    pub members: Vec<MemberView>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemberView {
     pub leaf: u32,
@@ -496,17 +504,18 @@ impl Groups {
     /// signature, the tree against it, roles, every certificate under today's pins), without joining or storing
     /// anything. Stale leaves are reported (`stale`), not refused, so a caller can decide: for linking, a device
     /// should only join a group it can see holds a current leaf of its own account.
-    pub fn inspect_group(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Vec<MemberView>> {
+    pub fn inspect_group(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<GroupInspection> {
         let cert = Self::device(store)?;
         let (info, tree) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
         let scratch = Provider::default();
         let mut directory = Self::client_directory(store, &cert);
         let public = ds_bootstrap(&scratch, &info, &tree, &mut directory, Stale::Any)?;
         let roles = validate_context(public.group_context().extensions())?;
-        Ok(public.members().filter_map(|m| {
+        let members = public.members().filter_map(|m| {
             let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key, false), Ok((_, Standing::Stale)));
             cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
-        }).collect())
+        }).collect();
+        Ok(GroupInspection { group_id: group_text(public.group_id()), members })
     }
 
     /// A pointer to a DM group is acceptable only if the group is a DM of exactly this account and `peer`, and every
@@ -744,13 +753,14 @@ impl Groups {
 
     /// External commit: public-channel self-join, this user's new device, or resync. Returns the commit for the
     /// DS; the group is kept (in memory) until [`Groups::merge_own`] after the DS accepts it.
-    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, true) }
+    /// `expected` is the group id the caller means to join: a GroupInfo for any other group is refused.
+    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, expected: Option<&str>) -> Result<Outgoing> { self.external_commit(store, group_info, tree, expected, true) }
 
     /// An external join that skips this device's own policy check: tests use it to play a malicious joiner.
     #[cfg(test)]
-    pub(crate) fn join_external_unchecked(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, false) }
+    pub(crate) fn join_external_unchecked(&mut self, store: &mut dyn Store, group_info: &str, tree: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, None, false) }
 
-    fn external_commit(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, check: bool) -> Result<Outgoing> {
+    fn external_commit(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, expected: Option<&str>, check: bool) -> Result<Outgoing> {
         if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
         let cert = Self::device(store)?;
         let (info_bytes, tree_bytes) = (unb64(group_info, "group info")?, unb64(tree, "tree")?);
@@ -760,6 +770,7 @@ impl Groups {
             let provider = &self.provider;
             let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(info_bytes.as_slice()).map_err(|_| ChatError::malformed())?.extract() else { return Err(invalid("not a GroupInfo")) };
             let group = info.group_id().clone();
+            if expected.is_some_and(|want| want != group_text(&group)) { return Err(invalid("that GroupInfo is for another group")); }
             if MlsGroup::load(provider.storage(), &group).map_err(|_| ChatError::storage("group state unreadable"))?.is_some() && !self.external.contains_key(&group_text(&group)) {
                 // Resync replaces a broken local copy: the caller must have dropped it first (`forgetGroup`).
                 return Err(invalid("already a member of this group on this device"));

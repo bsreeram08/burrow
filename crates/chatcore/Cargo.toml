@@ -45,6 +45,10 @@ native = ["dep:rusqlite"]
 # Browser build: no SQLite (the journal is persisted to IndexedDB by the JS shim).
 wasm = ["dep:getrandom", "dep:js-sys", "dep:getrandom04", "openmls?/js"]
 
+# Commands that play a malicious member (`mlsTestUnchecked`). For test builds only: build:wasm never enables it and
+# tests/unit/wasm-core.test.ts checks the shipped cores do not contain it.
+test-hooks = ["mls"]
+
 [[bin]]
 name = "interop"
 required-features = ["native"]

@@ -709,3 +709,50 @@ fn a_rejected_commit_is_classified_by_what_the_authors_signature_covers() {
     f.c1.sync(&f.server, &g);
     assert!(f.c1.groups.commit_author(&mut f.c1.store, &gid, &evil.commit).is_err());
 }
+
+#[test]
+fn an_external_commit_is_never_attributed_to_anyone() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let (info_text, tree_text) = (f.a1.view(&g).group_info, f.server.tree(&g));
+    let unb64 = |text: &str| base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, text).unwrap();
+    let (info_bytes, tree_bytes) = (unb64(&info_text), unb64(&tree_text));
+
+    // Mallory joins externally with a certificate that names Alice's laptop but is signed by her own account key.
+    let mallory = Account::new();
+    let (alice_id, laptop) = (f.alice.id.clone(), f.a1.device.clone());
+    let forged = f.b1.groups.scratch(&mut f.b1.store, |p, _, _| {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        signer.store(p.storage()).unwrap();
+        let key = key32(&b64(signer.public())).unwrap();
+        let cert = DeviceCert::issue(&mallory.aik, &alice_id, &laptop, "web", &key, 0).unwrap();
+        let credential = CredentialWithKey { credential: BasicCredential::new(cert.encode()).into(), signature_key: signer.public().into() };
+        let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(info_bytes.as_slice()).unwrap().extract() else { panic!("not a GroupInfo") };
+        let tree = RatchetTreeIn::tls_deserialize_exact(tree_bytes.as_slice()).unwrap();
+        let (_joined, bundle) = MlsGroup::external_commit_builder()
+            .with_ratchet_tree(tree)
+            .with_config(crate::mls::engine::join_config())
+            .build_group(p, info, credential).unwrap()
+            .leaf_node_parameters(LeafNodeParameters::builder().with_capabilities(capabilities()).build())
+            .load_psks(p.storage()).unwrap()
+            .build(p.rand(), p.crypto(), &signer, |_| true).unwrap()
+            .finalize(p).unwrap();
+        tls(bundle.commit())
+    });
+    // The DS refuses it (the certificate is not signed by Alice's pinned key)...
+    assert!(f.server.submit(&g, &forged).is_err());
+    // ...and if a faulty DS relayed it, members reject it without naming Alice's device as the author.
+    let err = f.c1.groups.process(&mut f.c1.store, &gid, &forged).unwrap_err();
+    assert_eq!((err.code(), err.class.as_deref()), (Some("poison"), Some("tag")), "{err}");
+    let check = f.c1.groups.commit_author(&mut f.c1.store, &gid, &forged).unwrap();
+    assert_eq!((check.authenticated, check.signed_content_invalid, check.class(), check.author), (false, false, "tag", None));
+
+    // A genuine but unauthorized external join (a stranger to an invite-only group) is not attributed either.
+    let dave = Account::new();
+    let mut d1 = f.admit(&dave, "web");
+    let out = d1.groups.join_external_unchecked(&mut d1.store, &info_text, &tree_text).unwrap();
+    let check = f.c1.groups.commit_author(&mut f.c1.store, &gid, &out.commit).unwrap();
+    assert_eq!((check.authenticated, check.class(), check.author), (false, "tag", None));
+    assert_eq!(f.c1.groups.process(&mut f.c1.store, &gid, &out.commit).unwrap_err().class.as_deref(), Some("tag"));
+}

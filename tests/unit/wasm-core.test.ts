@@ -96,3 +96,15 @@ describe('committed delivery-service core', () => {
         expect(brotliCompressSync(wasm, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length).toBeLessThanOrEqual(400 * 1024);
     });
 });
+
+// Commands that play a malicious member exist only in test builds (`test-hooks`); a shipped core must not carry them.
+describe('shipped cores carry no test hooks', () => {
+    for (const [name, dirUrl] of [['browser', '../../packages/signaling/public/core/'], ['delivery service', '../../packages/signaling/ds-core/']] as const) {
+        test(`${name} core`, () => {
+            const directory = fileURLToPath(new URL(dirUrl, import.meta.url));
+            const wasm = readFileSync(join(directory, (JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')) as { wasm: string }).wasm));
+            expect(wasm.includes('mlsTestUnchecked')).toBe(false);
+            expect(JSON.parse(readFileSync(join(directory, 'manifest.json'), 'utf8')).features).not.toContain('test-hooks');
+        });
+    }
+});

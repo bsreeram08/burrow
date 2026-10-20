@@ -28,7 +28,7 @@ export function clientCore(): { core: CoreClass } | { skip: string } {
     const dir = join(tmpdir(), `webrtc-bun-mls-client-${process.getuid?.() ?? 0}`);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = join(root, 'crates/chatcore-wasm/target');
-    const built = run('cargo', ['build', '--release', '--quiet', '--target', 'wasm32-unknown-unknown', '--features', 'mls,ds', '--manifest-path', join(root, 'crates/chatcore-wasm/Cargo.toml')], { CARGO_TARGET_DIR: target });
+    const built = run('cargo', ['build', '--release', '--quiet', '--target', 'wasm32-unknown-unknown', '--features', 'mls,ds,test-hooks', '--manifest-path', join(root, 'crates/chatcore-wasm/Cargo.toml')], { CARGO_TARGET_DIR: target });
     if (!built.ok) return { skip: `the MLS client core did not build: ${built.err.slice(-300)}` };
     const wasm = join(target, 'wasm32-unknown-unknown/release/chatcore_wasm.wasm');
     const stamp = join(dir, `cc-${statSync(wasm).mtimeMs}`);

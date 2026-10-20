@@ -17,6 +17,8 @@ mls = ["chatcore/mls"]
 # The delivery service's validator for the Bun/Node server (the `ds*` commands): build with
 # `--no-default-features --features ds`.
 ds = ["chatcore/ds"]
+# Test builds only: see chatcore's `test-hooks`. Never enabled by scripts/build-wasm.ts.
+test-hooks = ["chatcore/test-hooks"]
 
 [dependencies]
 chatcore = { path = "../chatcore", default-features = false, features = ["wasm"] }

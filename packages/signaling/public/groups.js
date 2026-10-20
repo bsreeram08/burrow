@@ -334,10 +334,9 @@
     const info = await call(`/api/channels/${id}/join-info`);
     if (info.status !== 200) return false;
     try {
-      // The served tree, validated like a join (read-only): its members. (A GroupInfo for another group can't be used
-      // to join this channel: the delivery service refuses the commit.)
-      const members = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
-      return Array.isArray(members) && members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
+      // The served tree, validated like a join (read-only): it must be this channel's group, holding a leaf of ours.
+      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
+      return view?.groupId === id && Array.isArray(view.members) && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
     } catch { return false; }
   }
   let removedNote = null;
@@ -441,7 +440,8 @@
     }
     const list = await call(`/api/channels/${id}/members`);
     if (list.status === 200) await ensurePins(list.body.members.map(member => member.userId));
-    const out = await withPins(id, () => run({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree }));
+    // The core refuses a GroupInfo for any other group than the one we mean to join.
+    const out = await withPins(id, () => run({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree, group: id }));
     const result = await call(`/api/channels/${id}/join`, 'POST', { message: out.commit });
     if (result.status !== 201) { await run({ cmd: 'mlsClearOwn', group: id }).catch(() => {}); throw Object.assign(new Error(result.body.error || 'Could not join.'), { status: result.status }); }
     const view = await run({ cmd: 'mlsMergeOwn', group: id });

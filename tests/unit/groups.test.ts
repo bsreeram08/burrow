@@ -15,7 +15,7 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[] } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[]; joinInfo?: () => [number, any]; commit?: () => [number, any] } = {}) {
   const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
@@ -46,11 +46,11 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: log.current?.(Number(match[1])) ?? [], more: false, gap: false }]],
     ['GET', /^\/api\/users\/\w+\/identity$/, () => [200, { userId: BOB, username: 'bob', identity: { dh: 'dh2', sign: 'sign2' } }]],
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
-    ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
+    ['POST', /^\/api\/channels\/\w+\/commits$/, () => options.commit?.() ?? [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
     ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : options.poison === 409 ? [409, { error: 'That is not the latest sequenced commit.' }] : [202, { frozen: true }]],
     ['POST', /^\/api\/channels\/\w+\/cursor$/, () => [200, {}]],
-    ['GET', /^\/api\/channels\/\w+\/join-info$/, () => [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
+    ['GET', /^\/api\/channels\/\w+\/join-info$/, () => options.joinInfo?.() ?? [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
     ['POST', /^\/api\/channels\/\w+\/join$/, () => [201, { epoch: 4, seq: 7, digest: sha('join') }]],
   ];
   async function fetch(path: string, init: any = {}) {
@@ -81,7 +81,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
     contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {},
     // Our devices as a verified signed list proves them (account.js); null: nothing verifiable.
-    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping() {},
+    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping(_peer: string, _payload?: unknown) {},
     verifiedOwnDevices: async () => { const own = options.own === undefined ? { listed: [DEV], dropped: [] } : options.own; return own && { listed: new Set(own.listed), dropped: new Set(own.dropped) }; } };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
@@ -368,6 +368,19 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     }
   });
 
+  test('8b. the GroupInfo proven to hold our leaf is the one joined with; "between epochs" is waited out, not taken as "not ours"', async () => {
+    const OTHER = 'O'.repeat(22);
+    const rows = [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }];
+    const answers: [number, any][] = [[409, { error: 'Between epochs.' }], [409, { error: 'Between epochs.' }], [200, { epoch: 4, seq: 6, groupInfo: 'gi-4', tree: 't-4' }], [200, { epoch: 5, seq: 8, groupInfo: 'gi-5', tree: 't-5' }]];
+    const w = world({ channels: rows, own: { listed: [DEV, OTHER], dropped: [] }, tree: [{ userId: ME, deviceId: OTHER, stale: false }], joinInfo: () => answers.shift()! });
+    w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 4 });
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/join')), 'joined');
+    expect(w.requests.filter(request => request.path.endsWith('/join-info'))).toHaveLength(3);
+    expect(w.of('mlsInspectGroup').map(command => command.groupInfo)).toEqual(['gi-4']);
+    expect(w.of('mlsJoinExternal').map(command => [command.groupInfo, command.tree, command.group])).toEqual([['gi-4', 't-4', G]]);
+  });
+
   test('9. own leaves go only when a verified signed list dropped them (or the core finds them stale); frames are hints', async () => {
     const GONE = 'Z'.repeat(22), KEPT = 'K'.repeat(22);
     const ours = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }, { leaf: 3, userId: ME, deviceId: KEPT, admin: true }];
@@ -389,6 +402,16 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: KEPT });
     await Bun.sleep(150);
     expect(w.of('mlsCommit')).toHaveLength(1);
+  });
+
+  test('9b. a commit refused because a member\'s account key moved without a record is reported, not retried as a race', async () => {
+    const GONE = 'Z'.repeat(22);
+    const w = world({ own: { listed: [DEV], dropped: [GONE] }, commit: () => [409, { error: 'A member\'s identity key does not match the one this channel was built on.' }] });
+    w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }];
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/commits')), 'committed');
+    await Bun.sleep(900); // a race would be retried after 500 ms
+    expect(w.requests.filter(request => request.path.endsWith('/commits'))).toHaveLength(1);
   });
 
   test('10. a rollback removes the authenticated (user, device) only, never another user\'s leaf claiming the same device id', async () => {
@@ -429,6 +452,45 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     const stored = await w.storeList();
     expect(stored.map((record: any) => [record.conversationId, record.direction, record.text, record.from])).toEqual([[PAIR, 'incoming', 'hello over MLS', undefined]]);
     expect(w.of('mlsCheckDm').length).toBe(2);
+  });
+
+  test('12. a DM group\'s contact never moves; its typing is that contact\'s only, once checked; a renamed peer costs the check', async () => {
+    const EVE = 'V'.repeat(22);
+    const rows = [{ id: G, kind: 'dm', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true, peer: { id: BOB, username: 'bob' } }];
+    const w = world({ channels: rows });
+    const typed: string[] = [];
+    w.ctx.dmTyping = (peer: string) => { typed.push(peer); };
+    await w.start();
+    const typingFrom = async (userId: string) => {
+      w.calls.length = 0;
+      w.handlers.mlsReceive = () => ({ ...application(typing), sender: { leaf: 1, userId, deviceId: BOB_DEV, platform: 'web', admin: false } });
+      w.Groups.frame(live);
+      await w.until(() => w.of('mlsAbortReceived').length + w.of('mlsCommitReceived').length > 0, 'decision');
+      await w.settle();
+    };
+    await typingFrom(BOB); // not checked yet
+    expect(typed).toEqual([]);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(null);
+    w.handlers.mlsCheckDm = command => { if (command.peer !== BOB) throw coded('invalid', 'not a DM of these two'); return null; };
+    expect(await w.Groups.acceptDm(G, BOB)).toBe(true);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(G);
+    await typingFrom(EVE); // another leaf in the group
+    await typingFrom(ME);
+    await typingFrom(BOB);
+    expect(typed).toEqual([BOB]);
+    // The server now names eve as the peer: the group stays bob's, unchecked until checked again, and is never eve's.
+    rows[0].peer = { id: EVE, username: 'eve' };
+    await w.start();
+    await w.until(() => w.requests.filter(request => request.path === '/api/channels').length === 2, 'refreshed');
+    await w.settle();
+    expect(w.Groups.dmChannelWith(BOB)).toBe(null);
+    expect(w.Groups.dmChannelWith(EVE)).toBe(null);
+    expect(await w.Groups.acceptDm(G, EVE)).toBe(false);
+    expect(w.of('mlsCheckDm').filter(command => command.peer === EVE)).toEqual([]);
+    await typingFrom(EVE); await typingFrom(BOB);
+    expect(typed).toEqual([BOB]);
+    expect(await w.Groups.acceptDm(G, BOB)).toBe(true);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(G);
   });
 
   test('3e. a report refused because the commit was rolled back meanwhile reads on; it never rejoins (or retries a 429 report)', async () => {

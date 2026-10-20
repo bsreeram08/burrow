@@ -15,7 +15,7 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; listed?: string[] } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[] } = {}) {
   const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
@@ -26,6 +26,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
     setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
     mlsSignResolution: () => 'L'.repeat(86),
+    mlsInspectGroup: () => ({ groupId: G, epoch: 3, members: options.tree ?? [] }),
     mlsVerifyResolution: command => { if (command.signature !== 'L'.repeat(86) || command.by !== DEV2) throw coded('auth', 'bad resolution signature'); return { userId: ME, deviceId: DEV2 }; },
     mlsCommitAuthor: () => ({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false } }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),
@@ -39,7 +40,6 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const routes: [string, RegExp, (body: any, match: RegExpExecArray) => [number, any]][] = [
     ['GET', /^\/api\/mls\/keypackages$/, () => [200, { oneTime: 100, lastResort: true, low: false, max: 100 }]],
     ['GET', /^\/api\/channels$/, () => [200, { channels: options.channels ?? [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
-    ['GET', /^\/api\/devices\/me$/, () => [200, { list: { devices: (options.listed ?? [DEV]).map(deviceId => ({ deviceId })) } }]],
     ['GET', /^\/api\/channels\/[\w-]{22}$/, () => [200, { id: G, kind: 'private', name: null, epoch: options.epoch ?? 3, seq: 5, frozen: false, member: true, cursor: 5, admin: true }]],
     ['GET', /^\/api\/channels\/\w+\/members$/, () => [200, { members: [{ userId: ME, username: 'me', deviceId: DEV, admin: true }, { userId: BOB, username: 'bob', deviceId: BOB_DEV, admin: false }] }]],
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
@@ -79,7 +79,9 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const Groups = context.Groups;
   const dm = { peer: options.dmPeer ?? null };
   const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
-    contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {} };
+    contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {},
+    // Our devices as a verified signed list proves them (account.js); null: nothing verifiable.
+    verifiedOwnDevices: async () => { const own = options.own === undefined ? { listed: [DEV], dropped: [] } : options.own; return own && { listed: new Set(own.listed), dropped: new Set(own.dropped) }; } };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
   const settle = () => Bun.sleep(60);
@@ -343,33 +345,61 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.requests.filter(request => request.path.endsWith('/join-info') || request.path.endsWith('/join'))).toEqual([]);
   });
 
-  test('8. a linked device joins the channels its account is in by external commit (m5 §3), never one it left', async () => {
-    const H = 'h'.repeat(22);
-    const w = world({ channels: [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }, { id: H, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }] });
-    w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 });
-    w.storage.set(`groups-v1:${ME}-${DEV}-${'A'.repeat(12)}`, JSON.stringify({ [H]: { kind: 'private', status: 'left', cursor: 0, members: [], admins: [], unread: 0, lastAt: 0 } }));
-    await w.start();
-    await w.until(() => w.Groups.debug(G)?.status === 'active', 'joined');
-    expect(w.requests.filter(request => request.path.endsWith('/join')).map(request => request.path)).toEqual([`/api/channels/${G}/join`]);
-    expect(w.Groups.debug(H).status).toBe('left');
+  test('8. a device joins its account\'s channels by external commit only when the tree proves our account is in it (m5 §3)', async () => {
+    const H = 'h'.repeat(22), OTHER = 'O'.repeat(22);
+    const rows = [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }, { id: H, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }];
+    const ourLeaf = { userId: ME, deviceId: OTHER, stale: false };
+    const cases: [string, any, any[], boolean][] = [
+      ['our other listed device is in the tree', { listed: [DEV, OTHER], dropped: [] }, [ourLeaf], true],
+      ['the tree has no leaf of ours', { listed: [DEV, OTHER], dropped: [] }, [{ userId: BOB, deviceId: BOB_DEV, stale: false }], false],
+      ['our leaf is for a device the verified list does not name', { listed: [DEV], dropped: [] }, [ourLeaf], false],
+      ['our leaf is stale', { listed: [DEV, OTHER], dropped: [] }, [{ ...ourLeaf, stale: true }], false],
+      ['our device list cannot be verified', null, [ourLeaf], false],
+    ];
+    for (const [what, own, tree, joins] of cases) {
+      const w = world({ channels: rows, own, tree });
+      w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 });
+      w.storage.set(`groups-v1:${ME}-${DEV}-${'A'.repeat(12)}`, JSON.stringify({ [H]: { kind: 'private', status: 'left', cursor: 0, members: [], admins: [], unread: 0, lastAt: 0 } }));
+      await w.start();
+      await Bun.sleep(300);
+      expect([what, w.requests.filter(request => request.path.endsWith('/join')).map(request => request.path)]).toEqual([what, joins ? [`/api/channels/${G}/join`] : []]);
+      expect(w.Groups.debug(H).status).toBe('left'); // never one we left
+    }
   });
 
-  test('9. a revoked device of ours leaves our groups: a remove-device frame, or a leaf not in the signed list at start', async () => {
-    const GONE = 'Z'.repeat(22);
-    const ours = () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 2, userId: ME, deviceId: GONE, platform: 'ios', admin: true }];
-    const w = world();
+  test('9. own leaves go only when a verified signed list dropped them (or the core finds them stale); frames are hints', async () => {
+    const GONE = 'Z'.repeat(22), KEPT = 'K'.repeat(22);
+    const ours = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }, { leaf: 3, userId: ME, deviceId: KEPT, admin: true }];
+    // The server's word alone (an unverifiable list) removes nothing.
+    const unverified = world({ own: null });
+    unverified.handlers.mlsMembers = ours;
+    await unverified.start(); await unverified.settle();
+    unverified.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
+    await Bun.sleep(150);
+    expect(unverified.of('mlsCommit')).toEqual([]);
+    // A verified list that dropped GONE: it goes at start; KEPT (merely missing, not dropped) stays.
+    const w = world({ own: { listed: [DEV], dropped: [GONE] } });
     w.handlers.mlsMembers = ours;
     await w.start();
     await w.until(() => w.of('mlsCommit').length === 1, 'removed at start');
-    expect(w.of('mlsCommit')[0].removes).toEqual([{ userId: ME, deviceId: GONE }]);
-    // The frame for a device that is already gone, or someone else's, changes nothing.
-    w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV }, { leaf: 1, userId: BOB, deviceId: BOB_DEV }];
-    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: BOB_DEV });
-    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
     await w.settle();
+    expect(w.of('mlsCommit').map(command => command.removes)).toEqual([[{ userId: ME, deviceId: GONE }]]);
+    // A frame for a device the verified list still names (or never dropped) is ignored.
+    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: KEPT });
+    await Bun.sleep(150);
     expect(w.of('mlsCommit')).toHaveLength(1);
-    w.handlers.mlsMembers = ours;
-    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
-    await w.until(() => w.of('mlsCommit').length === 2, 'removed on the frame');
+  });
+
+  test('10. a rollback removes the authenticated (user, device) only, never another user\'s leaf claiming the same device id', async () => {
+    const EVE = 'V'.repeat(22);
+    const evil = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); });
+    evil.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 4, userId: EVE, deviceId: BOB_DEV, admin: false }];
+    await evil.el('group-rollback').onclick(); await evil.settle(); await Bun.sleep(100);
+    expect(evil.of('mlsCommit')).toEqual([]); // bob's leaf is gone; eve's look-alike stays
+    const both = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); });
+    both.handlers.mlsMembers = () => [{ leaf: 1, userId: BOB, deviceId: BOB_DEV, admin: false }, { leaf: 4, userId: EVE, deviceId: BOB_DEV, admin: false }];
+    await both.el('group-rollback').onclick();
+    await both.until(() => both.of('mlsCommit').length === 1, 'removal');
+    expect(both.of('mlsCommit')[0].removes).toEqual([{ userId: BOB, deviceId: BOB_DEV }]);
   });
 });

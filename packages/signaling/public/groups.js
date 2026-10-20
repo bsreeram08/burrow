@@ -296,6 +296,9 @@
       await sleep(wait);
       try {
         await enqueue(id, async () => {
+          // Only a group our account is really in: the tree must hold a current leaf of ours, for a device our verified
+          // signed list names. Otherwise the server could pull this device into any channel (m5 §3).
+          if (!await ownLeafProven(id)) throw Object.assign(new Error('not one of our groups'), { status: 403 });
           await run({ cmd: 'mlsForget', group: id }).catch(() => {});
           const seq = await joinExternal(id);
           Object.assign(ch, { kind: row.kind, serverName: row.name, status: 'active', cursor: seq, lastAt: Date.now() });
@@ -311,6 +314,16 @@
     };
     attempt(0);
   }
+  async function ownLeafProven(id) {
+    const own = await ctx.verifiedOwnDevices?.().catch(() => null);
+    if (!own) return false;
+    const info = await call(`/api/channels/${id}/join-info`);
+    if (info.status !== 200) return false;
+    try {
+      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
+      return view.groupId === id && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
+    } catch { return false; }
+  }
   let removedNote = null;
   /** Commits the removal of one of this account's own devices from one channel (m5 §4). "No such member" means done. */
   function removeOwnDevice(id, target) {
@@ -321,24 +334,33 @@
       catch (error) { if (/no such member/i.test(error.message || '') || error.status === 409) return false; throw error; }
     });
   }
-  /** A revoked device of ours must leave the channel: one device of the account does it, after a random 0–3 s. */
+  /**
+   * A revoked device of ours must leave the channel: one device of the account does it, after a random 0–3 s. The
+   * frame is only a hint: the device goes only if a verified signed list has dropped it.
+   */
   function onRemoveDevice(id, target) {
     if (!ID.test(target || '') || !usable(channels.get(id))) return;
-    setTimeout(() => removeOwnDevice(id, target).then(done => {
+    setTimeout(async () => {
+      const own = await ctx?.verifiedOwnDevices?.().catch(() => null);
+      if (!own?.dropped.has(target)) return;
+      removeOwnDevice(id, target).then(done => {
       if (!done) return;
       removedNote ||= { count: 0 }; removedNote.count++;
       clearTimeout(removedNote.timer);
       removedNote.timer = setTimeout(() => { ctx?.notice(`Removed a revoked device from ${removedNote.count} ${removedNote.count === 1 ? 'group' : 'groups'}.`); removedNote = null; }, 2000);
-    }).catch(() => {}), Math.random() * 3000);
+      }).catch(() => {});
+    }, Math.random() * 3000);
   }
-  /** At start: our own leaves for devices no longer in the signed list, or left stale by a new account key, go. */
+  /**
+   * At start: our own leaves go if a verified signed list dropped their device, or if the core finds them stale (a
+   * certificate under an account key we no longer hold, m5 §7). A list we can't verify proves nothing: keep them.
+   */
   async function removeOwnStale() {
-    const view = await must(`/api/devices/${me.username}`);
-    const listed = new Set((view.list?.devices || []).map(device => device.deviceId));
+    const own = await ctx.verifiedOwnDevices?.().catch(() => null);
     for (const [id, ch] of channels) {
       if (!usable(ch)) continue;
       const leaves = await run({ cmd: 'mlsMembers', group: id }).catch(() => []);
-      for (const leaf of leaves) if (leaf.userId === me.id && leaf.deviceId !== deviceId && (leaf.stale || !listed.has(leaf.deviceId))) await removeOwnDevice(id, leaf.deviceId).catch(() => {});
+      for (const leaf of leaves) if (leaf.userId === me.id && leaf.deviceId !== deviceId && (leaf.stale || own?.dropped.has(leaf.deviceId))) await removeOwnDevice(id, leaf.deviceId).catch(() => {});
     }
   }
 
@@ -754,10 +776,12 @@
       await commitInner(id, { removes: [{ userId }] });
     }).catch(() => {});
   }
-  function removeDevice(id, device) {
+  /** Removes exactly one leaf: the device of that user (never another user's leaf that claims the same device id). */
+  function removeDevice(id, userId, device) {
+    if (!ID.test(userId || '') || !ID.test(device || '')) return;
     enqueue(id, async () => {
-      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.deviceId === device);
-      if (leaf) await commitInner(id, { removes: [{ userId: leaf.userId, deviceId: device }] });
+      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.userId === userId && member.deviceId === device);
+      if (leaf) await commitInner(id, { removes: [{ userId, deviceId: device }] });
     }).catch(error => failed(id, error));
   }
   async function create({ kind, name, users }) {
@@ -834,7 +858,7 @@
       // The notice alone proves nothing (the server sends it): an admin of this group, as this device's own copy of
       // the group knows it, must have signed this exact resolution with its leaf key...
       try {
-        await run({ cmd: 'mlsVerifyResolution', group: id, action: 'rollback', seq: notice.seq, digest: notice.digest, author: typeof notice.author === 'string' ? notice.author : '', by: notice.by, signature: notice.signature });
+        await run({ cmd: 'mlsVerifyResolution', group: id, action: 'rollback', seq: notice.seq, digest: notice.digest, author: typeof notice.author === 'string' ? notice.author : '', by: notice.by, byUser: notice.byUser, signature: notice.signature });
       } catch { return; }
       // ...and the channel must really be back before our commit: at its epoch, without it in the log.
       const info = await call(`/api/channels/${id}`);
@@ -954,7 +978,7 @@
     // Only the author this device authenticated, for content it signed, is removed; any other answer removes nobody.
     if (action === 'rollback' && author) {
       if (answer.removeDevice !== author) status(id, 'The server named a different device to remove than the one that made the change. Nobody was removed; ask another admin to check.');
-      else removeDevice(id, author);
+      else removeDevice(id, check.authorUser, author);
     }
     flush(id);
   }

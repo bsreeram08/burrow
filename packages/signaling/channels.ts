@@ -547,7 +547,7 @@ export function createChannels(deps: Deps) {
         announce(channelId, { added, removed });
         // Everyone learns which commit is gone (its author, if it stays, rejoins and makes the change again); then
         // sequencing resumes (members who reported it are waiting for this, as after a dismissal).
-        const notice = { type: 'channel', id: channelId, change: 'rolled-back', action: 'rollback', seq: body.seq, digest: body.digest, author: body.author, by: deviceId, signature: body.leafSignature };
+        const notice = { type: 'channel', id: channelId, change: 'rolled-back', action: 'rollback', seq: body.seq, digest: body.digest, author: body.author, by: deviceId, byUser: user.id, signature: body.leafSignature };
         for (const member of usersOf(members(channelId))) deps.notify(member, notice);
         for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'thawed' });
         const restored = { resolved: 'rollback', epoch: channelRow(channelId)!.epoch, seq: body.seq - 1 };

@@ -665,9 +665,10 @@ suite('poison commits', () => {
         const done = await resolve(w.a2, 'rollback');
         expect(done.status).toBe(200);
         expect(done.body).toMatchObject({ resolved: 'rollback', epoch: 1, seq: w.seq - 1, removeDevice: w.a1.deviceId });
-        let change: any;
-        do { change = await watch.next('channel'); } while (change.change !== 'remove-needed');
+        let change: any; const seen: string[] = [];
+        do { change = await watch.next('channel'); seen.push(change.change); } while (change.change !== 'remove-needed');
         expect(change).toMatchObject({ deviceId: w.a1.deviceId });
+        expect(seen).toContain('thawed'); // members who reported it resume
 
         // The poison commit and its state are gone; the author can no longer write or read here.
         expect(one('SELECT epoch, seq, frozen_seq FROM channels WHERE id = ?', w.channel)).toEqual({ epoch: 1, seq: w.seq - 1, frozen_seq: null });

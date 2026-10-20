@@ -168,8 +168,11 @@
         if (published && !same(published, theirs.identity) && !theirs.blocked) await ctx.box.notePeer(userId, published).catch(() => {});
         const current = published && !same(published, theirs.identity) ? await ctx.box.peer(userId) : theirs;
         if (current.blocked) { problems.push(userId); continue; }
+        // First sight is trust on first use; a different key than the group store knew is a change, and a change
+        // waits for an explicit review (the group sheet, or accepting it in the 1:1 safety sheet). Never silent.
+        if (mine && !same(mine.identity, current.identity)) rememberChange(userId, mine.identity, current.identity);
         if (!same(mine?.identity, current.identity)) { mine = await run({ cmd: 'notePeer', contact: userId, identity: current.identity }); changed = true; }
-        if (mine.blocked) { await run({ cmd: 'acceptChange', contact: userId }); changed = true; }
+        if (mine.blocked) { problems.push(userId); continue; }
         pinned.add(userId); continue;
       }
       if (!mine && !published) { problems.push(userId); continue; }
@@ -233,6 +236,16 @@
     ch.status = 'paused'; ch.pausedFor = userId; save(); paint(id);
   }
   /** The user accepted a changed security code (1:1 safety sheet or the group banner): resume what waited for it. */
+  /**
+   * The user accepted or verified a contact's changed code in the 1:1 safety sheet: that explicit decision covers
+   * the same key here (only if the group store holds exactly the key the 1:1 pin now trusts). Then resume.
+   */
+  async function contactAccepted(userId) {
+    if (!run || !ctx) return;
+    const [mine, theirs] = await Promise.all([run({ cmd: 'peer', contact: userId }).catch(() => null), ctx.box.peer(userId).catch(() => null)]);
+    if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId }); forgetChange(userId); }
+    pinsChanged(userId);
+  }
   function pinsChanged(userId) {
     pinned.delete(userId);
     for (const [id, ch] of channels) if (ch.status === 'paused' && (!userId || ch.pausedFor === userId)) { ch.status = 'active'; delete ch.pausedFor; save(); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); paint(id); }
@@ -351,6 +364,8 @@
     if (!ID.test(id || '')) return;
     if (!ch) { refreshChannels().then(() => ctx?.render()).catch(() => {}); return; }
     if (ch.status === 'left') { sendCursor(id, entry.seq); return; } // We asked to leave: keep the log moving for the others.
+    // Nothing is sequenced while a channel is frozen: a new entry means it was resolved (a missed `thawed`). Re-check.
+    if (ch.status === 'frozen') { thawIfResolved(id); return; }
     enqueue(id, async () => {
       if (!usable(ch) || entry.seq <= ch.cursor) return;
       if (entry.seq === ch.cursor + 1 && entry.message) {
@@ -389,7 +404,9 @@
       return 'ok';
     }
     const before = entry.kind === 'commit' ? await treeUsers(id) : null, rolesBefore = entry.kind === 'commit' ? ch.admins.slice() : null;
-    await ensurePins([entry.from.userId]);
+    // A sender whose code changed can't be read until someone reviews it: pause here, never decide for the user.
+    const sender = await ensurePins([entry.from.userId]);
+    if (sender.problems.length) { pause(id, sender.problems[0]); return 'stop'; }
     let processed;
     for (let attempt = 0; ; attempt++) {
       // The log says what the entry is; the core refuses a message that is something else.
@@ -432,9 +449,15 @@
     const digest = POISON.exec(error.message || '')?.[1];
     const ch = channels.get(id);
     if (digest) ch.rejected = { seq: entry.seq, digest }; // This device's own verdict, for resolving it later.
-    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }) : { status: 0 };
+    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }) : { status: -1, body: {} };
     if (result.status === 202 || result.status === 200 || (result.status === 409 && result.body.frozen)) {
-      setFrozen(id, result.body.frozen || { seq: entry.seq, digest });
+      // 202 answers `{ frozen: true }`; 409 names the commit the channel is frozen on.
+      setFrozen(id, typeof result.body.frozen === 'object' ? result.body.frozen : { seq: entry.seq, digest });
+      return 'stop';
+    }
+    // Rate limited or unreachable: stop here and try again later (the commit is still there to report).
+    if (result.status === 429 || result.status === 0 || result.status >= 500) {
+      setTimeout(() => { if (usable(channels.get(id))) enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); }, 30000);
       return 'stop';
     }
     // The report can't be made (dismissed before, or not the latest commit any more): this device can't follow; rejoin.
@@ -712,6 +735,11 @@
   }
   const hex = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
   const unb64 = text => Uint8Array.from(atob(text.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
+  async function thawIfResolved(id) {
+    const ch = channels.get(id), info = await call(`/api/channels/${id}`);
+    if (info.status !== 200 || info.body.frozen || ch?.status !== 'frozen') return;
+    onChannel({ id, change: 'thawed' });
+  }
   /** A reported commit froze the channel. Record it and, on an admin device, check it before offering a verdict. */
   function setFrozen(id, frozen) {
     const ch = channels.get(id);
@@ -1030,8 +1058,7 @@
     $('group-review').onclick = async () => {
       const ch = channels.get(currentId), userId = ch?.pausedFor;
       if (!userId) return;
-      if (ctx.contacts().some(contact => contact.id === userId && contact.state === 'mutual')) { ctx.review(userId); return; }
-      // Someone you only know from groups: the same explicit review as for contacts, never a silent accept.
+      // Contact or not: the group's own review sheet, old and new code side by side, never a silent accept.
       openReview(userId);
     };
     $('pin-review-cancel').onclick = () => { reviewing = null; $('pin-review').hidden = true; };
@@ -1050,7 +1077,7 @@
   ]);
 
   window.Groups = Object.freeze({
-    start, stop, frame, devicesChanged, pinsChanged, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
+    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
     active: () => currentId, enabled: () => enabled, flush: () => currentId && flush(currentId),
     onReact: (target, emoji, on) => send(currentId, { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }),
     async onEdit(record, text) {

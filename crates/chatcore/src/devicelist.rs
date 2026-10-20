@@ -48,7 +48,7 @@ pub struct SignedList {
 
 fn alphabet(text: &str) -> bool { text.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') }
 pub fn user_id_ok(text: &str) -> bool { (1..=64).contains(&text.len()) && alphabet(text) }
-fn device_id_ok(text: &str) -> bool { text.len() == 22 && alphabet(text) }
+pub fn device_id_ok(text: &str) -> bool { text.len() == 22 && alphabet(text) }
 
 fn exactly(object: &Map<String, Value>, keys: &[&str]) -> bool { object.len() == keys.len() && keys.iter().all(|key| object.contains_key(*key)) }
 

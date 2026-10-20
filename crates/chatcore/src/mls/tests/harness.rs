@@ -25,6 +25,8 @@ pub struct Account {
 }
 
 impl Account {
+    /// The same user with a new account identity key (recovery, or the target of a succession).
+    pub fn rekeyed(&self) -> Self { Self { id: self.id.clone(), aik: SigningKey::generate(&mut OsRng) } }
     pub fn new() -> Self { Self { id: rid(), aik: SigningKey::generate(&mut OsRng) } }
     pub fn pin(&self) -> String { b64(&self.aik.verifying_key().to_bytes()) }
 }
@@ -71,11 +73,14 @@ pub struct Dev {
 
 impl Dev {
     /// `peers`: the accounts whose keys this device has pinned (TOFU contacts).
-    pub fn new(account: &Account, platform: &str, peers: &[&Account]) -> Self {
+    pub fn new(account: &Account, platform: &str, peers: &[&Account]) -> Self { Self::issued(account, platform, peers, 1_700_000_000_000) }
+
+    /// A device whose certificate was issued at `issued_at` (Unix ms).
+    pub fn issued(account: &Account, platform: &str, peers: &[&Account], issued_at: u64) -> Self {
         let mut store = MemoryStore::default();
         let mut groups = Groups::load(&mut store, "mls").unwrap();
         let device = rid();
-        groups.init_device(&mut store, &account.id, &device, platform, 1_700_000_000_000, &account.aik).unwrap();
+        groups.init_device(&mut store, &account.id, &device, platform, issued_at, &account.aik).unwrap();
         for peer in peers { store.put(&format!("peer:{}", peer.id), json!({ "aik": peer.pin() })).unwrap(); }
         Self { user: account.id.clone(), device, aik: account.aik.clone(), store, groups, cursor: HashMap::new(), skip: HashSet::new() }
     }
@@ -169,6 +174,20 @@ impl Dev {
     }
 
     pub fn sync(&mut self, server: &Server, group: &str) -> Vec<Processed> { self.try_sync(server, group).unwrap() }
+
+    /// Moves past the entry `try_sync` stopped at (a message this test expects to be refused).
+    pub fn skip_next(&mut self, group: &str) { *self.cursor.entry(group.to_string()).or_default() += 1; }
+
+    /// Like `sync` but a refused entry is skipped; returns the kind of each accepted one.
+    pub fn sync_lossy(&mut self, server: &Server, group: &str) -> Vec<String> {
+        let mut kinds = Vec::new();
+        loop {
+            match self.try_sync(server, group) {
+                Ok(done) => { kinds.extend(done.into_iter().map(|p| p.kind)); return kinds; }
+                Err(_) => self.skip_next(group),
+            }
+        }
+    }
 
     pub fn texts(&mut self, server: &Server, group: &str) -> Vec<String> {
         self.sync(server, group).into_iter().filter_map(|p| p.plaintext).collect()

@@ -93,9 +93,9 @@ fn two_devices_and_a_delivery_service_over_json_commands() {
     // A frozen-channel resolution is signed with the admin device's leaf key and checked by any member.
     let digest = "ab".repeat(32);
     let signature = call(&mut alice, json!({ "cmd": "mlsSignResolution", "group": group, "action": "rollback", "seq": 3, "digest": digest, "author": "" }));
-    let signer = call(&mut bob, json!({ "cmd": "mlsVerifyResolution", "group": group, "action": "rollback", "seq": 3, "digest": digest, "author": "", "by": cert["deviceId"], "signature": signature }));
+    let signer = call(&mut bob, json!({ "cmd": "mlsVerifyResolution", "group": group, "action": "rollback", "seq": 3, "digest": digest, "author": "", "by": cert["deviceId"], "byUser": alice_id, "signature": signature }));
     assert_eq!(signer, json!({ "userId": alice_id, "deviceId": cert["deviceId"] }));
-    assert_eq!(fails(&mut bob, json!({ "cmd": "mlsVerifyResolution", "group": group, "action": "dismiss", "seq": 3, "digest": digest, "author": "", "by": cert["deviceId"], "signature": signature }))["code"], "auth");
+    assert_eq!(fails(&mut bob, json!({ "cmd": "mlsVerifyResolution", "group": group, "action": "dismiss", "seq": 3, "digest": digest, "author": "", "by": cert["deviceId"], "byUser": alice_id, "signature": signature }))["code"], "auth");
     assert_eq!(fails(&mut alice, json!({ "cmd": "mlsSignResolution", "group": group, "action": "remove", "seq": 3, "digest": digest }))["code"], "invalid");
 
     // A conflict leaves nothing behind; a stale commit is answered, not applied.

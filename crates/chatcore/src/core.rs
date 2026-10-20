@@ -48,6 +48,9 @@ pub struct PeerRecord {
     pub changed: bool,
     #[serde(default)]
     pub blocked: bool,
+    /// Account keys this contact moved on from by signed succession (oldest first); see `accept_succession`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous: Vec<PreviousKey>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -111,6 +114,27 @@ struct Pending {
     fresh: Option<(u64, Handshake)>,
 }
 
+mod companion;
+pub use companion::{Account, LinkAccepted, PinExport};
+
+/// What a primary remembers of the last device list it signed (`devlist:last`).
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct ListMemory {
+    version: u64,
+    hash: String,
+    #[serde(default, rename = "userId")]
+    user_id: String,
+    #[serde(default)]
+    devices: Vec<String>,
+}
+
+/// An account key a contact (or this account) moved on from, with the time of the succession.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviousKey {
+    pub sign: String,
+    pub until: u64,
+}
+
 pub struct Core {
     store: Box<dyn Store>,
     /// A missing identity may be generated only in a brand-new store or after an explicit `reset_identity`.
@@ -170,6 +194,7 @@ impl Core {
     pub fn has_identity(&mut self) -> Result<bool> { Ok(self.get::<Identity>("identity")?.is_some()) }
 
     pub fn identity(&mut self) -> Result<Identity> {
+        if self.store.get("account")?.is_some() { return Err(ChatError::coded("companion", "This device does not hold the account's identity key")); }
         if let Some(identity) = self.get::<Identity>("identity")? { return Ok(identity); }
         // Never mint a new identity because one went missing from an existing key database.
         if !self.may_create_identity { return Err(ChatError::storage("identity missing from the key database")); }
@@ -182,6 +207,7 @@ impl Core {
     /// Proves this device holds the account identity key for one device-claim challenge (docs/devices.md):
     /// signs `claim_bytes` only, never caller-chosen bytes, and never creates an identity.
     pub fn prove_identity(&mut self, user_id: &str, device_id: &str, challenge: &str) -> Result<String> {
+        self.reject_companion()?;
         let bytes = claim_bytes(user_id, device_id, challenge)?;
         let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
         Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
@@ -199,22 +225,21 @@ impl Core {
     /// signature verifies under this core's own key. A head older than the memory is ignored; a different list at
     /// the same version is a fork and is refused.
     pub fn sign_device_list(&mut self, user_id: &str, published_sign: &str, list_json: &str, head: Option<&crate::devicelist::ListHead>) -> Result<crate::devicelist::SignedList> {
+        self.reject_companion()?;
         use crate::devicelist::{cert_bytes, list_bytes, list_hash, parse_list, SignedList};
-        #[derive(Serialize, Deserialize, Clone, PartialEq)]
-        struct Last { version: u64, hash: String }
         let list = parse_list(list_json)?;
         if list.user_id != user_id { return Err(ChatError::coded("invalid", "The device list names another account")); }
         let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
         if identity.public.sign != published_sign { return Err(ChatError::coded("mismatch", "This device does not hold the account's published identity key")); }
         let key = SigningKey::from_bytes(&identity.sign.0);
-        let mut last = self.get::<Last>("devlist:last")?;
+        let mut last = self.get::<ListMemory>("devlist:last")?;
         if let Some(head) = head {
             let served = parse_list(&head.list_json)?;
             if served.user_id != user_id { return Err(ChatError::coded("invalid", "The served device list names another account")); }
             let signature = crate::primitives::unb64(&head.signature, Some(64)).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
             let signature = ed25519_dalek::Signature::from_slice(&signature).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
             key.verifying_key().verify_strict(&list_bytes(&served), &signature).map_err(|_| ChatError::coded("invalid", "The served device list is not signed by this account's identity key"))?;
-            let seen = Last { version: served.version, hash: list_hash(&served) };
+            let seen = ListMemory { version: served.version, hash: list_hash(&served), user_id: user_id.to_string(), devices: served.devices.iter().map(|d| d.device_id.clone()).collect() };
             match &last {
                 Some(known) if seen.version < known.version => {}
                 Some(known) if seen.version == known.version && seen.hash != known.hash => return Err(ChatError::coded("invalid", "The served device list forks the last one this identity signed")),
@@ -228,7 +253,7 @@ impl Core {
         };
         if !follows { return Err(ChatError::coded("invalid", "The device list does not follow the last one this identity signed")); }
         // Remembered before anything is signed: a signature that cannot be recorded is never handed out.
-        self.store.put("devlist:last", to_value(&Last { version: list.version, hash }))?;
+        self.store.put("devlist:last", to_value(&ListMemory { version: list.version, hash, user_id: user_id.to_string(), devices: list.devices.iter().map(|d| d.device_id.clone()).collect() }))?;
         let certs = list.devices.iter().map(|device| (device.device_id.clone(), b64(&key.sign(&cert_bytes(user_id, device)).to_bytes()))).collect();
         Ok(SignedList { signature: b64(&key.sign(&list_bytes(&list)).to_bytes()), certs })
     }
@@ -237,6 +262,7 @@ impl Core {
     /// seed of the key that seals device labels inside the list. Deterministic (RFC 8032), so every holder of
     /// the AIK derives the same key. Keep it on the device; it is a key, not something to publish.
     pub fn device_meta_signature(&mut self, user_id: &str) -> Result<String> {
+        self.reject_companion()?;
         let bytes = crate::devicelist::meta_bytes(user_id)?;
         let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
         Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
@@ -286,7 +312,7 @@ impl Core {
         let known = self.peer(contact)?;
         if let Some(known) = &known { if same_identity(&known.identity, public) { return Ok((known.clone(), Vec::new(), false)); } }
         let changed = known.is_some();
-        let record = PeerRecord { identity: public.clone(), verified: false, changed, blocked: changed };
+        let record = PeerRecord { identity: public.clone(), verified: false, changed, blocked: changed, previous: Vec::new() };
         let mut writes = vec![Write::Put(format!("peer:{contact}"), to_value(&record))];
         if changed { writes.push(Write::Delete(format!("sessions:{contact}"))); }
         Ok((record, writes, changed))
@@ -308,6 +334,7 @@ impl Core {
     fn sessions(&mut self, contact: &str) -> Result<SessionRecord> { Ok(self.get(&format!("sessions:{contact}"))?.unwrap_or_default()) }
 
     pub fn encrypt_to(&mut self, contact: &str, plaintext_json: &str, bundle: Option<&Bundle>) -> Result<EncryptOutcome> {
+        self.reject_companion()?;
         serde_json::from_str::<Value>(plaintext_json).map_err(|_| ChatError::coded("invalid", "Plaintext must be JSON"))?;
         self.assert_sendable(contact)?;
         let mut record = self.sessions(contact)?;
@@ -346,6 +373,7 @@ impl Core {
     /// Authenticates and decrypts without advancing the stored ratchet. `published` is the identity the
     /// server publishes for this contact (defence in depth only — circular if the server is the attacker).
     pub fn decrypt_from(&mut self, contact: &str, envelope: &str, published: Option<&IdentityPub>) -> Result<Decrypted> {
+        self.reject_companion()?;
         let parsed = parse_envelope(envelope)?;
         let record = self.sessions(contact)?;
         let snapshot = self.store.get(&format!("sessions:{contact}"))?;

@@ -250,14 +250,24 @@
       meta.textContent = [row.current ? 'This browser' : null, row.primary ? 'Primary · holds your keys' : null, row.state === 'pending' ? 'Signed in · not linked' : null, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
       item.append(name, meta);
       if (amPrimary && !row.current && !row.primary) {
-        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger-text device-remove'; remove.textContent = 'Remove';
+        // A linked device is revoked (signed out, dropped from the signed list and from every group); a device that
+        // only signed in is simply removed.
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger-text device-remove'; remove.textContent = row.state === 'listed' ? 'Revoke' : 'Remove';
+        remove.setAttribute('aria-label', `${remove.textContent} ${name.textContent}`);
         remove.onclick = () => removeDevice(row).catch(error => { deviceWarning = `Could not remove the device: ${error.message}`; renderDevices(); });
         item.append(remove);
+        if (row.state === 'listed' && window.Linking?.can('makePrimary')) {
+          const promote = document.createElement('button'); promote.type = 'button'; promote.className = 'link device-promote'; promote.textContent = 'Make primary';
+          promote.setAttribute('aria-label', `Make ${name.textContent} your primary device`);
+          promote.onclick = () => window.Linking.run('makePrimary', row);
+          item.append(promote);
+        }
       }
       rows.push(item);
     }
     list.replaceChildren(...rows);
   }
+  window.addEventListener('linking-flows', () => renderDevices());
   /** Signs the device out everywhere and, if it was listed, publishes the list without it. */
   async function removeDevice(row) {
     let body = {};
@@ -269,7 +279,7 @@
     await api(`/api/devices/${row.id}`, 'DELETE', body);
     if (body.list) await pinOwn(body);
     deviceView = await api(`/api/devices/${me.username}`);
-    deviceNotice = 'Device removed: it was signed out and can no longer receive messages.';
+    deviceNotice = row.state === 'listed' ? 'Device revoked: it was signed out, left your groups, and can no longer receive messages.' : 'Device removed: it was signed out and can no longer receive messages.';
     renderDevices();
   }
   /** A contact's served list, checked against the identity key we pinned for them (never the server's word). */

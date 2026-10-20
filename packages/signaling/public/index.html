@@ -18,6 +18,8 @@
   <script src="/theme.js" defer></script>
   <script src="/alerts.js" defer></script>
   <script src="/devices.js" defer></script>
+  <script src="/qr.js" defer></script>
+  <script src="/link.js" defer></script>
   <script src="/groups.js" defer></script>
   <script src="/account.js" defer></script>
   <script src="/install.js" defer></script>
@@ -107,7 +109,7 @@
     <div id="device-banner" class="notify-banner" role="alert" hidden>
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
       <p id="device-banner-text">Encrypted messaging for this account is active on another device or browser. Messages are not sent or received here.</p>
-      <div class="notify-actions"><button id="device-takeover" class="primary" type="button">Use this device instead</button></div>
+      <div class="notify-actions"><button id="device-link-this" class="primary" type="button" hidden>Link this browser</button><button id="device-takeover" class="primary" type="button">Use this device instead</button><button id="device-recover" class="link" type="button" hidden>I can’t use my other devices</button></div>
     </div>
     <p id="chats-status" role="status" aria-live="polite"></p>
     <section id="pinned-section" class="list-section" aria-labelledby="pinned-head" hidden>
@@ -291,6 +293,32 @@
     <div class="dialog-actions"><button id="receipt-close" class="primary" type="button">Done</button></div>
   </div></div>
 
+  <div id="link-dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="link-title" hidden><div class="dialog-card device-link-card">
+    <h2 id="link-title">Link a device</h2>
+    <p id="link-hint" class="note"></p>
+    <div id="link-qr-box" class="device-link-qr-box" hidden><div id="link-qr" class="device-link-qr"></div><p class="note">Or type this code on the other device:</p><p id="link-code" class="device-link-code"></p></div>
+    <div id="link-entry" hidden>
+      <form id="link-code-form"><label for="link-code-input">Code from your other device</label>
+        <input id="link-code-input" autocomplete="off" spellcheck="false" autocapitalize="characters" inputmode="text" placeholder="1234 5678 9012">
+        <div class="dialog-actions"><button id="link-scan" type="button" hidden>Scan its code</button><button id="link-code-submit" class="primary" type="submit">Link</button></div></form>
+      <div id="link-scan-box" hidden><video id="link-video" class="device-link-video" playsinline muted></video></div>
+    </div>
+    <div id="link-confirm" hidden>
+      <p>Check that both screens show the same numbers:</p><p id="link-sas" class="safety-number"></p>
+      <div class="dialog-actions"><button id="link-mismatch" class="danger" type="button">They don’t match</button><button id="link-match" class="primary" type="button">They match</button></div>
+    </div>
+    <p id="link-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="link-cancel" type="button">Cancel</button></div>
+  </div></div>
+
+  <div id="recovery" class="dialog" role="alertdialog" aria-labelledby="recovery-title" hidden><div class="dialog-card">
+    <h2 id="recovery-title">Start over on this device?</h2>
+    <p>Only do this if you can’t reach any device where you’re signed in. This browser gets new keys, and your old devices are signed out.</p>
+    <p>Everyone you talk to will see that your security code changed. People who verified you will need to check it again before they trust it. In groups and channels you’ll come back once they’ve checked it.</p>
+    <p>Messages stay on the devices that have them; this browser starts empty.</p>
+    <div class="dialog-actions"><button id="recovery-cancel" type="button">Keep trying to link</button><button id="recovery-yes" class="danger" type="button">Start over here</button></div>
+  </div></div>
+
   <div id="remove-confirm" class="dialog" role="alertdialog" aria-labelledby="remove-title" hidden><div class="dialog-card">
     <h2 id="remove-title">Remove this contact?</h2>
     <p>You stop seeing each other online and can no longer call or message until one of you adds the other again. Messages on this device stay.</p>
@@ -366,6 +394,7 @@
       <h3>Devices</h3>
       <p class="note">The device that holds your keys is the primary. It signs the list of your devices; contacts check that signature, so the server cannot add a device they would trust.</p>
       <ul id="device-list" class="device-list" aria-label="Your devices"></ul>
+      <button id="device-link-new" type="button" hidden>Link a new device</button>
       <p id="devices-status" class="note" role="status" aria-live="polite"></p>
     </div>
     <div class="account-only">

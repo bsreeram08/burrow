@@ -756,3 +756,64 @@ fn an_external_commit_is_never_attributed_to_anyone() {
     assert_eq!((check.authenticated, check.class(), check.author), (false, "tag", None));
     assert_eq!(f.c1.groups.process(&mut f.c1.store, &gid, &out.commit).unwrap_err().class.as_deref(), Some("tag"));
 }
+
+#[test]
+fn a_resolution_is_signed_with_a_leaf_key_every_member_can_check_and_only_admins_count() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let gid = group_id(&f.group).unwrap();
+    let digest = "ab".repeat(32);
+    let author = f.b1.device.clone();
+    let sign = |dev: &mut Dev, action: &str, seq: u64, digest: &str, author: &str| dev.groups.sign_resolution(&mut dev.store, &gid, action, seq, digest, author);
+
+    // An admin device signs; every other member's device verifies it against its own tree, learning who signed.
+    let signature = sign(&mut f.a2, "rollback", 7, &digest, &author).unwrap();
+    for verifier in [&mut f.b1, &mut f.b2, &mut f.c1, &mut f.a1] {
+        let who = verifier.groups.verify_resolution(&mut verifier.store, &gid, "rollback", 7, &digest, &author, &f.a2.device, &signature).unwrap();
+        assert_eq!((who.user_id.as_str(), who.device_id.as_str()), (f.alice.id.as_str(), f.a2.device.as_str()));
+    }
+    // An empty author (a rollback that removes nobody) and a dismissal sign too.
+    let keep = sign(&mut f.a1, "rollback", 7, &digest, "").unwrap();
+    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "rollback", 7, &digest, "", &f.a1.device, &keep).is_ok());
+    let dismiss = sign(&mut f.a1, "dismiss", 7, &digest, "").unwrap();
+    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "dismiss", 7, &digest, "", &f.a1.device, &dismiss).is_ok());
+
+    // Every signed part matters: a different action, seq, digest, author, signer or signature is `auth`.
+    let verify = |dev: &mut Dev, action: &str, seq: u64, digest: &str, author: &str, by: &str, sig: &str| dev.groups.verify_resolution(&mut dev.store, &gid, action, seq, digest, author, by, sig);
+    let (a2, a1) = (f.a2.device.clone(), f.a1.device.clone());
+    for (name, result) in [
+        ("action", verify(&mut f.c1, "dismiss", 7, &digest, &author, &a2, &signature)),
+        ("seq", verify(&mut f.c1, "rollback", 8, &digest, &author, &a2, &signature)),
+        ("digest", verify(&mut f.c1, "rollback", 7, &"cd".repeat(32), &author, &a2, &signature)),
+        ("author", verify(&mut f.c1, "rollback", 7, &digest, "", &a2, &signature)),
+        ("signer", verify(&mut f.c1, "rollback", 7, &digest, &author, &a1, &signature)),
+        ("signature", verify(&mut f.c1, "rollback", 7, &digest, &author, &a2, &keep)),
+    ] {
+        assert_eq!(result.unwrap_err().code(), Some("auth"), "{name}");
+    }
+    // Another group's resolution doesn't carry over.
+    let other = rid();
+    let mut server2 = Server::new(&[&f.alice]);
+    f.a2.create(&mut server2, &other, &Roles::group(vec![f.alice.id.clone()], JoinPolicy::Invite));
+    let other_id = group_id(&other).unwrap();
+    let elsewhere = f.a2.groups.sign_resolution(&mut f.a2.store, &other_id, "rollback", 7, &digest, &author).unwrap();
+    assert_eq!(verify(&mut f.c1, "rollback", 7, &digest, &author, &a2, &elsewhere).unwrap_err().code(), Some("auth"));
+
+    // Only an admin's device counts; strangers and malformed inputs are refused before any signature work.
+    let plain = sign(&mut f.b1, "rollback", 7, &digest, &author).unwrap();
+    let err = verify(&mut f.c1, "rollback", 7, &digest, &author, &f.b1.device.clone(), &plain).unwrap_err();
+    assert!(err.message.contains("only an admin"), "{err}");
+    assert!(verify(&mut f.c1, "rollback", 7, &digest, &author, &rid(), &signature).unwrap_err().message.contains("not in this group"));
+    for bad in [("remove", digest.clone(), author.clone()), ("rollback", "AB".repeat(32), author.clone()), ("rollback", "ab".repeat(31), author.clone()), ("rollback", digest.clone(), "not a device".to_string())] {
+        assert!(sign(&mut f.a1, bad.0, 1, &bad.1, &bad.2).is_err(), "{bad:?}");
+        assert!(verify(&mut f.c1, bad.0, 1, &bad.1, &bad.2, &a1, &signature).is_err());
+    }
+    assert!(verify(&mut f.c1, "rollback", 7, &digest, &author, "short", &signature).is_err());
+    assert!(verify(&mut f.c1, "rollback", 7, &digest, &author, &a2, "!!").is_err());
+    assert!(verify(&mut f.c1, "rollback", 7, &digest, &author, &a2, &b64(&[0u8; 10])).is_err());
+    // A device that was removed can no longer sign for the group.
+    f.a1.accepted(&mut f.server, &f.group.clone(), &[], &[(f.bob.id.clone(), Some(f.b2.device.clone()))], None, false);
+    f.b2.sync(&f.server, &f.group.clone());
+    assert!(sign(&mut f.b2, "rollback", 7, &digest, &author).is_err());
+    // The commands spell it the same way.
+    let _ = &mut f.server;
+}

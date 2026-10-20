@@ -222,6 +222,7 @@ row under the wrong group; OpenMLS never sees a panic from a corrupt row.
 | `mls_receive(group_id, message)` / `mls_receive_commit(pending_id)` / `mls_receive_abort(pending_id)` | `Processed` / `()` / `()` |
 | `mls_members(group_id)` / `mls_roles(group_id)` / `mls_group_view(group_id)` | `Vec<MemberView>` / `Roles` / `GroupView` |
 | `mls_validate_payload(payload_json, context)` | the payload type |
+| `mls_sign_resolution(group_id, action, seq, digest, author)` / `mls_verify_resolution(group_id, action, seq, digest, author, by, signature)` | A frozen-channel resolution signed with this device's MLS leaf key over `"webrtc-bun-mlsresolve-leaf-v1\n" + group + "\n" + action + "\n" + seq + "\n" + digest + "\n" + author` (action `rollback` or `dismiss`, digest 64 lowercase hex, author empty or a device id; nothing else is ever signed this way). Verifying finds device `by` in this device's tree, checks its certificate under the pinned account key, requires its user to be an admin, and returns `{ userId, deviceId }`; `auth` for a bad signature, `invalid` otherwise. Commands `mlsSignResolution`, `mlsVerifyResolution`. |
 | `mls_commit_author(group_id, message)` | `CommitCheck { authenticated, signedContentInvalid, class, author? }`: who signed a commit at the current epoch and whether what they signed is valid, judged on this device's tree without the tags (changes nothing). For resolving a reported commit; see "Who a rejected commit blames". |
 
 JSON commands: `mlsInitDevice`, `mlsDeviceLeaf`, `mlsSetDeviceCert`, `mlsKeyPackages`, `mlsCreate`, `mlsCommit`,

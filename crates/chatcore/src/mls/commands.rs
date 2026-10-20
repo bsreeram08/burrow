@@ -116,6 +116,12 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 let roles = match command.get("roles") { None | Some(Value::Null) => None, Some(value) => Some(roles_of(value)?) };
                 ok(groups.commit_unchecked(store, &group()?, &list(command, "adds")?, &removes, roles.as_ref(), flag(command, "update"))?)
             }
+            "mlsSignResolution" | "mlsVerifyResolution" => {
+                let (action, digest, author) = (text(command, "action")?, text(command, "digest")?, command.get("author").and_then(Value::as_str).unwrap_or("").to_string());
+                let seq = command.get("seq").and_then(Value::as_u64).ok_or_else(|| ChatError::coded("invalid", "seq must be a number"))?;
+                if cmd == "mlsSignResolution" { ok(groups.sign_resolution(store, &group()?, &action, seq, &digest, &author)?) }
+                else { ok(groups.verify_resolution(store, &group()?, &action, seq, &digest, &author, &text(command, "by")?, &text(command, "signature")?)?) }
+            }
             "mlsMergeOwn" => ok(groups.merge_own(store, &group()?)?),
             "mlsClearOwn" => { groups.clear_own(store, &group()?)?; Ok(Value::Null) }
             "mlsPending" => ok(groups.pending_commit(store, &group()?)?),

@@ -198,6 +198,25 @@ fn check_commit(provider: &Provider, group: &MlsGroup, protocol: ProtocolMessage
     }
 }
 
+/// A group member who signed a resolution of a frozen channel (see [`Groups::verify_resolution`]).
+#[cfg(feature = "mls")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResolutionSigner {
+    #[serde(rename = "userId")]
+    pub user_id: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: String,
+}
+
+/// The only bytes a resolution signature covers, built here from validated parts.
+#[cfg(feature = "mls")]
+fn resolution_bytes(group: &GroupId, action: &str, seq: u64, digest: &str, author: &str) -> Result<Vec<u8>> {
+    if !matches!(action, "rollback" | "dismiss") { return Err(invalid("a resolution is a rollback or a dismissal")); }
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) { return Err(invalid("the digest is 64 lowercase hex characters")); }
+    if !(author.is_empty() || super::cert::canonical_id(author)) { return Err(invalid("the author is empty or a device id")); }
+    Ok(format!("webrtc-bun-mlsresolve-leaf-v1\n{}\n{action}\n{seq}\n{digest}\n{author}", group_text(group)).into_bytes())
+}
+
 /// A commit built here and not yet resolved: the DS has neither accepted nor refused it as far as this device knows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCommit {
@@ -767,6 +786,42 @@ impl Groups {
         // If the check itself can't run, nothing is known about the author: not attributable, so class `tag`.
         let class = check_commit(provider, group, again, store, cert).map(|check| check.class()).unwrap_or("tag");
         ChatError::coded("poison", &format!("poison {digest}: {reason}")).with_class(class)
+    }
+
+    /// Signs a resolution of a frozen channel with THIS device's leaf signature key, over bytes built here (nothing
+    /// else is ever signed with it this way). Every member can check it against the group's tree (certified by the
+    /// pinned account keys), so a relay cannot forge or alter it.
+    pub fn sign_resolution(&mut self, store: &mut dyn Store, group: &GroupId, action: &str, seq: u64, digest: &str, author: &str) -> Result<String> {
+        use openmls_traits::signatures::Signer as _;
+        let bytes = resolution_bytes(group, action, seq, digest, author)?;
+        let cert = Self::device(store)?;
+        self.gate(store, group)?;
+        let mls_group = Self::load_group(&self.provider, group)?;
+        if !mls_group.is_active() { return Err(invalid("this device is no longer in that group")); }
+        let signer = Self::signer(&self.provider, &cert)?;
+        Ok(b64(&signer.sign(&bytes).map_err(mls)?))
+    }
+
+    /// Verifies a resolution signed by the group member whose device id is `by`: that device must be in this
+    /// device's tree with a certificate that verifies under the pinned account key, its user must be an admin, and
+    /// the signature must be its leaf key's over the bytes of [`Groups::sign_resolution`]. Changes nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_resolution(&mut self, store: &mut dyn Store, group: &GroupId, action: &str, seq: u64, digest: &str, author: &str, by: &str, signature: &str) -> Result<ResolutionSigner> {
+        let bytes = resolution_bytes(group, action, seq, digest, author)?;
+        if !super::cert::canonical_id(by) { return Err(invalid("the signer is a device id")); }
+        let signature: [u8; 64] = unb64(signature, "signature")?.try_into().map_err(|_| invalid("a signature is 64 bytes"))?;
+        let cert = Self::device(store)?;
+        self.gate(store, group)?;
+        let mls_group = Self::load_group(&self.provider, group)?;
+        let roles = validate_context(mls_group.extensions())?;
+        let member = mls_group.members().find(|m| cert_of(&m.credential).is_some_and(|c| c.device_id == by)).ok_or_else(|| invalid("that device is not in this group"))?;
+        let mut directory = Self::client_directory(store, &cert);
+        let signer = super::cert::verify_credential(&mut directory, &member.credential, &member.signature_key)?;
+        if !roles.is_admin(&signer.user_id) { return Err(invalid("only an admin's device resolves a frozen channel")); }
+        let key: [u8; 32] = member.signature_key.as_slice().try_into().map_err(|_| invalid("malformed leaf key"))?;
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&key).map_err(|_| invalid("malformed leaf key"))?;
+        key.verify_strict(&bytes, &ed25519_dalek::Signature::from_bytes(&signature)).map_err(|_| ChatError::coded("auth", "the resolution is not signed by that device"))?;
+        Ok(ResolutionSigner { user_id: signer.user_id, device_id: signer.device_id })
     }
 
     pub fn process_as(&mut self, store: &mut dyn Store, group: &GroupId, message: &str, expect: Option<Expect>) -> Result<Processed> {

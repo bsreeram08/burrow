@@ -1,13 +1,13 @@
 {
   "js": "chatcore.98e35a3f0ad57bd9.js",
-  "wasm": "chatcore_bg.fdec237c13f2b8cc.wasm",
+  "wasm": "chatcore_bg.5049d7019eccdb1b.wasm",
   "sha256": {
     "chatcore.98e35a3f0ad57bd9.js": "98e35a3f0ad57bd97fdceccc2e3fb2d153aea4df5e017b2942fb768c49b7be40",
-    "chatcore_bg.fdec237c13f2b8cc.wasm": "fdec237c13f2b8cc7259b6b13fc530f49657f0abe80c3b4f999ce8c36fba9d3c"
+    "chatcore_bg.5049d7019eccdb1b.wasm": "5049d7019eccdb1bd9ac1df002bc9c9a14aa8708392b5ada83559d77f000ba97"
   },
   "bytes": {
     "chatcore.98e35a3f0ad57bd9.js": 15690,
-    "chatcore_bg.fdec237c13f2b8cc.wasm": 1028707
+    "chatcore_bg.5049d7019eccdb1b.wasm": 1028707
   },
   "protocol": "chatcore-commands-1",
   "variant": "ds",
@@ -16,6 +16,6 @@
   ],
   "wasmBindgen": "0.2.129",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-  "source": "6bce16855352bce51756821ce5e88de25b523172ffd3a4d5e4d89312542d7403",
+  "source": "f139ca15ef489ea9810c583ea3003d7c02d08079a7463cdef9026c1dc3efd9f8",
   "host": "darwin-arm64"
 }

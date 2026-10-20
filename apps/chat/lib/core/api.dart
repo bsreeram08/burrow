@@ -167,6 +167,76 @@ class Api {
     body: {'deviceId': deviceId, 'deviceKey': deviceKey, 'challenge': challenge, 'signature': signature, 'identityProof': ?identityProof},
   );
 
+  // ---- Linking, revocation, succession, DM capability (docs/m5-linking.md §10.2) ----
+  /// Starts a link (no session needed for `link`; a listed device's session for `transfer`): `{linkId, claim, expiresAt}`.
+  Future<Map<String, dynamic>> linkStart({
+    required String purpose,
+    required String deviceId,
+    required String deviceKey,
+    required String platform,
+    required String signature,
+  }) => call('/api/link/start', method: 'POST', body: {'purpose': purpose, 'deviceId': deviceId, 'deviceKey': deviceKey, 'platform': platform, 'client': client, 'signature': signature});
+
+  /// The primary offers its ephemeral key for a scanned link.
+  Future<Map<String, dynamic>> linkOffer(String linkId, String eph) => call('/api/link/$linkId/offer', method: 'POST', body: {'eph': eph});
+
+  /// `{state, eph?, purpose, platform}`; the new device authenticates with its [claim] (no session yet).
+  Future<Map<String, dynamic>> linkState(String linkId, {String? claim}) => _linkCall('/api/link/$linkId', claim: claim);
+
+  Future<void> linkSend(String linkId, String dir, String data, {String? claim}) async {
+    await _linkCall('/api/link/$linkId/messages', method: 'POST', body: {'dir': dir, 'data': data}, claim: claim);
+  }
+
+  /// Sealed messages in one direction after index [after]: `{messages: [...]}`.
+  Future<List<String>> linkMessages(String linkId, String dir, {int after = 0, String? claim}) async {
+    final data = await _linkCall('/api/link/$linkId/messages?dir=$dir&after=$after', claim: claim);
+    return [for (final m in (data['messages'] as List? ?? const [])) m is String ? m : (m as Map)['data'] as String];
+  }
+
+  Future<void> linkGrant(String linkId) async {
+    await call('/api/link/$linkId/grant', method: 'POST', body: const {});
+  }
+
+  /// The new device claims its session: `{user, session: {token, expiresAt}}`.
+  Future<({User user, String token})> linkClaim(String linkId, {required String claim, required String signature}) async =>
+      _session(await call('/api/link/$linkId/claim', method: 'POST', body: {'claim': claim, 'signature': signature, 'client': client}));
+
+  Future<void> linkCancel(String linkId, {String? claim}) async {
+    await _linkCall('/api/link/$linkId', method: 'DELETE', claim: claim);
+  }
+
+  Future<Map<String, dynamic>> _linkCall(String path, {String method = 'GET', Object? body, String? claim}) async {
+    if (claim == null) return call(path, method: method, body: body);
+    final request = http.Request(method, uri(path))
+      ..headers['Accept'] = 'application/json'
+      ..headers['X-Link-Claim'] = claim;
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    if (body != null) {
+      request.headers['Content-Type'] = 'application/json';
+      request.body = jsonEncode(body);
+    }
+    final response = await http.Response.fromStream(await _client.send(request).timeout(const Duration(seconds: 15)));
+    lastStatus = response.statusCode;
+    Map<String, dynamic> data = const {};
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) data = decoded;
+    } catch (_) {}
+    if (response.statusCode < 200 || response.statusCode >= 300) throw ApiException(data['error'] as String? ?? 'Something went wrong. Try again.', response.statusCode, data);
+    return data;
+  }
+
+  /// Cuts one of the account's devices off at once (any session of the account; not the primary).
+  Future<List<String>> revokeDevice(String deviceId) async =>
+      ((await call('/api/devices/$deviceId/revoke', method: 'POST', body: const {}))['revoked'] as List? ?? const []).cast<String>();
+
+  Future<void> publishSuccession(Map<String, dynamic> record, String signature) async {
+    await call('/api/devices/succession', method: 'PUT', body: {'record': record, 'signature': signature});
+  }
+
+  /// `{userId, devices, channel}`: the contact's MLS-capable devices and our DM channel with them, if any.
+  Future<Map<String, dynamic>> mlsCapability(String username) => call('/api/mls/capability/$username');
+
   /// Removes one of our devices: a pending one (or ourselves), or a listed one with the next signed list
   /// without it (`{list, signature, certs}`) from the primary.
   Future<void> removeDevice(String deviceId, [Map<String, dynamic> signed = const {}]) async {

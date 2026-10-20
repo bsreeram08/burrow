@@ -370,3 +370,61 @@ Map<String, String>? openMeta(Uint8List key, String userId, String deviceId, Str
   } catch (_) {}
   return null;
 }
+
+// ---------- Linking and succession (docs/m5-linking.md §1.3, §5.1) ----------
+const _linkStartLabel = 'webrtc-bun-linkstart-v1', _linkClaimLabel = 'webrtc-bun-linkclaim-v1', _successionLabel = 'webrtc-bun-succession-v1';
+
+/// What a new device's key signs to start a link: `text16(label) ‖ text16(deviceId) ‖ text16(platform) ‖
+/// bytes8(deviceKey raw 32)`.
+Uint8List linkStartBytes(String deviceId, String platform, String deviceKey) {
+  if (!_deviceId.hasMatch(deviceId) || !devicePlatforms.contains(platform) || !_key.hasMatch(deviceKey)) _fail('Invalid link start');
+  return (_Writer()
+        ..text16(_linkStartLabel)
+        ..text16(deviceId)
+        ..text16(platform)
+        ..bytes8(unb64(deviceKey)))
+      .done();
+}
+
+/// What a new device's key signs to claim its session: `text16(label) ‖ text16(linkId) ‖ text16(deviceId) ‖
+/// bytes8(claim raw 32)`.
+Uint8List linkClaimBytes(String linkId, String deviceId, String claim) {
+  if (!_deviceId.hasMatch(linkId) || !_deviceId.hasMatch(deviceId) || !_hash.hasMatch(claim)) _fail('Invalid link claim');
+  return (_Writer()
+        ..text16(_linkClaimLabel)
+        ..text16(linkId)
+        ..text16(deviceId)
+        ..bytes8(unb64(claim)))
+      .done();
+}
+
+/// What the old account key signs to hand the account to a new one (a succession record).
+Uint8List successionBytes(String userId, String oldSign, String newSign, String newDh, int at) {
+  if (!_userId.hasMatch(userId) || !_key.hasMatch(oldSign) || !_key.hasMatch(newSign) || !_key.hasMatch(newDh) || at < 0) _fail('Invalid succession record');
+  return (_Writer()
+        ..text16(_successionLabel)
+        ..text16(userId)
+        ..bytes8(unb64(oldSign))
+        ..bytes8(unb64(newSign))
+        ..bytes8(unb64(newDh))
+        ..u64(at))
+      .done();
+}
+
+/// A succession chain as served (`succession`, oldest first) checked from [pinnedSign]: each record verifies
+/// under the previous key and names the next, and the chain ends at [servedSign]. Records the user id.
+bool verifySuccessionChain(String userId, String pinnedSign, String servedSign, List<Map<String, dynamic>> records) {
+  var key = pinnedSign;
+  if (records.isEmpty || records.length > 8) return false;
+  try {
+    for (final r in records) {
+      if (r['v'] != 1 || r['userId'] != userId || r['oldSign'] != key) return false;
+      final bytes = successionBytes(userId, r['oldSign'] as String, r['newSign'] as String, r['newDh'] as String, r['at'] as int);
+      if (!verifyBytes(key, bytes, r['signature'])) return false;
+      key = r['newSign'] as String;
+    }
+  } catch (_) {
+    return false;
+  }
+  return key == servedSign;
+}

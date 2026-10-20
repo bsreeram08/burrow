@@ -23,7 +23,8 @@ sealed class AccountEvent {
         'presence' => Presence(m['id'] as String, m['online'] as bool),
         'contacts' => const ContactsChanged(),
         'keys' => KeysChanged(m['id'] as String),
-        'devices' => DevicesChanged(m['id'] as String),
+        'devices' => DevicesChanged(m['id'] as String, needsList: m['needsList'] == true),
+        'link' => LinkEvent(m['id'] as String, m['event'] as String),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
           fromId: (m['from'] as Map)['id'] as String,
@@ -97,8 +98,18 @@ class Hello extends AccountEvent {
 
 /// An account's device list changed (ours or a contact's): re-verify it.
 class DevicesChanged extends AccountEvent {
-  const DevicesChanged(this.id);
+  const DevicesChanged(this.id, {this.needsList = false});
   final String id;
+
+  /// To the primary after a revocation: publish the next list without the revoked device.
+  final bool needsList;
+}
+
+/// A link session of this account moved on: hello, offer, grant or a new sealed message.
+class LinkEvent extends AccountEvent {
+  const LinkEvent(this.id, this.event);
+  final String id;
+  final String event;
 }
 
 class Presence extends AccountEvent {

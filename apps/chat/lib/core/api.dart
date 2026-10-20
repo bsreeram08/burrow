@@ -168,38 +168,60 @@ class Api {
   );
 
   // ---- Linking, revocation, succession, DM capability (docs/m5-linking.md §10.2) ----
-  /// Starts a link (no session needed for `link`; a listed device's session for `transfer`): `{linkId, claim, expiresAt}`.
+  /// Starts a link (no session needed for `link`; a listed device's own session for `transfer`). Code mode
+  /// names the account ([username]) and answers with the 8-character code too: `{linkId, claim, expiresAt, code?}`.
   Future<Map<String, dynamic>> linkStart({
     required String purpose,
     required String deviceId,
     required String deviceKey,
     required String platform,
     required String signature,
-  }) => call('/api/link/start', method: 'POST', body: {'purpose': purpose, 'deviceId': deviceId, 'deviceKey': deviceKey, 'platform': platform, 'client': client, 'signature': signature});
+    String mode = 'qr',
+    String? username,
+  }) => call(
+    '/api/link/start',
+    method: 'POST',
+    body: {'purpose': purpose, 'mode': mode, 'username': ?username, 'deviceId': deviceId, 'deviceKey': deviceKey, 'platform': platform, 'signature': signature},
+  );
 
-  /// The primary offers its ephemeral key for a scanned link.
+  /// Code mode, new device: its commitment to the ephemeral key it will reveal later.
+  Future<void> linkCommit(String linkId, String commit, {required String claim}) async {
+    await _linkCall('/api/link/$linkId/commit', method: 'POST', body: {'commit': commit}, claim: claim);
+  }
+
+  /// Code mode, new device: opens the commitment once the primary's key is in.
+  Future<void> linkReveal(String linkId, {required String eph, required String nonce, required String claim}) async {
+    await _linkCall('/api/link/$linkId/reveal', method: 'POST', body: {'eph': eph, 'nonce': nonce}, claim: claim);
+  }
+
+  /// Code mode, primary: `{linkId, deviceId, platform, commit, expiresAt}` for a typed code (404 for anything wrong).
+  Future<Map<String, dynamic>> linkLookup(String code) => call('/api/link/lookup', method: 'POST', body: {'code': code});
+
+  /// The primary offers its ephemeral key: `{deviceId, platform, purpose, mode}`.
   Future<Map<String, dynamic>> linkOffer(String linkId, String eph) => call('/api/link/$linkId/offer', method: 'POST', body: {'eph': eph});
 
-  /// `{state, eph?, purpose, platform}`; the new device authenticates with its [claim] (no session yet).
+  /// `{state, purpose, mode, platform, expiresAt}` plus, for the new device ([claim]), `eph` and `offerDeviceId`
+  /// once offered; for the primary, `deviceId`, `commit?`, `reveal?`.
   Future<Map<String, dynamic>> linkState(String linkId, {String? claim}) => _linkCall('/api/link/$linkId', claim: claim);
 
-  Future<void> linkSend(String linkId, String dir, String data, {String? claim}) async {
-    await _linkCall('/api/link/$linkId/messages', method: 'POST', body: {'dir': dir, 'data': data}, claim: claim);
+  /// Posts one sealed message in this side's own direction; returns its seq.
+  Future<int> linkSend(String linkId, String data, {String? claim}) async =>
+      (await _linkCall('/api/link/$linkId/messages', method: 'POST', body: {'data': data}, claim: claim))['seq'] as int;
+
+  /// The other side's sealed messages after [after] (exclusive), in order.
+  Future<List<({int seq, String data})>> linkMessages(String linkId, {int after = 0, String? claim}) async {
+    final data = await _linkCall('/api/link/$linkId/messages?after=$after', claim: claim);
+    return [for (final m in (data['messages'] as List? ?? const []).cast<Map>()) (seq: m['seq'] as int, data: m['data'] as String)];
   }
 
-  /// Sealed messages in one direction after index [after]: `{messages: [...]}`.
-  Future<List<String>> linkMessages(String linkId, String dir, {int after = 0, String? claim}) async {
-    final data = await _linkCall('/api/link/$linkId/messages?dir=$dir&after=$after', claim: claim);
-    return [for (final m in (data['messages'] as List? ?? const [])) m is String ? m : (m as Map)['data'] as String];
-  }
-
+  /// The primary: the list naming the new device is published and the grant sent.
   Future<void> linkGrant(String linkId) async {
     await call('/api/link/$linkId/grant', method: 'POST', body: const {});
   }
 
-  /// The new device claims its session: `{user, session: {token, expiresAt}}`.
+  /// The new device claims its session (no session yet): `{user, session: {token, expiresAt}}`.
   Future<({User user, String token})> linkClaim(String linkId, {required String claim, required String signature}) async =>
-      _session(await call('/api/link/$linkId/claim', method: 'POST', body: {'claim': claim, 'signature': signature, 'client': client}));
+      _session(await _linkCall('/api/link/$linkId/claim', method: 'POST', body: {'claim': claim, 'signature': signature}));
 
   Future<void> linkCancel(String linkId, {String? claim}) async {
     await _linkCall('/api/link/$linkId', method: 'DELETE', claim: claim);

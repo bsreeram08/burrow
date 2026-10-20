@@ -10,7 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-# The browser ships 1:1 only until the web client moves to groups (M4); flip the default then.
+# No default features: scripts/build-wasm.ts builds the browser core with `mls` and the server's with `ds`.
 default = []
 # MLS groups in the browser (the `mls*` commands).
 mls = ["chatcore/mls"]

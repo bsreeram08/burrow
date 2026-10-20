@@ -1,19 +1,21 @@
 {
-  "js": "chatcore.98e35a3f0ad57bd9.js",
-  "wasm": "chatcore_bg.aa054a4481eb7d73.wasm",
+  "js": "chatcore.3a6a912ca1d73d04.js",
+  "wasm": "chatcore_bg.016409fe547e98c2.wasm",
   "sha256": {
-    "chatcore.98e35a3f0ad57bd9.js": "98e35a3f0ad57bd97fdceccc2e3fb2d153aea4df5e017b2942fb768c49b7be40",
-    "chatcore_bg.aa054a4481eb7d73.wasm": "aa054a4481eb7d73e829c8c97f32ac6268ae4188e51c45865999e395926c6847"
+    "chatcore.3a6a912ca1d73d04.js": "3a6a912ca1d73d043be5967e325f5df0561ae7f7ef6c1efafcd50ed24a553b63",
+    "chatcore_bg.016409fe547e98c2.wasm": "016409fe547e98c274e383ef93217b241b6d4d955ec9aa1f3ba1421b810a81b6"
   },
   "bytes": {
-    "chatcore.98e35a3f0ad57bd9.js": 15690,
-    "chatcore_bg.aa054a4481eb7d73.wasm": 366369
+    "chatcore.3a6a912ca1d73d04.js": 15900,
+    "chatcore_bg.016409fe547e98c2.wasm": 1588250
   },
   "protocol": "chatcore-commands-1",
   "variant": "browser",
-  "features": [],
+  "features": [
+    "mls"
+  ],
   "wasmBindgen": "0.2.129",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-  "source": "fd0aebfb3fe27b950af2c88cb368f25b002aa17d38615565aa58cb271c5611bf",
+  "source": "552087c0beb213228a9954410b60bab8a222bdfa809de2d76bfb40abcccf7e12",
   "host": "darwin-arm64"
 }

@@ -166,6 +166,9 @@ impl Core {
         self.store.get(key)?.map(from_value).transpose()
     }
 
+    /// Whether this key database holds a 1:1 identity (never creates one).
+    pub fn has_identity(&mut self) -> Result<bool> { Ok(self.get::<Identity>("identity")?.is_some()) }
+
     pub fn identity(&mut self) -> Result<Identity> {
         if let Some(identity) = self.get::<Identity>("identity")? { return Ok(identity); }
         // Never mint a new identity because one went missing from an existing key database.

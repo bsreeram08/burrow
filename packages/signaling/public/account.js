@@ -554,10 +554,10 @@
 
   // ---------- Sending ----------
   const bundleFor = contact => () => api(`/api/keys/${contact.username}`);
-  async function sendControl(contact, payload, ephemeral = false) {
+  async function sendControl(contact, payload) {
     if (!box) throw new Error('Encrypted messaging is unavailable in this browser.');
     const envelope = await box.encryptTo(contact.id, payload, bundleFor(contact));
-    await api('/api/messages', 'POST', ephemeral ? { to: contact.username, envelope, ephemeral: true } : { to: contact.username, envelope });
+    await api('/api/messages', 'POST', { to: contact.username, envelope });
   }
   // ---------- 1:1 chats on MLS (docs/m5-linking.md §8) ----------
   // A moved chat keeps its pairId as the conversation; its transport is the DM group. Double Ratchet stays
@@ -773,8 +773,8 @@
   }
   window.addEventListener('focus', () => App.onDisplayed());
   document.addEventListener('visibilitychange', () => App.onDisplayed());
-  // Typing: sent ephemeral (never stored by the server), only to an online contact with a session already open,
-  // so a hint never spends one of their one-time keys. `on` at most every 4 s while there is text; `off` on send/clear/blur.
+  // Typing: only in a moved chat's DM group, as a live-only frame (m5 §9); never over the 1:1 session.
+  // `on` at most every 4 s while there is text; `off` on send/clear/blur.
   let typingSent = 0, typingOn = false, typingHide = null, typingFrom = null;
   App.onTyping = active => {
     if (window.Groups?.active()) { window.Groups.onTyping(active); return; }

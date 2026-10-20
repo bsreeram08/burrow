@@ -286,7 +286,7 @@
       if (!row.member) { if (!['left', 'removed'].includes(channels.get(row.id)?.status)) joinOwn(row); continue; }
       const known = channels.has(row.id), ch = channel(row.id, { kind: row.kind, serverName: row.name });
       ch.kind = row.kind; ch.serverName = row.name;
-      if (row.kind === 'dm' && row.peer?.id) ch.peer = row.peer.id; // A 1:1 chat on MLS (m5 §8): shown under its contact.
+      if (row.kind === 'dm' && row.peer?.id) bindPeer(ch, row.peer.id); // A 1:1 chat on MLS (m5 §8): shown under its contact.
       if (row.frozen && ch.status === 'active') ch.status = 'frozen';
       else if (!row.frozen && ch.status === 'frozen') { ch.status = 'active'; delete ch.frozen; }
       if (!known || !ch.members.length) await members(row.id).catch(() => {});
@@ -294,6 +294,14 @@
     // Gone from the server's list while this device thought it was in: removed while we were away.
     for (const [id, ch] of channels) if (!seen.has(id) && ch.status !== 'left' && ch.status !== 'removed') removed(id, false);
     save();
+  }
+  /**
+   * A DM group's contact is set once, from the first server row that names it, and never moved: a server that later
+   * names someone else only costs the check (dmChecked holds the peer id it was checked for, so it must match ch.peer).
+   */
+  function bindPeer(ch, peerId) {
+    if (!ch.peer) ch.peer = peerId;
+    else if (ch.peer !== peerId) ch.dmChecked = false;
   }
   // ---------- Own devices (docs/m5-linking.md §3, §4) ----------
   const linkedStore = userId => { try { const value = JSON.parse(localStorage.getItem(`linked-store-v1:${userId}`) || 'null'); return value?.instance ? value : null; } catch { return null; } };
@@ -310,32 +318,32 @@
         await enqueue(id, async () => {
           // Only a group our account is really in: the tree must hold a current leaf of ours, for a device our verified
           // signed list names. Otherwise the server could pull this device into any channel (m5 §3).
-          if (!await ownLeafProven(id)) throw Object.assign(new Error('not one of our groups'), { status: 403 });
+          // One fetch: the GroupInfo proven to hold our leaf is the one we join with.
+          const info = await joinInfo(id);
+          if (!await ownLeafProven(id, info)) throw Object.assign(new Error('not one of our groups'), { status: 403 });
           await run({ cmd: 'mlsForget', group: id }).catch(() => {});
-          const seq = await joinExternal(id);
+          const seq = await joinExternal(id, info);
           Object.assign(ch, { kind: row.kind, serverName: row.name, status: 'active', cursor: seq, lastAt: Date.now() });
           delete ch.joining; save();
           // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
-          if (row.kind === 'dm' && row.peer?.id) { ch.peer = row.peer.id; await run({ cmd: 'mlsCheckDm', group: id, peer: ch.peer }).then(() => { ch.dmChecked = true; }, () => {}); save(); }
+          if (row.kind === 'dm' && row.peer?.id) { bindPeer(ch, row.peer.id); const peer = ch.peer; await run({ cmd: 'mlsCheckDm', group: id, peer }).then(() => { ch.dmChecked = peer; }, () => {}); save(); }
           await members(id).catch(() => {});
           await note(id, `own-join:${seq}`, 'This device joined. Earlier messages stay on your other devices.');
         });
         ctx?.render();
       } catch (error) {
-        if (tries >= 5 || [403, 404].includes(error.status)) { delete ch.joining; ch.status = 'join-pending'; save(); ctx?.render(); return; } // Retried on the next start.
+        if (tries >= 5 || [403, 404].includes(error.status) || error.code === 'identity') { delete ch.joining; ch.status = 'join-pending'; save(); ctx?.render(); return; } // Retried on the next start.
         setTimeout(() => attempt(tries + 1), 1000 * 2 ** tries);
       }
     };
     attempt(0);
   }
-  async function ownLeafProven(id) {
+  async function ownLeafProven(id, info) {
     const own = await ctx.verifiedOwnDevices?.().catch(() => null);
     if (!own) return false;
-    const info = await call(`/api/channels/${id}/join-info`);
-    if (info.status !== 200) return false;
     try {
       // The served tree, validated like a join (read-only): it must be this channel's group, holding a leaf of ours.
-      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
+      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.groupInfo, tree: info.tree });
       return view?.groupId === id && Array.isArray(view.members) && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
     } catch { return false; }
   }
@@ -418,7 +426,7 @@
     const info = await must(`/api/channels/${id}`).catch(() => ({}));
     const joined = channel(id, { kind: info.kind || 'group_dm', serverName: info.name ?? null });
     Object.assign(joined, { kind: info.kind || joined.kind, serverName: info.name ?? joined.serverName, status: 'active', cursor: full.seq, lastAt: Date.now() });
-    if (info.kind === 'dm' && info.peer?.id) joined.peer = info.peer.id;
+    if (info.kind === 'dm' && info.peer?.id) bindPeer(joined, info.peer.id);
     delete joined.pausedFor;
     save();
     await call(`/api/channels/${id}/cursor`, 'POST', { seq: full.seq });
@@ -430,20 +438,30 @@
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
   }
   /** External join: a public channel from the directory, or this device's resync of a channel it is in. */
-  async function joinExternal(id) {
-    let info;
+  /**
+   * The DS refuses a commit when a member's registry key moved without a signed succession or a recorded identity
+   * change: that needs a person to compare codes, so it is reported, never retried as a race.
+   */
+  const identityConflict = result => result.status === 409 && (result.body.code === 'identity' || /identity key/i.test(result.body.error || ''));
+  const refused = (result, fallback) => identityConflict(result)
+    ? coded('identity', `${result.body.error} Compare security codes with the people here before changing this group.`)
+    : Object.assign(new Error(result.body.error || fallback), { status: result.status });
+  async function joinInfo(id) {
     for (let attempt = 0; ; attempt++) {
       const result = await call(`/api/channels/${id}/join-info`);
-      if (result.status === 200) { info = result.body; break; }
+      if (result.status === 200) return result.body;
       if (result.status !== 409 || attempt >= 5) throw Object.assign(new Error(result.body.error || 'Could not join.'), { status: result.status });
       await sleep(500 * 2 ** attempt); // Between epochs: the committer uploads the new GroupInfo right after merging.
     }
+  }
+  async function joinExternal(id, info) {
+    info ||= await joinInfo(id);
     const list = await call(`/api/channels/${id}/members`);
     if (list.status === 200) await ensurePins(list.body.members.map(member => member.userId));
     // The core refuses a GroupInfo for any other group than the one we mean to join.
     const out = await withPins(id, () => run({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree, group: id }));
     const result = await call(`/api/channels/${id}/join`, 'POST', { message: out.commit });
-    if (result.status !== 201) { await run({ cmd: 'mlsClearOwn', group: id }).catch(() => {}); throw Object.assign(new Error(result.body.error || 'Could not join.'), { status: result.status }); }
+    if (result.status !== 201) { await run({ cmd: 'mlsClearOwn', group: id }).catch(() => {}); throw refused(result, 'Could not join.'); }
     const view = await run({ cmd: 'mlsMergeOwn', group: id });
     await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
     return result.body.seq;
@@ -613,7 +631,7 @@
   async function deliverDm(id, ch, from, type, payload) {
     const peer = ch.peer, mine = from === me.id;
     if (!peer || (from !== peer && !mine)) return;
-    if (!ch.dmChecked) { await run({ cmd: 'mlsCheckDm', group: id, peer }); ch.dmChecked = true; save(); }
+    if (ch.dmChecked !== peer) { await run({ cmd: 'mlsCheckDm', group: id, peer }); ch.dmChecked = peer; save(); }
     const conversation = await ctx.pairIdOf(peer);
     if (type === 'message') {
       if (mine) { const record = { id: payload.id, conversationId: conversation, direction: 'outgoing', text: payload.text, createdAt: payload.createdAt, status: 'sent', expiresAt: payload.expiresAt }; for (const field of ['kind', 'replyTo', 'attachment', 'link']) if (payload[field] !== undefined) record[field] = payload[field]; await window.ChatStore.put(record); }
@@ -781,7 +799,7 @@
         return result.body;
       }
       await run({ cmd: 'mlsClearOwn', group: id });
-      if (result.status !== 409) throw Object.assign(new Error(result.body.error || 'The change was refused.'), { status: result.status });
+      if (result.status !== 409 || identityConflict(result)) throw refused(result, 'The change was refused.');
       await sleep(500 * 2 ** attempt);
     }
     throw new Error('The group kept changing. Try again in a moment.');
@@ -849,14 +867,14 @@
     Object.assign(ch, { kind: 'dm', peer: peer.id, cursor: 0, status: 'active', lastAt: Date.now(), dmChecked: false }); save();
     await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
     await enqueue(id, () => addInner(id, [peer.id], true));
-    await enqueue(id, async () => { await run({ cmd: 'mlsCheckDm', group: id, peer: peer.id }); ch.dmChecked = true; save(); });
+    await enqueue(id, async () => { await run({ cmd: 'mlsCheckDm', group: id, peer: peer.id }); ch.dmChecked = peer.id; save(); });
     return id;
   }
   /** Is this DM group ours with that contact, joined and checked (or checkable) here? Used before accepting a pointer. */
   async function acceptDm(id, peerId) {
     const ch = channels.get(id);
     if (!ch || ch.kind !== 'dm' || ch.peer !== peerId || !usable(ch)) return false;
-    try { await enqueue(id, () => run({ cmd: 'mlsCheckDm', group: id, peer: peerId })); ch.dmChecked = true; save(); return true; } catch { return false; }
+    try { await enqueue(id, () => run({ cmd: 'mlsCheckDm', group: id, peer: peerId })); ch.dmChecked = peerId; save(); return true; } catch { return false; }
   }
   /** Sends one Phase 1 payload in a moved 1:1 chat; typing goes live-only (m5 §9). */
   function sendDm(id, payload) {
@@ -949,7 +967,7 @@
       delete ch.lastCommit; save();
       for (let attempt = 0; ; attempt++) {
         try { await resyncInner(id); break; }
-        catch (error) { if (attempt >= 4) throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
+        catch (error) { if (attempt >= 4 || error.code === 'identity') throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
       }
       if (mine.adds.length) await addInner(id, mine.adds.filter(user => user !== me.id));
       else await commitInner(id, { removes: mine.removes || undefined, roles: mine.roles || undefined, update: mine.update });
@@ -1076,7 +1094,9 @@
     else if (typingOn) { typingOn = false; typingSent = 0; post(false); }
   }
   function typing(id, userId, payload) {
-    if (channels.get(id)?.kind === 'dm') { if (userId !== me.id) ctx.dmTyping?.(userId, payload); return; }
+    const dm = channels.get(id);
+    // A 1:1 group's typing is the contact's only, and only once the group checked out as the DM of the two of us.
+    if (dm?.kind === 'dm') { if (dm.peer && userId === dm.peer && dm.dmChecked === dm.peer) ctx.dmTyping?.(dm.peer, payload); return; }
     const people = typingFrom.get(id) || new Map();
     clearTimeout(people.get(userId));
     people.delete(userId);
@@ -1364,7 +1384,7 @@
       pinsChanged(contactId);
     },
     /** The DM group this device holds with a contact, if any (m5 §8). */
-    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked && usable(ch))?.[0] || null,
+    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked === peerId && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */

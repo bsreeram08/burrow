@@ -54,6 +54,22 @@ class MemoryRotationPrefs implements RotationPrefs {
   void clearTold() => _told.clear();
 }
 
+/// One of this account's devices (Settings → Devices).
+class OwnDevice {
+  const OwnDevice({required this.id, required this.platform, required this.state, required this.primary, required this.current, this.label, this.lastSeenAt});
+  final String id;
+  final String platform;
+
+  /// From the sealed list entry, when this device can open it.
+  final String? label;
+
+  /// pending, listed, revoked or placeholder.
+  final String state;
+  final bool primary;
+  final bool current;
+  final int? lastSeenAt;
+}
+
 class Messenger {
   Messenger({
     required this.api,
@@ -242,6 +258,61 @@ class Messenger {
     if (after.ok) devices.setPin(me.id, me.id, after.pin!);
     deviceWarning = null;
     return true;
+  }
+
+  /// This account's devices as the server lists them, labelled from the sealed list where this device can open
+  /// it (the identity-key holder derives the label key), else by client kind.
+  Future<List<OwnDevice>> ownDevices() async {
+    final view = await api.devices(me.username);
+    final list = view['list'] is Map ? (view['list'] as Map).cast<String, dynamic>() : null;
+    final own = await crypto.identity();
+    final served = view['identity'];
+    final holder = served is Map && served['sign'] == own.sign && served['dh'] == own.dh;
+    final key = holder ? deviceMetaKey(await crypto.deviceMetaSignature(me.id)) : null;
+    return [
+      for (final row in (view['devices'] as List? ?? const []).cast<Map>())
+        () {
+          final id = row['id'] as String;
+          final entry = (list?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).firstOrNull;
+          final meta = key != null && entry != null ? openMeta(key, me.id, id, entry['meta'] as String? ?? '') : null;
+          return OwnDevice(
+            id: id,
+            platform: meta?['platform'] ?? row['platform'] as String? ?? 'unknown',
+            label: meta?['label'],
+            state: row['state'] as String? ?? 'pending',
+            primary: row['primary'] == true,
+            current: row['current'] == true,
+            lastSeenAt: row['lastSeenAt'] as int?,
+          );
+        }(),
+    ];
+  }
+
+  /// Signs a device out for good and, if it was listed, publishes the next list without it (primary only).
+  Future<void> removeOwnDevice(OwnDevice device) async {
+    var signed = const <String, dynamic>{};
+    if (device.state == 'listed') {
+      final own = await crypto.identity();
+      final view = await api.devices(me.username);
+      final current = (view['list']! as Map).cast<String, Object?>();
+      final check = verifyView(userId: me.id, aikSign: own.sign, list: current, signature: view['signature'], certs: view['certs'], pin: devices.pin(me.id, me.id));
+      if (!check.ok) throw CryptoException('The device list on the server is not one this device signed (${check.reason}).');
+      final list = <String, Object?>{
+        'v': 1,
+        'userId': me.id,
+        'version': (current['version']! as int) + 1,
+        'prevHash': check.hash!,
+        'devices': [for (final d in (current['devices']! as List).cast<Map>()) if (d['deviceId'] != device.id) Map<String, Object?>.from(d)],
+      };
+      final sig = await crypto.signDeviceList(me.id, own.sign, list, head: (list: current, signature: view['signature'] as String));
+      signed = {'list': list, 'signature': sig.signature, 'certs': sig.certs};
+    }
+    await api.removeDevice(device.id, signed);
+    if (signed.isNotEmpty) {
+      final own = await crypto.identity();
+      final after = verifyView(userId: me.id, aikSign: own.sign, list: signed['list'], signature: signed['signature'], certs: signed['certs'], pin: devices.pin(me.id, me.id));
+      if (after.ok) devices.setPin(me.id, me.id, after.pin!);
+    }
   }
 
   static String _deviceLabel(String platform) =>

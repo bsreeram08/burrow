@@ -167,6 +167,12 @@ class Api {
     body: {'deviceId': deviceId, 'deviceKey': deviceKey, 'challenge': challenge, 'signature': signature, 'identityProof': ?identityProof},
   );
 
+  /// Removes one of our devices: a pending one (or ourselves), or a listed one with the next signed list
+  /// without it (`{list, signature, certs}`) from the primary.
+  Future<void> removeDevice(String deviceId, [Map<String, dynamic> signed = const {}]) async {
+    await call('/api/devices/$deviceId', method: 'DELETE', body: signed);
+  }
+
   /// A contact's (or our own) served device list: `{userId, identity, list, signature, certs}`.
   Future<Map<String, dynamic>> devices(String username) => call('/api/devices/$username');
   Future<String> bundleJson(String username) async => jsonEncode(await call('/api/keys/$username'));

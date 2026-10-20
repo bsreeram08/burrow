@@ -253,7 +253,7 @@ fn an_external_join_names_the_group_it_means_and_refuses_a_groupinfo_for_another
     let info = f.a1.view(&g).group_info;
     let tree = f.server.tree(&g);
     let other = b64(&[7u8; 16]);
-    let err = b3.groups.join_external(&mut b3.store, &info, &tree, Some(&other)).unwrap_err();
+    let err = b3.groups.join_external(&mut b3.store, &info, &tree, &other).unwrap_err();
     assert!(err.message.contains("another group"), "{err}");
-    b3.groups.join_external(&mut b3.store, &info, &tree, Some(&g)).unwrap();
+    b3.groups.join_external(&mut b3.store, &info, &tree, &g).unwrap();
 }

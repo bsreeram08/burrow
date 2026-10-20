@@ -268,7 +268,7 @@ Every command takes optional `now` (ms) where it says so; results are the `ok` v
 | `mlsMembers` | members now include `stale`. |
 | `mlsCheckDm { group, peer }` | §8.3 step 3. |
 | `mlsInspectGroup { groupInfo, tree }` | `{ groupId, members: [ { leaf, userId, deviceId, platform, admin, stale } ] }` after the whole-group validation of a join; changes nothing (§3). Check `groupId` is the channel you asked for. |
-| `mlsJoinExternal { groupInfo, tree, group? }` | With `group` (the expected group id) a GroupInfo for any other group is refused ("that GroupInfo is for another group"). Always pass it. |
+| `mlsJoinExternal { groupInfo, tree, group }` | `group` (the channel id) is required; a GroupInfo for any other group is refused ("that GroupInfo is for another group"). |
 | `mlsVerifyResolution { …, by, byUser, signature }` | needs the signer's user id; a device id names one leaf (duplicates are refused in a group). |
 | `dsRepin { userId, aik }` / `dsSucceed { userId, records }` | DS side of §7. |
 

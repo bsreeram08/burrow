@@ -258,7 +258,7 @@ pub fn mls_join(welcome: String, tree: String) -> Result<GroupView> { with_group
 
 /// External join (public channel, own new device, resync after `mls_forget_group`): submit the commit, then `mls_merge_own`.
 #[cfg(feature = "mls")]
-pub fn mls_join_external(group_info: String, tree: String, group: Option<String>) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree, group.as_deref())) }
+pub fn mls_join_external(group_info: String, tree: String, group: String) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree, &group)) }
 
 #[cfg(feature = "mls")]
 pub fn mls_forget_group(group_id: String) -> Result<()> {

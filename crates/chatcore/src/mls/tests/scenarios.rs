@@ -178,7 +178,7 @@ fn invite_only_refuses_a_stranger_everywhere() {
     let (info, tree) = (f.a1.view(&g).group_info, f.server.tree(&g));
 
     // The joiner refuses to build it.
-    assert!(d1.groups.join_external(&mut d1.store, &info, &tree, None).is_err());
+    assert!(d1.groups.join_external(&mut d1.store, &info, &tree, &g).is_err());
     // A joiner that skips its own check is refused by the DS...
     let out = d1.groups.join_external_unchecked(&mut d1.store, &info, &tree).unwrap();
     let err = f.server.submit(&g, &out.commit).unwrap_err();
@@ -231,7 +231,7 @@ fn an_existing_copy_must_be_forgotten_before_resync() {
     let mut f = Fixture::new(JoinPolicy::Invite);
     let g = f.group.clone();
     let info = f.a1.view(&g).group_info;
-    assert!(f.b2.groups.join_external(&mut f.b2.store, &info, &f.server.tree(&g), None).is_err());
+    assert!(f.b2.groups.join_external(&mut f.b2.store, &info, &f.server.tree(&g), &g).is_err());
 }
 
 #[test]

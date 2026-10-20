@@ -1748,6 +1748,22 @@ impl SseDecode for Vec<u8> {
     }
 }
 
+impl SseDecode for crate::api::MlsCommitCheck {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut var_authenticated = <bool>::sse_decode(deserializer);
+        let mut var_signedContentInvalid = <bool>::sse_decode(deserializer);
+        let mut var_class_ = <String>::sse_decode(deserializer);
+        let mut var_author = <Option<crate::api::MlsMember>>::sse_decode(deserializer);
+        return crate::api::MlsCommitCheck {
+            authenticated: var_authenticated,
+            signed_content_invalid: var_signedContentInvalid,
+            class: var_class_,
+            author: var_author,
+        };
+    }
+}
+
 impl SseDecode for crate::api::MlsDeviceCert {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1943,6 +1959,17 @@ impl SseDecode for Option<crate::api::MlsExpect> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<crate::api::MlsExpect>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::MlsMember> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::MlsMember>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -2206,6 +2233,24 @@ impl flutter_rust_bridge::IntoDart for crate::api::Identity {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::Identity {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::Identity> for crate::api::Identity {
     fn into_into_dart(self) -> crate::api::Identity {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::MlsCommitCheck {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        [
+            self.authenticated.into_into_dart().into_dart(),
+            self.signed_content_invalid.into_into_dart().into_dart(),
+            self.class.into_into_dart().into_dart(),
+            self.author.into_into_dart().into_dart(),
+        ]
+        .into_dart()
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::MlsCommitCheck {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::MlsCommitCheck> for crate::api::MlsCommitCheck {
+    fn into_into_dart(self) -> crate::api::MlsCommitCheck {
         self
     }
 }
@@ -2546,6 +2591,16 @@ impl SseEncode for Vec<u8> {
     }
 }
 
+impl SseEncode for crate::api::MlsCommitCheck {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.authenticated, serializer);
+        <bool>::sse_encode(self.signed_content_invalid, serializer);
+        <String>::sse_encode(self.class, serializer);
+        <Option<crate::api::MlsMember>>::sse_encode(self.author, serializer);
+    }
+}
+
 impl SseEncode for crate::api::MlsDeviceCert {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2702,6 +2757,16 @@ impl SseEncode for Option<crate::api::MlsExpect> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <crate::api::MlsExpect>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::MlsMember> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::MlsMember>::sse_encode(value, serializer);
         }
     }
 }

@@ -14,6 +14,10 @@ class FakeGroupCrypto implements GroupCrypto {
 
   final String userId;
   String deviceId;
+
+  /// Tests: commits from this device fail here on a tag (outside the author's signature), as if corrupted in
+  /// transit.
+  String? tagFailFrom;
   String platform;
   bool _device = false;
   final Map<String, _Group> _groups = {};
@@ -204,7 +208,7 @@ class FakeGroupCrypto implements GroupCrypto {
     } else {
       next = g.apply(from, _list(body['adds']), _list(body['removes']), body['roles'] == null ? null : _rolesFrom(body['roles']));
     }
-    if (next == null) throw CryptoException('poison ${_digest(message)}: not allowed by the group roles', code: 'poison');
+    if (next == null || body['tagBad'] == true || from['deviceId'] == tagFailFrom) throw CryptoException('poison ${_digest(message)}: ${next == null ? 'not allowed by the group roles' : 'confirmation tag mismatch'}', code: 'poison');
     final gone = !next.members.any((m) => m['deviceId'] == deviceId);
     _pendingReceives[pendingId] = (groupId: groupId, next: next, id: '');
     return GroupProcessed(
@@ -217,15 +221,25 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<GroupMember> commitAuthor(String groupId, String message) async {
+  /// Tests mark a commit's tag as broken with `"tagBad": true`: outside the author's signature.
+  Future<CommitCheck> commitAuthor(String groupId, String message) async {
     final g = _group(groupId);
     final body = _decode(message);
     if (body['t'] != 'commit' || body['g'] != groupId) throw const CryptoException('not a commit', code: 'malformed');
     if (body['epoch'] != g.epoch) throw const CryptoException('that commit is not for the current epoch', code: 'invalid');
     final from = (body['from']! as Map).cast<String, Object?>();
-    final known = g.members.any((m) => m['deviceId'] == from['deviceId']) || body['external'] == true;
-    if (!known) throw const CryptoException('that commit has no member author', code: 'invalid');
-    return GroupMember(leaf: 0, userId: from['userId']! as String, deviceId: from['deviceId']! as String, platform: from['platform']! as String, admin: g.roles.isAdmin(from['userId']! as String));
+    final external = body['external'] == true;
+    final index = g.members.indexWhere((m) => m['deviceId'] == from['deviceId']);
+    if (index < 0 && !external) return const CommitCheck(authenticated: false, signedContentInvalid: false, cls: 'tag');
+    final author = GroupMember(
+      leaf: external ? CommitCheck.externalLeaf : index,
+      userId: from['userId']! as String,
+      deviceId: from['deviceId']! as String,
+      platform: from['platform']! as String,
+      admin: g.roles.isAdmin(from['userId']! as String),
+    );
+    final invalid = !external && g.apply(from, _list(body['adds']), _list(body['removes']), body['roles'] == null ? null : _rolesFrom(body['roles'])) == null;
+    return CommitCheck(authenticated: true, signedContentInvalid: invalid, cls: invalid ? 'signed-content' : 'tag', author: author);
   }
 
   @override

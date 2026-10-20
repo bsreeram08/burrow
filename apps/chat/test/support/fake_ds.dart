@@ -231,8 +231,10 @@ class FakeDs {
         if (channel.frozen == null) return _error('not frozen', 409);
         final frozenEntry = channel.log.where((e) => e['seq'] == channel.frozen!['seq']).firstOrNull;
         final sender = (frozenEntry?['from'] as Map?)?['deviceId'];
-        if (body['author'] != sender) return _error('That is not the commit\'s author.', 409);
+        final author = body['author'] as String? ?? '';
+        if (author.isNotEmpty && author != sender) return _error('That is not the commit\'s author.', 409);
         channel.resolved.add(body['action']! as String);
+        final rolled = {'seq': channel.frozen!['seq'], 'digest': channel.frozen!['digest']};
         channel.frozen = null;
         if (body['action'] == 'rollback') {
           channel.log.removeWhere((e) => e['seq'] == body['seq']);
@@ -248,9 +250,10 @@ class FakeDs {
           }
         }
         for (final u in channel.users) {
+          if (body['action'] == 'rollback') _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String));
           _notifyUser(u, ChannelEvent(id: channel.id, change: 'thawed'));
         }
-        return _json({'resolved': body['action'], if (body['action'] == 'rollback') 'removeDevice': sender});
+        return _json({'resolved': body['action'], if (body['action'] == 'rollback' && author.isNotEmpty) 'removeDevice': sender});
     }
     return _error('Not found', 404);
   }

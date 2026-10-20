@@ -127,7 +127,7 @@ abstract class RustLibApi extends BaseApi {
     required bool update,
   });
 
-  Future<MlsMember> crateApiMlsCommitAuthor({
+  Future<MlsCommitCheck> crateApiMlsCommitAuthor({
     required String groupId,
     required String message,
   });
@@ -658,7 +658,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
-  Future<MlsMember> crateApiMlsCommitAuthor({
+  Future<MlsCommitCheck> crateApiMlsCommitAuthor({
     required String groupId,
     required String message,
   }) {
@@ -676,7 +676,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           );
         },
         codec: SseCodec(
-          decodeSuccessData: sse_decode_mls_member,
+          decodeSuccessData: sse_decode_mls_commit_check,
           decodeErrorData: sse_decode_core_error,
         ),
         constMeta: kCrateApiMlsCommitAuthorConstMeta,
@@ -1759,6 +1759,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsMember dco_decode_box_autoadd_mls_member(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_mls_member(raw);
+  }
+
+  @protected
   MlsPendingCommit dco_decode_box_autoadd_mls_pending_commit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_mls_pending_commit(raw);
@@ -1861,6 +1867,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw as Uint8List;
+  }
+
+  @protected
+  MlsCommitCheck dco_decode_mls_commit_check(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return MlsCommitCheck(
+      authenticated: dco_decode_bool(arr[0]),
+      signedContentInvalid: dco_decode_bool(arr[1]),
+      class_: dco_decode_String(arr[2]),
+      author: dco_decode_opt_box_autoadd_mls_member(arr[3]),
+    );
   }
 
   @protected
@@ -2014,6 +2034,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsMember? dco_decode_opt_box_autoadd_mls_member(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_mls_member(raw);
+  }
+
+  @protected
   MlsPendingCommit? dco_decode_opt_box_autoadd_mls_pending_commit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_mls_pending_commit(raw);
@@ -2139,6 +2165,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsMember sse_decode_box_autoadd_mls_member(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_mls_member(deserializer));
+  }
+
+  @protected
   MlsPendingCommit sse_decode_box_autoadd_mls_pending_commit(
     SseDeserializer deserializer,
   ) {
@@ -2259,6 +2291,21 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  MlsCommitCheck sse_decode_mls_commit_check(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_authenticated = sse_decode_bool(deserializer);
+    var var_signedContentInvalid = sse_decode_bool(deserializer);
+    var var_class_ = sse_decode_String(deserializer);
+    var var_author = sse_decode_opt_box_autoadd_mls_member(deserializer);
+    return MlsCommitCheck(
+      authenticated: var_authenticated,
+      signedContentInvalid: var_signedContentInvalid,
+      class_: var_class_,
+      author: var_author,
+    );
   }
 
   @protected
@@ -2436,6 +2483,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsMember? sse_decode_opt_box_autoadd_mls_member(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_mls_member(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   MlsPendingCommit? sse_decode_opt_box_autoadd_mls_pending_commit(
     SseDeserializer deserializer,
   ) {
@@ -2597,6 +2657,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_box_autoadd_mls_member(
+    MlsMember self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_mls_member(self, serializer);
+  }
+
+  @protected
   void sse_encode_box_autoadd_mls_pending_commit(
     MlsPendingCommit self,
     SseSerializer serializer,
@@ -2718,6 +2787,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_i_32(self.length, serializer);
     serializer.buffer.putUint8List(self);
+  }
+
+  @protected
+  void sse_encode_mls_commit_check(
+    MlsCommitCheck self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_bool(self.authenticated, serializer);
+    sse_encode_bool(self.signedContentInvalid, serializer);
+    sse_encode_String(self.class_, serializer);
+    sse_encode_opt_box_autoadd_mls_member(self.author, serializer);
   }
 
   @protected
@@ -2854,6 +2935,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_mls_expect(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_member(
+    MlsMember? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_mls_member(self, serializer);
     }
   }
 

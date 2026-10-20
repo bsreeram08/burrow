@@ -299,8 +299,20 @@ pub fn mls_receive(group_id: String, message: String, expect: Option<MlsExpect>)
     let p = core::mls_receive(group_id, message, expect)?;
     Ok(MlsProcessed { pending_id: p.pending_id, kind: p.kind, plaintext: p.plaintext, sender: p.sender.into(), epoch: p.epoch, digest: p.digest })
 }
-/// Who signed a commit at the current epoch, verified against this device's own tree (changes nothing).
-pub fn mls_commit_author(group_id: String, message: String) -> Result<MlsMember> { Ok(core::mls_commit_author(group_id, message)?.into()) }
+/// The core's verdict on a commit at the current epoch, checked against this device's own tree like the
+/// delivery service does (changes nothing). `class` is `signed-content` only when the author's signature
+/// verifies and what they signed is itself invalid; otherwise `tag` (outside the signature: proves nothing
+/// about the author). `author` is set when the signature verified.
+pub struct MlsCommitCheck {
+    pub authenticated: bool,
+    pub signed_content_invalid: bool,
+    pub class: String,
+    pub author: Option<MlsMember>,
+}
+pub fn mls_commit_author(group_id: String, message: String) -> Result<MlsCommitCheck> {
+    let check = core::mls_commit_author(group_id, message)?;
+    Ok(MlsCommitCheck { authenticated: check.authenticated, signed_content_invalid: check.signed_content_invalid, class: check.class.to_string(), author: check.author.map(Into::into) })
+}
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { Ok(core::mls_receive_commit(pending_id)?) }
 pub fn mls_receive_abort(pending_id: String) -> Result<()> { Ok(core::mls_receive_abort(pending_id)?) }
 pub fn mls_members(group_id: String) -> Result<Vec<MlsMember>> { Ok(core::mls_members(group_id)?.into_iter().map(Into::into).collect()) }

@@ -97,6 +97,22 @@ Future<SessionInfo?> sessionInfo({required String contactId}) =>
 
 Future<void> resetIdentity() => RustLib.instance.api.crateApiResetIdentity();
 
+/// Signs one device-list record with the account identity key (docs/devices.md): `bytes` must be a
+/// DeviceList or a DeviceCert in devices.js's canonical encoding, which starts with the u16-length-prefixed
+/// label `webrtc-bun-devicelist-v1` or `webrtc-bun-devicecert-v1` (the app builds them with devices.dart,
+/// the same bytes the server and contacts verify). Anything else is refused, so this signs device records
+/// and nothing else. The key never leaves Rust: the account's sealed key database is opened read-only for
+/// this call with the store key the app already holds. Returns the base64url Ed25519 signature.
+Future<String> signDeviceRecord({
+  required String dbPath,
+  required List<int> storeKey,
+  required List<int> bytes,
+}) => RustLib.instance.api.crateApiSignDeviceRecord(
+  dbPath: dbPath,
+  storeKey: storeKey,
+  bytes: bytes,
+);
+
 /// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
 /// domain-separated bytes itself, so this is never a general signing oracle.
 Future<String> proveIdentity({

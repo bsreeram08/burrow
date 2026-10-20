@@ -102,6 +102,31 @@ pub fn session_info(contact_id: String) -> Result<Option<SessionInfo>> {
 }
 pub fn reset_identity() -> Result<()> { Ok(core::reset_identity()?) }
 
+/// Signs one device-list record with the account identity key (docs/devices.md): `bytes` must be a
+/// DeviceList or a DeviceCert in devices.js's canonical encoding, which starts with the u16-length-prefixed
+/// label `webrtc-bun-devicelist-v1` or `webrtc-bun-devicecert-v1` (the app builds them with devices.dart,
+/// the same bytes the server and contacts verify). Anything else is refused, so this signs device records
+/// and nothing else. The key never leaves Rust: the account's sealed key database is opened read-only for
+/// this call with the store key the app already holds. Returns the base64url Ed25519 signature.
+pub fn sign_device_record(db_path: String, store_key: Vec<u8>, bytes: Vec<u8>) -> Result<String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    const LABELS: [&str; 2] = ["webrtc-bun-devicelist-v1", "webrtc-bun-devicecert-v1"];
+    let labelled = LABELS.iter().any(|label| {
+        let len = label.len();
+        bytes.len() > 2 + len && bytes[..2] == (len as u16).to_be_bytes() && &bytes[2..2 + len] == label.as_bytes()
+    });
+    if !labelled || bytes.len() > 16 * 1024 {
+        return Err(CoreError { code: Some("invalid".into()), message: "not a device list or certificate".into() });
+    }
+    let key = <[u8; 32]>::try_from(store_key.as_slice()).map_err(|_| CoreError { code: Some("storage".into()), message: "store key must be 32 bytes".into() })?;
+    let store = chatcore::store::SqliteStore::open_sealed(&db_path, key, chatcore::store::Open::Existing)?;
+    let mut core = chatcore::Core::new(Box::new(store));
+    let aik = core.account_signing_key()?;
+    Ok(URL_SAFE_NO_PAD.encode(aik.sign(&bytes).to_bytes()))
+}
+
 /// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
 /// domain-separated bytes itself, so this is never a general signing oracle.
 pub fn prove_identity(user_id: String, device_id: String, challenge: String) -> Result<String> { Ok(core::prove_identity(user_id, device_id, challenge)?) }

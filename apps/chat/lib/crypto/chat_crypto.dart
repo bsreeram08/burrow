@@ -7,6 +7,8 @@
 /// protocol. [FakeChatCrypto] implements the same contract for tests and UI work.
 library;
 
+import 'dart:typed_data';
+
 /// A contact's long-term identity: X25519 (`dh`) and Ed25519 (`sign`) public
 /// keys, base64url, exactly as the server publishes them.
 class Identity {
@@ -202,6 +204,11 @@ abstract class ChatCrypto {
   /// challenge (docs/devices.md): the identity key's signature over the claim bytes, which the core builds
   /// itself, so it signs nothing else. Base64url.
   Future<String> proveIdentity(String userId, String deviceId, String challenge);
+
+  /// Signs one device-list record (a DeviceList or DeviceCert in devices.js's canonical bytes, built with
+  /// devices.dart) with the account identity key, so this device can publish the account's signed list
+  /// (docs/devices.md). The core refuses any other bytes. Base64url.
+  Future<String> signDeviceRecord(Uint8List bytes);
 
   /// Records an identity seen from the server (key-change events). A
   /// different identity than the pinned one is flagged and blocks sending.

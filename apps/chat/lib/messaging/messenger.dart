@@ -180,6 +180,61 @@ class Messenger {
     return true;
   }
 
+  /// On the identity-key holder (account.js `syncDevices`): verify the served list against our own key and
+  /// pin, and publish the next version if this device is missing from it or isn't its primary. The list
+  /// names this device and every listed device the server still has; meta is empty (the app doesn't seal
+  /// labels). Returns whether this device is now listed. One at a time.
+  Future<bool> syncDevices() => _syncing = _syncing.then((_) => _syncDevicesNow(), onError: (_) => _syncDevicesNow());
+  Future<bool> _syncing = Future.value(false);
+
+  /// Why the served list was not accepted, if it wasn't.
+  String? deviceWarning;
+
+  Future<bool> _syncDevicesNow() async {
+    if (!active || keysLocked || _disposed) return false;
+    final id = (await device()).deviceId, own = await crypto.identity();
+    final view = await api.devices(me.username);
+    final served = view['identity'];
+    if (served is! Map || served['sign'] != own.sign || served['dh'] != own.dh) return false; // Not the key holder.
+    final pin = devices.pin(me.id, me.id);
+    Map<String, dynamic>? base;
+    String? baseHash;
+    if (view['list'] != null) {
+      final check = verifyView(userId: me.id, aikSign: own.sign, list: view['list'], signature: view['signature'], certs: view['certs'], pin: pin);
+      if (!check.ok) {
+        deviceWarning = 'The device list on the server is not one this device signed (${check.reason}). It was not changed.';
+        _notices.add(deviceWarning!);
+        return false;
+      }
+      devices.setPin(me.id, me.id, check.pin!);
+      base = (view['list'] as Map).cast<String, dynamic>();
+      baseHash = check.hash;
+      final rows = (view['devices'] as List? ?? const []).cast<Map>();
+      final mine = rows.where((r) => r['id'] == id).firstOrNull;
+      final listed = (base['devices'] as List).any((d) => (d as Map)['deviceId'] == id);
+      if (view['currentDevice'] == id && mine?['primary'] == true && listed) {
+        deviceWarning = null;
+        return true;
+      }
+    }
+    final rows = (view['devices'] as List? ?? const []).cast<Map>();
+    final keep = [
+      for (final d in (base?['devices'] as List? ?? const []).cast<Map>())
+        if (d['deviceId'] != id && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
+    ];
+    final self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
+        {'deviceId': id, 'addedAt': _now(), 'meta': ''};
+    final entries = [...keep, self]..sort((a, b) => (a['deviceId'] as String).compareTo(b['deviceId'] as String));
+    final list = {'v': 1, 'userId': me.id, 'version': ((base?['version'] as int?) ?? 0) + 1, 'prevHash': baseHash ?? '', 'devices': entries};
+    final certs = {for (final d in entries) d['deviceId'] as String: await crypto.signDeviceRecord(certBytes(me.id, d))};
+    final signed = {'list': list, 'signature': await crypto.signDeviceRecord(listBytes(list)), 'certs': certs};
+    await api.publishDeviceList(signed, id);
+    final after = verifyView(userId: me.id, aikSign: own.sign, list: list, signature: signed['signature'], certs: certs, pin: devices.pin(me.id, me.id));
+    if (after.ok) devices.setPin(me.id, me.id, after.pin!);
+    deviceWarning = null;
+    return true;
+  }
+
   /// Only on the user's tap: publish this device's identity, signed prekey and 100 fresh
   /// one-time prekeys. This device becomes active; contacts see a security-code change.
   Future<void> takeOver() async {

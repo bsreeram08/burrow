@@ -21,6 +21,7 @@
   const stateKey = () => `groups-v1:${instance}`, namesKey = () => `names-v1:${me.id}`;
   function load() {
     try { channels = new Map(Object.entries(JSON.parse(localStorage.getItem(stateKey()) || '{}') || {})); } catch { channels = new Map(); }
+    for (const ch of channels.values()) delete ch.joining; // A join cut short by a reload is tried again.
     try { names = JSON.parse(localStorage.getItem(namesKey()) || '{}') || {}; } catch { names = {}; }
   }
   let saveTimer = null;
@@ -102,14 +103,16 @@
   async function setup(mine) {
     try {
       const device = await window.DeviceFormat.deviceKey(me.id);
-      const aik = (await ctx.box.identity()).pub.sign;
       deviceId = device.deviceId;
-      // One store per (account, device, account key): a new device id or identity starts clean (§2).
-      instance = `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
+      // A linked device (docs/m5-linking.md §1) keeps the store it was linked with; its certificate came in the grant.
+      const linked = linkedStore(me.id);
+      const aik = linked ? null : (await ctx.box.identity()).pub.sign;
+      // One store per (account, device, account key): a new device id or identity starts clean (m4 §9).
+      instance = linked?.instance || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
       run = window.Core.groupStore(me.id, instance);
       load();
       const certified = `mls-cert-v1:${instance}`;
-      if (localStorage.getItem(certified) !== '1') {
+      if (!linked && localStorage.getItem(certified) !== '1') {
         const leaf = await run({ cmd: 'mlsDeviceLeaf' }), issuedAt = Date.now(), F = window.DeviceFormat;
         const sig = await ctx.signWithIdentity(F.mlsCertBytes(me.id, deviceId, 'web', leaf, aik, issuedAt));
         await run({ cmd: 'mlsSetDeviceCert', cert: F.mlsCertJson(me.id, deviceId, 'web', leaf, aik, issuedAt, sig), aik });
@@ -125,6 +128,7 @@
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
       flushAll();
       ctx.render();
+      removeOwnStale().catch(() => {});
     } catch (error) {
       if (mine !== generation) return;
       reason = `Groups are unavailable on this device: ${error.message || error}`;
@@ -267,7 +271,8 @@
     const seen = new Set();
     for (const row of list) {
       seen.add(row.id);
-      if (!row.member) continue; // Another device of ours is in it; this one isn't (yet).
+      // Another device of ours is in it and this one isn't (a newly linked device): join it (m5 §3), unless we left it here.
+      if (!row.member) { if (!['left', 'removed'].includes(channels.get(row.id)?.status)) joinOwn(row); continue; }
       const known = channels.has(row.id), ch = channel(row.id, { kind: row.kind, serverName: row.name });
       ch.kind = row.kind; ch.serverName = row.name;
       if (row.frozen && ch.status === 'active') ch.status = 'frozen';
@@ -278,6 +283,65 @@
     for (const [id, ch] of channels) if (!seen.has(id) && ch.status !== 'left' && ch.status !== 'removed') removed(id, false);
     save();
   }
+  // ---------- Own devices (docs/m5-linking.md §3, §4) ----------
+  const linkedStore = userId => { try { const value = JSON.parse(localStorage.getItem(`linked-store-v1:${userId}`) || 'null'); return value?.instance ? value : null; } catch { return null; } };
+  let joinsAt = 0;
+  /** This device joins a channel its account is in (the own-device rule), at most 3 joins a second, retried with backoff. */
+  function joinOwn(row) {
+    const id = row.id, ch = channel(id, { kind: row.kind, serverName: row.name });
+    if (ch.joining) return;
+    ch.joining = true; ch.status = 'join-pending'; save();
+    const attempt = async tries => {
+      const wait = Math.max(0, joinsAt - Date.now()); joinsAt = Math.max(Date.now(), joinsAt) + 350;
+      await sleep(wait);
+      try {
+        await enqueue(id, async () => {
+          await run({ cmd: 'mlsForget', group: id }).catch(() => {});
+          const seq = await joinExternal(id);
+          Object.assign(ch, { kind: row.kind, serverName: row.name, status: 'active', cursor: seq, lastAt: Date.now() });
+          delete ch.joining; save();
+          await members(id).catch(() => {});
+          await note(id, `own-join:${seq}`, 'This device joined. Earlier messages stay on your other devices.');
+        });
+        ctx?.render();
+      } catch (error) {
+        if (tries >= 5 || [403, 404].includes(error.status)) { delete ch.joining; ch.status = 'join-pending'; save(); ctx?.render(); return; } // Retried on the next start.
+        setTimeout(() => attempt(tries + 1), 1000 * 2 ** tries);
+      }
+    };
+    attempt(0);
+  }
+  let removedNote = null;
+  /** Commits the removal of one of this account's own devices from one channel (m5 §4). "No such member" means done. */
+  function removeOwnDevice(id, target) {
+    return enqueue(id, async () => {
+      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.userId === me.id && member.deviceId === target);
+      if (!leaf || target === deviceId) return false;
+      try { await commitInner(id, { removes: [{ userId: me.id, deviceId: target }] }); return true; }
+      catch (error) { if (/no such member/i.test(error.message || '') || error.status === 409) return false; throw error; }
+    });
+  }
+  /** A revoked device of ours must leave the channel: one device of the account does it, after a random 0–3 s. */
+  function onRemoveDevice(id, target) {
+    if (!ID.test(target || '') || !usable(channels.get(id))) return;
+    setTimeout(() => removeOwnDevice(id, target).then(done => {
+      if (!done) return;
+      removedNote ||= { count: 0 }; removedNote.count++;
+      clearTimeout(removedNote.timer);
+      removedNote.timer = setTimeout(() => { ctx?.notice(`Removed a revoked device from ${removedNote.count} ${removedNote.count === 1 ? 'group' : 'groups'}.`); removedNote = null; }, 2000);
+    }).catch(() => {}), Math.random() * 3000);
+  }
+  /** At start: our own leaves for devices no longer in the signed list, or left stale by a new account key, go. */
+  async function removeOwnStale() {
+    const view = await must(`/api/devices/${me.username}`);
+    const listed = new Set((view.list?.devices || []).map(device => device.deviceId));
+    for (const [id, ch] of channels) {
+      if (!usable(ch)) continue;
+      const leaves = await run({ cmd: 'mlsMembers', group: id }).catch(() => []);
+      for (const leaf of leaves) if (leaf.userId === me.id && leaf.deviceId !== deviceId && (leaf.stale || !listed.has(leaf.deviceId))) await removeOwnDevice(id, leaf.deviceId).catch(() => {});
+    }
+  }
+
   /** Members from the server's mirror (usernames), admins from the group's own roles when we hold it. */
   async function members(id) {
     const ch = channel(id);
@@ -558,6 +622,7 @@
     else if (message.change === 'thawed') { if (ch?.status === 'frozen') { ch.status = 'active'; delete ch.frozen; save(); paint(id); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); } }
     // `remove-needed` is not acted on: a frame alone never makes this device remove anyone. The device to remove
     // comes from this device's own signed rollback (resolve() below).
+    else if (message.change === 'remove-device') { if (ch) onRemoveDevice(id, message.deviceId); }
     else if (message.change === 'rolled-back') { if (ch) rolledBack(id, message); }
     else if (message.change === 'gap') { if (usable(ch)) enqueue(id, () => resyncInner(id)).catch(error => failed(id, error)); }
   }

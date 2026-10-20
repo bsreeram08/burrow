@@ -862,7 +862,7 @@
     const groups = window.Groups?.sections() || { rows: [], enabled: false, reason: '' }, channelRows = [], groupRows = [];
     for (const item of groups.rows.sort((a, b) => Math.max(b.lastAt, last.get(b.id)?.createdAt || 0) - Math.max(a.lastAt, last.get(a.id)?.createdAt || 0))) {
       const recent = last.get(item.id);
-      const state = item.status === 'left' ? 'You left' : item.status === 'removed' ? 'You were removed' : item.status === 'frozen' ? 'Paused while an admin checks a change' : item.status === 'paused' ? 'Paused: a security code changed' : null;
+      const state = item.status === 'left' ? 'You left' : item.status === 'removed' ? 'You were removed' : item.status === 'frozen' ? 'Paused while an admin checks a change' : item.status === 'paused' ? 'Paused: a security code changed' : item.status === 'join-pending' ? 'Join pending: this device is joining…' : null;
       const row = convoRow({ className: `contact group ${item.channel ? 'is-channel' : 'is-group'} status-${item.status}`, avatar: item.channel ? '#' : initial(item.title), title: item.title,
         sub: state || preview(recent) || item.topic || (item.channel ? 'Say what this channel is for.' : 'Say hello to everyone.'), time: recent?.createdAt || item.lastAt, count: item.unread, mentioned: item.mentioned,
         label: `Open ${item.channel ? 'channel' : 'group'} ${item.title}${item.mentioned ? ', you were mentioned' : ''}${item.unread ? `, ${item.unread} unread` : ''}`, onOpen: () => openGroup(item.id) });

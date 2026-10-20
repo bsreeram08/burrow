@@ -15,7 +15,7 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; listed?: string[] } = {}) {
   const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
@@ -38,7 +38,8 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const core = async (command: Cmd) => { calls.push(command); const handler = handlers[command.cmd]; if (!handler) throw new Error(`unexpected ${command.cmd}`); return handler(command); };
   const routes: [string, RegExp, (body: any, match: RegExpExecArray) => [number, any]][] = [
     ['GET', /^\/api\/mls\/keypackages$/, () => [200, { oneTime: 100, lastResort: true, low: false, max: 100 }]],
-    ['GET', /^\/api\/channels$/, () => [200, { channels: [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
+    ['GET', /^\/api\/channels$/, () => [200, { channels: options.channels ?? [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
+    ['GET', /^\/api\/devices\/me$/, () => [200, { list: { devices: (options.listed ?? [DEV]).map(deviceId => ({ deviceId })) } }]],
     ['GET', /^\/api\/channels\/[\w-]{22}$/, () => [200, { id: G, kind: 'private', name: null, epoch: options.epoch ?? 3, seq: 5, frozen: false, member: true, cursor: 5, admin: true }]],
     ['GET', /^\/api\/channels\/\w+\/members$/, () => [200, { members: [{ userId: ME, username: 'me', deviceId: DEV, admin: true }, { userId: BOB, username: 'bob', deviceId: BOB_DEV, admin: false }] }]],
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
@@ -72,6 +73,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     Core: { supported: () => true, groupStore: () => core },
     DeviceFormat: { deviceKey: async () => ({ deviceId: DEV, sign: async () => 'signature' }), mlsCertBytes: () => new Uint8Array(1), mlsCertJson: () => '{}', b64: (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url') },
   };
+  context.Math = Object.assign(Object.create(Math), { random: () => 0 }); // No 0–3 s jitter in tests.
   context.window = context;
   for (const source of sources) runInNewContext(source, context);
   const Groups = context.Groups;
@@ -339,5 +341,35 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.Groups.debug(G)).toMatchObject({ status: 'active', cursor: 0 }); // still before the commit, to report it again
     expect(w.of('mlsForget')).toEqual([]);
     expect(w.requests.filter(request => request.path.endsWith('/join-info') || request.path.endsWith('/join'))).toEqual([]);
+  });
+
+  test('8. a linked device joins the channels its account is in by external commit (m5 §3), never one it left', async () => {
+    const H = 'h'.repeat(22);
+    const w = world({ channels: [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }, { id: H, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }] });
+    w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 });
+    w.storage.set(`groups-v1:${ME}-${DEV}-${'A'.repeat(12)}`, JSON.stringify({ [H]: { kind: 'private', status: 'left', cursor: 0, members: [], admins: [], unread: 0, lastAt: 0 } }));
+    await w.start();
+    await w.until(() => w.Groups.debug(G)?.status === 'active', 'joined');
+    expect(w.requests.filter(request => request.path.endsWith('/join')).map(request => request.path)).toEqual([`/api/channels/${G}/join`]);
+    expect(w.Groups.debug(H).status).toBe('left');
+  });
+
+  test('9. a revoked device of ours leaves our groups: a remove-device frame, or a leaf not in the signed list at start', async () => {
+    const GONE = 'Z'.repeat(22);
+    const ours = () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 2, userId: ME, deviceId: GONE, platform: 'ios', admin: true }];
+    const w = world();
+    w.handlers.mlsMembers = ours;
+    await w.start();
+    await w.until(() => w.of('mlsCommit').length === 1, 'removed at start');
+    expect(w.of('mlsCommit')[0].removes).toEqual([{ userId: ME, deviceId: GONE }]);
+    // The frame for a device that is already gone, or someone else's, changes nothing.
+    w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV }, { leaf: 1, userId: BOB, deviceId: BOB_DEV }];
+    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: BOB_DEV });
+    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
+    await w.settle();
+    expect(w.of('mlsCommit')).toHaveLength(1);
+    w.handlers.mlsMembers = ours;
+    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
+    await w.until(() => w.of('mlsCommit').length === 2, 'removed on the frame');
   });
 });

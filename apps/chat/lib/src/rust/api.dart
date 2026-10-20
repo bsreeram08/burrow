@@ -226,11 +226,16 @@ Future<String> mlsEncrypt({
   plaintext: plaintext,
 );
 
+/// `expect`: the log entry's kind (`app` → Application, `commit` → Commit), whenever it is known.
 Future<MlsProcessed> mlsReceive({
   required String groupId,
   required String message,
-}) =>
-    RustLib.instance.api.crateApiMlsReceive(groupId: groupId, message: message);
+  MlsExpect? expect,
+}) => RustLib.instance.api.crateApiMlsReceive(
+  groupId: groupId,
+  message: message,
+  expect: expect,
+);
 
 Future<void> mlsReceiveCommit({required String pendingId}) =>
     RustLib.instance.api.crateApiMlsReceiveCommit(pendingId: pendingId);
@@ -371,6 +376,9 @@ class MlsDeviceCert {
           aikSign == other.aikSign &&
           issuedAt == other.issuedAt;
 }
+
+/// What a log entry's kind says a message is: a refused mismatch is never decrypted or staged.
+enum MlsExpect { application, commit }
 
 /// Public state after a change: the signed GroupInfo and the ratchet tree, for the delivery service and joiners.
 class MlsGroupView {

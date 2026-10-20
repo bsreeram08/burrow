@@ -166,9 +166,10 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<GroupProcessed> receive(String groupId, String message) async {
+  Future<GroupProcessed> receive(String groupId, String message, {ProcessedKind? expect}) async {
     final g = _group(groupId);
     final body = _decode(message);
+    if (expect != null && (expect == ProcessedKind.application) != (body['t'] == 'app')) throw const CryptoException('not the expected kind of message', code: 'malformed');
     if (body['g'] != groupId) throw const CryptoException('wrong group', code: 'malformed');
     final from = (body['from']! as Map).cast<String, Object?>();
     final pendingId = 'p${++_counter}';

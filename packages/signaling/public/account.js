@@ -454,7 +454,7 @@
       } catch {}
       return;
     }
-    let receipt = null, burned = false, rotated = false, failure = null;
+    let receipt = null, burned = false, rotated = false, failure = null, pointer = null;
     try {
       await box.decryptFrom(from.id, message.envelope, async (payload, info) => {
         const type = window.ChatStore.checkPayload(payload); // Shape only; message content is validated by ChatStore.receive.
@@ -483,6 +483,7 @@
           else if (type === 'read') { if (App.readReceipts) await window.ChatStore.markRead(conversationId, payload.ids, 'outgoing'); }
           else if (type === 'typing') typing(from.id, payload); // A typing hint that came through the mailbox: shown only if still fresh.
           else if (type === 'vote') await window.ChatStore.vote(conversationId, payload.poll, 'peer', payload.option); // A tally update: no row, no receipt.
+          else if (type === 'mls-dm') { await window.ChatStore.note(conversationId, payload.id, 'Messages in this chat now use the new encryption.'); pointer = payload; }
           else if (payload.type === 'receipt') await window.ChatStore.setStatus(conversationId, payload.id, 'delivered');
           else if (payload.type === 'burn') { await window.ChatStore.removeConversation(conversationId); burned = true; }
           else if (await window.ChatStore.receive(conversationId, payload) === 'stored') {
@@ -521,6 +522,7 @@
     if (viewing()) { App.refreshHistory(); updateBanner(); }
     render();
     if (receipt) sendControl(from, { v: 1, type: 'receipt', id: receipt }).catch(() => {});
+    if (pointer && !failure) { const contact = contactById(from.id); if (contact) acceptPointer(contact, pointer).catch(() => {}); }
   }
 
   // ---------- Sending ----------
@@ -530,9 +532,56 @@
     const envelope = await box.encryptTo(contact.id, payload, bundleFor(contact));
     await api('/api/messages', 'POST', ephemeral ? { to: contact.username, envelope, ephemeral: true } : { to: contact.username, envelope });
   }
+  // ---------- 1:1 chats on MLS (docs/m5-linking.md §8) ----------
+  // A moved chat keeps its pairId as the conversation; its transport is the DM group. Double Ratchet stays
+  // receive-only for it (the server refuses sends after 60 days), and typing never uses it any more (§9).
+  const movedKey = () => `dm-moved-v1:${me.id}`;
+  const readMoved = () => readJson(movedKey(), {});
+  /** The DM group of a moved chat, if this device holds it (a linked device that hasn't joined yet doesn't). */
+  async function dmChannel(contact) {
+    const moved = readMoved()[await pairId(contact.id)];
+    return moved && window.Groups?.dmChannelWith(contact.id) === moved.channel ? moved.channel : null;
+  }
+  async function markMoved(contact, channel) {
+    const all = readMoved(); all[await pairId(contact.id)] = { channel, at: Date.now() }; writeJson(movedKey(), all);
+  }
+  /** Every payload to a contact goes here: the DM group once moved, otherwise the 1:1 session (never typing). */
+  async function sendToContact(contact, payload) {
+    const channel = await dmChannel(contact);
+    if (channel) return window.Groups.sendDm(channel, payload);
+    if (payload.type === 'typing') return; // Typing hints travel only in MLS groups now.
+    return sendControl(contact, payload);
+  }
+  const tried = new Map();
+  /**
+   * §8.2: the first sender moves the chat, when both of us have a device that can (and this one holds the 1:1
+   * session to send the pointer over). At most one try per contact every 10 minutes.
+   */
+  async function maybeMove(contact) {
+    if (!box || linked || !window.Groups?.enabled() || readMoved()[await pairId(contact.id)] || Date.now() - (tried.get(contact.id) || 0) < 600000) return;
+    tried.set(contact.id, Date.now());
+    const capability = await api(`/api/mls/capability/${encodeURIComponent(contact.username)}`).catch(() => null);
+    if (!capability || capability.devices < 1 || capability.channel) return; // They can't yet, or they are already moving it.
+    const channel = await window.Groups.createDm(contact).catch(() => null);
+    if (!channel) return;
+    const pointer = { v: 1, type: 'mls-dm', id: crypto.randomUUID(), channel, at: Date.now() };
+    await sendControl(contact, pointer); // The last Double Ratchet message of this chat.
+    await markMoved(contact, channel);
+    await window.ChatStore.note(await pairId(contact.id), pointer.id, 'Messages in this chat now use the new encryption.').catch(() => {});
+  }
+  /** §8.3: their pointer moves the chat only when the group is really our DM, chained to the pinned keys. */
+  async function acceptPointer(contact, payload) {
+    const deadline = Date.now() + 600000;
+    while (me && Date.now() < deadline) {
+      const info = await api(`/api/channels/${payload.channel}`).catch(() => null);
+      if (info && (info.kind !== 'dm' || info.peer?.id !== contact.id)) return; // Not our DM: ignore the pointer.
+      if (info?.member && await window.Groups?.acceptDm(payload.channel, contact.id)) { await markMoved(contact, payload.channel); render(); return; }
+      await new Promise(resolve => setTimeout(resolve, 15000)); // The Welcome may still be on its way.
+    }
+  }
   /** Encrypts and posts every queued outgoing message, oldest first, one contact at a time. */
   async function flushOutgoing() {
-    if (!me || !await ready || !box || inactive) return;
+    if (!me || !await ready || (!box && !linked) || inactive) return;
     if (flushing) { flushAgain = true; return; }
     flushing = true; flushAgain = false; clearTimeout(flushTimer);
     let retryLater = false;
@@ -541,11 +590,14 @@
       for (const contact of contacts.filter(value => value.state === 'mutual')) {
         const conversationId = await pairId(contact.id);
         const queued = records.filter(value => value.conversationId === conversationId && value.direction === 'outgoing' && value.status === 'queued');
-        let prepared = false;
+        if (queued.length) await maybeMove(contact).catch(() => {});
+        const channel = queued.length ? await dmChannel(contact) : null;
+        if (!box && !channel) continue; // A linked device sends 1:1 only once the chat has moved.
+        let prepared = Boolean(channel);
         for (const record of queued) {
           try {
             if (!prepared) { await rotateIfDue(contact); await tellPolicy(contact); prepared = true; }
-            await sendControl(contact, App.messagePayload(record)); // Plain, /me action or poll.
+            await sendToContact(contact, App.messagePayload(record)); // Plain, /me action or poll.
             await window.ChatStore.setStatus(conversationId, record.id, 'sent');
           } catch (error) {
             if (current?.id === contact.id) App.chatStatus(error.code === 'identity-blocked' ? `${contact.username}'s security code changed. Review it to keep sending.` : error.status === 404 ? `${contact.username} has not opened the app since encryption was enabled. Messages wait on this device.` : `Not sent yet: ${error.message}`);
@@ -631,7 +683,7 @@
   App.onVote = async (poll, option) => {
     const contact = current && contactById(current.id);
     if (!contact) throw new Error('Open the conversation to vote.');
-    await sendControl(contact, { v: 1, type: 'vote', id: crypto.randomUUID(), poll, option });
+    await sendToContact(contact, { v: 1, type: 'vote', id: crypto.randomUUID(), poll, option });
   };
 
   // ---------- Reactions, edits, read receipts and typing (docs/phase1-protocol.md §2) ----------
@@ -641,7 +693,7 @@
     if (inactive) throw new Error('Messaging is active on another device. Move it here first.');
     return contact;
   };
-  App.onReact = async (target, emoji, on) => { if (window.Groups?.active()) return window.Groups.onReact(target, emoji, on); await sendControl(openContact(), { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }); };
+  App.onReact = async (target, emoji, on) => { if (window.Groups?.active()) return window.Groups.onReact(target, emoji, on); await sendToContact(openContact(), { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }); };
   App.onEdit = async (record, text) => {
     if (window.Groups?.active()) return window.Groups.onEdit(record, text);
     const contact = openContact(), conversationId = await pairId(contact.id);
@@ -650,7 +702,7 @@
     // Not sent yet: it leaves this device with the new text. Otherwise the edit follows it end to end.
     const latest = (await window.ChatStore.list()).find(value => value.conversationId === conversationId && value.id === record.id);
     if (latest?.status === 'queued') { flushOutgoing(); return; }
-    await sendControl(contact, { v: 1, type: 'edit', id: crypto.randomUUID(), target: record.id, text, editedAt });
+    await sendToContact(contact, { v: 1, type: 'edit', id: crypto.randomUUID(), target: record.id, text, editedAt });
   };
   // Read receipts: once the conversation is on screen and focused, batched and at most once every 2 s.
   // Every shown message is marked read here (so it is reported once); the receipt is only sent when allowed.
@@ -658,19 +710,19 @@
   const looking = () => Boolean(current) && body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus();
   App.onDisplayed = () => {
     if (window.Groups?.active()) { window.Groups.onDisplayed(); return; }
-    if (readTimer || !looking() || !box || inactive) return;
+    if (readTimer || !looking() || (!box && !linked) || inactive) return;
     readTimer = setTimeout(sendReads, Math.max(0, 2000 - (Date.now() - readAt)));
   };
   async function sendReads() {
     readTimer = null;
     const contact = current && contactById(current.id);
-    if (!contact || !looking() || !box || inactive) return;
+    if (!contact || !looking() || (!box && !await dmChannel(contact)) || inactive) return;
     const conversationId = await pairId(contact.id);
     const waiting = (await window.ChatStore.list()).filter(value => value.conversationId === conversationId && value.direction === 'incoming' && value.status === 'delivered').map(value => value.id);
     if (!waiting.length) return;
     readAt = Date.now();
     const ids = await window.ChatStore.markRead(conversationId, waiting.slice(-100), 'incoming');
-    if (ids.length && App.readReceipts) sendControl(contact, { v: 1, type: 'read', id: crypto.randomUUID(), ids }).catch(() => {});
+    if (ids.length && App.readReceipts) sendToContact(contact, { v: 1, type: 'read', id: crypto.randomUUID(), ids }).catch(() => {});
     if (waiting.length > 100) App.onDisplayed();
   }
   window.addEventListener('focus', () => App.onDisplayed());
@@ -681,14 +733,15 @@
   App.onTyping = active => {
     if (window.Groups?.active()) { window.Groups.onTyping(active); return; }
     const contact = current && contactById(current.id);
-    if (!contact || contact.state !== 'mutual' || !box || inactive) { typingOn = false; return; }
+    if (!contact || contact.state !== 'mutual' || inactive) { typingOn = false; return; }
     if (active) {
       if (!contact.online || Date.now() - typingSent < 4000) return;
       typingSent = Date.now(); typingOn = true; sendTyping(contact, true);
     } else if (typingOn) { typingOn = false; typingSent = 0; sendTyping(contact, false); }
   };
+  /** Typing goes only through a moved chat's DM group (m5 §9); an unmoved chat shows none. */
   async function sendTyping(contact, on) {
-    try { if (await box.sessionInfo(contact.id)) await sendControl(contact, { v: 1, type: 'typing', id: crypto.randomUUID(), at: Date.now(), on }, true); } catch {}
+    try { const channel = await dmChannel(contact); if (channel) await window.Groups.sendDm(channel, { v: 1, type: 'typing', id: crypto.randomUUID(), at: Date.now(), on }); } catch {}
   }
   /** Shows "<name> is typing…" for 6 s after their last `on`; stale hints (over 15 s old) are dropped. */
   function typing(fromId, payload) {
@@ -1012,7 +1065,7 @@
     delete unread[contact.id]; try { localStorage.setItem(`unread-v1:${me.id}`, JSON.stringify(unread)); } catch {}
     if (!App.active) App.openConversation({ conversationId, peerName: contact.username, peerId: contact.id, online: contact.online });
     if (!await ready) App.chatStatus('This browser is too old for encrypted messaging. Update it to send and receive messages.');
-    else if (linked) App.chatStatus(`This chat stays on your primary device until it moves to the new encryption. Groups and channels work here.`);
+    else if (linked && !await dmChannel(contact)) App.chatStatus(`This chat stays on your primary device until it moves to the new encryption. Groups and channels work here.`);
     updateBanner(); flushOutgoing();
   }
   /** A group or channel: the same conversation screen, driven by groups.js. Calls stay 1:1. */
@@ -1030,6 +1083,10 @@
       viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
       looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
       socket: () => events, openGroup, verifiedOwnDevices,
+      pairIdOf: id => pairId(id),
+      dmIncoming: peerId => { if (!(body.dataset.screen === 'conversation' && current?.id === peerId)) { unread[peerId] = (unread[peerId] || 0) + 1; writeJson(`unread-v1:${me.id}`, unread); } },
+      dmTyping: (peerId, payload) => typing(peerId, payload),
+      dmChanged: peerId => { if (current?.id === peerId && body.dataset.screen === 'conversation') App.refreshHistory(); render(); },
     };
   }
   $('channels-new').onclick = () => window.Groups?.openNew('channel');

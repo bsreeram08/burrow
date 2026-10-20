@@ -275,6 +275,7 @@
       if (!row.member) { if (!['left', 'removed'].includes(channels.get(row.id)?.status)) joinOwn(row); continue; }
       const known = channels.has(row.id), ch = channel(row.id, { kind: row.kind, serverName: row.name });
       ch.kind = row.kind; ch.serverName = row.name;
+      if (row.kind === 'dm' && row.peer?.id) ch.peer = row.peer.id; // A 1:1 chat on MLS (m5 §8): shown under its contact.
       if (row.frozen && ch.status === 'active') ch.status = 'frozen';
       else if (!row.frozen && ch.status === 'frozen') { ch.status = 'active'; delete ch.frozen; }
       if (!known || !ch.members.length) await members(row.id).catch(() => {});
@@ -403,6 +404,7 @@
     const info = await must(`/api/channels/${id}`).catch(() => ({}));
     const joined = channel(id, { kind: info.kind || 'group_dm', serverName: info.name ?? null });
     Object.assign(joined, { kind: info.kind || joined.kind, serverName: info.name ?? joined.serverName, status: 'active', cursor: full.seq, lastAt: Date.now() });
+    if (info.kind === 'dm' && info.peer?.id) joined.peer = info.peer.id;
     delete joined.pausedFor;
     save();
     await call(`/api/channels/${id}/cursor`, 'POST', { seq: full.seq });
@@ -580,11 +582,37 @@
     for (const user of ch.leaving || []) if (amAdmin(id)) queueRemoval(id, user);
   }
   /** One decrypted application payload: the Phase 1 shapes plus `meta` and `leave` (§5). */
+  /**
+   * A message in a 1:1 chat that moved to MLS (m5 §8.4): stored in the chat's own conversation (its pairId), with the
+   * 1:1 meaning of every payload. Only the two people are accepted, and only after this device has checked that the
+   * group is exactly the DM of us two, chained to the pinned account keys (mlsCheckDm, §8.3).
+   */
+  async function deliverDm(id, ch, from, type, payload) {
+    const peer = ch.peer, mine = from === me.id;
+    if (!peer || (from !== peer && !mine)) return;
+    if (!ch.dmChecked) { await run({ cmd: 'mlsCheckDm', group: id, peer }); ch.dmChecked = true; save(); }
+    const conversation = await ctx.pairIdOf(peer);
+    if (type === 'message') {
+      if (mine) { const record = { id: payload.id, conversationId: conversation, direction: 'outgoing', text: payload.text, createdAt: payload.createdAt, status: 'sent', expiresAt: payload.expiresAt }; for (const field of ['kind', 'replyTo', 'attachment', 'link']) if (payload[field] !== undefined) record[field] = payload[field]; await window.ChatStore.put(record); }
+      else if (await window.ChatStore.receive(conversation, payload) === 'stored') { ctx.dmIncoming?.(peer); ctx.dmTyping?.(peer, null); }
+    }
+    else if (type === 'react') await window.ChatStore.react(conversation, payload.target, mine ? 'me' : 'peer', payload.emoji, payload.on);
+    else if (type === 'edit') await window.ChatStore.edit(conversation, payload.target, mine ? 'me' : 'peer', payload.text, Math.min(payload.editedAt, Date.now() + 300000));
+    else if (type === 'read') await window.ChatStore.markRead(conversation, payload.ids, mine ? 'incoming' : 'outgoing');
+    else if (type === 'typing') { if (!mine) ctx.dmTyping?.(peer, payload); }
+    else if (type === 'vote') await window.ChatStore.vote(conversation, payload.poll, mine ? 'me' : 'peer', payload.option);
+    ctx.dmChanged?.(peer);
+  }
   async function deliver(id, sender, entry, plaintext) {
     let payload, type;
     try { payload = JSON.parse(plaintext); type = window.ChatStore.checkPayload(payload); }
     catch { await note(id, `drop:${entry.seq}`, `A message from ${nameOf(sender.userId)} had invalid content and was skipped.`); return; }
     const ch = channels.get(id), from = sender.userId, viewing = ctx.viewing(id);
+    if (ch.kind === 'dm') {
+      try { await deliverDm(id, ch, from, type, payload); }
+      catch (error) { if (!error.code || error.code === 'storage') throw error; } // Anything else is dropped, like a bad 1:1 envelope.
+      return;
+    }
     try {
       if (type === 'message') {
         const fromName = nameOf(from) === 'someone' ? undefined : nameOf(from);
@@ -758,7 +786,7 @@
     const fresh = keyPackages.filter(item => !(item.userId === me.id && item.deviceId === deviceId));
     if (fresh.some(item => item.userId !== me.id)) {
       await commitInner(id, {}, fresh);
-      await sendMetaInner(id);
+      if (channels.get(id)?.kind !== 'dm') await sendMetaInner(id); // A DM has no name or topic.
     }
     return users.filter(user => !reachable.has(user));
   }
@@ -783,6 +811,35 @@
       const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.userId === userId && member.deviceId === device);
       if (leaf) await commitInner(id, { removes: [{ userId, deviceId: device }] });
     }).catch(error => failed(id, error));
+  }
+  /**
+   * m5 §8.2: the first sender moves a 1:1 chat to a DM group of the two of us (every listed device of both). Resolves
+   * the channel id, or null when the other side already made one (they are the first sender; wait for their pointer).
+   */
+  async function createDm(peer) {
+    if (!enabled) throw new Error(reason || 'Groups are not ready yet.');
+    const id = window.DeviceFormat.b64(crypto.getRandomValues(new Uint8Array(16))), users = [me.id, peer.id].sort();
+    const view = await run({ cmd: 'mlsCreate', group: id, roles: { v: 1, kind: 'dm', admins: users, joinPolicy: 'invite', dm: users } });
+    const made = await call('/api/channels', 'POST', { id, kind: 'dm', peer: peer.username, groupInfo: view.groupInfo, tree: view.tree });
+    if (made.status !== 201) { await run({ cmd: 'mlsForget', group: id }).catch(() => {}); if (made.status === 409) return null; throw new Error(made.body.error || 'Could not move this chat.'); }
+    const ch = channel(id, { kind: 'dm' });
+    Object.assign(ch, { kind: 'dm', peer: peer.id, cursor: 0, status: 'active', lastAt: Date.now(), dmChecked: false }); save();
+    await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
+    await enqueue(id, () => addInner(id, [peer.id], true));
+    await enqueue(id, async () => { await run({ cmd: 'mlsCheckDm', group: id, peer: peer.id }); ch.dmChecked = true; save(); });
+    return id;
+  }
+  /** Is this DM group ours with that contact, joined and checked (or checkable) here? Used before accepting a pointer. */
+  async function acceptDm(id, peerId) {
+    const ch = channels.get(id);
+    if (!ch || ch.kind !== 'dm' || ch.peer !== peerId || !usable(ch)) return false;
+    try { await enqueue(id, () => run({ cmd: 'mlsCheckDm', group: id, peer: peerId })); ch.dmChecked = true; save(); return true; } catch { return false; }
+  }
+  /** Sends one Phase 1 payload in a moved 1:1 chat; typing goes live-only (m5 §9). */
+  function sendDm(id, payload) {
+    if (payload?.type !== 'typing') return send(id, payload);
+    if (!usable(channels.get(id)) || !idle(id)) return Promise.resolve();
+    return enqueue(id, async () => { const message = await run({ cmd: 'mlsEncrypt', group: id, plaintext: JSON.stringify(payload) }); await call(`/api/channels/${id}/ephemeral`, 'POST', { message }); });
   }
   async function create({ kind, name, users }) {
     if (!enabled) throw new Error(reason || 'Groups are not ready yet.');
@@ -996,6 +1053,7 @@
     else if (typingOn) { typingOn = false; typingSent = 0; post(false); }
   }
   function typing(id, userId, payload) {
+    if (channels.get(id)?.kind === 'dm') { if (userId !== me.id) ctx.dmTyping?.(userId, payload); return; }
     const people = typingFrom.get(id) || new Map();
     clearTimeout(people.get(userId));
     people.delete(userId);
@@ -1210,7 +1268,7 @@
   // ---------- Sidebar data for account.js ----------
   function sections() {
     const rows = [];
-    for (const [id, ch] of channels) rows.push({ id, kind: ch.kind, channel: isChannel(ch), title: title(id), unread: ch.unread, mentioned: ch.mentioned, status: ch.status, lastAt: ch.lastAt, topic: ch.meta?.topic || '' });
+    for (const [id, ch] of channels) if (ch.kind !== 'dm') rows.push({ id, kind: ch.kind, channel: isChannel(ch), title: title(id), unread: ch.unread, mentioned: ch.mentioned, status: ch.status, lastAt: ch.lastAt, topic: ch.meta?.topic || '' });
     return { rows, enabled, reason };
   }
   /** For app.js: who is who in the open group. */
@@ -1270,11 +1328,13 @@
     { id: 'action:new-group', group: 'Actions', label: 'New group', keywords: 'people start chat', run: () => openNew('group_dm') },
     { id: 'action:new-channel', group: 'Actions', label: 'New channel', keywords: 'topic public private', run: () => openNew('channel') },
     { id: 'action:browse', group: 'Actions', label: 'Browse channels', keywords: 'join public directory', run: openBrowser },
-    ...[...channels].filter(([, ch]) => ch.status !== 'left').map(([id, ch]) => ({ id: `group:${id}`, group: 'Conversations', label: `${isChannel(ch) ? '# ' : ''}${title(id)}`, hint: ch.unread ? `${ch.unread} unread` : '', run: () => { ctx.openGroup(id); } })),
+    ...[...channels].filter(([, ch]) => ch.status !== 'left' && ch.kind !== 'dm').map(([id, ch]) => ({ id: `group:${id}`, group: 'Conversations', label: `${isChannel(ch) ? '# ' : ''}${title(id)}`, hint: ch.unread ? `${ch.unread} unread` : '', run: () => { ctx.openGroup(id); } })),
   ]);
 
   window.Groups = Object.freeze({
-    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember,
+    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, createDm, acceptDm, sendDm,
+    /** The DM group this device holds with a contact, if any (m5 §8). */
+    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */

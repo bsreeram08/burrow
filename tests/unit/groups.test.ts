@@ -9,7 +9,7 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 // remove-needed, a changed code of someone met in a group).
 const read = (name: string) => readFileSync(new URL(`../../packages/signaling/public/${name}`, import.meta.url), 'utf8');
 const sources = [read('chat-store.js'), read('groups.js')];
-const DEV2 = 'F'.repeat(22), G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
+const PAIR = 'p'.repeat(43), DEV2 = 'F'.repeat(22), G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
 const coded = (code: string | null, message: string) => Object.assign(new Error(message), { code });
 const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
@@ -81,11 +81,12 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
     contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {},
     // Our devices as a verified signed list proves them (account.js); null: nothing verifiable.
+    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping() {},
     verifiedOwnDevices: async () => { const own = options.own === undefined ? { listed: [DEV], dropped: [] } : options.own; return own && { listed: new Set(own.listed), dropped: new Set(own.dropped) }; } };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
   const settle = () => Bun.sleep(60);
-  return { log, storage, dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
+  return { storeList: () => context.ChatStore.list(), log, storage, dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
     async start() { Groups.start(ctx); await until(() => Groups.enabled(), 'groups enabled'); await settle(); },
     of: (name: string) => calls.filter(command => command.cmd === name) };
 }
@@ -401,5 +402,32 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     await both.el('group-rollback').onclick();
     await both.until(() => both.of('mlsCommit').length === 1, 'removal');
     expect(both.of('mlsCommit')[0].removes).toEqual([{ userId: BOB, deviceId: BOB_DEV }]);
+  });
+
+  test('11. a 1:1 chat on MLS lands in its own conversation, as 1:1, only once checked, and only from the two of us (m5 §8)', async () => {
+    const EVE = 'V'.repeat(22);
+    const rows = [{ id: G, kind: 'dm', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true, peer: { id: BOB, username: 'bob' } }];
+    const entry = (seq: number) => ({ type: 'group', channel: G, seq, epoch: 3, kind: 'app', from: { userId: BOB, deviceId: BOB_DEV }, message: b64(`m${seq}`), createdAt: Date.now() });
+    const w = world({ channels: rows });
+    await w.start();
+    expect(w.Groups.sections().rows).toEqual([]); // not a group: shown under its contact
+    // A check that fails (not our DM) stores nothing.
+    w.handlers.mlsCheckDm = () => { throw coded('invalid', 'not a DM of these two'); };
+    w.handlers.mlsReceive = () => application({ ...text, id: crypto.randomUUID(), text: 'unchecked' });
+    w.Groups.frame(entry(1));
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    // Checked: bob's message lands under the pair, incoming, without group fields.
+    w.handlers.mlsCheckDm = () => null;
+    const hello = { ...text, id: crypto.randomUUID(), text: 'hello over MLS' };
+    w.handlers.mlsReceive = () => application(hello);
+    w.Groups.frame(entry(2));
+    await w.until(() => w.Groups.debug(G).cursor === 2, 'processed');
+    // Someone else in the group (never in a real DM) is ignored.
+    w.handlers.mlsReceive = () => ({ ...application({ ...text, id: crypto.randomUUID(), text: 'from eve' }), sender: { leaf: 2, userId: EVE, deviceId: 'Q'.repeat(22) } });
+    w.Groups.frame(entry(3));
+    await w.until(() => w.Groups.debug(G).cursor === 3, 'processed');
+    const stored = await w.storeList();
+    expect(stored.map((record: any) => [record.conversationId, record.direction, record.text, record.from])).toEqual([[PAIR, 'incoming', 'hello over MLS', undefined]]);
+    expect(w.of('mlsCheckDm').length).toBe(2);
   });
 });

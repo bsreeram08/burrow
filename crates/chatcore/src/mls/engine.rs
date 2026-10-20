@@ -443,7 +443,12 @@ impl Groups {
         let (_, certs) = validate_group_state(mls_group.extensions(), mls_group.members(), &mut directory, Stale::Any)?;
         if mls_group.is_active() {
             let own = certs.iter().find(|(index, _)| *index == mls_group.own_leaf_index()).ok_or_else(|| invalid("this device's leaf is missing from its group"))?;
-            if own.1 != cert { return Err(invalid("this device's leaf does not match its certificate")); }
+            // After a recertification (a new certificate under the new account key for the same leaf key) the tree
+            // still holds the older certificate until a self-update carries the new one: same user, device and leaf
+            // key, and not stale, is still this device.
+            let same_leaf = own.1.user_id == cert.user_id && own.1.device_id == cert.device_id && own.1.leaf_sig_key == cert.leaf_sig_key;
+            let renewable = own.1 != cert && same_leaf && mls_group.own_leaf().is_some_and(|leaf| matches!(verify_standing(&mut directory, leaf.credential(), leaf.signature_key().as_slice(), true), Ok((_, Standing::Current | Standing::Previous))));
+            if own.1 != cert && !renewable { return Err(invalid("this device's leaf does not match its certificate")); }
         }
         let seen = Verified::of(Some(cert.clone()), &mut directory, &certs)?;
         self.verified.insert(key, seen);
@@ -657,7 +662,12 @@ impl Groups {
                 }
                 if leaves.len() == before { return Err(invalid("no such member")); }
             }
+            let renew = update && mls_group.own_leaf().and_then(|leaf| cert_of(leaf.credential())).is_some_and(|held| held != cert);
             let mut builder = mls_group.commit_builder().propose_adds(packages).propose_removals(leaves).force_self_update(update);
+            // A self-update carries this device's installed certificate when the tree's differs (after a recertification).
+            if renew {
+                builder = builder.leaf_node_parameters(LeafNodeParameters::builder().with_credential_with_key(Self::credential(&cert)?).build());
+            }
             if let Some(roles) = roles { builder = builder.propose_group_context_extensions(group_extensions(roles)?).map_err(mls)?; }
             let bundle = builder
                 .load_psks(provider.storage())

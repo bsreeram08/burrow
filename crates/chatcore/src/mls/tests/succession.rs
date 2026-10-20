@@ -274,3 +274,35 @@ fn a_leaf_is_known_only_when_a_group_this_device_holds_has_exactly_that_device_w
     assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[], &f.b2.device, &b2_leaf).unwrap(), "no groups prove nothing");
     assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[group_id(&b64(&[3u8; 16])).unwrap()], &f.b2.device, &b2_leaf).unwrap(), "a group it is not in");
 }
+
+#[test]
+fn a_recertified_device_passes_the_gate_and_its_self_update_carries_the_new_certificate_so_adds_work_again() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let bob = f.bob.rekeyed();
+    f.server.ds.succeed(&mut f.server.store, &bob.id, &vec![record(&f.bob, &bob, AT)]).unwrap();
+    for dev in [&mut f.a1, &mut f.a2, &mut f.c1] { point(dev, &f.bob, &bob, Some((&f.bob, AT))); }
+    // Bob's two devices hold the new account key and remember the old one; each installs a certificate under the new key.
+    for dev in [&mut f.b1, &mut f.b2] {
+        dev.store.put("own-previous", json!([{ "sign": f.bob.pin(), "until": AT }])).unwrap();
+        dev.groups.recertify_device(&mut dev.store, "linux", AT + 1, &bob.aik).unwrap();
+        dev.restart();
+    }
+    // The tree still holds the old certificates: the gate lets the devices on (same user, device and leaf key), and a
+    // commit that adds people is still refused while old-key leaves remain.
+    assert!(f.b1.members(&g).iter().all(|m| !m.stale));
+    let dave = Account::new();
+    let mut d1 = f.admit(&dave, "web");
+    for dev in [&mut f.a1] { dev.store.put(&format!("peer:{}", dave.id), json!({ "aik": dave.pin() })).unwrap(); dev.restart(); }
+    point(&mut d1, &f.bob, &bob, None);
+    let err = f.a1.commit(&mut f.server, &g, &d1.kp(1), &[], None, false).unwrap_err();
+    assert!(err.message.contains("previous account key"), "{err}");
+    // The self-update carries the installed certificate; every member accepts it (it chains to the new key).
+    f.b1.accepted(&mut f.server, &g, &[], &[], None, true);
+    f.b2.sync(&f.server, &g);
+    f.b2.accepted(&mut f.server, &g, &[], &[], None, true);
+    for dev in [&mut f.a1, &mut f.a2, &mut f.c1, &mut f.b1] { dev.sync(&f.server, &g); }
+    // Both old-key leaves are gone from the tree: adding people works again.
+    let out = f.a1.accepted(&mut f.server, &g, &d1.kp(1), &[], None, false);
+    d1.join(&mut f.server, &out.welcome.unwrap(), &g);
+}

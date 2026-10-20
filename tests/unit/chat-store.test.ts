@@ -595,4 +595,14 @@ describe('groups and channels (docs/m4-groups.md §10)', () => {
     expect(await store.note(GROUP, b, 'dave joined')).toBe(false);
     expect((await store.list()).map((record: any) => record.text).sort()).toEqual(['alice added bob', 'dave joined']);
   });
+
+  test('M5: the mls-dm pointer is an exact payload, and history from another device keeps an imported mark', async () => {
+    const store = groupStore();
+    const pointer = { v: 1, type: 'mls-dm', id: crypto.randomUUID(), channel: 'c'.repeat(22), at: NOW };
+    expect(store.checkPayload(pointer)).toBe('mls-dm');
+    for (const bad of [{ channel: 'short' }, { at: -1 }, { extra: 1 }]) expect(() => store.checkPayload({ ...pointer, ...bad })).toThrow();
+    const record = message({ status: 'delivered', imported: true } as any);
+    expect(await store.put(record)).toMatchObject({ imported: true });
+    await expect(store.put(message({ imported: false } as any))).rejects.toThrow();
+  });
 });

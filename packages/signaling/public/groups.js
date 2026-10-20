@@ -53,9 +53,14 @@
   // ---------- HTTP ----------
   /** Like account.js api(), but answers with the status instead of throwing (409/423 are part of the protocol). */
   async function call(path, method = 'GET', payload) {
-    const response = await fetch(path, { method, cache: 'no-store', credentials: 'same-origin', headers: payload === undefined ? {} : { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
-    const body = await response.json().catch(() => ({}));
-    return { status: response.status, body };
+    // A burst (a chat moving to MLS, a device joining its groups) can meet the server's rate limits: those are
+    // momentary, so wait a little and try again rather than failing the operation.
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(path, { method, cache: 'no-store', credentials: 'same-origin', headers: payload === undefined ? {} : { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
+      const body = await response.json().catch(() => ({}));
+      if (response.status !== 429 || attempt >= 5) return { status: response.status, body };
+      await sleep(250 * 2 ** attempt + Math.random() * 250);
+    }
   }
   async function must(path, method, payload) {
     const result = await call(path, method, payload);
@@ -137,7 +142,13 @@
   }
   /** When this device joins the signed list (or anything about our devices changes), try again. */
   function devicesChanged() { if (ctx && !enabled && run && !reason.includes('another tab')) starting = setup(generation); }
-  async function topUp(count) {
+  // One upload at a time: start-up and a `keypackages` frame racing would both top up and overshoot the cap.
+  let toppingUp = null;
+  function topUp(count) {
+    toppingUp ||= topUpNow(count).finally(() => { toppingUp = null; });
+    return toppingUp;
+  }
+  async function topUpNow(count) {
     count ||= await must('/api/mls/keypackages');
     const want = Math.min(KEYPACKAGES, count.max ?? KEYPACKAGES) - count.oneTime;
     const body = {};
@@ -410,7 +421,8 @@
     await call(`/api/channels/${id}/cursor`, 'POST', { seq: full.seq });
     await call(`/api/mls/welcomes/${welcomeId}`, 'DELETE');
     await members(id).catch(() => {});
-    await note(id, `welcome:${welcomeId}`, `${nameOf(full.from)} added you. You'll see messages from now on.`);
+    if (joined.kind === 'dm') ctx.dmJoined?.(id); // A 1:1 chat moving to MLS: its pointer may be waiting (m5 §8.3).
+    else await note(id, `welcome:${welcomeId}`, `${nameOf(full.from)} added you. You'll see messages from now on.`);
     ctx.render();
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
   }

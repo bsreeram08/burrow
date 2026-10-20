@@ -192,5 +192,10 @@
     channel.postMessage({ backend: mine });
     return next => channel.postMessage({ backend: next });
   }
-  window.Core = Object.freeze({ box, groupStore, supported, backend, setBackend, hasKeys, guard });
+  /** A test-only local switch (e.g. 'dm-move-test'), honoured only where the server allows test flags (loopback). */
+  async function testFlag(name) {
+    if (!await testFlagsOn()) return null;
+    try { return localStorage.getItem(name); } catch { return null; }
+  }
+  window.Core = Object.freeze({ box, groupStore, supported, backend, setBackend, hasKeys, guard, testFlag });
 })();

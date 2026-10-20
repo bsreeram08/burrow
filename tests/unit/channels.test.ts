@@ -4,9 +4,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cpSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import '../../packages/signaling/public/devices.js';
 import { startSignaling } from '../../packages/signaling/server';
+import { resolveBytes } from '../../packages/signaling/channels';
 import { Client, clientCore, enroll, id, pinAll, type Device, type User } from './helpers/mls';
 
 // The MLS delivery service end to end: real chatcore clients (WebAssembly) against a real server. Skipped, loudly,
@@ -622,6 +623,27 @@ suite('channels', () => {
     });
 });
 
+suite('commit classification', () => {
+    test('what a plain member signed that policy forbids is signed-content (and the DS never sequences it); a corrupted tag is not', async () => {
+        const w = await populated();
+        // A modified client (test build only): bob removes carol, which only an admin may do.
+        const evil = w.b1.client.call({ cmd: 'mlsTestUnchecked', group: w.channel, removes: [{ userId: w.carol.id }] });
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/commits`, { message: evil.commit })).status).toBe(422);
+        w.b1.client.call({ cmd: 'mlsClearOwn', group: w.channel });
+        // Members that are handed it anyway (a faulty DS) reject it and may blame its author: he signed it.
+        const failure = (() => { try { w.c1.client.call({ cmd: 'mlsReceive', group: w.channel, message: evil.commit }); } catch (error: any) { return error; } })();
+        expect(failure.code).toBe('poison');
+        const check = w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: evil.commit });
+        expect(check).toMatchObject({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { deviceId: w.b1.deviceId } });
+        // With only its tag flipped it is still his content...
+        expect(w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: flip(evil.commit, -1) }).class).toBe('signed-content');
+        // ...while an honest commit with a flipped tag blames nobody.
+        const honest = w.a1.client.call({ cmd: 'mlsCommit', group: w.channel, update: true });
+        expect(w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: flip(honest.commit, -1) })).toMatchObject({ authenticated: true, signedContentInvalid: false, class: 'tag' });
+        w.a1.client.call({ cmd: 'mlsClearOwn', group: w.channel });
+    });
+});
+
 suite('poison commits', () => {
     /** a1 builds a self-update, and the last byte (a confirmation tag only members can check) is flipped. */
     async function poisoned() {
@@ -935,5 +957,12 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         w.a1.client.call({ cmd: 'mlsForget', group: w.channel });
         expect((await w.a1.joinExternal(w.channel)).status).toBe(201);
         watch.socket.close();
+    });
+
+    test('resolve bytes v2: a fixed vector shared with the app (apps/chat/test/group_sync_test.dart)', async () => {
+        await start(); // this file's teardown expects a server
+        const bytes = resolveBytes('C'.repeat(22), 'rollback', 7, 'd'.repeat(64), 'a'.repeat(22));
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe('15911786d65cec6da7b01ae0de4df45929815e2d0073cad52665c981f5710bd3');
+        expect(bytes.toString()).toBe(`webrtc-bun-mlsresolve-v2\n${'C'.repeat(22)}\nrollback\n7\n${'d'.repeat(64)}\n${'a'.repeat(22)}`);
     });
 });

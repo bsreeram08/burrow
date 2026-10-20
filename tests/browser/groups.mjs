@@ -255,6 +255,44 @@ try {
   step(`dave's commit lost the race (answers ${answers.join(', ')}): he caught up, rebuilt it and alice got in; all four read #general`);
   await shot(dave, 'channel');
 
+  // ---------- Leaving, and a reported commit an admin dismisses ----------
+  // Dave's app is closed for a while, so the log keeps the next commit (it is trimmed once every device read it).
+  const general = await bob.evaluate(() => window.Groups.active());
+  await dave.goto('about:blank');
+  await alice.click('#conv-menu summary'); await alice.click('#conv-leave');
+  await visible(alice, '#group-leave-confirm'); await alice.click('#group-leave-yes');
+  await until(alice, () => !document.getElementById('group-banner').hidden && /You left/.test(document.getElementById('group-banner-text').textContent));
+  // Bob, the admin, removes her when her request arrives (MLS lets nobody remove themselves).
+  await until(bob, id => !window.Groups.debug(id).members.includes('alice'), general);
+  await sees(bob, 'alice left');
+  step('alice leaves #general: her app asks, bob\'s app (an admin) removes her devices');
+
+  // Carol's device rejects that commit (here: reports it by hand) and the channel freezes until an admin decides.
+  const report = await carol.evaluate(async id => {
+    const page = await (await fetch(`/api/channels/${id}/log?after=0`)).json();
+    const entry = page.entries.filter(item => item.kind === 'commit').at(-1);
+    const bytes = Uint8Array.from(atob(entry.message.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+    const digest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const response = await fetch(`/api/channels/${id}/poison`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ seq: entry.seq, digest }) });
+    return { status: response.status, seq: entry.seq };
+  }, general);
+  if (report.status !== 202) throw new Error(`report: ${JSON.stringify(report)}`);
+  await until(bob, () => !document.getElementById('group-dismiss').hidden && /rejected/.test(document.getElementById('group-banner-text').textContent));
+  await shot(bob, 'frozen');
+  await bob.fill('#chat-input', 'while frozen'); await bob.press('#chat-input', 'Enter');
+  await bob.waitForTimeout(1500);
+  if (await message(carol, 'while frozen').count()) throw new Error('a message went out while the channel was frozen');
+  await bob.click('#group-dismiss');
+  await until(bob, () => document.getElementById('group-banner').hidden);
+  await sees(carol, 'while frozen');
+  await say(bob, 'Back to normal');
+  await sees(carol, 'Back to normal');
+  await dave.goto(origin); await ready(dave);
+  await openGroup(dave, 'general');
+  await sees(dave, 'Back to normal');
+  if (await message(alice, 'Back to normal').count()) throw new Error('a member who left still receives');
+  step('carol reports the commit: #general freezes, bob sees "rejected" with Roll back / Dismiss, dismisses it, and the queued message goes out');
+
   console.log('GROUPS E2E PASSED');
 } catch (error) {
   console.error(error);

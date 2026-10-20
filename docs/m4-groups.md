@@ -94,8 +94,10 @@ Receivers process an `ephemeral` frame with `mlsReceive { commit: true }` only w
 
 ## 9. Web specifics
 
-- The browser runs MLS in its own core store: IndexedDB `webrtc-bun-mls-v1-<userId>` (same sealing as `webrtc-bun-core-v1`, associated data `mls1|<userId>|<row>`), its own Web Lock `chatcore-mls:<userId>` and worker, so the 1:1 core (signal.js by default) is untouched. The AIK stays a non-extractable WebCrypto key: it signs only the device certificate bytes.
-- `chatcore-wasm` is built with the `mls` feature (`bun run build:wasm`).
+- The browser runs MLS in its own core store (`groups.js` through `Core.groupStore`): IndexedDB `webrtc-bun-mls-v1-<instance>` where `instance` is `<userId>-<deviceId>-<first 12 characters of the AIK>`, so a new device id or a new identity starts a clean store. Same sealing as `webrtc-bun-core-v1`, associated data `mls1|<instance>|<row>`; its own worker and Web Lock (`chatcore-mls:<instance>`). The 1:1 core (signal.js by default) is untouched. The AIK stays a non-extractable WebCrypto key: it signs only the device certificate bytes (`DeviceFormat.mlsCertBytes`).
+- One tab per account runs the group engine (Web Lock `groups:<userId>`); other tabs of the same account say so and take over when that tab closes.
+- Per-device state (cursors, names and topics, unread and mention counts) lives in `localStorage['groups-v1:<instance>']`; usernames seen in groups in `names-v1:<userId>`; pinned conversations in `pins-v1:<userId>` (`dm:<userId>` / `g:<channelId>`).
+- `chatcore-wasm` is built with the `mls` feature (`bun run build:wasm`): 1.59 MB raw / 452 KB brotli, within the 2 MB / 700 KB budget.
 
 ## 10. Message store (both clients)
 

@@ -199,7 +199,7 @@
   /** The user accepted a changed security code (1:1 safety sheet or the group banner): resume what waited for it. */
   function pinsChanged(userId) {
     pinned.delete(userId);
-    for (const [id, ch] of channels) if (ch.status === 'paused' && (!userId || ch.pausedFor === userId)) { ch.status = 'active'; delete ch.pausedFor; save(); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); paint(id); }
+    for (const [id, ch] of channels) if (ch.status === 'paused' && (!userId || ch.pausedFor === userId)) { ch.status = 'active'; delete ch.pausedFor; save(); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); paint(id); }
   }
 
   // ---------- Channels and members ----------
@@ -374,7 +374,7 @@
     }
     await run({ cmd: 'mlsCommitReceived', pendingId: processed.pendingId });
     if (processed.kind === 'removed') { removed(id, true); return 'stop'; }
-    if (processed.kind === 'commit') await afterCommit(id, entry, processed, before, rolesBefore);
+    if (processed.kind === 'commit') await describe(id, `commit:${entry.seq}:${processed.digest || ''}`, processed.sender.userId, processed.sender.leaf === EXTERNAL, before, rolesBefore);
     return 'ok';
   }
   /** A rejected commit may only mean a pin moved (a changed key, a person met for the first time): check first. */
@@ -396,20 +396,20 @@
     await resyncInner(id).catch(() => {});
     return 'stop';
   }
-  /** Users who joined, left or became admins, as a system line; and the roster. */
-  async function afterCommit(id, entry, processed, before, rolesBefore) {
+  /** A commit (ours or someone else's) as a system line: who joined, left, was added or removed, became admin. */
+  async function describe(id, key, author, external, before, rolesBefore) {
     const after = await treeUsers(id);
-    const sender = processed.sender, by = nameOf(sender.userId);
+    const by = author === me.id ? 'You' : nameOf(author);
     await members(id).catch(() => {});
     const added = after.filter(user => !before.includes(user)), gone = before.filter(user => !after.includes(user));
     const ch = channels.get(id), nowAdmins = ch.admins.filter(user => !rolesBefore.includes(user) && after.includes(user));
     const lines = [];
-    if (sender.leaf === EXTERNAL && added.includes(sender.userId)) lines.push(`${by} joined`);
+    if (external && added.includes(author)) lines.push(`${by} joined`);
     else if (added.length) lines.push(`${by} added ${added.map(nameOf).join(', ')}`);
-    for (const user of gone) lines.push(user === sender.userId || ch.leaving?.includes(user) ? `${nameOf(user)} left` : `${by} removed ${nameOf(user)}`);
+    for (const user of gone) lines.push(user === author || ch.leaving?.includes(user) ? `${nameOf(user)} left` : `${by} removed ${nameOf(user)}`);
     if (nowAdmins.length) lines.push(`${by} made ${nowAdmins.map(nameOf).join(', ')} ${nowAdmins.length > 1 ? 'admins' : 'an admin'}`);
     if (ch.leaving) ch.leaving = ch.leaving.filter(user => after.includes(user));
-    if (lines.length) await note(id, `commit:${entry.seq}:${processed.digest || ''}`, lines.join(' · '));
+    if (lines.length) await note(id, key, lines.join(' · '));
     // Someone asked to leave and we can remove them now.
     for (const user of ch.leaving || []) if (amAdmin(id)) queueRemoval(id, user);
   }
@@ -539,13 +539,14 @@
     for (let attempt = 0; attempt < 5; attempt++) {
       await syncInner(id);
       if (await run({ cmd: 'mlsPending', group: id })) await run({ cmd: 'mlsClearOwn', group: id });
+      const before = await treeUsers(id), rolesBefore = channels.get(id).admins.slice();
       const out = await withPins(id, () => run({ cmd: 'mlsCommit', group: id, adds: claimed.map(item => item.keyPackage), removes: change.removes, roles: change.roles, update: Boolean(change.update) }));
       const body = out.welcome ? { message: out.commit, welcome: out.welcome, joiners: claimed.map(item => item.deviceId) } : { message: out.commit };
       const result = await call(`/api/channels/${id}/commits`, 'POST', body);
       if (result.status === 201) {
         const view = await run({ cmd: 'mlsMergeOwn', group: id });
         await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
-        await members(id).catch(() => {});
+        await describe(id, `commit:${result.body.seq}:${result.body.digest}`, me.id, false, before, rolesBefore);
         return result.body;
       }
       await run({ cmd: 'mlsClearOwn', group: id });
@@ -663,6 +664,7 @@
     await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, signature: await device.sign(bytes) });
     ch.status = 'active'; delete ch.frozen; save(); paint(id);
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
+    flush(id);
   }
 
   // ---------- Typing (§5.1) ----------
@@ -743,7 +745,8 @@
     $('group-rollback').hidden = $('group-dismiss').hidden = !(ch?.status === 'frozen' && admin && ch.frozen);
     $('group-review').hidden = ch?.status !== 'paused';
     $('group-rejoin').hidden = ch?.status !== 'broken';
-    window.App.setComposable?.(usable(ch));
+    // Frozen or paused: writing still works and waits on this device; gone or out of step: read-only.
+    window.App.setComposable?.(Boolean(ch) && !['left', 'removed', 'broken'].includes(ch.status));
   }
   const status = (id, text) => { if (id === currentId) window.App.chatStatus(text); else ctx?.notice(text); };
 

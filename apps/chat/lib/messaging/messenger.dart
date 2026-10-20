@@ -159,6 +159,9 @@ class Messenger {
   final _activeChanges = StreamController<bool>.broadcast();
   Stream<bool> get activeChanges => _activeChanges.stream;
 
+  /// A resumed take-over found the server already serving this device's key (m5 §5.2).
+  void markActive() => _setActive(true);
+
   void _setActive(bool value) {
     if (active == value) return;
     active = value;

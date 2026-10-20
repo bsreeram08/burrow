@@ -63,24 +63,28 @@ void main() {
     };
   }
 
-  for (final forged in [false, true]) {
-  test(forged
-      ? "a served list our primary didn't sign stops the take-over before anything is published"
-      : 'hand over: request, compare, record, keys, list v1 (only our signed list), demote, step down', () async {
+  /// Two app devices of one account over a fake relay and server: P0 (the primary) and N (a linked device).
+  /// [fail] makes one request of N's fail as a lost connection (a crash at that step).
+  Future<_Rig> rig({bool forged = false}) async {
+    final r = _Rig();
     final aik = ed.generateKey(), other = ed.generateKey();
-    final p0Link = _SigningLink(aik);
-    final p0Chat = FakeChatCrypto(me: p0Link.identity!);
-    final nChat = FakeChatCrypto(me: const Identity(dh: 'unused', sign: 'unused'));
-    final nLink = _TakingLink(nChat)..companion = (userId: me.id, identity: p0Link.identity!, certJson: '{}');
-    final nGroups = FakeGroupCrypto(userId: me.id), p0Groups = FakeGroupCrypto(userId: me.id, deviceId: p0Device);
+    r.p0Link = _SigningLink(aik);
+    final p0Chat = FakeChatCrypto(me: r.p0Link.identity!);
+    r.nChat = FakeChatCrypto(me: const Identity(dh: 'unused', sign: 'unused'));
+    r.nLink = _TakingLink(r.nChat)..companion = (userId: me.id, identity: r.p0Link.identity!, certJson: '{}');
+    r.nGroups = FakeGroupCrypto(userId: me.id);
+    r.p0Groups = FakeGroupCrypto(userId: me.id, deviceId: p0Device);
     final n2p = <String>[], p2n = <String>[];
     var state = <String, dynamic>{'state': 'waiting'};
-    Map<String, dynamic>? succession, published;
-    Map<String, dynamic> served = p0Link.identity!.toJson();
+    r.served = r.p0Link.identity!.toJson();
     late String nDevice;
 
     MockClient client(bool isN) => MockClient((request) async {
       final path = request.url.path, method = request.method;
+      if (isN && (r.fail?.call(method, path) ?? false)) {
+        r.fail = null;
+        throw http.ClientException('connection lost');
+      }
       http.Response ok(Object body, [int status = 200]) => http.Response(jsonEncode(body), status);
       final body = request.body.isEmpty ? const <String, dynamic>{} : jsonDecode(request.body) as Map<String, dynamic>;
       if (path == '/api/link/start') {
@@ -104,74 +108,109 @@ void main() {
       if (path == '/api/devices/me') {
         return ok({
           'userId': me.id,
-          'identity': served,
+          'identity': r.served,
           ...signed(forged ? other : aik, [p0Device, nDevice]),
+          if (r.succession != null) 'succession': [{...(r.succession!['record'] as Map), 'signature': r.succession!['signature']}],
           // The server also shows a device our list never named: it must not be signed into the new list.
           'devices': [{'id': p0Device, 'state': 'listed', 'platform': 'ios', 'primary': true}, {'id': nDevice, 'state': 'listed', 'platform': 'macos'}, {'id': 'x' * 22, 'state': 'listed', 'platform': 'web'}],
         });
       }
       if (path == '/api/devices/succession') {
-        expect(published, isNull, reason: 'the record goes before the keys');
-        succession = body;
+        expect(r.published, isNull, reason: 'the record goes before the keys');
+        r.succession = body;
+        r.records++;
         return ok({'seq': 1}, 201);
       }
       if (path == '/api/keys' && method == 'PUT') {
-        expect(succession, isNotNull, reason: 'keys only after the record');
-        served = (body['identity'] as Map).cast<String, dynamic>();
+        expect(r.succession, isNotNull, reason: 'keys only after the record');
+        r.served = (body['identity'] as Map).cast<String, dynamic>();
         return ok({});
       }
-      if (path == '/api/keys/count') return ok({'oneTimePreKeys': 0, 'signedPreKeyId': null, 'identity': served});
+      if (path == '/api/keys/count') return ok({'oneTimePreKeys': 0, 'signedPreKeyId': null, 'identity': r.served});
       if (path == '/api/devices/list') {
-        published = body;
+        r.published = body;
+        r.lists++;
         return ok({'version': 1});
       }
       return ok({'error': 'nope'}, 404);
     });
 
-    final nApi = Api(baseUrl: 'https://calls.example', client: client(true), clientName: 'macos')..token = 'n';
+    r.nApi = Api(baseUrl: 'https://calls.example', client: client(true), clientName: 'macos')..token = 'n';
     final p0Api = Api(baseUrl: 'https://calls.example', client: client(false), clientName: 'ios')..token = 'p';
-    final nStore = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
-    final p0Store = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
-    final nPrefs = MemoryDevicePrefs();
-    final nMessenger = Messenger(api: nApi, crypto: nChat, store: nStore, me: me, contactById: (_) => null, mutualContacts: () => [], ack: (_) {}, devices: nPrefs)..companion = true;
-    final p0Messenger = Messenger(api: p0Api, crypto: p0Chat, store: p0Store, me: me, contactById: (_) => null, mutualContacts: () => [], ack: (_) {});
-    final p0Ctx = LinkContext(api: p0Api, crypto: p0Chat, link: p0Link, messenger: p0Messenger, store: p0Store, contacts: () => [], wait: (_) async => Future<void>.delayed(const Duration(milliseconds: 5)));
+    r.nStore = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
+    r.p0Store = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
+    r.nMessenger = r.messenger();
+    final p0Messenger = Messenger(api: p0Api, crypto: p0Chat, store: r.p0Store, me: me, contactById: (_) => null, mutualContacts: () => [], ack: (_) {});
+    final p0Ctx = LinkContext(api: p0Api, crypto: p0Chat, link: r.p0Link, messenger: p0Messenger, store: r.p0Store, contacts: () => [], wait: (_) async => Future<void>.delayed(const Duration(milliseconds: 5)));
+    r.take = await TakeOver.start(api: r.nApi, link: r.nLink, groups: r.nGroups, device: await r.nMessenger.device(), platform: 'macos', wait: (_) => Future<void>.delayed(const Duration(milliseconds: 5)));
+    final offered = r.take.waitOffer();
+    r.hand = await HandOver.fromQr(p0Ctx, r.p0Groups, r.take.qr);
+    expect(await offered, r.hand.code, reason: 'both screens show the same digits');
+    r.request = await r.hand.waitRequest();
+    expect(r.request.leafSigKey, await r.nGroups.deviceLeaf());
+    expect(r.succession, isNull, reason: 'nothing signed before the user confirms');
+    return r;
+  }
 
-    final take = await TakeOver.start(api: nApi, link: nLink, groups: nGroups, device: await nMessenger.device(), platform: 'macos', wait: (_) => Future<void>.delayed(const Duration(milliseconds: 5)));
-    final offered = take.waitOffer();
-    final hand = await HandOver.fromQr(p0Ctx, p0Groups, take.qr);
-    expect(await offered, hand.code, reason: 'both screens show the same digits');
-    final request = await hand.waitRequest();
-    expect(request.leafSigKey, await nGroups.deviceLeaf());
-    expect(succession, isNull, reason: 'nothing signed before the user confirms');
-
-    if (forged) {
-      unawaited(hand.approve(timeout: const Duration(milliseconds: 300)).then((_) {}, onError: (_) {}));
-      await expectLater(take.run(nMessenger, platform: 'macos'), throwsA(isA<StoreException>()));
-      expect((succession, published, served['sign']), (null, null, p0Link.identity!.sign), reason: 'no record, keys or list');
-      expect(nMessenger.companion, isTrue);
-      await nStore.close();
-      await p0Store.close();
-      return;
-    }
-    await Future.wait([hand.approve(), take.run(nMessenger, platform: 'macos')], eagerError: true);
-
-    // N: record, then keys, then list v1 under the new key naming the old primary; its own leaf re-signed.
-    expect((succession!['record'] as Map)['newSign'], request.identity.sign);
-    expect(served['sign'], request.identity.sign);
-    final list = published!['list'] as Map;
+  Future<void> expectHandedOver(_Rig r) async {
+    // N: record, then keys, then list v1 under the new key naming the old primary (never the server-only device).
+    expect((r.succession!['record'] as Map)['newSign'], r.request.identity.sign);
+    expect(r.served['sign'], r.request.identity.sign);
+    final list = r.published!['list'] as Map;
     expect((list['version'], list['prevHash']), (1, ''));
-    expect({for (final d in list['devices'] as List) d['deviceId']}, {p0Device, nDevice});
-    expect(nGroups.recertified, 1);
-    expect(nMessenger.companion, isFalse);
+    expect({for (final d in list['devices'] as List) d['deviceId']}, {p0Device, (await r.nMessenger.device()).deviceId});
+    expect(r.nGroups.recertified, 1);
+    expect(r.nMessenger.companion, isFalse);
+    expect(r.marker, isNull, reason: 'the marker is cleared when done');
     // P0: a linked device of the new key now, with its leaf certified under it.
-    expect(p0Link.identity, isNull);
-    expect(p0Link.companion?.identity, request.identity);
-    final cert = jsonDecode(p0Link.companion!.certJson) as Map;
-    expect((cert['deviceId'], cert['leafSigKey'], cert['aikSign']), (p0Device, await p0Groups.deviceLeaf(), request.identity.sign));
-    await nStore.close();
-    await p0Store.close();
+    expect(r.p0Link.identity, isNull);
+    expect(r.p0Link.companion?.identity, r.request.identity);
+    final cert = jsonDecode(r.p0Link.companion!.certJson) as Map;
+    expect((cert['deviceId'], cert['leafSigKey'], cert['aikSign']), (p0Device, await r.p0Groups.deviceLeaf(), r.request.identity.sign));
+    await r.nStore.close();
+    await r.p0Store.close();
+  }
+
+  test('hand over: request, compare, record, keys, list v1 (only our signed list), demote, step down', () async {
+    final r = await rig();
+    await Future.wait([r.hand.approve(), r.take.run(r.nMessenger, platform: 'macos', markers: r.markers)], eagerError: true);
+    await expectHandedOver(r);
   });
+
+  test("a served list our primary didn't sign stops the take-over before anything is published", () async {
+    final r = await rig(forged: true);
+    unawaited(r.hand.approve(timeout: const Duration(milliseconds: 300)).then((_) {}, onError: (_) {}));
+    await expectLater(r.take.run(r.nMessenger, platform: 'macos', markers: r.markers), throwsA(isA<StoreException>()));
+    expect((r.succession, r.published, r.served['sign']), (null, null, r.p0Link.identity!.sign), reason: 'no record, keys or list');
+    expect((r.nMessenger.companion, r.marker), (true, null));
+    await r.nStore.close();
+    await r.p0Store.close();
+  });
+
+  // A crash (here: the connection lost) at each step after the user confirmed; the next start resumes and finishes,
+  // repeating nothing that was done.
+  for (final (step, at) in <(String, bool Function(_Rig, String, String))>[
+    ('publishing the record', (r, m, p) => m == 'PUT' && p == '/api/devices/succession'),
+    ('right after holding the new key', (r, m, p) => p == '/api/keys/count' && r.succession != null),
+    ('uploading the keys', (r, m, p) => m == 'PUT' && p == '/api/keys'),
+    ('publishing list v1', (r, m, p) => m == 'PUT' && p == '/api/devices/list'),
+    ('sending demote', (r, m, p) => m == 'POST' && p.endsWith('/messages') && r.published != null),
+  ]) {
+    test('a take-over cut short while $step resumes on the next start and completes', () async {
+      final r = await rig();
+      r.fail = (m, p) => at(r, m, p);
+      final stepped = r.hand.approve(timeout: const Duration(seconds: 20));
+      await expectLater(r.take.run(r.nMessenger, platform: 'macos', markers: r.markers), throwsA(anything));
+      expect(r.marker, isNotNull, reason: 'kept for the resume');
+      expect(jsonDecode(r.marker!)['newSign'], r.request.identity.sign, reason: 'bound to the new key');
+      // Restart: a new Messenger over the same key store, pins and marker.
+      r.nMessenger = r.messenger();
+      expect(await TakeOver.resume(api: r.nApi, link: r.nLink, groups: r.nGroups, messenger: r.nMessenger, platform: 'macos', markers: r.markers), isTrue);
+      await stepped;
+      expect((r.records, r.lists), (1, 1), reason: 'nothing published twice');
+      await expectHandedOver(r);
+      expect(await TakeOver.resume(api: r.nApi, link: r.nLink, groups: r.nGroups, messenger: r.nMessenger, platform: 'macos', markers: r.markers), isFalse);
+    });
   }
 
   test('a linked device follows its account to a new key only along a valid chain, then asks for a certificate', () async {
@@ -277,4 +316,27 @@ void main() {
     expect([for (final d in list['devices'] as List) d['deviceId']], [(await messenger.device()).deviceId]);
     await store.close();
   });
+}
+
+class _Rig {
+  late _SigningLink p0Link;
+  late FakeChatCrypto nChat;
+  late _TakingLink nLink;
+  late FakeGroupCrypto nGroups, p0Groups;
+  late Api nApi;
+  late MessageStore nStore, p0Store;
+  final MemoryDevicePrefs nPrefs = MemoryDevicePrefs();
+  late Messenger nMessenger;
+  late TakeOver take;
+  late HandOver hand;
+  late ({Identity identity, String leafSigKey}) request;
+  Map<String, dynamic>? succession, published;
+  late Map<String, dynamic> served;
+  int records = 0, lists = 0;
+  bool Function(String method, String path)? fail;
+  String? marker;
+  late final TakeOverMarkers markers = (read: () async => marker, write: (String? v) async => marker = v);
+
+  Messenger messenger() => Messenger(api: nApi, crypto: nChat, store: nStore, me: const User(id: 'uuuuuuuuuuuuuuuuuuuuuu', username: 'me'), contactById: (_) => null, mutualContacts: () => [], ack: (_) {}, devices: nPrefs)
+    ..companion = true;
 }

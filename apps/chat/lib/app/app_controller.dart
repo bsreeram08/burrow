@@ -529,21 +529,44 @@ class AppController extends Notifier<AppState> {
     final m = messenger ?? (throw StateError('Not signed in'));
     final prefs = await SharedPreferences.getInstance(), key = 'device-meta-key-v1:${m.me.id}';
     final old = prefs.getString(key);
-    await t.run(m, platform: _api.client, oldMetaKey: old == null ? null : unb64(old));
+    await t.run(m, platform: _api.client, markers: await _takeOverMarkers(m.me.id), oldMetaKey: old == null ? null : unb64(old));
     await prefs.remove(key); // A primary derives its own label key.
     await _reopen();
     await _recommitLeaves();
     unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
   }
 
-  /// After a succession this device's leaf carries a certificate under the new key: commit it in every group, so
-  /// nobody sees it as Previous (which blocks adding people, m5 §7).
+  Future<TakeOverMarkers> _takeOverMarkers(String userId) async {
+    final prefs = await SharedPreferences.getInstance(), key = 'takeover-v1:$userId';
+    return (read: () async => prefs.getString(key), write: (String? v) async => v == null ? await prefs.remove(key) : await prefs.setString(key, v));
+  }
+
+  /// A take-over cut short after it was confirmed resumes on the next start (m5 §5.2).
+  Future<bool> _resumeTakeOver() async {
+    final m = messenger;
+    if (m == null) return false;
+    try {
+      final done = await TakeOver.resume(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), messenger: m, platform: _api.client, markers: await _takeOverMarkers(m.me.id));
+      if (done) state = state.copyWith(notice: 'This device finished becoming your primary.');
+      return done;
+    } on StoreException catch (error) {
+      state = state.copyWith(notice: error.message);
+    } catch (_) {
+      // Offline: tried again on the next start.
+    }
+    return false;
+  }
+
+  /// After a succession this device's leaf carries a certificate under the new key: commit it in every group until
+  /// no group sees it as Previous (which blocks adding people, m5 §7), a bounded number of tries each.
   Future<void> _recommitLeaves() async {
     final g = groups, s = store;
     if (g == null || s == null) return;
+    var left = 0;
     for (final c in await s.groups()) {
-      if (c.active) await g.sync.updateLeaf(c.id).catchError((_) {});
+      if (c.active && !await g.sync.recommitLeaf(c.id)) left++;
     }
+    if (left > 0) state = state.copyWith(notice: "$left ${left == 1 ? 'group still sees' : 'groups still see'} this device's old key. It tries again on the next start.");
   }
 
   /// Linked devices following the account to a new key, and the primary certifying their leaves (§5.2.2).
@@ -657,6 +680,11 @@ class AppController extends Notifier<AppState> {
   }
 
   Future<void> _checkActive() async {
+    if (await _resumeTakeOver()) {
+      await _reopen();
+      await _recommitLeaves();
+      return;
+    }
     if (messenger?.companion ?? false) {
       // A linked device: groups (and moved chats) only; the account's keys are on the primary.
       if (!(groups?.ready ?? true)) await _startGroups();

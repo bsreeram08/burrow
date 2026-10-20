@@ -370,6 +370,22 @@ class GroupSync {
   /// Previous.
   Future<void> updateLeaf(String groupId) => _serial(groupId, () => _commit(groupId, () => crypto.commit(groupId, update: true), redo: () => updateLeaf(groupId)));
 
+  /// [updateLeaf] until the group holds no stale leaf of this device, at most [attempts] times with backoff.
+  /// Returns whether it got there.
+  Future<bool> recommitLeaf(String groupId, {int attempts = 5}) async {
+    final self = (await device()).deviceId;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(_backoff(attempt - 1) * 2);
+      try {
+        await updateLeaf(groupId);
+        if (!(await crypto.members(groupId)).any((m) => m.userId == me.id && m.deviceId == self && m.stale)) return true;
+      } catch (_) {
+        // A conflict or a lost connection: try again.
+      }
+    }
+    return false;
+  }
+
   /// Changes the group's admins (admins only).
   Future<void> setAdmins(String groupId, List<String> admins) => _serial(groupId, () async {
     final roles = await crypto.roles(groupId);

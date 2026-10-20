@@ -110,7 +110,7 @@ class FakeGroupCrypto implements GroupCrypto {
     if (next == null) throw const CryptoException('not allowed by the group roles', code: 'invalid');
     final body = {'t': 'commit', 'g': groupId, 'epoch': g.epoch, 'from': _me, 'adds': added, 'removes': removed, 'roles': ?(roles == null ? null : _rolesJson(roles)), 'n': ++_counter};
     final text = _encode(body);
-    _pendingCommits[groupId] = {'text': text, 'body': body};
+    _pendingCommits[groupId] = {'text': text, 'body': body, 'update': update};
     final welcome = added.isEmpty ? null : _encode({'t': 'welcome', 'group': next.toJson()});
     return GroupCommit(groupId: groupId, commit: text, welcome: welcome, digest: _digest(text), epoch: g.epoch);
   }
@@ -119,6 +119,8 @@ class FakeGroupCrypto implements GroupCrypto {
   Future<GroupView> mergeOwn(String groupId) async {
     final pending = _pendingCommits.remove(groupId) ?? (throw const CryptoException('no pending commit', code: 'invalid'));
     final body = pending['body']! as Map<String, Object?>;
+    // Our own update commit carries a fresh leaf: it is no longer stale.
+    if (pending['update'] == true) staleDevices.remove(deviceId);
     final g = _group(groupId);
     if (body['external'] == true) {
       _groups[groupId] = _Group.fromJson(body['group']! as Map<String, Object?>);

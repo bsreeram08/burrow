@@ -1,7 +1,8 @@
 // Linked devices and DMs on MLS end to end (docs/m5-linking.md), in Chromium against the real server:
 // a 1:1 chat with history on the Double Ratchet moves to MLS with that history intact; alice links a second browser
-// (QR text typed across, the 6-digit codes compared), which then shows her channel and her moved DM; and revoking it
-// signs it out so it receives nothing more.
+// (QR text typed across, the 6-digit codes compared), which then shows her channel and her moved DM; the linked
+// browser then takes over as primary under a new account key (contacts follow the signed record); and revoking the
+// old one from it signs that out so it receives nothing more.
 // Starts its own signaling server on a throwaway DATA_DIR. Usage: node tests/browser/linking.mjs
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -178,29 +179,78 @@ try {
   await shot(laptop, 'linked');
   step('the linked browser joins #Team by itself (earlier messages only as labelled history from the primary), shows the moved DM with its history, and sends in it');
 
-  // ---------- Revoke it ----------
-  await alice.click('#conv-back');
+  // ---------- The laptop takes over as primary (m5 §5) ----------
+  const oldIdentity = await alice.evaluate(async () => (await (await fetch('/api/keys/count')).json()).identity);
+  await laptop.click('#conv-back').catch(() => {});
+  await laptop.click('#account-menu summary'); await laptop.click('#account-settings');
+  await laptop.locator('.device-become-primary').click({ timeout: TIMEOUT });
+  await visible(laptop, '#link-qr svg');
+  const transferText = (await laptop.textContent('#link-code')).replace(/\s+/g, '');
+  await alice.click('#conv-back').catch(() => {});
   await alice.click('#account-menu summary'); await alice.click('#account-settings');
-  const laptopDevice = await laptop.evaluate(() => JSON.parse(localStorage.getItem(`linked-store-v1:${window.App.accountId}`)).deviceId);
-  const laptopRow = alice.locator('#device-list .device-row[data-state="listed"]').filter({ hasNot: alice.locator('small', { hasText: 'This browser' }) });
-  await laptopRow.getByRole('button', { name: /^Revoke/ }).click();
-  await until(alice, () => /revoked/i.test(document.getElementById('devices-status').textContent));
-  await alice.evaluate(() => { document.getElementById('settings').open = false; });
-  await visible(laptop, '#welcome', 30000); // its session ended
-  await say(bob, 'After the laptop was revoked').catch(async () => { await openDm(bob, 'alice'); await say(bob, 'After the laptop was revoked'); });
-  await openDm(alice, 'bob');
-  await sees(alice, 'After the laptop was revoked');
+  await alice.locator('#device-list .device-promote').click({ timeout: TIMEOUT });
+  await visible(alice, '#link-code-input');
+  await alice.fill('#link-code-input', transferText);
+  await alice.click('#link-code-submit');
+  await visible(alice, '#link-confirm');
+  const transferCode = await alice.textContent('#link-sas');
+  await until(laptop, code => document.getElementById('link-status').textContent.includes(code), transferCode);
+  await shot(alice, 'transfer');
+  await alice.click('#link-match');
+  await until(laptop, () => /now your primary/.test(document.getElementById('link-status').textContent), undefined, 60000);
+  await until(alice, () => /now your primary/.test(document.getElementById('link-status').textContent), undefined, 60000);
+  // Both reload: the laptop as the primary under a new account key, alice's first browser as a linked device of it.
+  await alice.waitForLoadState('load'); await laptop.waitForLoadState('load');
+  await visible(alice, '#chats', 60000); await visible(laptop, '#chats', 60000);
+  await until(laptop, () => window.App?.accountId && !localStorage.getItem(`linked-store-v1:${window.App.accountId}`));
+  await until(alice, () => window.App?.accountId && localStorage.getItem(`linked-store-v1:${window.App.accountId}`));
+  const newIdentity = await laptop.evaluate(async () => (await (await fetch('/api/keys/count')).json()).identity);
+  if (!newIdentity || newIdentity.sign === oldIdentity.sign) throw new Error('the account key did not move');
+  const view = await laptop.evaluate(async () => (await fetch(`/api/devices/alice`)).json());
+  if (view.list?.version !== 1 || view.list.devices.length !== 2 || view.succession?.length !== 1 || view.devices.find(row => row.current)?.primary !== true) throw new Error(`unexpected device view after the transfer: ${JSON.stringify({ version: view.list?.version, devices: view.list?.devices.length, succession: view.succession?.length })}`);
+  // bob's pin followed the signed record: verification state kept, a soft notice instead of a review.
+  await until(bob, async () => (await window.ChatStore.list()).some(record => /alice moved to a new device/.test(record.text || '')), undefined, 60000);
+  // Each of alice's devices recertifies in each group: a self-update with its certificate under the new key.
+  for (const page of [alice, laptop]) await until(page, () => window.Groups.enabled() && window.Groups.sections().rows.every(row => !window.Groups.debug(row.id).recertify), undefined, 60000);
+  await until(bob, async () => { const id = window.Groups.sections().rows[0]?.id; const leaves = id ? await window.Groups.leaves(id) : []; return leaves.length === 3 && leaves.every(leaf => !leaf.stale); }, undefined, 30000);
+  const team = async page => { await page.click('#conv-back').catch(() => {}); const row = page.locator('#channel-list li').filter({ has: page.locator('strong', { hasText: 'Team' }) }); await row.waitFor({ state: 'visible', timeout: 60000 }); await row.locator('.row-button').click(); await visible(page, '#conv-head'); };
+  await team(laptop); await team(alice); await team(bob);
+  await say(laptop, 'The laptop is primary now');
+  await sees(bob, 'The laptop is primary now', 60000); await sees(alice, 'The laptop is primary now', 60000);
+  await say(alice, 'Still here, linked');
+  await sees(bob, 'Still here, linked', 60000); await sees(laptop, 'Still here, linked', 60000);
+  await openDm(laptop, 'bob'); await openDm(bob, 'alice');
+  await say(laptop, 'DM from the new primary');
+  await sees(bob, 'DM from the new primary', 60000);
+  await say(bob, 'DM back to both');
+  await sees(laptop, 'DM back to both', 60000);
+  await openDm(alice, 'bob'); await sees(alice, 'DM back to both', 60000);
+  await shot(laptop, 'transferred');
+  step(`the laptop becomes primary (both showing ${transferCode}): a new account key with a signed record, list v1 naming both, bob's pin follows with a soft notice, both devices recertify and #Team and the DM keep working both ways`);
+
+  // ---------- Revoke the old primary from the new one ----------
+  await laptop.click('#conv-back');
+  await laptop.click('#account-menu summary'); await laptop.click('#account-settings');
+  const aliceDevice = await alice.evaluate(() => JSON.parse(localStorage.getItem(`linked-store-v1:${window.App.accountId}`)).deviceId);
+  const aliceRow = laptop.locator('#device-list .device-row[data-state="listed"]').filter({ hasNot: laptop.locator('small', { hasText: 'This browser' }) });
+  await aliceRow.getByRole('button', { name: /^Revoke/ }).click({ timeout: TIMEOUT });
+  await until(laptop, () => /revoked/i.test(document.getElementById('devices-status').textContent));
+  await laptop.evaluate(() => { document.getElementById('settings').open = false; });
+  await visible(alice, '#welcome', 30000); // its session ended
+  await say(bob, 'After the old browser was revoked').catch(async () => { await openDm(bob, 'alice'); await say(bob, 'After the old browser was revoked'); });
+  await openDm(laptop, 'bob');
+  await sees(laptop, 'After the old browser was revoked');
   // Its leaves left both of alice's groups (#Team and the DM): gone from the MLS trees, not just from the server.
-  await until(alice, async device => {
+  await until(laptop, async device => {
     const bob = (await (await fetch('/api/contacts')).json()).contacts.find(contact => contact.username === 'bob');
     const groups = [window.Groups.dmChannelWith(bob.id), ...window.Groups.sections().rows.map(row => row.id)];
     if (groups.length !== 2 || groups.some(id => !id)) return false;
     for (const id of groups) if ((await window.Groups.leaves(id)).some(leaf => leaf.deviceId === device)) return false;
     return true;
-  }, laptopDevice, 30000);
-  const leaked = await laptop.evaluate(async () => (await window.ChatStore.list()).some(record => record.text === 'After the laptop was revoked'));
+  }, aliceDevice, 30000);
+  const leaked = await alice.evaluate(async () => (await window.ChatStore.list()).some(record => record.text === 'After the old browser was revoked'));
   if (leaked) throw new Error('a revoked device still received messages');
-  step('alice revokes the laptop: it is signed out at once and receives nothing more');
+  step('the new primary revokes the old browser: it is signed out at once and receives nothing more');
 
   console.log('LINKING E2E PASSED');
 } catch (error) {

@@ -25,10 +25,11 @@
     try { names = JSON.parse(localStorage.getItem(namesKey()) || '{}') || {}; } catch { names = {}; }
   }
   let saveTimer = null;
-  function save() {
+  function persist() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => { try { localStorage.setItem(stateKey(), JSON.stringify(Object.fromEntries(channels))); localStorage.setItem(namesKey(), JSON.stringify(names)); } catch {} }, 50);
+    try { localStorage.setItem(stateKey(), JSON.stringify(Object.fromEntries(channels))); localStorage.setItem(namesKey(), JSON.stringify(names)); } catch {}
   }
+  function save() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 50); }
   function channel(id, defaults = {}) {
     if (!channels.has(id)) channels.set(id, { kind: 'group_dm', serverName: null, meta: null, cursor: 0, status: 'active', unread: 0, mentioned: false, lastAt: 0, members: [], admins: [], ...defaults });
     return channels.get(id);
@@ -112,10 +113,13 @@
       // A linked device (docs/m5-linking.md §1) keeps the store it was linked with; its certificate came in the grant.
       const linked = linkedStore(me.id);
       const aik = linked ? null : (await ctx.box.identity()).pub.sign;
-      // One store per (account, device, account key): a new device id or identity starts clean (m4 §9).
-      instance = linked?.instance || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
+      // One store per (account, device, account key): a new device id or identity starts clean (m4 §9). A primary
+      // transfer (m5 §5) keeps the store under the new key: its core adopted the succession.
+      const kept = (() => { try { return JSON.parse(localStorage.getItem(`group-instance-v1:${me.id}`) || 'null'); } catch { return null; } })();
+      instance = linked?.instance || (kept?.aik === aik && kept.instance) || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
       run = window.Core.groupStore(me.id, instance);
       load();
+      if (linked) await ctx.followOwnSuccession?.().catch(() => {}); // Our account moved to a new primary meanwhile (m5 §5.2 step 6).
       const certified = `mls-cert-v1:${instance}`;
       if (!linked && localStorage.getItem(certified) !== '1') {
         const leaf = await run({ cmd: 'mlsDeviceLeaf' }), issuedAt = Date.now(), F = window.DeviceFormat;
@@ -131,15 +135,44 @@
       await refreshChannels();
       await welcomes();
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
+      for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id);
       flushAll();
       ctx.render();
       removeOwnStale().catch(() => {});
+      ctx.recerts?.(); // Certificates under a new account key: asked for, answered or installed (m5 §5.2.2).
     } catch (error) {
       if (mine !== generation) return;
       reason = `Groups are unavailable on this device: ${error.message || error}`;
       ctx?.render();
     }
   }
+  /**
+   * After this account moved to a new key (m5 §5, §7 "Recertify"): one self-update per group carries this device's
+   * certificate under the new key. Until then the leaf is Previous and the group can't add people. Retried on start.
+   */
+  function recertify(id) {
+    enqueue(id, async () => { await commitInner(id, { update: true }); delete channels.get(id).recertify; save(); }).catch(error => failed(id, error));
+  }
+  /**
+   * The account key moved (m5 §5.2): the core adopts the old key's signed record and `cert`, this device's certificate
+   * under the new key. `before`: on a primary stepping down, the old key and a certificate under it, so the core
+   * becomes a companion first (it then keeps the old key as a predecessor). Every group is marked for recertifying.
+   */
+  async function adoptSuccession({ record, signature, cert, before }) {
+    if (before) await run({ cmd: 'companionSetup', userId: me.id, identity: before.identity, cert: before.cert });
+    const identity = await run({ cmd: 'adoptSuccession', userId: me.id, record, signature, ...(cert ? { cert } : {}) });
+    if (cert) for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true;
+    persist();
+    return identity;
+  }
+  /** A companion's certificate under the account's new key arrived (m5 §5.2.2): install it, then recertify everywhere. */
+  async function installCert(identity, cert) {
+    await run({ cmd: 'companionSetup', userId: me.id, identity, cert });
+    for (const [id, ch] of channels) if (!['left', 'removed'].includes(ch.status)) { ch.recertify = true; if (usable(ch)) recertify(id); }
+    persist();
+  }
+  /** Is exactly this (device, leaf key) of our account already a leaf in a group this device holds? (m5 §5.2.2) */
+  const leafKnown = (target, leafSigKey) => run({ cmd: 'mlsLeafKnown', deviceId: target, leafSigKey, groups: [...channels].filter(([, ch]) => usable(ch)).map(([id]) => id) });
   /** When this device joins the signed list (or anything about our devices changes), try again. */
   function devicesChanged() { if (ctx && !enabled && run && !reason.includes('another tab')) starting = setup(generation); }
   // One upload at a time: start-up and a `keypackages` frame racing would both top up and overshoot the cap.
@@ -506,10 +539,20 @@
       } else await syncInner(id);
     }).catch(error => failed(id, error));
   }
+  /**
+   * A 403 because this device isn't in the account's signed list (yet, or for a moment: a primary transfer re-lists
+   * every device under the new key) removes nothing: groups pause and start again when the list changes.
+   */
+  function unlisted(result) {
+    if (result.status !== 403 || !/signed device list/.test(result.body?.error || '')) return false;
+    enabled = false; reason = 'Groups start once this device is in your signed device list.'; ctx?.render();
+    return true;
+  }
   async function syncInner(id) {
     const ch = channels.get(id);
     for (let pages = 0; pages < 400 && usable(ch); pages++) {
       const result = await call(`/api/channels/${id}/log?after=${ch.cursor}`);
+      if (unlisted(result)) return;
       if (result.status === 404 || result.status === 403) { removed(id, true); return; }
       if (result.status !== 200) throw new Error(result.body.error || 'Could not read the conversation.');
       const page = result.body;
@@ -755,6 +798,7 @@
         continue;
       }
       if (result.status === 423) { setFrozen(id, result.body.frozen); throw coded('stale', 'Frozen'); }
+      if (unlisted(result)) throw coded('stale', 'Unlisted');
       if (result.status === 404 || result.status === 403) { removed(id, true); throw coded('stale', 'Removed'); }
       throw new Error(result.body.error || 'Could not send.');
     }
@@ -1386,6 +1430,8 @@
     /** The DM group this device holds with a contact, if any (m5 §8). */
     dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked === peerId && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
+    /** For a primary transfer (m5 §5): this store's name, its leaf key, its pins, and adopting the new account key. */
+    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown,
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
     bundleChannels: () => [...channels].filter(([, ch]) => ['active', 'frozen', 'paused'].includes(ch.status) && ch.kind !== 'dm').map(([id, ch]) => ({ id, kind: ch.kind, name: ch.meta?.name || ch.serverName || null, topic: ch.meta?.topic || null })), sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
@@ -1402,6 +1448,6 @@
     // For tests and diagnostics: the state of one channel on this device.
     /** For tests and diagnostics: the devices in this device's copy of a group's tree. */
     leaves: id => run ? run({ cmd: 'mlsMembers', group: id }).then(list => list.map(member => ({ userId: member.userId, deviceId: member.deviceId, stale: Boolean(member.stale) }))) : Promise.resolve([]),
-    debug: id => { const ch = channels.get(id); return ch && { status: ch.status, cursor: ch.cursor, kind: ch.kind, members: ch.members.map(member => member.username), admins: ch.admins }; },
+    debug: id => { const ch = channels.get(id); return ch && { status: ch.status, cursor: ch.cursor, kind: ch.kind, recertify: Boolean(ch.recertify), members: ch.members.map(member => member.username), admins: ch.admins }; },
   });
 })();

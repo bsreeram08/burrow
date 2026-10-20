@@ -147,5 +147,8 @@ class RustGroupCrypto implements GroupCrypto {
   Future<GroupView> view(String groupId) => _call(() async => _view(await core.mlsGroupView(groupId: groupId)));
 
   @override
+  Future<String> deviceLeaf() => _call(core.mlsDeviceLeaf);
+
+  @override
   Future<void> checkDm(String groupId, String peer) => _call(() => core.mlsCheckDm(groupId: groupId, peerUserId: peer));
 }

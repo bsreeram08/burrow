@@ -198,6 +198,8 @@ class AppState {
     this.groupTyping = const {},
     this.pausedGroups = const {},
     this.groupsUnavailable,
+    this.companion = false,
+    this.movedChats = const {},
   });
   final AuthPhase phase;
   final User? user;
@@ -231,6 +233,12 @@ class AppState {
   /// Why groups are off on this device, if they are.
   final String? groupsUnavailable;
 
+  /// This install is a linked device of the account (m5 §0): 1:1 chats stay on the primary until they move.
+  final bool companion;
+
+  /// Contacts whose 1:1 chat moved to MLS here (m5 §8).
+  final Set<String> movedChats;
+
   AppState copyWith({
     AuthPhase? phase,
     User? user,
@@ -251,6 +259,8 @@ class AppState {
     Map<String, String>? pausedGroups,
     String? groupsUnavailable,
     bool clearGroupsUnavailable = false,
+    bool? companion,
+    Set<String>? movedChats,
   }) => AppState(
     phase: phase ?? this.phase,
     user: user ?? this.user,
@@ -267,6 +277,8 @@ class AppState {
     groupTyping: groupTyping ?? this.groupTyping,
     pausedGroups: pausedGroups ?? this.pausedGroups,
     groupsUnavailable: clearGroupsUnavailable ? null : groupsUnavailable ?? this.groupsUnavailable,
+    companion: companion ?? this.companion,
+    movedChats: movedChats ?? this.movedChats,
   );
 }
 
@@ -324,15 +336,51 @@ class AppController extends Notifier<AppState> {
     await _signedIn(result.user, result.token);
   }
 
-  Future<void> _signedIn(User user, String token) async {
+  /// The device-key slot of an install that is linking and doesn't know its account yet.
+  static const _linkOwner = '__link__';
+
+  /// Welcome → "Link to my account" (m5 §1): this install shows a QR (or, with [username], an 8-character code
+  /// for that account). Its key database is a fresh one under a link-scoped name, kept for the account once
+  /// linked; the device key too.
+  Future<NewDeviceLink> startLink({String? username}) async {
+    final device = await localDevice(await ref.read(devicePrefsProvider)(), _linkOwner);
+    await _crypto.init('keys-link-${device.deviceId}');
+    return NewDeviceLink.start(
+      api: _api,
+      link: ref.read(linkCryptoProvider),
+      groups: ref.read(groupCryptoProvider),
+      device: device,
+      platform: _api.client,
+      label: platformLabel(_api.client),
+      username: username?.trim().toLowerCase(),
+    );
+  }
+
+  /// The primary granted the link: check it, keep the core and device key for the account, sign in as a
+  /// linked device, and install the bundle's history and channel names.
+  Future<void> finishLink(NewDeviceLink link) async {
+    final setup = await link.waitGrant();
+    final prefs = await ref.read(devicePrefsProvider)();
+    final key = await prefs.readDevice(_linkOwner);
+    if (key != null) await prefs.writeDevice(setup.user.id, key);
+    await prefs.writeDevice(_linkOwner, 'null'); // The next link starts with a new device.
+    prefs.setPin(setup.user.id, setup.user.id, setup.pin);
+    await (await SharedPreferences.getInstance()).setString('linked-core-v1:${setup.user.id}', 'keys-link-${link.deviceId}');
+    await _signedIn(setup.user, setup.token, linked: setup.bundle);
+  }
+
+  Future<void> _signedIn(User user, String token, {Map<String, Object?>? linked}) async {
     _api.token = token;
     await ref.read(tokenStoreProvider).write(token);
     await ref.read(themePrefsProvider.notifier).load(user.id);
     await ref.read(chatSettingsProvider.notifier).load(user.id);
     final dbStore = await ref.read(storeOpenerProvider)(user.id);
     store = dbStore;
+    var companion = false;
     try {
-      await _crypto.init('keys-${user.id}');
+      // A linked install keeps the key database it linked with.
+      await _crypto.init((await SharedPreferences.getInstance()).getString('linked-core-v1:${user.id}') ?? 'keys-${user.id}');
+      companion = await ref.read(linkCryptoProvider).account() != null;
     } on CryptoException catch (error) {
       if (!error.keysLocked) rethrow;
       // Signed in, but encrypted messaging stays off until the user chooses recovery. Never reset silently.
@@ -354,7 +402,7 @@ class AppController extends Notifier<AppState> {
       rotation: await ref.read(rotationPrefsProvider)(user.id),
       devices: await ref.read(devicePrefsProvider)(),
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
-    );
+    )..companion = companion;
     messenger = m;
     final sync = GroupSync(
       api: _api,
@@ -365,6 +413,7 @@ class AppController extends Notifier<AppState> {
       platform: _api.client,
       ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
       verifiedOwnDevices: m.verifiedOwnDevices,
+      companion: companion,
       tagLog: SharedTagRollbackLog(await SharedPreferences.getInstance(), user.id),
       sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
       ackWelcome: events.ack,
@@ -397,7 +446,8 @@ class AppController extends Notifier<AppState> {
       ..add(m.activeChanges.listen((active) => state = state.copyWith(inactiveDevice: !active)))
       ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
       ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
-    state = state.copyWith(phase: AuthPhase.signedIn, user: user, clearNotice: true);
+    if (linked != null) await installLinkBundle(linked, dbStore, sync);
+    state = state.copyWith(phase: AuthPhase.signedIn, user: user, companion: companion, clearNotice: true);
     await _loadGroups();
     unawaited(_checkActive());
     await loadContacts();
@@ -413,8 +463,11 @@ class AppController extends Notifier<AppState> {
     if (s == null) return;
     try {
       // A 1:1 chat's DM group shows as that chat, never as a group.
-      final list = [for (final g in await s.groups()) if (g.kind != GroupKindName.dm) g];
-      state = state.copyWith(groups: list);
+      final all = await s.groups();
+      state = state.copyWith(
+        groups: [for (final g in all) if (g.kind != GroupKindName.dm) g],
+        movedChats: {for (final g in all) if (g.kind == GroupKindName.dm && g.active && g.dmChecked && g.movedAt != null) ?g.peer},
+      );
     } catch (_) {}
   }
 
@@ -518,6 +571,11 @@ class AppController extends Notifier<AppState> {
   }
 
   Future<void> _checkActive() async {
+    if (messenger?.companion ?? false) {
+      // A linked device: groups (and moved chats) only; the account's keys are on the primary.
+      if (!(groups?.ready ?? true)) await _startGroups();
+      return;
+    }
     try {
       final active = await messenger?.checkActive();
       if (active != null) state = state.copyWith(inactiveDevice: !active);

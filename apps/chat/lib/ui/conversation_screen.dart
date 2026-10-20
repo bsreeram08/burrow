@@ -13,6 +13,7 @@ import '../app/chat_settings.dart';
 import '../core/api.dart';
 import '../crypto/chat_crypto.dart';
 import '../messaging/attachments.dart';
+import '../messaging/messenger.dart' show companionNotice;
 import '../store/message.dart';
 import '../theme/theme_prefs.dart';
 import 'command_palette.dart';
@@ -254,7 +255,10 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
         ),
         body: _messages == null
             ? const SizedBox.shrink()
-            : _dropTarget(
+            : _onPrimaryNotice(
+                show: state.companion && !state.movedChats.contains(widget.contactId),
+                color: tokens.muted,
+                child: _dropTarget(
                 accent: tokens.accent,
                 child: ValueListenableBuilder<List<PendingUpload>>(
                   valueListenable: _attachments.uploads,
@@ -280,9 +284,20 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
                   ),
                 ),
               ),
+              ),
       ),
     );
   }
+
+  /// A linked device sends here only once the chat moved to MLS (m5 §8); until then it is on the primary.
+  Widget _onPrimaryNotice({required bool show, required Color color, required Widget child}) => !show
+      ? child
+      : Column(
+          children: [
+            Padding(padding: const EdgeInsets.all(12), child: Text(companionNotice, key: const Key('companion-notice'), style: TextStyle(color: color))),
+            Expanded(child: child),
+          ],
+        );
 
   static final _desktop = !kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
 

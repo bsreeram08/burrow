@@ -98,6 +98,24 @@ void main() {
     await dir.delete(recursive: true);
   });
 
+  test('a linked device imports its bundle history once: malformed records skipped, queued ones not resent', () async {
+    final id = const Uuid().v4(), queued = const Uuid().v4();
+    final records = [
+      {'id': id, 'conversationId': dm, 'direction': 'incoming', 'text': 'imported', 'createdAt': now, 'status': 'read', 'expiresAt': null, 'reactions': {'me': ['👍']}},
+      {'id': queued, 'conversationId': dm, 'direction': 'outgoing', 'text': 'never sent', 'createdAt': now, 'status': 'queued', 'expiresAt': null},
+      {'id': 'not-a-uuid', 'conversationId': dm, 'direction': 'incoming', 'text': 'x', 'createdAt': now, 'status': 'read'},
+      {'id': const Uuid().v4(), 'conversationId': group, 'direction': 'incoming', 'text': 'from alice', 'createdAt': now, 'status': 'delivered', 'from': alice, 'fromName': 'alice'},
+      'junk',
+    ];
+    expect(await store.importLinked(records), 3);
+    expect(await store.importLinked(records), 0, reason: 'already there');
+    final list = await store.list(dm);
+    expect(list.firstWhere((m) => m.id == id).reactions.of('me'), ['👍']);
+    expect(list.firstWhere((m) => m.id == queued).status, MessageStatus.uncertain);
+    expect(await store.queued(), isEmpty);
+    expect((await store.list(group)).single.sender, alice);
+  });
+
   test('group records: create, update atomically, pin, unread, frozen, remove with history', () async {
     await store.putGroup(GroupConversation(id: group, kind: GroupKindName.private, createdAt: now));
     await store.updateGroup(group, (g) => g.copyWith(name: 'design', unread: 2, mentioned: true, pinned: true, cursor: 7, frozen: const Frozen(seq: 7, digest: 'd')));

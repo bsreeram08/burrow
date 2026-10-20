@@ -5,9 +5,11 @@ import 'dart:math' as math;
 import '../core/api.dart';
 import '../core/devices.dart';
 import '../crypto/chat_crypto.dart';
+import '../crypto/group_crypto.dart' show GroupCrypto;
 import '../crypto/link_crypto.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
+import 'group_sync.dart' show GroupSync;
 import 'messenger.dart';
 
 /// Bundle limits (docs/m5-linking.md §2): history of at most 20 conversations, 200 messages each; at most 16
@@ -120,7 +122,7 @@ class PrimaryLink {
     final me = _ctx.messenger.me;
     final metaKey = deviceMetaKey(await _ctx.crypto.deviceMetaSignature(me.id));
     final now = _ctx.now();
-    final entry = <String, Object?>{'deviceId': h.deviceId, 'addedAt': now, 'meta': sealMeta(metaKey, me.id, h.deviceId, label: h.label.isEmpty ? _platformLabel(h.platform) : h.label, platform: h.platform)};
+    final entry = <String, Object?>{'deviceId': h.deviceId, 'addedAt': now, 'meta': sealMeta(metaKey, me.id, h.deviceId, label: h.label.isEmpty ? platformLabel(h.platform) : h.label, platform: h.platform)};
     final published = await _ctx.messenger.publishNextList(add: entry);
     final cert = await _ctx.link.signDeviceCert(userId: me.id, deviceId: h.deviceId, platform: h.platform, leafSigKey: h.leafSigKey, issuedAt: now);
     final identity = await _ctx.crypto.identity();
@@ -165,7 +167,206 @@ class PrimaryLink {
   }
 }
 
-String _platformLabel(String platform) =>
+/// What a new device learned from a checked grant (§1.6): its session, the account, and what to install.
+class LinkedSetup {
+  const LinkedSetup({required this.user, required this.token, required this.identity, required this.pin, required this.metaKey, required this.bundle});
+  final User user;
+  final String token;
+
+  /// The account's public identity, from the QR-authenticated primary (never from the server).
+  final Identity identity;
+
+  /// Our own account's list as it verified under [identity]: the pin to keep.
+  final DevicePin pin;
+
+  /// The device-label key (§1.4 `metaKey`).
+  final String metaKey;
+
+  /// The bundle (§2): pins, channel names, conversations and their history.
+  final Map<String, Object?> bundle;
+}
+
+/// This device joins an account as a linked device (docs/m5-linking.md §1, §1.6, §1.7): it shows a QR (or an
+/// 8-character code for one account), both screens show the same 6 digits, the primary signs it in, and it
+/// checks the grant before trusting any of it. Its core must be fresh (no identity of its own).
+class NewDeviceLink {
+  NewDeviceLink._(this._api, this._link, this._groups, this._device, this._wait, {required this.linkId, required this.claim, required this.platform, required this.label, this.qr, this.shortCode});
+
+  final Api _api;
+  final LinkCrypto _link;
+  final GroupCrypto _groups;
+  final LocalDevice _device;
+  final Future<void> Function(Duration) _wait;
+  final String linkId;
+  final String claim;
+  final String platform;
+  final String label;
+
+  /// What to show: the QR text, or (code mode) the 8-character code to type on the primary.
+  final String? qr;
+  final String? shortCode;
+
+  /// "123 456", once the primary offered its key.
+  String? code;
+  String? _leaf;
+
+  String get deviceId => _device.deviceId;
+
+  static Future<NewDeviceLink> start({
+    required Api api,
+    required LinkCrypto link,
+    required GroupCrypto groups,
+    required LocalDevice device,
+    required String platform,
+    required String label,
+    String? username,
+    Future<void> Function(Duration)? wait,
+  }) async {
+    final started = await api.linkStart(
+      purpose: 'link',
+      mode: username == null ? 'qr' : 'code',
+      username: username,
+      deviceId: device.deviceId,
+      deviceKey: device.publicKey,
+      platform: platform,
+      signature: device.sign(linkStartBytes(device.deviceId, platform, device.publicKey)),
+    );
+    final linkId = started['linkId'] as String, claim = started['claim'] as String;
+    try {
+      String? qr;
+      if (username == null) {
+        qr = await link.qr(linkId);
+      } else {
+        await api.linkCommit(linkId, await link.commit(linkId, device.deviceId), claim: claim);
+      }
+      return NewDeviceLink._(api, link, groups, device, wait ?? ((d) => Future<void>.delayed(d)),
+          linkId: linkId, claim: claim, platform: platform, label: label, qr: qr, shortCode: username == null ? null : started['code'] as String?);
+    } catch (_) {
+      await link.end(linkId).catchError((_) {});
+      unawaited(api.linkCancel(linkId, claim: claim).catchError((_) {}));
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> _until(bool Function(Map<String, dynamic> state) ok, Duration timeout) async {
+    final end = DateTime.now().add(timeout);
+    while (true) {
+      final state = await _api.linkState(linkId, claim: claim);
+      if (state['state'] == 'expired') throw const StoreException('The link expired. Start again on both devices.');
+      if (ok(state)) return state;
+      if (DateTime.now().isAfter(end)) throw const StoreException('The link expired. Start again on both devices.');
+      await _wait(const Duration(milliseconds: 1500));
+    }
+  }
+
+  /// Waits for the primary's key, derives the 6 digits, and introduces this device (sealed) so the primary can
+  /// show its name next to them.
+  Future<String> waitOffer({Duration timeout = const Duration(minutes: 10)}) async {
+    final offered = await _until((s) => (s['state'] == 'offered' || s['state'] == 'granted') && s['eph'] is String, timeout);
+    final eph = offered['eph'] as String;
+    final String digits;
+    if (shortCode == null) {
+      digits = await _link.complete(linkId, eph);
+    } else {
+      final revealed = await _link.reveal(linkId, eph);
+      await _api.linkReveal(linkId, eph: revealed.eph, nonce: revealed.nonce, claim: claim);
+      digits = await _link.completeCode(linkId, ephP: eph, deviceP: offered['offerDeviceId'] as String);
+    }
+    code = digits;
+    final leaf = _leaf = await _groups.deviceLeaf();
+    final hello = {'v': 1, 'type': 'hello', 'deviceId': deviceId, 'platform': platform, 'label': label, 'leafSigKey': leaf, 'wantsHistory': true};
+    await _api.linkSend(linkId, await _link.seal(linkId, jsonEncode(hello)), claim: claim);
+    return digits;
+  }
+
+  /// After the user tapped Link on the primary: take the session, read the grant and the bundle, and check
+  /// them (§1.6) before installing the account in the core and importing the pins.
+  Future<LinkedSetup> waitGrant({Duration timeout = const Duration(minutes: 10)}) async {
+    final leaf = _leaf ?? (throw StateError('waitOffer first'));
+    await _until((s) => s['state'] == 'granted', timeout);
+    final claimed = await _api.linkClaim(linkId, claim: claim, signature: _device.sign(linkClaimBytes(linkId, deviceId, claim)));
+    _api.token = claimed.token;
+    Map<String, dynamic>? grant;
+    final chunks = <String>[];
+    var after = 0;
+    final end = DateTime.now().add(timeout);
+    while (grant == null || chunks.length < (grant['chunks'] as int)) {
+      for (final m in await _api.linkMessages(linkId, after: after, claim: claim)) {
+        after = m.seq;
+        final value = jsonDecode(await _link.open(linkId, m.data));
+        if (value is! Map || value['v'] != 1) throw const StoreException('The other device sent something unexpected.');
+        if (grant == null) {
+          if (value['type'] != 'grant' || value['chunks'] is! int || (value['chunks'] as int) > bundleChunks) throw const StoreException('The other device sent something unexpected.');
+          grant = value.cast<String, dynamic>();
+        } else if (value['type'] == 'bundle' && value['i'] == chunks.length && value['of'] == grant['chunks'] && value['data'] is String) {
+          chunks.add(utf8.decode(unb64(value['data'] as String)));
+        } else {
+          throw const StoreException('The other device sent something unexpected.');
+        }
+      }
+      if (grant != null && chunks.length >= (grant['chunks'] as int)) break;
+      if (DateTime.now().isAfter(end)) throw const StoreException('The link expired. Start again on both devices.');
+      await _wait(const Duration(milliseconds: 1000));
+    }
+    Map<String, Object?> bundle = const {};
+    try {
+      if (chunks.isNotEmpty) bundle = (jsonDecode(chunks.join()) as Map).cast<String, Object?>();
+    } catch (_) {
+      throw const StoreException('The other device sent something unexpected.');
+    }
+    const wrong = StoreException("This doesn't look like your account. Nothing was set up.");
+    final user = claimed.user, me = await _api.me();
+    final identityJson = grant['identity'];
+    if (grant['deviceId'] != deviceId || grant['userId'] != user.id || grant['username'] != user.username || me.id != user.id || me.username != user.username) throw wrong;
+    if (identityJson is! Map || grant['cert'] is! String || grant['metaKey'] is! String) throw wrong;
+    final identity = Identity.fromJson(identityJson.cast<String, dynamic>());
+    // The list the server serves must be the one the grant names, signed by the account key the primary showed.
+    final view = await _api.devices(user.username);
+    final check = verifyView(userId: user.id, aikSign: identity.sign, list: view['list'], signature: view['signature'], certs: view['certs']);
+    final pin = check.pin;
+    if (pin == null || check.version != grant['listVersion'] || check.hash != grant['listHash'] || !pin.devices.contains(deviceId)) throw wrong;
+    // The certificate must name this device and its leaf key and verify under that account key (the core checks).
+    final cert = await _link.companionSetup(userId: user.id, identity: identity, certJson: grant['cert'] as String);
+    if (cert.deviceId != deviceId || cert.leafSigKey != leaf || cert.userId != user.id) throw wrong;
+    final pins = <PinExport>[];
+    for (final p in (bundle['pins'] as List? ?? const [])) {
+      try {
+        pins.add(PinExport.fromJson(p));
+      } on FormatException {
+        // A malformed pin is skipped; that contact goes through the usual first-contact check.
+      }
+    }
+    if (pins.isNotEmpty) await _link.importPins(pins).catchError((_) => 0);
+    await _link.end(linkId).catchError((_) {});
+    return LinkedSetup(user: user, token: claimed.token, identity: identity, pin: pin, metaKey: grant['metaKey'] as String, bundle: bundle);
+  }
+
+  /// The user left the link screen before it finished: nothing was installed.
+  Future<void> cancel() async {
+    await _link.end(linkId).catchError((_) {});
+    try {
+      await _api.linkCancel(linkId, claim: claim);
+    } catch (_) {}
+  }
+}
+
+/// A checked link bundle on the new device (m5 §2, §3): history as received, and channel names for when this
+/// device joins those channels.
+Future<void> installLinkBundle(Map<String, Object?> bundle, MessageStore store, GroupSync sync) async {
+  for (final c in (bundle['channels'] as List? ?? const []).take(500)) {
+    if (c is! Map || c['id'] is! String || !groupIdPattern.hasMatch(c['id'] as String)) continue;
+    final name = c['name'] is String ? c['name'] as String : '', topic = c['topic'] is String ? c['topic'] as String : '';
+    sync.bundleNames[c['id'] as String] = (name: String.fromCharCodes(name.runes.take(64)), topic: String.fromCharCodes(topic.runes.take(256)));
+  }
+  final records = [
+    for (final c in (bundle['conversations'] as List? ?? const []).take(bundleConversations))
+      if (c is Map && c['history'] is List) ...(c['history'] as List).reversed.take(bundleMessages).toList().reversed,
+  ];
+  if (records.isNotEmpty) await store.importLinked(records);
+}
+
+/// What a device is called when it has no label of its own.
+String platformLabel(String platform) =>
     const {'web': 'Web browser', 'ios': 'iPhone app', 'android': 'Android app', 'macos': 'Mac app', 'windows': 'Windows app', 'linux': 'Linux app'}[platform] ?? 'Device';
 
 /// What a link needs from the rest of the app.

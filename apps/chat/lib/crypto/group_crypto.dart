@@ -144,6 +144,10 @@ abstract class GroupCrypto {
   /// Calling it again returns the same device.
   Future<GroupDevice> initDevice({required String userId, required String deviceId, required String platform, required int issuedAt});
 
+  /// This device's MLS leaf signature key (base64url), made on first use: a new device sends it in its link
+  /// hello before it has a certificate (m5 §1.4).
+  Future<String> deviceLeaf();
+
   /// [count] one-time KeyPackages (1-100), or one last-resort one.
   Future<List<String>> keyPackages(int count, {bool lastResort = false});
 

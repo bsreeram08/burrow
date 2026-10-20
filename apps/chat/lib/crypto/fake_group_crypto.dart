@@ -60,6 +60,9 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
+  Future<String> deviceLeaf() async => base64Url.encode(sha256.convert(utf8.encode('leaf:$userId:$deviceId')).bytes).replaceAll('=', '');
+
+  @override
   Future<List<String>> keyPackages(int count, {bool lastResort = false}) async {
     _requireDevice();
     if (count < 1 || count > 100) throw const CryptoException('1-100 KeyPackages', code: 'invalid');

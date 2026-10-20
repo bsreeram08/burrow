@@ -29,6 +29,15 @@ fn roles_of(value: &Value) -> Result<crate::mls::policy::Roles> {
     serde_json::from_value(value.clone()).map_err(|_| ChatError::coded("invalid", "malformed roles"))
 }
 
+/// The optional `expect` of `mlsReceive` and `dsSubmit`: `"application"` or `"commit"`.
+fn expect(command: &Value) -> Result<Option<crate::mls::engine::Expect>> {
+    match command.get("expect") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => crate::mls::engine::Expect::parse(text).map(Some),
+        Some(_) => Err(ChatError::coded("invalid", "expect must be a string")),
+    }
+}
+
 fn ok<T: serde::Serialize>(value: T) -> Result<Value> { Ok(serde_json::to_value(value).expect("serializes")) }
 
 /// `None`: not an MLS command.
@@ -104,7 +113,7 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
             "mlsForget" => { groups.forget_group(store, &group()?)?; Ok(Value::Null) }
             "mlsEncrypt" => ok(groups.encrypt(store, &group()?, &text(command, "plaintext")?)?),
             "mlsReceive" => {
-                let processed = groups.process(store, &group()?, &text(command, "message")?)?;
+                let processed = groups.process_as(store, &group()?, &text(command, "message")?, expect(command)?)?;
                 // Like `decrypt`: commit unless the caller wants to store the message first (commit: false).
                 if command.get("commit").and_then(Value::as_bool).unwrap_or(true) { groups.commit_pending(store, &processed.pending_id)?; }
                 ok(processed)
@@ -131,7 +140,7 @@ fn run_ds(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> 
             "dsCreate" => Ok(ds.create(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
             "dsKeyPackage" => ok(ds.key_package(store, &text(command, "keyPackage")?)?),
             "dsMembers" => ok(ds.members(store, &group()?)?),
-            "dsSubmit" => ok(ds.submit(store, &group()?, &text(command, "message")?)?),
+            "dsSubmit" => ok(ds.submit_as(store, &group()?, &text(command, "message")?, expect(command)?)?),
             "dsEpoch" => Ok(json!(ds.epoch(&group()?)?)),
             "dsTree" => ok(ds.tree(&group()?)?),
             "dsSnapshot" => ok(ds.snapshot(&group()?)?),

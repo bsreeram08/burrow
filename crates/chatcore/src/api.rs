@@ -105,7 +105,7 @@ pub fn sas_code(local_sdp: String, remote_sdp: String, my_nonce: String, peer_no
 #[cfg(feature = "mls")]
 pub use crate::mls::cert::DeviceCert;
 #[cfg(feature = "mls")]
-pub use crate::mls::engine::{GroupView, MemberView, Outgoing, PendingCommit, Processed};
+pub use crate::mls::engine::{Expect, GroupView, MemberView, Outgoing, PendingCommit, Processed};
 #[cfg(feature = "mls")]
 pub use crate::mls::payload::Context as PayloadContext;
 #[cfg(feature = "mls")]
@@ -189,8 +189,10 @@ pub fn mls_encrypt(group_id: String, plaintext: String) -> Result<String> {
 
 /// Phase one of receiving a message from the group's log; store the result, then `mls_receive_commit(pending_id)`.
 #[cfg(feature = "mls")]
-pub fn mls_receive(group_id: String, message: String) -> Result<Processed> {
-    with_groups(|groups, store| groups.process(store, &crate::mls::engine::group_id(&group_id)?, &message))
+/// `expect`: what the log entry's kind says it is (`Application` or `Commit`); a mismatch is refused before anything
+/// is staged. Pass it whenever the entry's kind is known.
+pub fn mls_receive(group_id: String, message: String, expect: Option<Expect>) -> Result<Processed> {
+    with_groups(|groups, store| groups.process_as(store, &crate::mls::engine::group_id(&group_id)?, &message, expect))
 }
 #[cfg(feature = "mls")]
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }

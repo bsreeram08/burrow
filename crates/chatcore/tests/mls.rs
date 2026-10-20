@@ -64,6 +64,14 @@ fn two_devices_and_a_delivery_service_over_json_commands() {
     assert_eq!(received["sender"]["userId"], alice_id);
     assert_eq!(received["sender"]["admin"], true);
 
+    // `expect` names what a log entry should be; the wrong kind is refused before anything is staged.
+    let probe = call(&mut alice, json!({ "cmd": "mlsEncrypt", "group": group, "plaintext": "{}" }));
+    assert_eq!(fails(&mut bob, json!({ "cmd": "mlsReceive", "group": group, "message": probe, "expect": "commit" }))["code"], "invalid");
+    assert_eq!(fails(&mut bob, json!({ "cmd": "mlsReceive", "group": group, "message": probe, "expect": "proposal" }))["code"], "invalid");
+    assert_eq!(fails(&mut ds, json!({ "cmd": "dsSubmit", "group": group, "message": probe, "expect": "commit" }))["code"], "invalid");
+    assert_eq!(call(&mut ds, json!({ "cmd": "dsSubmit", "group": group, "message": probe, "expect": "application" }))["accepted"]["epoch"], 1);
+    assert_eq!(call(&mut bob, json!({ "cmd": "mlsReceive", "group": group, "message": probe, "expect": "application" }))["plaintext"], "{}");
+
     // Two-phase receive: nothing persists until the caller commits.
     let second = call(&mut alice, json!({ "cmd": "mlsEncrypt", "group": group, "plaintext": "{}" }));
     let staged = call(&mut bob, json!({ "cmd": "mlsReceive", "group": group, "message": second, "commit": false }));

@@ -9,7 +9,7 @@ use rand_core::OsRng;
 
 use super::harness::*;
 use crate::mls::cert::{key32, DeviceCert};
-use crate::mls::engine::group_id;
+use crate::mls::engine::{group_id, Submit};
 use crate::mls::policy::{capabilities, JoinPolicy, Roles};
 use crate::mls::{CS, ROLES_EXT};
 use crate::store::Store;
@@ -549,4 +549,85 @@ fn a_pin_that_changes_after_verification_fails_the_next_gated_call() {
     let swapped = DeviceCert::issue(&f.b1.aik, &old.user_id, &rid(), &old.platform, &key32(&old.leaf_sig_key).unwrap(), 0).unwrap();
     f.b1.store.put("mlsx:device", serde_json::json!({ "cert": swapped })).unwrap();
     assert!(f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").is_err());
+}
+
+#[test]
+fn a_caller_that_knows_what_an_entry_is_says_so_and_a_mismatch_is_refused_before_anything_is_staged() {
+    use crate::mls::engine::Expect;
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    f.a1.send(&mut f.server, &g, "hello");
+    f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
+    let (app, commit) = (f.server.log[&g][1].clone(), f.server.log[&g][2].clone());
+    let epoch = f.b1.epoch(&g);
+
+    // The wrong kind, either way, errors; nothing is decrypted, merged or staged.
+    for (message, wrong) in [(&app, Expect::Commit), (&commit, Expect::Application)] {
+        let err = f.b1.groups.process_as(&mut f.b1.store, &gid, message, Some(wrong)).unwrap_err();
+        assert_eq!(err.code(), Some("invalid"), "{err}");
+        assert!(err.message.contains("expected a"), "{err}");
+    }
+    assert_eq!(f.b1.epoch(&g), epoch);
+    // The right kind, or none, goes through (and the refusals above consumed nothing).
+    let first = f.b1.groups.process_as(&mut f.b1.store, &gid, &app, Some(Expect::Application)).unwrap();
+    assert_eq!(first.plaintext.as_deref(), Some("hello"));
+    f.b1.groups.commit_pending(&mut f.b1.store, &first.pending_id).unwrap();
+    let second = f.b1.groups.process_as(&mut f.b1.store, &gid, &commit, Some(Expect::Commit)).unwrap();
+    assert_eq!(second.kind, "commit");
+    f.b1.groups.commit_pending(&mut f.b1.store, &second.pending_id).unwrap();
+    assert_eq!(f.b1.epoch(&g), epoch + 1);
+    // Our own commit is a commit too.
+    let out = f.b1.groups.commit(&mut f.b1.store, &gid, &[], &[], None, true).unwrap();
+    f.server.submit(&g, &out.commit).unwrap();
+    assert!(f.b1.groups.process_as(&mut f.b1.store, &gid, &out.commit, Some(Expect::Application)).is_err());
+    assert_eq!(f.b1.groups.process_as(&mut f.b1.store, &gid, &out.commit, Some(Expect::Commit)).unwrap().kind, "own");
+    // The JSON spelling.
+    assert_eq!(Expect::parse("application").unwrap(), Expect::Application);
+    assert!(Expect::parse("proposal").is_err());
+}
+
+#[test]
+fn the_ds_insists_on_the_framing_a_submission_is_for() {
+    use crate::mls::engine::Expect;
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let message = f.a1.groups.encrypt(&mut f.a1.store, &gid, "x").unwrap();
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    let ds = &mut f.server.ds;
+    let err = ds.submit_as(&mut f.server.store, &gid, &out.commit, Some(Expect::Application)).unwrap_err();
+    assert!(err.message.contains("expected a application message, but this is a commit one"), "{err}");
+    assert!(ds.submit_as(&mut f.server.store, &gid, &message, Some(Expect::Commit)).is_err());
+    // Refusals are not conflicts and sequence nothing: both go through for what they are.
+    assert_eq!(ds.epoch(&gid).unwrap(), f.a1.epoch(&g));
+    assert!(matches!(ds.submit_as(&mut f.server.store, &gid, &message, Some(Expect::Application)).unwrap(), Submit::Accepted { .. }));
+    assert!(matches!(ds.submit_as(&mut f.server.store, &gid, &out.commit, Some(Expect::Commit)).unwrap(), Submit::Accepted { .. }));
+}
+
+#[test]
+fn a_commit_sent_as_a_private_message_is_never_applied() {
+    use crate::mls::engine::Expect;
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    // A member that frames its commit as ciphertext, which the DS cannot read: the group is configured to allow it.
+    let hidden = f.a1.groups.scratch(&mut f.a1.store, |p, signer, _| {
+        let mut group = MlsGroup::load(p.storage(), &gid).unwrap().unwrap();
+        let config = MlsGroupJoinConfig::builder().wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY).build();
+        group.set_configuration(p.storage(), &config).unwrap();
+        let bundle = group.commit_builder().force_self_update(true).load_psks(p.storage()).unwrap().build(p.rand(), p.crypto(), signer, |_| true).unwrap().stage_commit(p).unwrap();
+        tls(bundle.commit())
+    });
+    let epoch = f.c1.epoch(&g);
+    // The DS refuses it as a commit; a member refuses it whatever it expects, and its state is untouched.
+    assert!(f.server.ds.submit_as(&mut f.server.store, &gid, &hidden, Some(Expect::Commit)).is_err());
+    for expect in [None, Some(Expect::Application)] {
+        let err = f.c1.groups.process_as(&mut f.c1.store, &gid, &hidden, expect).unwrap_err();
+        assert!(err.message.contains("must be a public message"), "{err}");
+    }
+    assert!(f.c1.groups.process_as(&mut f.c1.store, &gid, &hidden, Some(Expect::Commit)).is_err());
+    assert_eq!(f.c1.epoch(&g), epoch);
+    f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
+    f.c1.sync(&f.server, &g);
 }

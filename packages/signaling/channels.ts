@@ -203,7 +203,7 @@ export function createChannels(deps: Deps) {
                 // Certificates are checked against pinned account keys: needed for handshakes, not for application messages.
                 if (mode !== 'app') pinAccounts(deps, call, [user.id, ...usersOf(current), ...joinerRows.map(row => row!.user_id)]);
                 const before = mode === 'app' ? null : call({ cmd: 'dsSnapshot', group: channelId }) as string;
-                const verdict = call({ cmd: 'dsSubmit', group: channelId, message: text }) as { accepted?: { epoch: number; digest: string }; conflict?: { epoch: number } };
+                const verdict = call({ cmd: 'dsSubmit', group: channelId, message: text, expect: mode === 'app' ? 'application' : 'commit' }) as { accepted?: { epoch: number; digest: string }; conflict?: { epoch: number } };
                 if (verdict.conflict) return { status: 409, body: { error: 'The group moved on. Fetch the log from your cursor, rebuild and retry.', epoch: verdict.conflict.epoch, seq: channel.seq } };
                 const seq = channel.seq + 1, digest = verdict.accepted!.digest, created = now();
                 db.query('INSERT INTO group_log (channel_id, seq, epoch, kind, sender_user, sender_device, digest, message, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
@@ -394,7 +394,7 @@ export function createChannels(deps: Deps) {
         if (!body || !bytes || Object.keys(body).length !== 1) return json({ error: 'Invalid message' }, 400);
         if (wireFormat(bytes) !== 2) return json({ error: 'Application messages are private MLS messages.' }, 400);
         let verdict: { accepted?: unknown; conflict?: { epoch: number } };
-        try { verdict = deps.ds.transaction(call => call({ cmd: 'dsSubmit', group: channelId, message: body.message })); }
+        try { verdict = deps.ds.transaction(call => call({ cmd: 'dsSubmit', group: channelId, message: body.message, expect: 'application' })); }
         catch (error) { if (error instanceof DsError) return json({ error: error.message, code: error.code }, 422); throw error; }
         if (verdict.conflict) return json({ error: 'The group moved on.', epoch: verdict.conflict.epoch }, 409);
         const frame = JSON.stringify({ type: 'ephemeral', channel: channelId, from: { userId: user.id, deviceId }, message: body.message, createdAt: now() });

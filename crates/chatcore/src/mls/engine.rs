@@ -140,6 +140,61 @@ impl Expect {
     }
 }
 
+/// Whether a commit's author can be held to what it contains. A member's commit carries a signature over its
+/// content (proposals, path, group context) and two tags (the membership tag and the confirmation tag) that are NOT
+/// covered by the signature and that only members can check: whoever relays the commit can flip them without
+/// breaking the signature, so a commit rejected for its tags tells nothing about its author.
+/// - `authenticated`: the signature verifies under the author's leaf key in this device's tree.
+/// - `signed_content_invalid`: authenticated, and the signed content fails validation or policy (invalid proposals or
+///   path, a non-admin's add, a bad roles change, ...): the author really signed it.
+/// - `class()`: `signed-content` only for both of the above, else `tag` (a bad tag, a bad signature, anything
+///   outside the signature). Only `signed-content` failures justify removing the author.
+#[cfg(feature = "mls")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommitCheck {
+    pub authenticated: bool,
+    #[serde(rename = "signedContentInvalid")]
+    pub signed_content_invalid: bool,
+    pub class: &'static str,
+    /// The author, when the signature verified.
+    pub author: Option<MemberView>,
+}
+
+#[cfg(feature = "mls")]
+impl CommitCheck {
+    fn new(authenticated: bool, signed_content_invalid: bool, author: Option<MemberView>) -> Self {
+        Self { authenticated, signed_content_invalid, class: if authenticated && signed_content_invalid { "signed-content" } else { "tag" }, author }
+    }
+    pub fn class(&self) -> &'static str { self.class }
+}
+
+/// A commit checked as the delivery service checks it: the signature and the signed content, without the tags.
+#[cfg(feature = "mls")]
+fn check_commit(provider: &Provider, group: &MlsGroup, protocol: ProtocolMessage, store: &mut dyn Store, cert: &DeviceCert) -> Result<CommitCheck> {
+    let ProtocolMessage::PublicMessage(ref message) = protocol else { return Ok(CommitCheck::new(false, false, None)) };
+    let claimed = message.sender().clone();
+    let roles = validate_context(group.extensions())?;
+    let view = |sender: &Sender, processed_leaf: Option<&LeafNode>| match sender {
+        Sender::Member(index) => Groups::member_view(group, &roles, *index),
+        Sender::NewMemberCommit => processed_leaf.and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
+        _ => None,
+    };
+    match group.public_group().process_message(provider.crypto(), protocol) {
+        Ok(processed) => {
+            let sender = processed.sender().clone();
+            let ProcessedMessageContent::StagedCommitMessage(staged) = processed.into_content() else { return Ok(CommitCheck::new(true, true, view(&sender, None))) };
+            let author = view(&sender, staged.update_path_leaf_node());
+            let mut directory = Groups::client_directory(store, cert);
+            let policy = validate_staged(group.extensions(), group.members(), &sender, &staged, &mut directory);
+            Ok(CommitCheck::new(true, policy.is_err(), author))
+        }
+        // Staging happens after the signature has been checked: the author signed content that does not stage.
+        Err(PublicProcessMessageError::InvalidCommit(_)) => Ok(CommitCheck::new(true, true, view(&claimed, None))),
+        // Anything earlier (framing, epoch, signature, credentials): not attributable to the named author.
+        Err(_) => Ok(CommitCheck::new(false, false, None)),
+    }
+}
+
 /// A commit built here and not yet resolved: the DS has neither accepted nor refused it as far as this device knows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCommit {
@@ -686,29 +741,29 @@ impl Groups {
 
     /// [`Groups::process`] for a caller that knows what the entry should be (`expect`): a mismatch is refused before
     /// anything is decrypted, merged or staged.
-    /// Who signed a commit at the group's current epoch, checked against this device's own copy of the tree (the
-    /// signature only: like the delivery service, without the tags only members can check). Changes nothing. For
-    /// resolving a reported commit: the author whose device a rollback removes is decided here, not by the server.
-    pub fn commit_author(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<MemberView> {
+    /// What a commit at the group's current epoch is, judged only by what the delivery service can also see (the
+    /// author's signature and the signed content, not the confirmation and membership tags, which need epoch
+    /// secrets): see [`CommitCheck`]. Changes nothing. For resolving a reported commit: whether the author may be
+    /// removed is decided here, on a member's own tree, never by the server.
+    pub fn commit_author(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<CommitCheck> {
         if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
         let bytes = unb64(message, "message")?;
         bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
         let protocol: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?;
         Expect::check(Some(Expect::Commit), &protocol)?;
+        let cert = Self::device(store)?;
         self.gate(store, group)?;
         let mls_group = Self::load_group(&self.provider, group)?;
         if protocol.epoch() != mls_group.epoch() { return Err(invalid("that commit is not for this group's current epoch")); }
-        let roles = validate_context(mls_group.extensions())?;
-        let processed = mls_group.public_group().process_message(self.provider.crypto(), protocol).map_err(|e| ChatError::coded("auth", &format!("commit signature rejected: {e:?}")))?;
-        let author = match processed.sender() {
-            Sender::Member(index) => Self::member_view(&mls_group, &roles, *index),
-            Sender::NewMemberCommit => match processed.content() {
-                ProcessedMessageContent::StagedCommitMessage(staged) => staged.update_path_leaf_node().and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
-                _ => None,
-            },
-            _ => None,
-        };
-        author.ok_or_else(|| invalid("that commit has no member author"))
+        check_commit(&self.provider, &mls_group, protocol, store, &cert)
+    }
+
+    /// The `poison` error for a commit this device rejects, carrying the class of the failure.
+    #[allow(clippy::too_many_arguments)]
+    fn poisoned(provider: &Provider, group: &MlsGroup, again: ProtocolMessage, store: &mut dyn Store, cert: &DeviceCert, digest: &str, reason: String) -> ChatError {
+        // If the check itself can't run, nothing is known about the author: not attributable, so class `tag`.
+        let class = check_commit(provider, group, again, store, cert).map(|check| check.class()).unwrap_or("tag");
+        ChatError::coded("poison", &format!("poison {digest}: {reason}")).with_class(class)
     }
 
     pub fn process_as(&mut self, store: &mut dyn Store, group: &GroupId, message: &str, expect: Option<Expect>) -> Result<Processed> {
@@ -738,10 +793,11 @@ impl Groups {
             let (epoch, current) = (protocol.epoch().as_u64(), mls_group.epoch().as_u64());
             if is_commit && epoch < current { return Err(ChatError::replay()); }
             if epoch > current { return Err(ChatError::transient("message from a later epoch: process the log in order")); }
-            let poison = |reason: String| ChatError::coded("poison", &format!("poison {message_digest}: {reason}"));
+            // A rejected commit is `poison`, classified by what the author's signature covers (see CommitCheck).
+            let public_copy = if is_commit { Some(MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?) } else { None };
             let processed = match mls_group.process_message(provider, protocol) {
                 Ok(processed) => processed,
-                Err(error) if is_commit => return Err(poison(format!("{error:?}"))),
+                Err(error) if is_commit => return Err(Self::poisoned(provider, &mls_group, public_copy.expect("commit"), store, &cert, &message_digest, format!("{error:?}"))),
                 Err(error) => return Err(classify(&error)),
             };
             let roles = validate_context(mls_group.extensions())?;
@@ -761,12 +817,14 @@ impl Groups {
                     let sender = match sender_index {
                         Some(_) => sender_view(&mls_group),
                         None => staged.update_path_leaf_node().and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
-                    }.ok_or_else(|| poison("unknown committer".into()))?;
-                    {
+                    };
+                    let Some(sender) = sender else { return Err(Self::poisoned(provider, &mls_group, public_copy.expect("commit"), store, &cert, &message_digest, "unknown committer".into())) };
+                    let policy = {
                         let mut directory = Self::client_directory(store, &cert);
-                        validate_staged(mls_group.extensions(), mls_group.members(), &sender_kind, &staged, &mut directory).map_err(|e| poison(e.message))?;
-                    }
-                    mls_group.merge_staged_commit(provider, *staged).map_err(|e| poison(format!("{e:?}")))?;
+                        validate_staged(mls_group.extensions(), mls_group.members(), &sender_kind, &staged, &mut directory)
+                    };
+                    if let Err(error) = policy { return Err(Self::poisoned(provider, &mls_group, public_copy.expect("commit"), store, &cert, &message_digest, error.message)); }
+                    if let Err(error) = mls_group.merge_staged_commit(provider, *staged) { return Err(Self::poisoned(provider, &mls_group, public_copy.expect("commit"), store, &cert, &message_digest, format!("{error:?}"))); }
                     // After the merge: is this device still a member?
                     let removed = !mls_group.is_active();
                     let kind = if removed { "removed" } else { "commit" };

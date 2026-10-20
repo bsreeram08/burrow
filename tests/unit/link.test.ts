@@ -46,4 +46,39 @@ describe('link and succession bytes (shared vectors)', () => {
     const stranger = await key();
     expect(await F.verifySuccession('user_1', { sign: stranger.pub }, served, chain)).toBeNull(); // must start at our pin
   });
+  test('a succession is followed only from an accepted pin: an unreviewed (changed or blocked) one goes to review', async () => {
+    const key = async () => { const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as unknown as CryptoKeyPair; return { pair, pub: Buffer.from(await crypto.subtle.exportKey('raw', pair.publicKey)).toString('base64url') }; };
+    // The server first pushes its own key (pinned, but waiting for review), then serves a chain from it.
+    const [attacker, next] = [await key(), await key()];
+    const body = { v: 1, userId: 'user_1', oldSign: attacker.pub, newSign: next.pub, newDh: b64(9), at: 1 };
+    const chain = [{ ...body, signature: Buffer.from(await crypto.subtle.sign('Ed25519', attacker.pair.privateKey, new Uint8Array(F.successionBytes(body)))).toString('base64url') }];
+    const served = { sign: next.pub, dh: b64(9) }, identity = { sign: attacker.pub, dh: b64(8) };
+    expect(await F.successionFrom('user_1', { identity, verified: false, changed: true, blocked: true }, served, chain)).toBeNull();
+    expect(await F.successionFrom('user_1', { identity, verified: false, changed: true, blocked: false }, served, chain)).toBeNull();
+    expect(await F.successionFrom('user_1', null, served, chain)).toBeNull();
+    expect(await F.successionFrom('user_1', { identity, verified: true, changed: false, blocked: false }, served, chain)).toHaveLength(1); // accepted: followed
+  });
+  test('only devices our own verified list names are re-signed under a new key, with the platform from their sealed label', async () => {
+    const { publicKey, privateKey } = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as unknown as CryptoKeyPair;
+    const aikSign = Buffer.from(await crypto.subtle.exportKey('raw', publicKey)).toString('base64url');
+    const raw = async (bytes: Uint8Array) => new Uint8Array(await crypto.subtle.sign('Ed25519', privateKey, new Uint8Array(bytes)));
+    const sig = async (bytes: Uint8Array) => Buffer.from(await raw(bytes)).toString('base64url');
+    const metaKey = await F.deviceMetaKey('user_1', raw);
+    const [self, laptop, injected] = ['s'.repeat(22), 'l'.repeat(22), 'i'.repeat(22)];
+    const entry = async (deviceId: string, platform: string) => ({ deviceId, addedAt: 1_800_000_000_000, meta: await F.sealMeta(metaKey, 'user_1', deviceId, { label: deviceId, platform }) });
+    const list = { v: 1, userId: 'user_1', version: 1, prevHash: '', devices: [await entry(laptop, 'macos'), await entry(self, 'web')] };
+    const certs: Record<string, string> = {};
+    for (const device of list.devices) certs[device.deviceId] = await sig(F.certBytes(F.certFor('user_1', device)));
+    const view = { list, signature: await sig(F.listBytes(list)), certs };
+    const owned = await F.ownDevices({ userId: 'user_1', aikSign, view, metaKey });
+    expect(owned.devices.map((device: any) => [device.deviceId, device.described.platform])).toEqual([[laptop, 'macos'], [self, 'web']]);
+    expect(F.recertPlatform(owned, laptop, self)).toBe('macos');
+    expect(F.recertPlatform(owned, self, self)).toBeNull(); // never this device
+    expect(F.recertPlatform(owned, injected, self)).toBeNull(); // a known leaf for a device the list doesn't name gets nothing
+    expect(F.recertPlatform(null, laptop, self)).toBeNull();
+    // A device the server slips into the served list (unsigned by us): the whole list is refused, nothing carried over.
+    const slipped = { ...view, list: { ...list, devices: [...list.devices, await entry(injected, 'web')].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) }, certs: { ...certs, [injected]: certs[laptop] } };
+    expect(await F.ownDevices({ userId: 'user_1', aikSign, view: slipped, metaKey })).toBeNull();
+    expect(await F.ownDevices({ userId: 'user_1', aikSign, view: { list: null }, metaKey })).toBeNull();
+  });
 });

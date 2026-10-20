@@ -475,7 +475,7 @@
    * The DS refuses a commit when a member's registry key moved without a signed succession or a recorded identity
    * change: that needs a person to compare codes, so it is reported, never retried as a race.
    */
-  const identityConflict = result => result.status === 409 && (result.body.code === 'identity' || /identity key/i.test(result.body.error || ''));
+  const identityConflict = result => result.status === 409 && result.body.code === 'identity';
   const refused = (result, fallback) => identityConflict(result)
     ? coded('identity', `${result.body.error} Compare security codes with the people here before changing this group.`)
     : Object.assign(new Error(result.body.error || fallback), { status: result.status });

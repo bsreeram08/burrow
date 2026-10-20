@@ -467,3 +467,22 @@ describe('key rotation', () => {
         expect(alice.map.get('peer:bob')).toBeTruthy();
     });
 });
+
+describe('pins', () => {
+    test('a succession accept is bound to the key the chain verified: a different key pinned meanwhile is refused', async () => {
+        const B = Signal.box(memory());
+        const key = async () => (await Signal.generateIdentity()).pub;
+        const [old, served, other] = [await key(), await key(), await key()];
+        await B.notePeer('carol', old);
+        // The chain leads to `served`; meanwhile another key is noted (a concurrent refresh or a fresh session).
+        await Promise.all([B.notePeer('carol', served), B.notePeer('carol', other)]);
+        await expect(B.acceptChange('carol', served)).rejects.toMatchObject({ code: 'mismatch' });
+        await expect(B.setVerified('carol', true, served)).rejects.toMatchObject({ code: 'mismatch' });
+        const pin = await B.peer('carol');
+        expect([pin.identity.sign, pin.blocked, pin.verified]).toEqual([other.sign, true, false]); // left for the usual review
+        // The exact key is accepted.
+        await B.acceptChange('carol', other);
+        expect((await B.peer('carol')).blocked).toBe(false);
+    });
+});
+

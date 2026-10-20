@@ -308,7 +308,8 @@
     if (!box || linked) return;
     if (!await window.Linking.confirmRecovery()) return;
     try {
-      newChain = { keep: [] };
+      // Nothing from the server's list is carried over: the new key's list names only this browser.
+      newChain = { keep: [] }; try { localStorage.removeItem(`new-chain-v1:${me.id}`); } catch {}
       await box.resetIdentity();
       writeJson(`rotation-told-v1:${me.id}`, {});
       await publishKeys(true);
@@ -343,12 +344,16 @@
     const view = await api(`/api/devices/${me.username}`);
     const oldKey = await Devices.metaKeyFromBytes(Devices.unb64(localStorage.getItem(`device-meta-key-v1:${me.id}`) || '')).catch(() => null);
     const newKey = await Devices.deviceMetaKey(me.id, bytes => rawSign(bytes, next.box));
+    // Only devices our own signed list names (verified from our pin) are carried into the new key's list: a device the
+    // server merely shows would otherwise be signed in by us.
+    const owned = await Devices.ownDevices({ userId: me.id, aikSign: pinned.sign, view, pin: readPins()[me.id], metaKey: oldKey });
+    if (!owned) throw new Error('The device list on the server isn’t one your primary signed. Nothing changed.');
     const keep = [];
-    for (const device of view.list?.devices || []) {
+    for (const device of owned.devices) {
       const row = view.devices.find(value => value.id === device.deviceId);
       if (row?.state !== 'listed') continue;
-      const described = oldKey ? await Devices.openMeta(oldKey, me.id, device.deviceId, device.meta).catch(() => null) : null;
-      keep.push({ deviceId: device.deviceId, addedAt: device.addedAt, meta: await Devices.sealMeta(newKey, me.id, device.deviceId, { label: described?.label || platformName(row.platform), platform: described?.platform || row.platform }) });
+      const platform = device.described?.platform || row.platform;
+      keep.push({ deviceId: device.deviceId, addedAt: device.addedAt, meta: await Devices.sealMeta(newKey, me.id, device.deviceId, { label: device.described?.label || platformName(platform), platform }) });
     }
     const old = view.devices.find(row => row.id === primary.deviceId);
     if (!keep.some(device => device.deviceId === primary.deviceId) || !old) throw new Error('Your primary device isn’t in your device list. Nothing changed.');
@@ -372,7 +377,8 @@
     const after = await api(`/api/devices/${me.username}`);
     if (after.identity?.sign !== record.newSign || !after.list?.devices.some(device => device.deviceId === primary.deviceId)) throw new Error(deviceWarning || 'Your new device list wasn’t published. Reload and check Settings → Devices.');
     const at = Date.now();
-    const demoted = Devices.mlsCertJson(me.id, primary.deviceId, old.platform, primary.leafSigKey, record.newSign, at, await sign(Devices.mlsCertBytes(me.id, primary.deviceId, old.platform, primary.leafSigKey, record.newSign, at)));
+    const p0 = owned.devices.find(device => device.deviceId === primary.deviceId)?.described?.platform || old.platform;
+    const demoted = Devices.mlsCertJson(me.id, primary.deviceId, p0, primary.leafSigKey, record.newSign, at, await sign(Devices.mlsCertBytes(me.id, primary.deviceId, p0, primary.leafSigKey, record.newSign, at)));
     return { identity: next.identity, cert: demoted, metaKey: Devices.b64(await Devices.deviceMetaKeyBytes(me.id, rawSign)) };
   }
   /** P0: signs the account over to the key N minted (m5 §5.1). Nothing changes here until N has taken over. */
@@ -443,9 +449,14 @@
   async function answerRecerts() {
     if (linked || !box || inactive || !window.Groups?.enabled()) return;
     const { requests } = await api('/api/devices/recert');
-    const own = (await box.prekeys()).identity;
-    for (const { deviceId, platform, leafSigKey } of requests) {
-      if (!await window.Groups.leafKnown(deviceId, leafSigKey).catch(() => false)) continue; // Asks again later.
+    if (!requests.length) return;
+    const own = (await box.prekeys()).identity, self = (await localDevice()).deviceId;
+    // Only a device our verified signed list still names (a dropped one may keep a leaf until it is removed), never
+    // this one, with the platform its sealed label gives (not the server's request).
+    const owned = await Devices.ownDevices({ userId: me.id, aikSign: own.sign, view: await api(`/api/devices/${me.username}`), pin: readPins()[me.id], metaKey: await deviceMetaKey() });
+    for (const { deviceId, leafSigKey } of requests) {
+      const platform = Devices.recertPlatform(owned, deviceId, self);
+      if (!platform || !await window.Groups.leafKnown(deviceId, leafSigKey).catch(() => false)) continue; // Asks again later.
       const issuedAt = Date.now(), bytes = Devices.mlsCertBytes(me.id, deviceId, platform, leafSigKey, own.sign, issuedAt);
       await api(`/api/devices/recert/${deviceId}`, 'PUT', { cert: Devices.mlsCertJson(me.id, deviceId, platform, leafSigKey, own.sign, issuedAt, await signWithIdentity(bytes)) });
     }
@@ -1051,7 +1062,14 @@
   };
 
   // ---------- Security codes ----------
-  async function checkIdentity(contactId) {
+  // One identity check per contact at a time: a refresh and a succession never interleave their pin writes.
+  const identityChecks = new Map();
+  function checkIdentity(contactId) {
+    const next = (identityChecks.get(contactId) || Promise.resolve()).then(() => checkIdentityNow(contactId));
+    identityChecks.set(contactId, next.catch(() => {}));
+    return next;
+  }
+  async function checkIdentityNow(contactId) {
     const contact = contactById(contactId);
     if (!contact || !box) return;
     const { identity } = await api(`/api/keys/${contact.username}/identity`);
@@ -1067,12 +1085,17 @@
    */
   async function followSuccession(contact, before, served) {
     const view = await api(`/api/devices/${contact.username}`).catch(() => null);
-    const path = view?.succession?.length ? await Devices.verifySuccession(contact.id, before.identity, served, view.succession) : null;
+    // Only from a code the user accepted: a pin still waiting for review may be the server's own key.
+    const path = view?.succession?.length ? await Devices.successionFrom(contact.id, before, served, view.succession) : null;
     if (!path) return false;
     await window.Groups?.contactSucceeded(contact.id, path).catch(() => {}); // The group store keeps the old key as a predecessor.
     await box.notePeer(contact.id, served);
-    await box.acceptChange(contact.id); // Accepted because the old key signed it over, not on the server's word.
-    if (before.verified) await box.setVerified(contact.id, true);
+    // Accepted because the old key signed it over, not on the server's word: exactly the key the chain ends at. If
+    // another key was pinned meanwhile, the box refuses ('mismatch') and that one goes to the usual review.
+    try {
+      await box.acceptChange(contact.id, served);
+      if (before.verified) await box.setVerified(contact.id, true, served);
+    } catch (error) { if (error.code === 'mismatch') return true; throw error; }
     const text = `${contact.username} moved to a new device. Verification kept.`;
     await window.ChatStore.note(await pairId(contact.id), crypto.randomUUID(), text).catch(() => {});
     say('chats-status', text);

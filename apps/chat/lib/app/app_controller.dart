@@ -398,8 +398,8 @@ class AppController extends Notifier<AppState> {
     if (g == null) return;
     try {
       await g.start();
-    } catch (error) {
-      g.unavailable ??= 'Groups could not start on this device: $error';
+    } catch (_) {
+      // Offline or a server without groups: tried again on the next reconnect.
     }
     state = g.unavailable == null ? state.copyWith(clearGroupsUnavailable: true) : state.copyWith(groupsUnavailable: g.unavailable);
     await _loadGroups();

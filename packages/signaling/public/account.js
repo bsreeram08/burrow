@@ -68,7 +68,7 @@
     loadContacts(); connectEvents(); window.Alerts?.signedIn();
   }
   function signedOut(message = '') {
-    window.Groups?.stop(); delete body.dataset.kind;
+    window.Groups?.stop(); delete body.dataset.kind; linked = null;
     me = null; contacts = []; current = null; pairs.clear(); box = null; deviceView = null; announced = ''; metaKey = null; deviceWarning = ''; deviceNotice = ''; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
     clearTimeout(retryTimer); clearTimeout(flushTimer); const previous = events; events = null; previous?.close();
     if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true;
@@ -88,6 +88,14 @@
     if (!window.Signal || !await window.Signal.supported()) {
       say('chats-status', 'This browser is too old for encrypted messaging. Update it to send and receive messages; calls still work.');
       return false;
+    }
+    // A linked device (docs/m5-linking.md §1) holds no account identity key: no 1:1 keys here, ever (publishing
+    // some would take messaging away from the primary). Groups, channels and moved DMs run in its group store.
+    linked = linkedStore(user.id);
+    if (linked) {
+      backendName = 'linked'; box = null; keysLost = false; setInactive(false); showBackend();
+      $('identity-reset').hidden = true;
+      return true;
     }
     // One key store per account on this device. Private keys never leave it.
     const store = window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${user.id}`);
@@ -249,6 +257,18 @@
       const meta = document.createElement('small');
       meta.textContent = [row.current ? 'This browser' : null, row.primary ? 'Primary · holds your keys' : null, row.state === 'pending' ? 'Signed in · not linked' : null, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
       item.append(name, meta);
+      // Any device of the account may revoke another (m5 §4): it is cut off at once; the primary then signs the list without it.
+      if (!amPrimary && !row.current && !row.primary && row.state !== 'revoked') {
+        const revoke = document.createElement('button'); revoke.type = 'button'; revoke.className = 'danger-text device-remove'; revoke.textContent = 'Revoke';
+        revoke.setAttribute('aria-label', `Revoke ${name.textContent}`);
+        revoke.onclick = () => revokeDevice(row).catch(error => { deviceWarning = `Could not revoke the device: ${error.message}`; renderDevices(); });
+        item.append(revoke);
+      }
+      if (linked && row.current) {
+        const leave = document.createElement('button'); leave.type = 'button'; leave.className = 'danger-text device-remove'; leave.textContent = 'Unlink this browser';
+        leave.onclick = () => revokeDevice(row).catch(error => { deviceWarning = `Could not unlink: ${error.message}`; renderDevices(); });
+        item.append(leave);
+      }
       if (amPrimary && !row.current && !row.primary) {
         // A linked device is revoked (signed out, dropped from the signed list and from every group); a device that
         // only signed in is simply removed.
@@ -268,6 +288,14 @@
     list.replaceChildren(...rows);
   }
   window.addEventListener('linking-flows', () => renderDevices());
+  /** Revokes one of the account's devices from this (non-primary) device: the server cuts it off; the primary re-signs the list. */
+  async function revokeDevice(row) {
+    await api(`/api/devices/${row.id}/revoke`, 'POST', {});
+    if (row.current) { try { localStorage.removeItem(`linked-store-v1:${me.id}`); } catch {} signedOut('This browser was unlinked. Messages already here stay in it.'); return; }
+    deviceView = await api(`/api/devices/${me.username}`);
+    deviceNotice = 'Device revoked: it was signed out and can no longer receive messages. Your primary device updates your device list next time it’s online.';
+    renderDevices();
+  }
   /** Signs the device out everywhere and, if it was listed, publishes the list without it. */
   async function removeDevice(row) {
     let body = {};
@@ -678,7 +706,15 @@
   };
   // ---------- Encryption core (Settings → Advanced) ----------
   let backendName = 'signal', announceBackend = () => {};
+  // Set by the link flow when this browser became a linked device: { deviceId, instance } (its group store).
+  let linked = null;
+  const linkedStore = userId => { try { const value = JSON.parse(localStorage.getItem(`linked-store-v1:${userId}`) || 'null'); return value?.instance ? value : null; } catch { return null; } };
   function showBackend() {
+    if (backendName === 'linked') {
+      say('core-backend-state', 'This browser is linked to your primary device. It reads your groups and channels; your primary holds your keys.');
+      $('core-backend-switch').hidden = true;
+      return;
+    }
     const wasm = backendName === 'wasm';
     say('core-backend-state', wasm ? 'This device uses the experimental WebAssembly core.' : 'This device uses the standard browser core.');
     say('core-backend-switch', wasm ? 'Go back to the standard core' : 'Use the experimental encryption core');
@@ -752,7 +788,7 @@
   async function openSafety() {
     $('conv-menu').open = false;
     const contact = current && contactById(current.id);
-    if (!contact || !box) { App.chatStatus('Encrypted messaging is unavailable in this browser.'); return; }
+    if (!contact || !box) { App.chatStatus(linked ? 'Security codes for this chat are on your primary device.' : 'Encrypted messaging is unavailable in this browser.'); return; }
     try {
       if (!await box.peer(contact.id)) await box.notePeer(contact.id, (await api(`/api/keys/${contact.username}/identity`)).identity);
       const safety = await box.safety(me.username, contact.id, contact.username);
@@ -923,6 +959,7 @@
     delete unread[contact.id]; try { localStorage.setItem(`unread-v1:${me.id}`, JSON.stringify(unread)); } catch {}
     if (!App.active) App.openConversation({ conversationId, peerName: contact.username, peerId: contact.id, online: contact.online });
     if (!await ready) App.chatStatus('This browser is too old for encrypted messaging. Update it to send and receive messages.');
+    else if (linked) App.chatStatus(`This chat stays on your primary device until it moves to the new encryption. Groups and channels work here.`);
     updateBanner(); flushOutgoing();
   }
   /** A group or channel: the same conversation screen, driven by groups.js. Calls stay 1:1. */

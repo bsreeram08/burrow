@@ -161,7 +161,7 @@
       if (!ID.test(userId || '') || userId === me.id || (!force && pinned.has(userId))) continue;
       const contact = ctx.contacts().find(value => value.id === userId && value.state === 'mutual');
       let mine = await run({ cmd: 'peer', contact: userId });
-      const theirs = contact ? await ctx.box.peer(userId) : null;
+      const theirs = contact && ctx.box ? await ctx.box.peer(userId) : null; // A linked device has no 1:1 pins: its group store holds them.
       let published = null;
       if (force || (!theirs && !mine)) {
         const found = await call(`/api/users/${userId}/identity`);
@@ -255,7 +255,7 @@
    * the same key here (only if the group store holds exactly the key the 1:1 pin now trusts). Then resume.
    */
   async function contactAccepted(userId) {
-    if (!run || !ctx) return;
+    if (!run || !ctx?.box) return;
     const [mine, theirs] = await Promise.all([run({ cmd: 'peer', contact: userId }).catch(() => null), ctx.box.peer(userId).catch(() => null)]);
     if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId, identity: theirs.identity }); forgetChange(userId); }
     pinsChanged(userId);

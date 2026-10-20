@@ -166,7 +166,21 @@ JSON: `{ v, userId, oldSign, newSign, newDh, at, signature }` (keys base64url). 
 3. P0 shows "Make <label> your primary device?" with the code. On confirm: `signSuccession { userId, newSign, newDh, at }` (chatcore; signs only the record bytes; requires P0 to hold the published AIK) and sends sealed `succession { record, signature }`.
 4. N publishes: `PUT /api/devices/succession { record, signature }` (server verifies under the current AIK, §5.3), then `PUT /api/keys` with the new identity (the server accepts the identity change **as a succession** because a matching record is stored), then `successionComplete { record, signature }` (chatcore: verifies the record against the pinned account and the identity it minted, then holds that identity, remembers the old key as a predecessor until the record's time, leaves companion mode), then publishes **DeviceList version 1 under the new AIK** naming all current devices (including P0), with the usual per-device certs, and signs fresh MLS certificates for itself (`mlsInitDevice`).
 5. P0 receives a final sealed `demote { "v":1, "type":"demote", "identity": {dh, sign}, "cert"?: … }`, `retireIdentity` (chatcore: deletes its AIK secret, enters companion mode with the new account identity pinned, **keeps** its device key and MLS leaf), and asks N for a new MLS cert for its leaf with the same relay (`signDeviceCert` flow of §1.5, optional: its old certificate stays valid through the succession, §7). The 1:1 inbox moves to N (existing claim rules).
-6. Other companions: on the `devices` frame they fetch the new list, verify it under the new AIK via the succession chain (§5.3) and `companionSetup` again with the new pinned identity (no user action).
+6. Other companions: on the `devices` frame they fetch the new list, verify it under the new AIK via the succession chain (§5.3) and `adoptSuccession` it (see §5.2.1; no user action).
+
+### 5.2.1 Exact sealed messages, and the web profile (account key in WebCrypto)
+
+All JSON, UTF-8, exactly these keys (a client rejects extra or missing ones):
+
+- n2p `succession-request`: `{ "v":1, "type":"succession-request", "newSign", "newDh", "leafSigKey" }` (N's new account identity and N's own MLS leaf key).
+- p2n `succession`: `{ "v":1, "type":"succession", "record", "signature", "leafSigKey" }`. `record` is §5.1 without `signature`; `leafSigKey` is P0's MLS leaf key, so N can sign P0's new MLS certificate under the new key right away.
+- n2p `demote`: `{ "v":1, "type":"demote", "identity": { "dh", "sign" }, "cert", "metaKey" }`. `cert` is P0's MLS DeviceCert under the new key; `metaKey` is the new account's derived device-meta key (32 bytes, base64url, as `grant.metaKey`), so the demoted device still reads device labels.
+
+Order on N: `PUT /api/devices/succession`; adopt (chatcore primary: `successionComplete`; web store: `adoptSuccession` with N's own new cert); `PUT /api/keys` with the new identity; list v1 naming all live devices (labels resealed under the new meta key); then `demote`. P0 deletes its AIK only after `GET /api/keys/count` serves the new identity **and** it holds the `demote`.
+
+Becoming a companion without losing the old key as a predecessor: a chatcore primary uses `retireIdentity`. A web device's group store already is a companion (`account` row; its AIK is WebCrypto): P0 runs `adoptSuccession { userId, record, signature, cert }` with the record, signature and `cert` from `succession`/`demote`. `companionSetup` is only needed first on a store with no `account` row. `adoptSuccession` is the only way into the new identity that records the old key as `own-previous`.
+
+**Other companions** follow the chain with `adoptSuccession` without a `cert`: their account moves, their own leaf stays Previous (old certificate, old key in `own-previous`), and they can still send, receive and commit with the unchanged credential. They cannot commit a *changed* credential, and while their leaf is Previous nobody can add people to those groups (§7). They get a certificate under the new key only when someone who holds it signs one for their leaf key: until a flow for that exists (N would need each companion's `leafSigKey`), a companion that must recertify relinks (new device id) and an admin removes the old leaf.
 
 ### 5.3 Contacts and the server
 

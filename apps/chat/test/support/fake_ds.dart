@@ -12,7 +12,7 @@ import 'package:private_chat/core/events.dart';
 /// log, the member mirror, cursors, Welcomes and KeyPackages, freezes on a poison report, and pushes
 /// `group` / `welcome` / `channel` frames to each device's listener.
 class FakeDs {
-  final Map<String, _Channel> channels = {};
+  final Map<String, FakeChannel> channels = {};
   final Map<String, List<({String kp, bool lastResort})>> keyPackages = {};
   final Map<String, ({String userId, String username})> devices = {};
   final Map<String, List<Map<String, Object?>>> welcomes = {};
@@ -99,8 +99,8 @@ class FakeDs {
       final id = body['id']! as String;
       if (channels.containsKey(id)) return _error('That channel id is taken.', 409);
       final info = _mls(body['groupInfo']! as String);
-      channels[id] = _Channel(id, body['kind']! as String, body['name'] as String?, info['epoch']! as int)
-        ..members[deviceId] = _Member(userId, 0, 0, admin: true)
+      channels[id] = FakeChannel(id, body['kind']! as String, body['name'] as String?, info['epoch']! as int)
+        ..members[deviceId] = FakeMember(userId, 0, 0, admin: true)
         ..groupInfo = body['groupInfo'] as String;
       return _json({'id': id, 'epoch': 0, 'seq': 0}, 201);
     }
@@ -146,16 +146,16 @@ class FakeDs {
         final seq = channel.append('commit', userId, deviceId, message);
         channel.epoch++;
         final before = channel.users;
-        channel.previous = {for (final e in channel.members.entries) e.key: _Member(e.value.userId, e.value.cursor, e.value.joined, admin: e.value.admin)};
+        channel.previous = {for (final e in channel.members.entries) e.key: FakeMember(e.value.userId, e.value.cursor, e.value.joined, admin: e.value.admin)};
         // Mirror: the fake's commit names its adds/removes (or the external join's whole group).
         if (commit['external'] == true) {
-          channel.members[deviceId] = _Member(userId, seq, seq, admin: false);
+          channel.members[deviceId] = FakeMember(userId, seq, seq, admin: false);
         } else {
           for (final r in (commit['removes'] as List).cast<Map>()) {
             channel.members.remove(r['deviceId']);
           }
           for (final a in (commit['adds'] as List).cast<Map>()) {
-            channel.members[a['deviceId'] as String] = _Member(a['userId'] as String, seq, seq, admin: false);
+            channel.members[a['deviceId'] as String] = FakeMember(a['userId'] as String, seq, seq, admin: false);
           }
           final roles = commit['roles'] as Map?;
           if (roles != null) {
@@ -235,7 +235,7 @@ class FakeDs {
     return {'oneTime': oneTime, 'lastResort': list.any((e) => e.lastResort), 'low': oneTime < 20, 'max': 100};
   }
 
-  void _fanOut(_Channel channel, int seq) {
+  void _fanOut(FakeChannel channel, int seq) {
     final entry = channel.log.lastWhere((e) => e['seq'] == seq);
     final from = entry['from']! as Map;
     for (final device in channel.members.keys) {
@@ -257,16 +257,16 @@ class FakeDs {
   }
 }
 
-class _Member {
-  _Member(this.userId, this.cursor, this.joined, {required this.admin});
+class FakeMember {
+  FakeMember(this.userId, this.cursor, this.joined, {required this.admin});
   final String userId;
   int cursor;
   final int joined;
   bool admin;
 }
 
-class _Channel {
-  _Channel(this.id, this.kind, this.name, this.epoch);
+class FakeChannel {
+  FakeChannel(this.id, this.kind, this.name, this.epoch);
   final String id;
   final String kind;
   final String? name;
@@ -275,9 +275,9 @@ class _Channel {
   String? groupInfo;
   int? groupInfoEpoch = 0;
   Map<String, Object?>? frozen;
-  Map<String, _Member>? previous;
+  Map<String, FakeMember>? previous;
   final List<String> resolved = [];
-  final Map<String, _Member> members = {};
+  final Map<String, FakeMember> members = {};
   final List<Map<String, Object?>> log = [];
 
   Set<String> get users => {for (final m in members.values) m.userId};

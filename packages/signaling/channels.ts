@@ -18,7 +18,7 @@ export const LOG_TTL = 30 * 86400000, WELCOME_TTL = 30 * 86400000, MAX_BACKLOG =
 const COMMIT_MAX = 8 * 1024 * 1024, SMALL_MAX = 131072, INFLIGHT = 32, INLINE_MAX = 48 * 1024, PAGE = 50, PAGE_BYTES = 2 * 1024 * 1024, SWEEP_EVERY = 60000, REPORT_INTERVAL = 60000;
 const ID = /^[A-Za-z0-9_-]{22}$/, B64 = /^[A-Za-z0-9_-]+$/, DIGEST = /^[0-9a-f]{64}$/, SIG = /^[A-Za-z0-9_-]{86}$/;
 const NAME = /^[\p{L}\p{N}_\- ]{1,64}$/u;
-const GROUP_INFO_B64_MAX = 87382, WELCOME_B64_MAX = Math.ceil(4 * 1024 * 1024 * 4 / 3), COMMIT_B64_MAX = Math.ceil(1024 * 1024 * 4 / 3) + 4, APP_B64_MAX = Math.ceil(64 * 1024 * 4 / 3) + 4;
+const EPHEMERAL_B64_MAX = Math.ceil(2048 * 4 / 3) + 4, GROUP_INFO_B64_MAX = 87382, WELCOME_B64_MAX = Math.ceil(4 * 1024 * 1024 * 4 / 3), COMMIT_B64_MAX = Math.ceil(1024 * 1024 * 4 / 3) + 4, APP_B64_MAX = Math.ceil(64 * 1024 * 4 / 3) + 4;
 
 type Caller = { id: string; username: string; session: string };
 type Row = { id: string; kind: Kind; name: string | null; creator_id: string; epoch: number; seq: number; group_info: string | null; group_info_epoch: number | null; prev_state: string | null; prev_epoch: number | null; frozen_seq: number | null; frozen_digest: string | null; frozen_by: string | null; frozen_at: number | null };
@@ -65,6 +65,7 @@ export function createChannels(deps: Deps) {
     const allowRead = requestLimiter({ perSource: 40, global: 1000 }), allowCursor = requestLimiter({ perSource: 100, global: 4000 }), allowPoison = requestLimiter({ perSource: 10, global: 100 });
     const lastFreeze = new Map<string, number>();
     const allowJoin = requestLimiter({ perSource: 3, global: 100 }), allowInfo = requestLimiter({ perSource: 10, global: 200 });
+    const allowEphemeral = requestLimiter({ perSource: 10, global: 2000 }), allowIdentity = requestLimiter({ perSource: 20, global: 1000 });
 
     const channelRow = (id: string) => db.query<Row, [string]>('SELECT * FROM channels WHERE id = ?').get(id);
     const memberRow = (channelId: string, deviceId: string) => db.query<Member, [string, string]>('SELECT * FROM channel_members WHERE channel_id = ? AND device_id = ?').get(channelId, deviceId);
@@ -355,6 +356,61 @@ export function createChannels(deps: Deps) {
         return json({ epoch: body.epoch });
     }
 
+    // ---------- M4: directory, identities, ephemeral messages (docs/m4-groups.md §8) ----------
+
+    /** Public channels anyone may join: their names are the one thing the server sees anyway. */
+    function directory(user: Caller): Response {
+        const [, refusal] = deviceOf(user);
+        if (refusal) return refusal;
+        if (!allowRead(user.id)) return json({ error: 'Rate limited' }, 429);
+        const rows = db.query<{ id: string; name: string; members: number; joined: number }, [string]>(
+            "SELECT c.id, c.name, (SELECT COUNT(DISTINCT m.user_id) FROM channel_members m WHERE m.channel_id = c.id) AS members, EXISTS (SELECT 1 FROM channel_members j WHERE j.channel_id = c.id AND j.user_id = ?) AS joined FROM channels c WHERE c.kind = 'public' ORDER BY c.created_at DESC, c.id LIMIT 500").all(user.id);
+        return json({ channels: rows.map(row => ({ id: row.id, name: row.name, members: row.members, joined: Boolean(row.joined) })) });
+    }
+    /**
+     * A user's published identity, for pinning people met in a channel (trust on first use). User ids are 128-bit
+     * random, so this names no one the caller couldn't already name; the key is the one the validator pins.
+     */
+    function identity(user: Caller, userId: string): Response {
+        if (!allowIdentity(user.id)) return json({ error: 'Rate limited' }, 429);
+        const row = db.query<{ id: string; username: string; dh: string; sign: string }, [string]>('SELECT u.id, u.username, k.dh, k.sign FROM users u JOIN identity_keys k ON k.user_id = u.id WHERE u.id = ?').get(userId);
+        return row ? json({ userId: row.id, username: row.username, identity: { dh: row.dh, sign: row.sign } }) : json({ error: 'No such user.' }, 404);
+    }
+    /**
+     * A live-only application message (typing): checked for the current epoch, then handed to the open streams of
+     * the channel's other member devices. Never logged, stored, pushed or replayed.
+     */
+    async function ephemeral(request: Request, user: Caller, channelId: string): Promise<Response> {
+        const [deviceId, refusal] = deviceOf(user);
+        if (refusal) return refusal;
+        const channel = channelRow(channelId);
+        if (!channel || !memberRow(channelId, deviceId!)) return json({ error: 'No such channel.' }, 404);
+        if (banned(channelId, deviceId!)) return json({ error: 'This device was removed from that channel.' }, 403);
+        if (channel.frozen_seq !== null) return json({ error: 'This channel is frozen while a rejected commit is resolved.' }, 423);
+        if (!allowEphemeral(user.id)) return json({ error: 'Rate limited' }, 429);
+        if (Number(request.headers.get('content-length') ?? 0) > 4096) return json({ error: 'Request too large' }, 413);
+        const body = await readJson(request, 4096);
+        const bytes = decode(body?.message, EPHEMERAL_B64_MAX);
+        if (!body || !bytes || Object.keys(body).length !== 1) return json({ error: 'Invalid message' }, 400);
+        if (wireFormat(bytes) !== 2) return json({ error: 'Application messages are private MLS messages.' }, 400);
+        let verdict: { accepted?: unknown; conflict?: { epoch: number } };
+        try { verdict = deps.ds.transaction(call => call({ cmd: 'dsSubmit', group: channelId, message: body.message })); }
+        catch (error) { if (error instanceof DsError) return json({ error: error.message, code: error.code }, 422); throw error; }
+        if (verdict.conflict) return json({ error: 'The group moved on.', epoch: verdict.conflict.epoch }, 409);
+        const frame = JSON.stringify({ type: 'ephemeral', channel: channelId, from: { userId: user.id, deviceId }, message: body.message, createdAt: now() });
+        let delivered = false;
+        const devices = new Set(members(channelId).filter(row => row.device_id !== deviceId).map(row => row.device_id));
+        for (const userId of usersOf(members(channelId))) {
+            for (const socket of deps.streams(userId)) {
+                // Best effort: a stream that is closing or backed up simply misses a typing hint.
+                if (socket.readyState !== 1 || socket.getBufferedAmount() > 65536) continue;
+                const device = deps.sessionDevice(socket.data.session);
+                if (device && devices.has(device) && deps.eligible(userId, device)) { socket.send(frame); delivered = true; }
+            }
+        }
+        return json({ delivered }, 202);
+    }
+
     // ---------- Cursors and retention ----------
 
     /** Drops the log entries every member device has read. */
@@ -577,6 +633,9 @@ export function createChannels(deps: Deps) {
         const welcomeMatch = /^\/api\/mls\/welcomes\/([A-Za-z0-9_-]{22})$/.exec(path);
         if (welcomeMatch && (method === 'GET' || method === 'DELETE')) return welcome(user, welcomeMatch[1]!, method === 'DELETE');
         if (path === '/api/channels' && method === 'GET') return list(user);
+        if (path === '/api/channels/directory' && method === 'GET') return directory(user);
+        const userMatch = /^\/api\/users\/([A-Za-z0-9_-]{22})\/identity$/.exec(path);
+        if (userMatch && method === 'GET') return identity(user, userMatch[1]!);
         if (path === '/api/channels' && method === 'POST') return create(request, user);
         const match = /^\/api\/channels\/([A-Za-z0-9_-]{22})(?:\/([a-z-]+))?$/.exec(path);
         if (match) {
@@ -585,6 +644,7 @@ export function createChannels(deps: Deps) {
             if (action === 'members' && method === 'GET') return memberList(user, id);
             if (action === 'log' && method === 'GET') return log(url, user, id);
             if (action === 'messages' && method === 'POST') return submit(request, user, id, 'app');
+            if (action === 'ephemeral' && method === 'POST') return ephemeral(request, user, id);
             if (action === 'commits' && method === 'POST') return submit(request, user, id, 'commit');
             if (action === 'join' && method === 'POST') return submit(request, user, id, 'external');
             if (action === 'join-info' && method === 'GET') return joinInfo(user, id);

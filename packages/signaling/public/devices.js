@@ -110,6 +110,21 @@
     if (typeof challenge !== 'string' || !CHALLENGE.test(challenge)) fail('Invalid device challenge');
     return writer().text16(CLAIM_LABEL).text16(userId).text16(deviceId).bytes8(unb64(challenge)).done();
   }
+  /**
+   * The bytes of an MLS device certificate (crates/chatcore DeviceCert::tbs, docs/m4-groups.md §2): the account
+   * identity key signs them for this device's MLS leaf key. u32-length-prefixed strings, raw 32-byte keys.
+   */
+  function mlsCertBytes(userId, deviceId, platform, leafSigKey, aikSign, issuedAt) {
+    const text = value => { const bytes = encoder.encode(value); return [writer().u32(bytes.length).done(), bytes]; };
+    const key = value => { const bytes = unb64(value); if (bytes.length !== 32) fail('Invalid key'); return bytes; };
+    if (!timestamp(issuedAt)) fail('Invalid certificate time');
+    const parts = [encoder.encode('webrtc-bun-devcert-v1'), ...text(userId), ...text(deviceId), ...text(platform), key(leafSigKey), key(aikSign), writer().u64(issuedAt).done()];
+    const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0)); let at = 0;
+    for (const part of parts) { out.set(part, at); at += part.length; }
+    return out;
+  }
+  /** The certificate itself, as chatcore decodes it: canonical JSON with its fields in this order. */
+  const mlsCertJson = (userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig) => JSON.stringify({ v: 1, userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig });
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -215,5 +230,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

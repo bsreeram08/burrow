@@ -17,14 +17,14 @@
   // Keys are `<family>-light`, `<family>-dark` and `<family>-system`; the presets above stay available.
   const SANS = 'system-ui, -apple-system, "Segoe UI", sans-serif', SERIF = 'Georgia, "New York", "Iowan Old Style", "Times New Roman", serif', MONO = 'ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace';
   const FAMILIES = {
-    classic: { name: 'Classic', mood: 'Warm paper by day, ink by night.', light: ['#fbf8f3', '#f2ede4', '#1f1b16', '#5869e9'], dark: ['#121214', '#1c1c20', '#eceae6', '#7c8bff'] },
-    forest: { name: 'Forest', mood: 'Soft green-grey and deep forest: calm, like a walk outside.', light: ['#f3f6f2', '#e5ece3', '#18231b', '#2f7a4f'], dark: ['#0f1712', '#17221b', '#e3ede5', '#5fbf86'] },
-    ocean: { name: 'Ocean', mood: 'Sea glass and deep teal: cool, clear and bright.', light: ['#f1f8f8', '#e0eff0', '#0f2328', '#0f8a9d'], dark: ['#0b1a1e', '#12262b', '#e0f1f3', '#3cc6d8'] },
-    dusk: { name: 'Dusk', mood: 'Lilac evenings and violet ink, with a little sunset.', light: ['#f7f3fb', '#ece4f5', '#221a2b', '#7b4fd6'], dark: ['#17121f', '#221a2d', '#eee6f7', '#b08cff'], secondary: '#ff9a76' },
-    rose: { name: 'Rose', mood: 'Blush and raspberry: warm, friendly, a bit playful.', light: ['#fdf4f5', '#f8e5e8', '#2a1418', '#c8305a'], dark: ['#1c1013', '#2a181d', '#f7e6ea', '#ff6f93'] },
-    paper: { name: 'Paper', mood: 'Old paper and rust, serif throughout: reads like a book.', light: ['#f6f0e4', '#ede4d2', '#2b2118', '#a44a26'], dark: ['#1a1611', '#26201a', '#efe6d6', '#e07a4f'], font: SERIF },
-    mono: { name: 'Mono', mood: 'Greyscale and monospaced: plain names, square avatars, nothing extra.', light: ['#ffffff', '#f2f2f2', '#111111', '#111111'], dark: ['#0a0a0a', '#161616', '#ededed', '#ededed'], font: MONO, square: true, plain: true },
-    midnight: { name: 'Midnight', mood: 'True black for OLED, an electric accent and vivid names.', dark: ['#000000', '#0e0e10', '#f5f5f7', '#3d7bff'], vivid: true },
+    classic: { name: 'Classic', mood: 'Off-white by day, charcoal by night, with an indigo accent.', light: ['#fbf8f3', '#f2ede4', '#1f1b16', '#5869e9'], dark: ['#121214', '#1c1c20', '#eceae6', '#7c8bff'] },
+    forest: { name: 'Forest', mood: 'Muted greens with a deep green accent.', light: ['#f3f6f2', '#e5ece3', '#18231b', '#2f7a4f'], dark: ['#0f1712', '#17221b', '#e3ede5', '#5fbf86'] },
+    ocean: { name: 'Ocean', mood: 'Pale aqua with a teal accent.', light: ['#f1f8f8', '#e0eff0', '#0f2328', '#0f8a9d'], dark: ['#0b1a1e', '#12262b', '#e0f1f3', '#3cc6d8'] },
+    dusk: { name: 'Dusk', mood: 'Soft violet with a purple accent and a touch of coral.', light: ['#f7f3fb', '#ece4f5', '#221a2b', '#7b4fd6'], dark: ['#17121f', '#221a2d', '#eee6f7', '#b08cff'], secondary: '#ff9a76' },
+    rose: { name: 'Rose', mood: 'Pale pink with a crimson accent.', light: ['#fdf4f5', '#f8e5e8', '#2a1418', '#c8305a'], dark: ['#1c1013', '#2a181d', '#f7e6ea', '#ff6f93'] },
+    paper: { name: 'Paper', mood: 'Cream and brown, with serif text.', light: ['#f6f0e4', '#ede4d2', '#2b2118', '#a44a26'], dark: ['#1a1611', '#26201a', '#efe6d6', '#e07a4f'], font: SERIF },
+    mono: { name: 'Mono', mood: 'Black, white and grey in a monospaced font, with square avatars.', light: ['#ffffff', '#f2f2f2', '#111111', '#111111'], dark: ['#0a0a0a', '#161616', '#ededed', '#ededed'], font: MONO, square: true, plain: true },
+    midnight: { name: 'Midnight', mood: 'Pure black for OLED screens, with a bright blue accent.', dark: ['#000000', '#0e0e10', '#f5f5f7', '#3d7bff'], vivid: true },
   };
   // Name colours: 8 per scheme, picked by a hash of the person's id (Mono keeps names plain).
   const NAMES = {
@@ -168,7 +168,7 @@
   function applyAppearance() {
     const root = document.documentElement;
     root.style.setProperty('--chat-size', `${SIZES[appearance.size]}px`);
-    // The room between messages and between chats grows with the text size.
+    // Space between messages and chats scales with the text size.
     root.style.setProperty('--gap', `${Math.round(SIZES[appearance.size] * (appearance.density === 'compact' ? 0.12 : 0.4))}px`);
     root.style.setProperty('--row-pad', `${Math.round(SIZES[appearance.size] * (appearance.density === 'compact' ? 0.4 : 0.75))}px`);
     root.dataset.textSize = appearance.size; root.dataset.density = appearance.density; root.dataset.list = appearance.list;

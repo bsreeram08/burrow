@@ -1261,7 +1261,7 @@
     if (!enabled) { ctx.notice(reason || 'Groups are not ready yet.'); return; }
     newKind = kind;
     $('group-new-title').textContent = kind === 'group_dm' ? 'New group' : 'New channel';
-    $('group-new-hint').textContent = kind === 'group_dm' ? 'Pick two or more people to start a group.' : 'Channels are for a topic. Public ones can be found and joined by anyone here; private ones only by the people you add.';
+    $('group-new-hint').textContent = kind === 'group_dm' ? 'Choose at least two people for a group.' : 'Channels are for a topic. Public ones can be found and joined by anyone here; private ones only by the people you add.';
     $('group-new-visibility').hidden = kind === 'group_dm';
     $('group-new-name').value = ''; $('group-new-name').placeholder = kind === 'group_dm' ? 'Name (optional)' : 'Channel name';
     $('group-new-name').required = kind !== 'group_dm';
@@ -1274,7 +1274,7 @@
     event.preventDefault();
     const users = picked($('group-new-people')), name = $('group-new-name').value.trim();
     const kind = newKind === 'group_dm' ? 'group_dm' : [...document.getElementsByName('group-visibility')].find(input => input.checked)?.value || 'private';
-    if (kind === 'group_dm' && users.length < 2) { $('group-new-status').textContent = 'Pick two or more people to start a group.'; return; }
+    if (kind === 'group_dm' && users.length < 2) { $('group-new-status').textContent = 'Choose at least two people for a group.'; return; }
     if (kind === 'group_dm' && users.length > 8) { $('group-new-status').textContent = 'A group holds up to 9 people. Make a channel for more.'; return; }
     if (kind !== 'group_dm' && !/^[\p{L}\p{N}_\- ]{1,64}$/u.test(name)) { $('group-new-status').textContent = 'Name it with up to 64 letters, digits, spaces, - or _.'; return; }
     $('group-new-create').disabled = true; $('group-new-status').textContent = 'Setting up encryption…';

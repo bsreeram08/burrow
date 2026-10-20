@@ -142,9 +142,10 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<GroupCommit> joinExternal(String groupInfo, String tree) async {
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group}) async {
     _requireDevice();
     final g = _Group.fromJson(_decode(groupInfo));
+    if (g.groupId != group) throw const CryptoException('that GroupInfo is for another group', code: 'invalid');
     final inGroup = g.members.any((m) => m['userId'] == userId);
     if (!inGroup && g.roles.joinPolicy != JoinPolicy.open) throw const CryptoException('an invite-only group', code: 'invalid');
     final members = [for (final m in g.members) if (m['deviceId'] != deviceId) m, Map.of(_me)];
@@ -294,11 +295,11 @@ class FakeGroupCrypto implements GroupCrypto {
   bool canInspect = true;
 
   @override
-  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) async {
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree) async {
     if (!canInspect) throw const CryptoException('cannot inspect', code: 'unsupported');
     final g = _Group.fromJson(_decode(groupInfo));
     var leaf = 0;
-    return [
+    return (groupId: g.groupId, members: [
       for (final m in g.members)
         GroupMember(
           leaf: leaf++,
@@ -308,7 +309,7 @@ class FakeGroupCrypto implements GroupCrypto {
           admin: g.roles.isAdmin(m['userId']! as String),
           stale: staleDevices.contains(m['deviceId']),
         ),
-    ];
+    ]);
   }
 }
 

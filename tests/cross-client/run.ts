@@ -281,6 +281,49 @@ try {
     await waitFor('group-removed', 120000);
     await page.waitForFunction((id: string) => !(window as any).Groups.debug(id)?.members.includes('thirduser'), appGroupId, { timeout: 90000 });
     signal('group-removal-seen');
+
+    // M5 linking (docs/m5-linking.md §1): a fresh browser becomes a linked device of the app's account.
+    const laptopContext = await browser.newContext();
+    const laptop = await laptopContext.newPage();
+    laptop.on('pageerror', (error: Error) => console.log(`  laptop pageerror: ${error.message}`));
+    await laptop.goto(origin);
+    await laptop.waitForSelector('#welcome', { state: 'visible', timeout: 20000 });
+    await laptop.click('#signin-link');
+    await laptop.waitForSelector('#link-qr svg', { state: 'visible', timeout: 30000 });
+    signal('web-link-qr', (await laptop.textContent('#link-code'))!.replace(/\s+/g, ''));
+    const appCode = await waitFor('app-link-code', 120000);
+    await laptop.waitForFunction((code: string) => document.getElementById('link-status')!.textContent!.includes(code), appCode, { timeout: 60000 });
+    signal('web-link-code-ok');
+    const laptopDevice = await waitFor('app-link-approved', 120000);
+    await laptop.waitForSelector('#chats', { state: 'visible', timeout: 90000 });
+    const listed = testing.db.query("SELECT state FROM devices WHERE id = ? AND user_id = ?").get(laptopDevice, appUser.id) as any;
+    if (listed?.state !== 'listed') throw new Error(`the linked browser is not a listed device of the app's account: ${JSON.stringify(listed)}`);
+    // It joins the app's private channel by itself (external join), then reads what comes next.
+    const inChannel = () => testing.db.query('SELECT 1 FROM channel_members WHERE channel_id = ? AND device_id = ?').get(appGroupId, laptopDevice);
+    for (const end = Date.now() + 120000; !inChannel();) {
+        if (Date.now() > end || failed) {
+            const state = await laptop.evaluate((id: string) => ({ group: (window as any).Groups?.debug(id), status: document.getElementById('chats-status')?.textContent, enabled: (window as any).Groups?.enabled() }), appGroupId).catch(error => String(error));
+            throw new Error(`the linked browser never joined the app's channel: ${JSON.stringify(state)}`);
+        }
+        await Bun.sleep(300);
+    }
+    step('the app links a fresh browser as a device of its account: QR text across, the same 6 digits on both, list + MLS certificate + sealed grant; the browser joins the channel by itself');
+    signal('laptop-ready');
+    await waitFor('app-sent-laptop', 120000);
+    const laptopRecords = (): Promise<any[]> => laptop.evaluate(async (id: string) => (await (window as any).ChatStore.list()).filter((r: any) => r.conversationId === id), appGroupId);
+    for (const end = Date.now() + 90000; !(await laptopRecords()).some(r => r.text === 'hello laptop');) { if (Date.now() > end || failed) throw new Error(`laptop never read the app's message: ${JSON.stringify((await laptopRecords()).map(r => r.text))}`); await Bun.sleep(300); }
+    step('the linked browser reads the app\'s next channel message');
+    signal('laptop-read');
+
+    // Revocation (§4): the app revokes it; the browser is signed out, its leaf leaves the channel, and it reads nothing more.
+    await waitFor('app-revoked', 150000);
+    await laptop.waitForSelector('#welcome', { state: 'visible', timeout: 60000 });
+    if (inChannel()) throw new Error('the revoked browser is still in the channel');
+    if (testing.db.query("SELECT state FROM devices WHERE id = ?").get(laptopDevice) && (testing.db.query("SELECT state FROM devices WHERE id = ?").get(laptopDevice) as any).state !== 'revoked') throw new Error('the browser is not revoked');
+    if ((await laptopRecords().catch(() => [])).some(r => r.text === 'after revoking the laptop')) throw new Error('a revoked device received a message');
+    step('the app revokes the browser: signed out at once, its leaf removed from the channel, nothing more delivered');
+    signal('revoke-seen');
+    await laptopContext.close();
     await waitFor('done');
     step('the app adds thirduser (who reads from then on) and removes them; the web sees both');
     code = await dartDone;

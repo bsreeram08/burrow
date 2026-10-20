@@ -31,6 +31,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity dco_decode_box_autoadd_identity(dynamic raw);
 
   @protected
+  LinkedAccount dco_decode_box_autoadd_linked_account(dynamic raw);
+
+  @protected
   MlsExpect dco_decode_box_autoadd_mls_expect(dynamic raw);
 
   @protected
@@ -70,6 +73,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LinkReveal dco_decode_link_reveal(dynamic raw);
 
   @protected
+  LinkedAccount dco_decode_linked_account(dynamic raw);
+
+  @protected
   List<String> dco_decode_list_String(dynamic raw);
 
   @protected
@@ -98,6 +104,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect dco_decode_mls_expect(dynamic raw);
+
+  @protected
+  MlsGroupInspection dco_decode_mls_group_inspection(dynamic raw);
 
   @protected
   MlsGroupView dco_decode_mls_group_view(dynamic raw);
@@ -131,6 +140,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity? dco_decode_opt_box_autoadd_identity(dynamic raw);
+
+  @protected
+  LinkedAccount? dco_decode_opt_box_autoadd_linked_account(dynamic raw);
 
   @protected
   MlsExpect? dco_decode_opt_box_autoadd_mls_expect(dynamic raw);
@@ -193,6 +205,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer);
 
   @protected
+  LinkedAccount sse_decode_box_autoadd_linked_account(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   MlsExpect sse_decode_box_autoadd_mls_expect(SseDeserializer deserializer);
 
   @protected
@@ -234,6 +251,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   LinkReveal sse_decode_link_reveal(SseDeserializer deserializer);
 
   @protected
+  LinkedAccount sse_decode_linked_account(SseDeserializer deserializer);
+
+  @protected
   List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
@@ -262,6 +282,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect sse_decode_mls_expect(SseDeserializer deserializer);
+
+  @protected
+  MlsGroupInspection sse_decode_mls_group_inspection(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MlsGroupView sse_decode_mls_group_view(SseDeserializer deserializer);
@@ -295,6 +320,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity? sse_decode_opt_box_autoadd_identity(SseDeserializer deserializer);
+
+  @protected
+  LinkedAccount? sse_decode_opt_box_autoadd_linked_account(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MlsExpect? sse_decode_opt_box_autoadd_mls_expect(
@@ -365,6 +395,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_box_autoadd_identity(Identity self, SseSerializer serializer);
 
   @protected
+  void sse_encode_box_autoadd_linked_account(
+    LinkedAccount self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_box_autoadd_mls_expect(
     MlsExpect self,
     SseSerializer serializer,
@@ -419,6 +455,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_link_reveal(LinkReveal self, SseSerializer serializer);
 
   @protected
+  void sse_encode_linked_account(LinkedAccount self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
@@ -467,6 +506,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_mls_expect(MlsExpect self, SseSerializer serializer);
 
   @protected
+  void sse_encode_mls_group_inspection(
+    MlsGroupInspection self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_mls_group_view(MlsGroupView self, SseSerializer serializer);
 
   @protected
@@ -502,6 +547,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_identity(
     Identity? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_linked_account(
+    LinkedAccount? self,
     SseSerializer serializer,
   );
 

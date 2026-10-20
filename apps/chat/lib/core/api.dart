@@ -79,7 +79,19 @@ class Api {
 
   Uri uri(String path) => base.resolve(path);
 
+  /// A 429 means the server did nothing: wait and try again a few times (0.5, 1, 2 s) before giving up.
   Future<Map<String, dynamic>> call(String path, {String method = 'GET', Object? body}) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _callOnce(path, method: method, body: body);
+      } on ApiException catch (error) {
+        if (error.status != 429 || attempt >= 3) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 500 * (1 << attempt)));
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> _callOnce(String path, {required String method, Object? body}) async {
     final request = http.Request(method, uri(path))..headers['Accept'] = 'application/json';
     if (token != null) request.headers['Authorization'] = 'Bearer $token';
     if (body != null) {

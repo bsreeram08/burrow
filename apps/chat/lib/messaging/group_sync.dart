@@ -366,11 +366,18 @@ class GroupSync {
     }
   }
 
+  /// Joiners (new devices of members, public channel members) need the current epoch's GroupInfo: retry a
+  /// failed upload a few times (1, 2, 4, 8 s). A 409 means the group already moved on: the next committer
+  /// publishes that epoch's.
   Future<void> _publishGroupInfo(String groupId, GroupView view) async {
-    try {
-      await api.putGroupInfo(groupId, view.epoch, view.groupInfo);
-    } catch (_) {
-      // Best effort: the next committer publishes it; joiners wait for a current one.
+    for (var attempt = 0; attempt < 5 && !_disposed; attempt++) {
+      try {
+        await api.putGroupInfo(groupId, view.epoch, view.groupInfo);
+        return;
+      } on ApiException catch (error) {
+        if (error.status == 409 || error.status == 404 || error.status == 403) return;
+      } catch (_) {}
+      await Future<void>.delayed(Duration(seconds: 1 << attempt));
     }
   }
 
@@ -780,7 +787,7 @@ class GroupSync {
       try {
         await ensurePinned({for (final m in await api.channelMembers(groupId)) m['userId'] as String}.where((u) => u != me.id));
       } catch (_) {}
-      final out = await crypto.joinExternal(info['groupInfo'] as String, info['tree'] as String);
+      final out = await crypto.joinExternal(info['groupInfo'] as String, info['tree'] as String, group: groupId);
       Map<String, dynamic> accepted;
       try {
         accepted = await api.joinChannel(groupId, out.commit);
@@ -950,9 +957,10 @@ class GroupSync {
           await remove(group.id, me.id, deviceId: m.deviceId);
           removed++;
         } on CryptoException catch (e) {
-          if (e.code != 'invalid') rethrow; // "no such member": another device of ours already did it.
+          // "No such member": another device of ours already did it. Anything else is retried next time.
+          if (!e.message.contains('no such member')) _notice("Couldn't remove a revoked device from ${_label(group)} yet: ${e.message}");
         } on ApiException catch (e) {
-          if (e.status != 409) rethrow;
+          if (e.status != 409) _notice("Couldn't remove a revoked device from ${_label(group)} yet: ${e.message}");
         }
       }
     }
@@ -975,8 +983,10 @@ class GroupSync {
       if (known?.membership == Membership.left) continue;
       try {
         final info = await api.joinInfo(id);
-        final members = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
-        final ours = members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
+        final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
+        // The served GroupInfo must be for this very channel.
+        if (inspected.groupId != id) continue;
+        final ours = inspected.members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
         if (!ours) continue;
         await _serial(id, () async {
           await ensureReady();

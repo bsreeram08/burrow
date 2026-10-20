@@ -16,10 +16,12 @@ import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
+import 'package:private_chat/crypto/link_crypto.dart';
 import 'package:private_chat/crypto/rust_group_crypto.dart';
 import 'package:private_chat/messaging/attachments.dart';
 import 'package:private_chat/messaging/group_messenger.dart';
 import 'package:private_chat/messaging/group_sync.dart';
+import 'package:private_chat/messaging/linking.dart';
 import 'package:private_chat/messaging/messenger.dart';
 import 'package:private_chat/store/message.dart';
 import 'package:private_chat/store/message_store.dart';
@@ -220,6 +222,7 @@ void main() {
       device: () async => device,
       platform: 'ios',
       ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: messenger.verifiedOwnDevices,
       sendCursor: events.cursor,
       ackWelcome: events.ack,
     );
@@ -277,6 +280,39 @@ void main() {
     expect((await g.members(own.id, refresh: true)).map((m) => m.username).toSet(), {me.username, web.username});
     await signal('group-removed');
     await waitFor('group-removal-seen', timeout: const Duration(seconds: 120));
+
+    // 10. M5 linking (docs/m5-linking.md §1): a new web browser shows its QR text; the app, as the primary,
+    // takes it, both show the same 6 digits, and the app publishes the list naming it, signs its MLS certificate
+    // and sends the sealed grant and bundle.
+    final qrText = await waitFor('web-link-qr', timeout: const Duration(seconds: 120));
+    final linkCtx = LinkContext(api: api, crypto: crypto, link: const RustLinkCrypto(), messenger: messenger, store: store, contacts: () => [web, third]);
+    final primary = await PrimaryLink.fromQr(linkCtx, qrText);
+    final laptop = await primary.waitHello(timeout: const Duration(seconds: 90));
+    expect(laptop.platform, 'web');
+    await signal('app-link-code', primary.code);
+    await waitFor('web-link-code-ok', timeout: const Duration(seconds: 60));
+    await primary.approve();
+    await signal('app-link-approved', laptop.deviceId);
+    // The linked browser joins our private channel by itself; it reads what the app sends from then on.
+    await waitFor('laptop-ready', timeout: const Duration(seconds: 180));
+    await g.send(own.id, 'hello laptop');
+    await signal('app-sent-laptop');
+
+    // 11. Revocation (§4): the app revokes the laptop, publishes the list without it, and removes its leaf.
+    await waitFor('laptop-read', timeout: const Duration(seconds: 120));
+    expect(await api.revokeDevice(laptop.deviceId), [laptop.deviceId]);
+    await messenger.publishNextList();
+    describe = () async {
+      final verified = await messenger.verifiedOwnDevices();
+      return 'own list: listed ${verified?.listed} dropped ${verified?.dropped}; members ${[for (final m in await g.crypto.members(own.id)) '${m.userId}/${m.deviceId}']}; laptop ${laptop.deviceId}; notices ${notices.reversed.take(4).toList()}';
+    };
+    await until(() async {
+      await g.sync.removeDroppedOwnLeaves(groupId: own.id);
+      return !(await g.crypto.members(own.id)).any((m) => m.deviceId == laptop.deviceId);
+    }, 'revoked leaf removed', timeout: const Duration(seconds: 90));
+    await g.send(own.id, 'after revoking the laptop');
+    await signal('app-revoked');
+    await waitFor('revoke-seen', timeout: const Duration(seconds: 120));
     await g.dispose();
     await signal('done');
     await events.close();

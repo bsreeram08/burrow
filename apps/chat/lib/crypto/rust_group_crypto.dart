@@ -80,7 +80,8 @@ class RustGroupCrypto implements GroupCrypto {
   Future<GroupView> join(String welcome, String tree) => _call(() async => _view(await core.mlsJoin(welcome: welcome, tree: tree)));
 
   @override
-  Future<GroupCommit> joinExternal(String groupInfo, String tree) => _call(() async => _commit(await core.mlsJoinExternal(groupInfo: groupInfo, tree: tree)));
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group}) =>
+      _call(() async => _commit(await core.mlsJoinExternal(groupInfo: groupInfo, tree: tree, group: group)));
 
   @override
   Future<void> forget(String groupId) => _call(() => core.mlsForgetGroup(groupId: groupId));
@@ -137,8 +138,10 @@ class RustGroupCrypto implements GroupCrypto {
   Future<GroupRoles> roles(String groupId) => _call(() async => _fromRoles(await core.mlsRoles(groupId: groupId)));
 
   @override
-  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) =>
-      _call(() async => [for (final m in await core.mlsInspectGroup(groupInfo: groupInfo, tree: tree)) _member(m)]);
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree) => _call(() async {
+    final i = await core.mlsInspectGroup(groupInfo: groupInfo, tree: tree);
+    return (groupId: i.groupId, members: [for (final m in i.members) _member(m)]);
+  });
 
   @override
   Future<GroupView> view(String groupId) => _call(() async => _view(await core.mlsGroupView(groupId: groupId)));

@@ -1070,3 +1070,22 @@ suite('identity change in a channel (docs/m5-linking.md §7)', () => {
         expect((await w.a2.sync(w.channel))).toEqual([]);
     });
 });
+
+suite('recertifying a companion after a transfer (docs/m5-linking.md §5.2.2)', () => {
+    test('the primary certifies only a leaf key a group it holds already contains for that device: a swapped key in the relay is refused', async () => {
+        const w = await populated();
+        run('UPDATE devices SET is_primary = (id = ?) WHERE user_id = ?', w.a1.deviceId, w.alice.id);
+        const leaf = w.a2.client.call({ cmd: 'mlsDeviceLeaf' });
+        const asked = await w.a2.api('PUT', '/api/devices/recert', { platform: 'linux', leafSigKey: leaf });
+        expect(asked.status).toBe(201);
+        // The server (or anyone on the path) swaps the key before the primary reads the request.
+        const rogue = Buffer.alloc(32, 7).toString('base64url');
+        run('UPDATE recert_requests SET leaf_sig_key = ? WHERE device_id = ?', rogue, w.a2.deviceId);
+        const served = (await w.a1.must('GET', '/api/devices/recert')).requests[0];
+        expect(served).toMatchObject({ deviceId: w.a2.deviceId, leafSigKey: rogue });
+        const known = (key: string, device = served.deviceId) => w.a1.client.call({ cmd: 'mlsLeafKnown', deviceId: device, leafSigKey: key, groups: [w.channel] });
+        expect(known(served.leafSigKey)).toBe(false); // the swapped key: refused, nothing is certified
+        expect(known(leaf, w.b1.deviceId)).toBe(false); // the right key under another device's id
+        expect(known(leaf)).toBe(true); // what the group really holds for that device
+    });
+});

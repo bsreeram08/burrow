@@ -518,6 +518,25 @@ impl Groups {
         Ok(GroupInspection { group_id: group_text(public.group_id()), members })
     }
 
+    /// Whether one of this account's devices (`device_id`) holds exactly `leaf_sig_key` as a current leaf in any of
+    /// `groups` (groups that fail their load gate prove nothing). A new primary asks this before it certifies a
+    /// companion's leaf under the new account key: a key the server or the device merely claims is not enough, only
+    /// one the group already accepted (docs/m5-linking.md 5.2.2).
+    pub fn leaf_known(&mut self, store: &mut dyn Store, groups: &[GroupId], device_id: &str, leaf_sig_key: &str) -> Result<bool> {
+        let own = Self::device(store)?;
+        for group in groups {
+            if self.gate(store, group).is_err() { continue; }
+            let Ok(mls_group) = Self::load_group(&self.provider, group) else { continue };
+            let mut directory = Self::client_directory(store, &own);
+            for member in mls_group.members() {
+                let Some(cert) = cert_of(&member.credential) else { continue };
+                if cert.user_id == own.user_id && cert.device_id == device_id && cert.leaf_sig_key == leaf_sig_key
+                    && !matches!(verify_standing(&mut directory, &member.credential, &member.signature_key, true), Ok((_, Standing::Stale)) | Err(_)) { return Ok(true); }
+            }
+        }
+        Ok(false)
+    }
+
     /// A pointer to a DM group is acceptable only if the group is a DM of exactly this account and `peer`, and every
     /// leaf in it is current under the pins (docs/m5-linking.md §8.3).
     pub fn check_dm(&mut self, store: &mut dyn Store, group: &GroupId, peer: &str) -> Result<()> {

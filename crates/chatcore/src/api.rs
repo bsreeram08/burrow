@@ -206,6 +206,14 @@ pub fn mls_init_device(user_id: String, device_id: String, platform: String, iss
     })
 }
 
+/// Whether one of this account's devices holds exactly this leaf key as a current leaf in any of `groups`: what a
+/// new primary requires before it certifies a companion's leaf under the new account key.
+#[cfg(feature = "mls")]
+pub fn mls_leaf_known(device_id: String, leaf_sig_key: String, groups: Vec<String>) -> Result<bool> {
+    let ids = groups.iter().map(|g| crate::mls::engine::group_id(g)).collect::<Result<Vec<_>>>()?;
+    with_groups(|g, store| g.leaf_known(store, &ids, &device_id, &leaf_sig_key))
+}
+
 /// This device's MLS leaf signature key (base64url), made on first use. A new device sends it in its link hello
 /// before it has a certificate.
 #[cfg(feature = "mls")]

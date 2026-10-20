@@ -29,6 +29,19 @@
       await sleep(POLL);
     }
   }
+  const KEY = /^[A-Za-z0-9_-]{43}$/;
+  /** Reads the other side's sealed messages of one link in order, one per call (`open` unseals with the core). */
+  function inbox(linkId, open, claim) {
+    let after = 0;
+    const queue = [];
+    return (live, deadline) => until(async () => {
+      if (!queue.length) {
+        const { messages } = await call(`/api/link/${linkId}/messages?after=${after}`, 'GET', undefined, claim);
+        for (const message of messages) { after = message.seq; queue.push(JSON.parse(await open(message.data))); }
+      }
+      return queue.shift() || null;
+    }, live, deadline);
+  }
   const spacedCode = code => { const digits = String(code).replace(/\s+/g, ''); return `${digits.slice(0, 3)} ${digits.slice(3)}`; };
 
   // ---------- N: this browser joins an account ----------
@@ -130,26 +143,30 @@
     try { localStorage.setItem(`linked-store-v1:${user.id}`, JSON.stringify({ deviceId, instance, identity })); } catch {}
   }
 
-  // ---------- P: the primary links a new device ----------
-  async function linkNewDevice() {
+  // ---------- P: the primary links a new device (or hands over to one, §5) ----------
+  async function linkNewDevice(purpose = 'link', row = null) {
     if (!await ctx.isPrimary()) { ctx.notice('Link new devices from your primary device: the one that holds your keys.'); return; }
-    let open = true, linkId = null;
+    let open = true, linkId = null, handedOver = false;
     const ui = window.Linking.open({
-      title: 'Link a new device', entry: true,
-      hint: 'On the new device, open this app and choose “Link to my other device”. Scan the code it shows, or type the text under it.',
+      title: purpose === 'transfer' ? 'Make another device primary' : 'Link a new device', entry: true,
+      hint: purpose === 'transfer'
+        ? `On ${row ? 'that device' : 'the other device'}, open Settings → Devices and choose “Make this browser primary”. Scan the code it shows, or type the text under it.`
+        : 'On the new device, open this app and choose “Link to my other device”. Scan the code it shows, or type the text under it.',
       onEntry: async text => {
         if (!text.startsWith('wb-link1.')) throw new Error('That isn’t a link code from this app. Check the text and try again.');
         const accepted = await window.Groups.linkCore({ cmd: 'linkAccept', qr: text });
         linkId = accepted.linkId;
-        accept(ui, accepted, () => open).catch(error => { if (!error.cancelled) ui.fail(error.message || 'Linking didn’t work. Start again on both devices.'); });
+        // Once the account is signed over, the old primary must see the hand-over through: closing doesn't stop it.
+        accept(ui, accepted, () => open || handedOver, purpose, () => { handedOver = true; }).catch(error => { if (!error.cancelled) ui.fail(error.message || 'Linking didn’t work. Start again on both devices.'); });
       },
-      onCancel: () => { open = false; if (linkId) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {}); } },
+      onCancel: () => { open = false; if (linkId && !handedOver) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {}); } },
     });
   }
-  async function accept(ui, { linkId, eph, code }, live) {
+  async function accept(ui, { linkId, eph, code }, live, purpose = 'link', handingOver = () => {}) {
     const deadline = Date.now() + LINK_TTL;
     const offer = await call(`/api/link/${linkId}/offer`, 'POST', { eph });
-    if (offer.purpose !== 'link') throw new Error('That code is for something else. Start again on both devices.');
+    if (offer.purpose !== purpose) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); throw new Error(purpose === 'link' ? 'That code is for making a device primary. Use “Make primary” next to that device.' : 'That code is for linking a new device. Use “Link a new device”.'); }
+    if (purpose === 'transfer') return handOver(ui, linkId, code, offer, live, deadline, handingOver);
     ui.status('Waiting for the new device…');
     let after = 0;
     const hello = await until(async () => {
@@ -188,6 +205,60 @@
     ui.done(`Linked ${label}. It joins your groups, channels and chats on the new encryption by itself; other 1:1 chats stay on this device until they move.`);
     ctx.devicesChanged();
   }
+  /** P0 (§5.2): signs the account over to the key the other device minted, then steps down once it has taken over. */
+  async function handOver(ui, linkId, code, offer, live, deadline, handingOver) {
+    const next = inbox(linkId, data => window.Groups.linkCore({ cmd: 'linkOpen', linkId, data }));
+    const request = await next(live, deadline);
+    if (request?.v !== 1 || request.type !== 'succession-request' || !KEY.test(request.newSign || '') || !KEY.test(request.newDh || '') || !KEY.test(request.leafSigKey || '')) throw new Error('The other device sent something unexpected. Nothing changed.');
+    ui.status(`Make this ${ctx.platformName(offer.platform).toLowerCase()} your primary device? It will hold your keys and this browser stays linked.`);
+    if (!await ui.compare(code)) { call(`/api/link/${linkId}`, 'DELETE').catch(() => {}); ui.fail('Nothing changed. If you didn’t start this, someone may have shown you their code.'); return; }
+    ui.status('Handing over… keep this page open.');
+    const { record, signature } = await ctx.signSuccession(request);
+    handingOver();
+    const sealed = await window.Groups.linkCore({ cmd: 'linkSeal', linkId, plaintext: JSON.stringify({ v: 1, type: 'succession', record, signature, leafSigKey: await window.Groups.leafKey() }) });
+    await call(`/api/link/${linkId}/messages`, 'POST', { data: sealed });
+    const demote = await next(() => true, deadline);
+    if (demote?.v !== 1 || demote.type !== 'demote') throw new Error('The other device sent something unexpected.');
+    await ctx.stepDown({ record, signature, demote });
+    await window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {});
+    ui.done('Your other device is now your primary. This browser stays linked to your account.');
+    setTimeout(() => location.reload(), 1500);
+  }
+  // ---------- N: this linked browser takes over as primary (§5.2) ----------
+  async function becomePrimary() {
+    if (!ctx.linked()) return;
+    let open = true, linkId = null, claim = null;
+    try {
+      const me = ctx.me(), device = await F().deviceKey(me.id);
+      const signature = await device.sign(F().startBytes(device.deviceId, 'web', device.publicKey));
+      const start = await call('/api/link/start', 'POST', { purpose: 'transfer', deviceId: device.deviceId, deviceKey: device.publicKey, platform: 'web', signature });
+      ({ linkId, claim } = start);
+      const deadline = Math.min(start.expiresAt || Infinity, Date.now() + LINK_TTL);
+      const { qr } = await window.Groups.linkCore({ cmd: 'linkQr', linkId });
+      const shown = window.Linking.open({
+        title: 'Make this browser primary', qr, code: qr,
+        hint: 'On your primary device, open Settings → Devices and choose “Make primary” next to this browser. Scan this code there, or type the text under it.',
+        onCancel: () => { open = false; call(`/api/link/${linkId}`, 'DELETE', undefined, claim).catch(() => {}); window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {}); },
+      });
+      const offered = await until(async () => { const state = await call(`/api/link/${linkId}`, 'GET', undefined, claim); return state.state === 'offered' ? state : null; }, () => open, deadline);
+      const { code } = await window.Groups.linkCore({ cmd: 'linkComplete', linkId, eph: offered.eph });
+      const minted = await ctx.mintSuccessor();
+      const send = async value => call(`/api/link/${linkId}/messages`, 'POST', { data: await window.Groups.linkCore({ cmd: 'linkSeal', linkId, plaintext: JSON.stringify(value) }) }, claim);
+      await send({ v: 1, type: 'succession-request', newSign: minted.sign, newDh: minted.dh, leafSigKey: await window.Groups.leafKey() });
+      shown.status(`Check that your primary device shows ${spacedCode(code)}, then confirm there.`);
+      const signed = await inbox(linkId, data => window.Groups.linkCore({ cmd: 'linkOpen', linkId, data }), claim)(() => open, deadline);
+      if (signed?.v !== 1 || signed.type !== 'succession' || typeof signed.signature !== 'string' || !KEY.test(signed.leafSigKey || '')) throw new Error('Your primary device sent something unexpected. Nothing changed.');
+      shown.status('Taking over… keep this page open.');
+      const demote = await ctx.takeOver({ record: signed.record, signature: signed.signature, primary: { deviceId: offered.offerDeviceId, leafSigKey: signed.leafSigKey } });
+      await send({ v: 1, type: 'demote', ...demote });
+      await window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {});
+      shown.done('This browser is now your primary device. Your other device stays linked.');
+      setTimeout(() => location.reload(), 1500);
+    } catch (error) {
+      if (error.cancelled) return;
+      window.Linking.open({ title: 'Make this browser primary', hint: '' }).fail(error.message || 'That didn’t work. Start again on both devices.');
+    }
+  }
   /** §2: pins (not changed or blocked ones), channel names, and (if asked) recent history. Never a key. */
   async function buildBundle(withHistory) {
     const pins = [];
@@ -215,7 +286,7 @@
   /** account.js hands over what linking needs from the signed-in account, and the flows appear. */
   function attach(context) {
     ctx = context;
-    window.Linking.register(context ? { linkNew: linkNewDevice, linkThis: linkThisBrowser, recover: context.recover } : null);
+    window.Linking.register(context ? { linkNew: () => linkNewDevice(), linkThis: linkThisBrowser, recover: context.recover, makePrimary: row => linkNewDevice('transfer', row), becomePrimary } : null);
   }
   const wire = () => { const button = document.getElementById('signin-link'); if (button) button.onclick = () => linkThisBrowser(); };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire); else wire();

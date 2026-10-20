@@ -164,8 +164,8 @@
   // Highest verified list per account (own and contacts): a list may only move forward, never back or sideways.
   const readPins = () => { try { return JSON.parse(localStorage.getItem(`device-pins-v1:${me.id}`) || '{}') || {}; } catch { return {}; } };
   const writePins = pins => { try { localStorage.setItem(`device-pins-v1:${me.id}`, JSON.stringify(pins)); } catch {} };
-  async function rawSign(bytes) {
-    const identity = await box.identity();
+  async function rawSign(bytes, from = box) {
+    const identity = await from.identity();
     if (!identity?.sign?.privateKey) throw new Error('this encryption core cannot sign device lists yet');
     return new Uint8Array(await crypto.subtle.sign('Ed25519', identity.sign.privateKey, bytes));
   }
@@ -235,6 +235,7 @@
     const view = await api(`/api/devices/${me.username}`);
     if (!view.identity || view.identity.sign !== own.sign || view.identity.dh !== own.dh) return; // Not the key holder: publishKeys decides.
     const pins = readPins(), pin = pins[me.id];
+    newChain ||= readJson(`new-chain-v1:${me.id}`, null); // A transfer cut short by a reload still starts its chain.
     let base = null;
     if (view.list) {
       const check = await Devices.verifyView({ userId: me.id, aikSign: own.sign, list: view.list, signature: view.signature, certs: view.certs, pin });
@@ -255,7 +256,7 @@
     await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
     if (!base) { const pins = readPins(); delete pins[me.id]; writePins(pins); } // The new key's chain starts here.
     await pinOwn(signed);
-    newChain = null;
+    newChain = null; try { localStorage.removeItem(`new-chain-v1:${me.id}`); } catch {}
     deviceWarning = '';
     deviceView = await api(`/api/devices/${me.username}`);
     renderDevices();
@@ -283,6 +284,7 @@
   function linkContext() {
     return {
       me: () => me, notice: text => say('chats-status', text), platformName, addToList, signWithIdentity, contacts: () => contacts, recover,
+      linked: () => Boolean(linked), mintSuccessor, takeOver, signSuccession, stepDown,
       async isPrimary() {
         if (!box || linked || inactive) return false;
         const view = await api(`/api/devices/${me.username}`).catch(() => null);
@@ -313,6 +315,140 @@
       say('chats-status', 'This browser now holds your account. Everyone you talk to will see that your security code changed.');
       setTimeout(() => location.reload(), 1500);
     } catch (error) { newChain = null; say('chats-status', `Couldn’t start over: ${error.message}`); }
+  }
+  // ---------- Primary transfer (m5 §5) ----------
+  // N, a linked browser taking over: the account key it will hold, minted in its own key store and published only
+  // after the old primary signed the account over to it.
+  let successor = null;
+  async function mintSuccessor() {
+    if (!linked) throw new Error('Only a linked browser can take over as primary.');
+    const next = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${me.id}`), { identityChanged: contactId => identityChanged(contactId) });
+    await next.resetIdentity(); // A fresh key for every attempt, never one left in this browser from an earlier time.
+    const { pub } = await next.identity();
+    successor = { box: next, identity: { dh: pub.dh, sign: pub.sign } };
+    return successor.identity;
+  }
+  /**
+   * N: the old primary signed the account over (`record`, `signature`). Publishes the record, moves the group store to
+   * the new key, takes messaging over and signs list version 1 naming every live device (labels resealed under the new
+   * key). Returns the `demote` for the old primary (`primary`: its device id and MLS leaf key): its certificate under
+   * the new key and the new label key.
+   */
+  async function takeOver({ record, signature, primary }) {
+    const next = successor, pinned = linked?.identity;
+    if (!next || !pinned) throw new Error('Start again on both devices.');
+    if (record?.userId !== me.id || record.oldSign !== pinned.sign || record.newSign !== next.identity.sign || record.newDh !== next.identity.dh
+      || !await Devices.verifySuccession(me.id, pinned, next.identity, [{ ...record, signature }])) throw new Error('Your primary device sent something unexpected. Nothing changed.');
+    const sign = async bytes => Devices.b64(await rawSign(bytes, next.box));
+    const view = await api(`/api/devices/${me.username}`);
+    const oldKey = await Devices.metaKeyFromBytes(Devices.unb64(localStorage.getItem(`device-meta-key-v1:${me.id}`) || '')).catch(() => null);
+    const newKey = await Devices.deviceMetaKey(me.id, bytes => rawSign(bytes, next.box));
+    const keep = [];
+    for (const device of view.list?.devices || []) {
+      const row = view.devices.find(value => value.id === device.deviceId);
+      if (row?.state !== 'listed') continue;
+      const described = oldKey ? await Devices.openMeta(oldKey, me.id, device.deviceId, device.meta).catch(() => null) : null;
+      keep.push({ deviceId: device.deviceId, addedAt: device.addedAt, meta: await Devices.sealMeta(newKey, me.id, device.deviceId, { label: described?.label || platformName(row.platform), platform: described?.platform || row.platform }) });
+    }
+    const old = view.devices.find(row => row.id === primary.deviceId);
+    if (!keep.some(device => device.deviceId === primary.deviceId) || !old) throw new Error('Your primary device isn’t in your device list. Nothing changed.');
+    await api('/api/devices/succession', 'PUT', { record, signature });
+    const self = (await localDevice()).deviceId, leaf = await window.Groups.leafKey(), issuedAt = Date.now();
+    const cert = Devices.mlsCertJson(me.id, self, 'web', leaf, record.newSign, issuedAt, await sign(Devices.mlsCertBytes(me.id, self, 'web', leaf, record.newSign, issuedAt)));
+    await window.Groups.adoptSuccession({ record, signature, cert });
+    // From here this browser is the primary: its group store stays (under the new key) and 1:1 keys live here.
+    writeJson(`group-instance-v1:${me.id}`, { aik: record.newSign, instance: linked.instance });
+    writeJson(`new-chain-v1:${me.id}`, { keep });
+    // Moved 1:1 chats: a linked device went by its checked DM groups; a primary goes by its record of moves.
+    for (const contact of contacts) { const channel = window.Groups.dmChannelWith(contact.id); if (channel) await markMoved(contact, channel); }
+    for (const pin of await window.Groups.exportPins().catch(() => [])) {
+      await next.box.notePeer(pin.contact, pin.identity);
+      if (pin.verified) await next.box.setVerified(pin.contact, true);
+    }
+    try { localStorage.removeItem(`linked-store-v1:${me.id}`); localStorage.removeItem(`device-meta-key-v1:${me.id}`); } catch {}
+    window.Core?.setBackend(me.id, 'signal');
+    linked = null; box = next.box; backendName = 'signal'; successor = null; newChain = { keep };
+    await publishKeys(true);
+    const after = await api(`/api/devices/${me.username}`);
+    if (after.identity?.sign !== record.newSign || !after.list?.devices.some(device => device.deviceId === primary.deviceId)) throw new Error(deviceWarning || 'Your new device list wasn’t published. Reload and check Settings → Devices.');
+    const at = Date.now();
+    const demoted = Devices.mlsCertJson(me.id, primary.deviceId, old.platform, primary.leafSigKey, record.newSign, at, await sign(Devices.mlsCertBytes(me.id, primary.deviceId, old.platform, primary.leafSigKey, record.newSign, at)));
+    return { identity: next.identity, cert: demoted, metaKey: Devices.b64(await Devices.deviceMetaKeyBytes(me.id, rawSign)) };
+  }
+  /** P0: signs the account over to the key N minted (m5 §5.1). Nothing changes here until N has taken over. */
+  async function signSuccession({ newSign, newDh }) {
+    const own = (await box.prekeys()).identity;
+    const record = { v: 1, userId: me.id, oldSign: own.sign, newSign, newDh, at: Date.now() };
+    return { record, signature: await signWithIdentity(Devices.successionBytes(record)) };
+  }
+  /**
+   * P0: N took over and sent `demote`. This browser keeps its device key, MLS leaf and groups, becomes a linked device
+   * of the new key, and deletes the old account key: only once the server serves the new one.
+   */
+  async function stepDown({ record, signature, demote }) {
+    if (demote?.identity?.sign !== record.newSign || demote.identity.dh !== record.newDh || typeof demote.cert !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(demote.metaKey || '')) throw new Error('The new primary sent something unexpected.');
+    const served = (await api('/api/keys/count')).identity;
+    if (served?.sign !== record.newSign || served.dh !== record.newDh) throw new Error('The new primary hasn’t taken over yet. Nothing changed here.');
+    const own = (await box.prekeys()).identity, self = (await localDevice()).deviceId, leaf = await window.Groups.leafKey();
+    // The core enters companion mode under the old key first, so that key is kept as a predecessor of the new one.
+    const before = { identity: { dh: own.dh, sign: own.sign }, cert: Devices.mlsCertJson(me.id, self, 'web', leaf, own.sign, record.at, await signWithIdentity(Devices.mlsCertBytes(me.id, self, 'web', leaf, own.sign, record.at))) };
+    const pins = [];
+    for (const contact of contacts.filter(value => value.state === 'mutual')) {
+      const peer = await box.peer(contact.id).catch(() => null);
+      if (peer && !peer.changed && !peer.blocked) pins.push({ contact: contact.id, identity: { dh: peer.identity.dh, sign: peer.identity.sign }, verified: Boolean(peer.verified) });
+    }
+    await window.Groups.importPins(pins).catch(() => 0);
+    const instance = window.Groups.instance();
+    await window.Groups.adoptSuccession({ record, signature, cert: demote.cert, before });
+    writeJson(`linked-store-v1:${me.id}`, { deviceId: self, instance, identity: demote.identity });
+    try { localStorage.setItem(`device-meta-key-v1:${me.id}`, demote.metaKey); localStorage.removeItem(`keys-held-v1:${me.id}`); } catch {}
+    const all = readPins(); delete all[me.id]; writePins(all); // The new key's list starts a new chain.
+    await box.resetIdentity();
+  }
+  /**
+   * A linked browser whose account moved to a new primary while it was elsewhere (m5 §5.2 step 6): it follows the
+   * signed chain from the key pinned at link time, never the server's word. It has no certificate under the new key
+   * until the new primary signs one, so its leaf stays Previous.
+   */
+  async function followOwnSuccession() {
+    if (!linked || !me) return;
+    const view = await api(`/api/devices/${me.username}`), served = view.identity, pinned = linked.identity;
+    if (!served || (served.sign === pinned.sign && served.dh === pinned.dh)) return;
+    const path = view.succession?.length ? await Devices.verifySuccession(me.id, pinned, served, view.succession) : null;
+    if (!path) { deviceWarning = 'Your account key changed without a record from your previous primary. Link this browser again.'; renderDevices(); return; }
+    for (const { signature, ...record } of path) await window.Groups.adoptSuccession({ record, signature });
+    linked = { ...linked, identity: { dh: served.dh, sign: served.sign } };
+    writeJson(`linked-store-v1:${me.id}`, linked);
+    const all = readPins(); delete all[me.id]; writePins(all);
+    deviceNotice = 'Your account moved to a new primary device.'; renderDevices();
+    writeJson(`recert-wait-v1:${me.id}`, true);
+    await askRecert();
+  }
+  // §5.2.2: a companion that followed the chain asks the new primary to certify its leaf under the new key.
+  const askRecert = async () => api('/api/devices/recert', 'PUT', { platform: 'web', leafSigKey: await window.Groups.leafKey() });
+  /** Companion: installs the answer, if there is one yet (a request the server lost is asked again). */
+  async function takeRecert() {
+    if (!linked || !readJson(`recert-wait-v1:${me.id}`, false)) return;
+    let mine;
+    try { mine = await api('/api/devices/recert/mine'); } catch (error) { if (error.status === 404) await askRecert(); return; }
+    if (!mine.cert) return;
+    await window.Groups.installCert(linked.identity, mine.cert);
+    await api('/api/devices/recert', 'DELETE');
+    try { localStorage.removeItem(`recert-wait-v1:${me.id}`); } catch {}
+  }
+  /**
+   * New primary: certifies each waiting companion's leaf under our key, but only a (device, leaf key) a group we hold
+   * already contains (mlsLeafKnown): the server's word about which key is whose counts for nothing.
+   */
+  async function answerRecerts() {
+    if (linked || !box || inactive || !window.Groups?.enabled()) return;
+    const { requests } = await api('/api/devices/recert');
+    const own = (await box.prekeys()).identity;
+    for (const { deviceId, platform, leafSigKey } of requests) {
+      if (!await window.Groups.leafKnown(deviceId, leafSigKey).catch(() => false)) continue; // Asks again later.
+      const issuedAt = Date.now(), bytes = Devices.mlsCertBytes(me.id, deviceId, platform, leafSigKey, own.sign, issuedAt);
+      await api(`/api/devices/recert/${deviceId}`, 'PUT', { cert: Devices.mlsCertJson(me.id, deviceId, platform, leafSigKey, own.sign, issuedAt, await signWithIdentity(bytes)) });
+    }
   }
   const platformName = platform => ({ web: 'Web browser', ios: 'iPhone app', android: 'Android app', macos: 'Mac app', windows: 'Windows app', linux: 'Linux app' })[platform] || 'Device';
   async function renderDevices() {
@@ -347,6 +483,11 @@
         const leave = document.createElement('button'); leave.type = 'button'; leave.className = 'danger-text device-remove'; leave.textContent = 'Unlink this browser';
         leave.onclick = () => revokeDevice(row).catch(error => { deviceWarning = `Could not unlink: ${error.message}`; renderDevices(); });
         item.append(leave);
+        if (window.Linking?.can('becomePrimary')) {
+          const take = document.createElement('button'); take.type = 'button'; take.className = 'link device-become-primary'; take.textContent = 'Make this browser primary';
+          take.onclick = () => window.Linking.run('becomePrimary');
+          item.append(take);
+        }
       }
       if (amPrimary && !row.current && !row.primary) {
         // A linked device is revoked (signed out, dropped from the signed list and from every group); a device that
@@ -438,6 +579,8 @@
       else if (message.type === 'incoming') incoming(message);
       else if (message.type === 'envelope') inbound = inbound.then(() => receiveEnvelope(socket, message)).catch(() => {});
       else if (['group', 'welcome', 'channel', 'keypackages', 'ephemeral'].includes(message.type)) window.Groups?.frame(message);
+      else if (message.type === 'devices' && message.id === me?.id && linked) followOwnSuccession().then(() => window.Groups?.devicesChanged()).catch(() => {});
+      else if (message.type === 'recert' && message.id === me?.id) (linked ? takeRecert() : answerRecerts()).catch(() => {});
       else if (message.type === 'devices' && message.id === me?.id) { if (!inactive) syncDevices().then(() => window.Groups?.devicesChanged()).catch(() => {}); else api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); }
       else if (message.type === 'devices') { const contact = contactById(message.id); if (contact) verifyContactDevices(contact).catch(() => {}); }
       else if (message.type === 'keys' && message.id === me?.id) publishKeys().catch(() => {}); // Another device took over messaging.
@@ -1146,7 +1289,7 @@
   }
   function groupContext() {
     return {
-      me, backend: backendName, box, signWithIdentity, contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
+      me, backend: backendName, box, signWithIdentity, followOwnSuccession, recerts: () => (linked ? takeRecert() : answerRecerts()).catch(() => {}), contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
       viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
       looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
       socket: () => events, openGroup, verifiedOwnDevices,

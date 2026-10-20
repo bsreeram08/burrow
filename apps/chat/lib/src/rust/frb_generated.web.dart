@@ -33,6 +33,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity dco_decode_box_autoadd_identity(dynamic raw);
 
   @protected
+  LinkedAccount dco_decode_box_autoadd_linked_account(dynamic raw);
+
+  @protected
   MlsExpect dco_decode_box_autoadd_mls_expect(dynamic raw);
 
   @protected
@@ -66,6 +69,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity dco_decode_identity(dynamic raw);
 
   @protected
+  LinkAccepted dco_decode_link_accepted(dynamic raw);
+
+  @protected
+  LinkReveal dco_decode_link_reveal(dynamic raw);
+
+  @protected
+  LinkedAccount dco_decode_linked_account(dynamic raw);
+
+  @protected
   List<String> dco_decode_list_String(dynamic raw);
 
   @protected
@@ -73,6 +85,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<MlsRemoval> dco_decode_list_mls_removal(dynamic raw);
+
+  @protected
+  List<PinExport> dco_decode_list_pin_export(dynamic raw);
+
+  @protected
+  List<PreviousKey> dco_decode_list_previous_key(dynamic raw);
 
   @protected
   List<int> dco_decode_list_prim_u_8_loose(dynamic raw);
@@ -88,6 +106,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect dco_decode_mls_expect(dynamic raw);
+
+  @protected
+  MlsGroupInspection dco_decode_mls_group_inspection(dynamic raw);
 
   @protected
   MlsGroupView dco_decode_mls_group_view(dynamic raw);
@@ -123,6 +144,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity? dco_decode_opt_box_autoadd_identity(dynamic raw);
 
   @protected
+  LinkedAccount? dco_decode_opt_box_autoadd_linked_account(dynamic raw);
+
+  @protected
   MlsExpect? dco_decode_opt_box_autoadd_mls_expect(dynamic raw);
 
   @protected
@@ -150,6 +174,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Peer dco_decode_peer(dynamic raw);
 
   @protected
+  PinExport dco_decode_pin_export(dynamic raw);
+
+  @protected
+  PreviousKey dco_decode_previous_key(dynamic raw);
+
+  @protected
   Safety dco_decode_safety(dynamic raw);
 
   @protected
@@ -175,6 +205,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer);
+
+  @protected
+  LinkedAccount sse_decode_box_autoadd_linked_account(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MlsExpect sse_decode_box_autoadd_mls_expect(SseDeserializer deserializer);
@@ -212,6 +247,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity sse_decode_identity(SseDeserializer deserializer);
 
   @protected
+  LinkAccepted sse_decode_link_accepted(SseDeserializer deserializer);
+
+  @protected
+  LinkReveal sse_decode_link_reveal(SseDeserializer deserializer);
+
+  @protected
+  LinkedAccount sse_decode_linked_account(SseDeserializer deserializer);
+
+  @protected
   List<String> sse_decode_list_String(SseDeserializer deserializer);
 
   @protected
@@ -219,6 +263,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<MlsRemoval> sse_decode_list_mls_removal(SseDeserializer deserializer);
+
+  @protected
+  List<PinExport> sse_decode_list_pin_export(SseDeserializer deserializer);
+
+  @protected
+  List<PreviousKey> sse_decode_list_previous_key(SseDeserializer deserializer);
 
   @protected
   List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer);
@@ -234,6 +284,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect sse_decode_mls_expect(SseDeserializer deserializer);
+
+  @protected
+  MlsGroupInspection sse_decode_mls_group_inspection(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MlsGroupView sse_decode_mls_group_view(SseDeserializer deserializer);
@@ -267,6 +322,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity? sse_decode_opt_box_autoadd_identity(SseDeserializer deserializer);
+
+  @protected
+  LinkedAccount? sse_decode_opt_box_autoadd_linked_account(
+    SseDeserializer deserializer,
+  );
 
   @protected
   MlsExpect? sse_decode_opt_box_autoadd_mls_expect(
@@ -304,6 +364,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Peer sse_decode_peer(SseDeserializer deserializer);
 
   @protected
+  PinExport sse_decode_pin_export(SseDeserializer deserializer);
+
+  @protected
+  PreviousKey sse_decode_previous_key(SseDeserializer deserializer);
+
+  @protected
   Safety sse_decode_safety(SseDeserializer deserializer);
 
   @protected
@@ -329,6 +395,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_identity(Identity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_linked_account(
+    LinkedAccount self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_mls_expect(
@@ -379,6 +451,15 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_identity(Identity self, SseSerializer serializer);
 
   @protected
+  void sse_encode_link_accepted(LinkAccepted self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_link_reveal(LinkReveal self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_linked_account(LinkedAccount self, SseSerializer serializer);
+
+  @protected
   void sse_encode_list_String(List<String> self, SseSerializer serializer);
 
   @protected
@@ -390,6 +471,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_list_mls_removal(
     List<MlsRemoval> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_pin_export(
+    List<PinExport> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_previous_key(
+    List<PreviousKey> self,
     SseSerializer serializer,
   );
 
@@ -413,6 +506,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_mls_expect(MlsExpect self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_group_inspection(
+    MlsGroupInspection self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_mls_group_view(MlsGroupView self, SseSerializer serializer);
@@ -450,6 +549,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_identity(
     Identity? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_linked_account(
+    LinkedAccount? self,
     SseSerializer serializer,
   );
 
@@ -497,6 +602,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_peer(Peer self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_pin_export(PinExport self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_previous_key(PreviousKey self, SseSerializer serializer);
 
   @protected
   void sse_encode_safety(Safety self, SseSerializer serializer);

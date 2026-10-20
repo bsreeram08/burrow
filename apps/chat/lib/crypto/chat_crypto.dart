@@ -246,6 +246,10 @@ abstract class ChatCrypto {
   Future<void> acceptChangeFor(String contactId, Identity shown);
   Future<void> setVerifiedFor(String contactId, bool verified, Identity shown);
 
+  /// A contact moved their account key with a signed succession chain (m5 §5.3): verify [records] (oldest
+  /// first) from the pinned identity; on success the pin moves to the new identity and keeps `verified`.
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records);
+
   /// The identity pinned for [contactId] (a contact, or a group member pinned on first use), or null.
   Future<PinnedPeer?> peer(String contactId);
   Future<void> acceptChange(String contactId);

@@ -59,6 +59,19 @@ class FakeGroupCrypto implements GroupCrypto {
     return GroupDevice(userId: userId, deviceId: this.deviceId, platform: this.platform, leafSigKey: 'leaf-${this.deviceId}', aikSign: 'aik-$userId', issuedAt: issuedAt);
   }
 
+  /// Tests: certificate re-signs this device made, and the leaves a test says its groups hold.
+  int recertified = 0;
+  final Set<String> knownLeaves = {};
+
+  @override
+  Future<void> recertify({required String platform, required int issuedAt}) async => recertified++;
+
+  @override
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups) async => knownLeaves.contains('$deviceId:$leafSigKey');
+
+  @override
+  Future<String> deviceLeaf() async => base64Url.encode(sha256.convert(utf8.encode('leaf:$userId:$deviceId')).bytes).replaceAll('=', '');
+
   @override
   Future<List<String>> keyPackages(int count, {bool lastResort = false}) async {
     _requireDevice();
@@ -97,7 +110,7 @@ class FakeGroupCrypto implements GroupCrypto {
     if (next == null) throw const CryptoException('not allowed by the group roles', code: 'invalid');
     final body = {'t': 'commit', 'g': groupId, 'epoch': g.epoch, 'from': _me, 'adds': added, 'removes': removed, 'roles': ?(roles == null ? null : _rolesJson(roles)), 'n': ++_counter};
     final text = _encode(body);
-    _pendingCommits[groupId] = {'text': text, 'body': body};
+    _pendingCommits[groupId] = {'text': text, 'body': body, 'update': update};
     final welcome = added.isEmpty ? null : _encode({'t': 'welcome', 'group': next.toJson()});
     return GroupCommit(groupId: groupId, commit: text, welcome: welcome, digest: _digest(text), epoch: g.epoch);
   }
@@ -106,6 +119,8 @@ class FakeGroupCrypto implements GroupCrypto {
   Future<GroupView> mergeOwn(String groupId) async {
     final pending = _pendingCommits.remove(groupId) ?? (throw const CryptoException('no pending commit', code: 'invalid'));
     final body = pending['body']! as Map<String, Object?>;
+    // Our own update commit carries a fresh leaf: it is no longer stale.
+    if (pending['update'] == true) staleDevices.remove(deviceId);
     final g = _group(groupId);
     if (body['external'] == true) {
       _groups[groupId] = _Group.fromJson(body['group']! as Map<String, Object?>);
@@ -142,9 +157,10 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<GroupCommit> joinExternal(String groupInfo, String tree) async {
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group}) async {
     _requireDevice();
     final g = _Group.fromJson(_decode(groupInfo));
+    if (g.groupId != group) throw const CryptoException('that GroupInfo is for another group', code: 'invalid');
     final inGroup = g.members.any((m) => m['userId'] == userId);
     if (!inGroup && g.roles.joinPolicy != JoinPolicy.open) throw const CryptoException('an invite-only group', code: 'invalid');
     final members = [for (final m in g.members) if (m['deviceId'] != deviceId) m, Map.of(_me)];
@@ -250,11 +266,11 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) async {
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature}) async {
     final g = _group(groupId);
     if (signature != 'res:$by:$groupId:$action:$seq:$digest:$author') throw const CryptoException('bad resolution signature', code: 'auth');
     final member = g.members.where((m) => m['deviceId'] == by).firstOrNull;
-    if (member == null || !g.roles.isAdmin(member['userId']! as String)) throw const CryptoException('not an admin device', code: 'invalid');
+    if (member == null || member['userId'] != byUser || !g.roles.isAdmin(member['userId']! as String)) throw const CryptoException('not an admin device', code: 'invalid');
     return member['userId']! as String;
   }
 
@@ -273,13 +289,56 @@ class FakeGroupCrypto implements GroupCrypto {
     var leaf = 0;
     return [
       for (final m in g.members)
-        GroupMember(leaf: leaf++, userId: m['userId']! as String, deviceId: m['deviceId']! as String, platform: m['platform']! as String, admin: g.roles.isAdmin(m['userId']! as String)),
+        GroupMember(
+          leaf: leaf++,
+          userId: m['userId']! as String,
+          deviceId: m['deviceId']! as String,
+          platform: m['platform']! as String,
+          admin: g.roles.isAdmin(m['userId']! as String),
+          stale: staleDevices.contains(m['deviceId']),
+        ),
     ];
   }
 
   @override
   Future<GroupRoles> roles(String groupId) async => _group(groupId).roles;
+
+  /// Tests: devices whose leaves read as stale (an identity their user left).
+  final Set<String> staleDevices = {};
+
+  /// Tests: when false, inspecting refuses like a core without the command.
+  bool canInspect = true;
+
+  @override
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree) async {
+    if (!canInspect) throw const CryptoException('cannot inspect', code: 'unsupported');
+    final g = _Group.fromJson(_decode(groupInfo));
+    var leaf = 0;
+    return (groupId: g.groupId, members: [
+      for (final m in g.members)
+        GroupMember(
+          leaf: leaf++,
+          userId: m['userId']! as String,
+          deviceId: m['deviceId']! as String,
+          platform: m['platform']! as String,
+          admin: g.roles.isAdmin(m['userId']! as String),
+          stale: staleDevices.contains(m['deviceId']),
+        ),
+    ]);
+  }
+
+  /// Tests: peers whose keys are not pinned here (checkDm fails for them).
+  final Set<String> unpinned = {};
+
+  @override
+  Future<void> checkDm(String groupId, String peer) async {
+    final g = _group(groupId), users = ([userId, peer]..sort());
+    final ok = g.roles.kind == GroupKind.dm && _same(g.roles.dm, users) && !unpinned.contains(peer) && g.members.every((m) => users.contains(m['userId']));
+    if (!ok) throw const CryptoException('not the DM of us two', code: 'invalid');
+  }
 }
+
+bool _same(List<String>? a, List<String> b) => a != null && a.length == b.length && [for (var i = 0; i < a.length; i++) a[i] == b[i]].every((x) => x);
 
 List<Map<String, Object?>> _list(Object? value) => [for (final m in (value as List? ?? const [])) (m as Map).cast<String, Object?>()];
 

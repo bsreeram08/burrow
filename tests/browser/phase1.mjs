@@ -15,7 +15,8 @@ const playwright = await import(process.env.PLAYWRIGHT_MODULE || 'playwright-cor
 const port = Number(process.env.TEST_PORT || 3137), origin = `http://localhost:${port}`;
 const dataDir = process.env.DATA_DIR || mkdtempSync(join(tmpdir(), 'phase1-e2e-'));
 const shots = process.env.SCREENSHOT_DIR;
-const env = { ...process.env, PORT: String(port), ADMIN_TOKEN: randomBytes(32).toString('hex'), PUBLIC_ORIGIN: origin, DATA_DIR: dataDir };
+// Each browser is its own address (TRUST_PROXY + X-Real-IP), as two people's devices are: per-source limits see two.
+const env = { ...process.env, PORT: String(port), ADMIN_TOKEN: randomBytes(32).toString('hex'), PUBLIC_ORIGIN: origin, DATA_DIR: dataDir, TRUST_PROXY: 'true' };
 const server = spawn('bun', ['--no-env-file', 'packages/signaling/server.ts'], { cwd: root, env, stdio: ['ignore', 'pipe', 'inherit'] });
 process.on('exit', () => server.kill());
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => process.exit(1));
@@ -44,7 +45,7 @@ function png(width, height, marker) {
 }
 
 async function person() {
-  const context = await browser.newContext({ viewport: { width: 1100, height: 860 }, acceptDownloads: true });
+  const context = await browser.newContext({ viewport: { width: 1100, height: 860 }, acceptDownloads: true, extraHTTPHeaders: { 'X-Real-IP': `10.6.0.${pages.length + 1}` } });
   await context.grantPermissions(['camera', 'microphone', 'clipboard-read', 'clipboard-write'], { origin });
   const page = await context.newPage(); pages.push(page);
   page.on('pageerror', error => { console.error('pageerror', error); throw error; });

@@ -125,6 +125,76 @@
   }
   /** The certificate itself, as chatcore decodes it: canonical JSON with its fields in this order. */
   const mlsCertJson = (userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig) => JSON.stringify({ v: 1, userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig });
+  // ---------- Linking and succession (docs/m5-linking.md §1.3, §5.1) ----------
+  const PLATFORM_OK = value => typeof value === 'string' && PLATFORMS.includes(value);
+  const key32 = value => { const bytes = typeof value === 'string' && KEY.test(value) ? unb64(value) : null; if (!bytes || bytes.length !== 32) fail('Invalid key'); return bytes; };
+  /** What a new device's key signs to open a link: its id, platform and public device key. */
+  function startBytes(deviceId, platform, deviceKey) {
+    if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || !PLATFORM_OK(platform)) fail('Invalid link start');
+    return writer().text16('webrtc-bun-linkstart-v1').text16(deviceId).text16(platform).bytes8(key32(deviceKey)).done();
+  }
+  /** What the new device's key signs to claim its session once the link is granted. */
+  function linkClaimBytes(linkId, deviceId, claim) {
+    if (typeof linkId !== 'string' || !DEVICE_ID.test(linkId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid link claim');
+    return writer().text16('webrtc-bun-linkclaim-v1').text16(linkId).text16(deviceId).bytes8(key32(claim)).done();
+  }
+  /** The record the old account key signs to hand over to a new one (primary transfer): keeps contacts' verification. */
+  function successionBytes(record) {
+    if (!exact(record, ['v', 'userId', 'oldSign', 'newSign', 'newDh', 'at']) || record.v !== 1 || typeof record.userId !== 'string' || !USER_ID.test(record.userId) || !timestamp(record.at)) fail('Invalid succession record');
+    return writer().text16('webrtc-bun-succession-v1').text16(record.userId).bytes8(key32(record.oldSign)).bytes8(key32(record.newSign)).bytes8(key32(record.newDh)).u64(record.at).done();
+  }
+  /**
+   * m5 §5.3: does a served succession chain lead from the key we pinned to the key served now? Each record (oldest
+   * first, at most 8) must be signed by the previous key, the first by the pinned one, and the last must name the
+   * served identity. Resolves the records that make the path, or null.
+   */
+  async function verifySuccession(userId, pinned, served, records) {
+    if (!Array.isArray(records) || records.length > 8 || !pinned?.sign || !served?.sign || !served?.dh) return null;
+    const start = records.findIndex(record => record?.oldSign === pinned.sign);
+    if (start < 0) return null;
+    let key = pinned.sign;
+    const path = records.slice(start);
+    for (const record of path) {
+      if (record?.userId !== userId || record.oldSign !== key) return null;
+      const { signature, ...body } = record;
+      try { if (!await verifyBytes(key, successionBytes(body), signature)) return null; } catch { return null; }
+      key = record.newSign;
+    }
+    const last = path.at(-1);
+    return last.newSign === served.sign && last.newDh === served.dh ? path : null;
+  }
+  /**
+   * A contact's succession is followed only from an identity the user accepted: a pin whose code changed and waits for
+   * review (`changed`/`blocked`) could be the server's own key, and a chain from it proves nothing. Resolves the path
+   * from `record` (the 1:1 pin) to `served`, or null (then the usual review applies).
+   */
+  async function successionFrom(userId, record, served, records) {
+    if (!record?.identity || record.changed || record.blocked) return null;
+    return verifySuccession(userId, record.identity, served, records);
+  }
+  /**
+   * Our own devices as the served list names them, only if that list verifies under our account key moving forward
+   * from our pin (never the server's word), each with its sealed label opened (`metaKey`). null otherwise. What a new
+   * key may re-sign (a transfer's list v1, a companion's certificate, m5 §5.2) comes only from here.
+   */
+  async function ownDevices({ userId, aikSign, view, pin, metaKey }) {
+    if (!view?.list) return null;
+    const check = await verifyView({ userId, aikSign, list: view.list, signature: view.signature, certs: view.certs, pin });
+    if (!check.ok) return null;
+    const devices = [];
+    for (const device of view.list.devices) devices.push({ ...device, described: metaKey ? await openMeta(metaKey, userId, device.deviceId, device.meta).catch(() => null) : null });
+    return { pin: check.pin, devices };
+  }
+  /** A transfer's new-chain marker (m5 §5.2) counts only for the key it was made for, and only before that key's list has a pin. */
+  function chainMarker(marker, ownSign, pin) {
+    return marker && typeof marker.aik === 'string' && marker.aik === ownSign && !pin && Array.isArray(marker.keep) ? marker : null;
+  }
+  /** m5 §5.2.2: the platform to certify for `deviceId`, from our signed list's sealed label; null for this device or one the list doesn't name. */
+  function recertPlatform(owned, deviceId, selfId) {
+    if (!owned || deviceId === selfId) return null;
+    const platform = owned.devices.find(device => device.deviceId === deviceId)?.described?.platform;
+    return PLATFORMS.includes(platform) ? platform : null;
+  }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -174,6 +244,17 @@
     const base = await crypto.subtle.importKey('raw', seed, 'HKDF', false, ['deriveKey']);
     return crypto.subtle.deriveKey({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: encoder.encode(META_LABEL) }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
   }
+  /**
+   * The same key as raw bytes, for a linked device (docs/m5-linking.md §1.4 grant `metaKey`): HKDF-SHA-256 of the
+   * identity key's signature, salt 32 zero bytes, info the label, 32 bytes. Only the identity-key holder can make it.
+   */
+  async function deviceMetaKeyBytes(userId, sign) {
+    const seed = await sign(writer().text16(META_LABEL).text16(userId).done());
+    const base = await crypto.subtle.importKey('raw', seed, 'HKDF', false, ['deriveBits']);
+    return new Uint8Array(await crypto.subtle.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(32), info: encoder.encode(META_LABEL) }, base, 256));
+  }
+  /** A companion's label key from the bytes its primary sent (never extractable again). */
+  const metaKeyFromBytes = bytes => crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
   const metaAad = (userId, deviceId) => writer().text16(META_LABEL).text16(userId).text16(deviceId).done();
   /** Seals { label, platform } for one list entry; the AAD binds it to that account and device. */
   async function sealMeta(key, userId, deviceId, { label, platform }) {
@@ -223,6 +304,20 @@
     opened.catch(() => deviceKeys.delete(userId));
     return opened;
   }
+  /**
+   * A browser linking before it knows its account (docs/m5-linking.md §1) keeps its device key under a placeholder
+   * owner; once linked, the same id and key move under the account (the CryptoKey itself is copied, never exported).
+   */
+  async function adoptDeviceKey(from, userId) {
+    const db = await new Promise((resolve, reject) => { const request = indexedDB.open('webrtc-bun-device-key-v1', 1); request.onupgradeneeded = () => request.result.createObjectStore('kv'); request.onerror = () => reject(request.error); request.onsuccess = () => resolve(request.result); });
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('kv', 'readwrite'), store = tx.objectStore('kv');
+      const read = store.get(from);
+      read.onsuccess = () => { if (read.result) { store.put(read.result, userId); store.delete(from); } };
+      tx.oncomplete = resolve; tx.onerror = tx.onabort = () => reject(tx.error);
+    });
+    db.close(); deviceKeys.delete(from); deviceKeys.delete(userId);
+  }
   function describeThisDevice() {
     const agent = typeof navigator !== 'undefined' ? navigator.userAgent : '';
     const browserName = /Edg\//.test(agent) ? 'Edge' : /Firefox\//.test(agent) ? 'Firefox' : /Chrome\//.test(agent) ? 'Chrome' : /Safari\//.test(agent) ? 'Safari' : 'Browser';
@@ -230,5 +325,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, chainMarker, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

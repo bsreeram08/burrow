@@ -32,7 +32,7 @@ pub fn init(db_path: String, store_key: Vec<u8>, expect_existing: bool) -> Resul
     Ok(())
 }
 
-pub fn identity() -> Result<IdentityPub> { with(|core| Ok(core.identity()?.public)) }
+pub fn identity() -> Result<IdentityPub> { with(|core| core.public_identity()) }
 
 /// Signed prekey state to upload (rotates weekly). `now_ms` is Unix time in milliseconds.
 pub fn prepare_prekeys(now_ms: u64) -> Result<PrekeyUpload> { with(|core| core.prekeys(now_ms, None)) }
@@ -112,13 +112,70 @@ pub fn sas_code(local_sdp: String, remote_sdp: String, my_nonce: String, peer_no
     sas::sas_from_sdp(&local_sdp, &remote_sdp, [&my_nonce, &peer_nonce])
 }
 
+// ---------- Linked devices, succession and pin transfer (docs/m5-linking.md) ----------
+pub use crate::core::{Account, LinkAccepted, PinExport, PreviousKey};
+
+/// New device: ephemeral key and link secret for `link_id` (from the server); returns the QR text.
+pub fn link_qr(link_id: String, now_ms: u64) -> Result<String> { with(|core| core.link_qr(&link_id, now_ms)) }
+/// Primary: checks a scanned QR and derives the keys; the result carries the ephemeral key to offer and the code.
+pub fn link_accept(qr: String, now_ms: u64) -> Result<LinkAccepted> { with(|core| core.link_accept(&qr, now_ms)) }
+/// New device: the primary's ephemeral key arrived; returns the confirmation code.
+pub fn link_complete(link_id: String, eph: String, now_ms: u64) -> Result<String> { with(|core| core.link_complete(&link_id, &eph, now_ms)) }
+pub fn link_seal(link_id: String, plaintext: String, now_ms: u64) -> Result<String> { with(|core| core.link_seal(&link_id, &plaintext, now_ms)) }
+pub fn link_open(link_id: String, data: String, now_ms: u64) -> Result<String> { with(|core| core.link_open(&link_id, &data, now_ms)) }
+/// Short-code rendezvous, new device: commits to an ephemeral key before the primary's is known.
+pub fn link_commit(link_id: String, device_id: String, now_ms: u64) -> Result<String> { with(|core| core.link_commit(&link_id, &device_id, now_ms)) }
+/// New device, after the primary's key arrived: opens the commitment `(eph, nonce)` for the primary to check.
+pub fn link_reveal(link_id: String, eph_p: String, now_ms: u64) -> Result<(String, String)> { with(|core| core.link_reveal(&link_id, &eph_p, now_ms)) }
+/// Primary, after looking a code up: remembers the commitment; returns the ephemeral key to offer.
+pub fn link_lookup(link_id: String, device_n: String, commit: String, device_p: String, now_ms: u64) -> Result<String> { with(|core| core.link_lookup(&link_id, &device_n, &commit, &device_p, now_ms)) }
+/// Primary: checks the revealed key against the commitment, derives the keys; returns the confirmation code.
+pub fn link_open_commitment(link_id: String, eph_n: String, nonce: String, now_ms: u64) -> Result<String> { with(|core| core.link_open_commitment(&link_id, &eph_n, &nonce, now_ms)) }
+/// New device: derives the keys; returns the confirmation code (it must equal the primary's).
+pub fn link_complete_code(link_id: String, eph_p: String, device_p: String, now_ms: u64) -> Result<String> { with(|core| core.link_complete_code(&link_id, &eph_p, &device_p, now_ms)) }
+pub fn link_end(link_id: String) -> Result<()> { with(|core| core.link_end(&link_id)) }
+pub fn export_pins() -> Result<Vec<PinExport>> { with(|core| core.export_pins()) }
+pub fn import_pins(pins: Vec<PinExport>) -> Result<u32> { with(|core| Ok(core.import_pins(&pins)? as u32)) }
+/// Companion becoming primary: mints the identity it will publish.
+pub fn succession_start() -> Result<IdentityPub> { with(|core| core.succession_start()) }
+/// `record_json` is the signed record the old primary sent (`{v,userId,oldSign,newSign,newDh,at}`), `signature` its signature.
+pub fn succession_complete(record_json: String, signature: String) -> Result<IdentityPub> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed succession record"))?;
+    with(|core| core.succession_complete(&record, &signature))
+}
+/// A companion core whose account key lives outside it adopts the succession the old primary signed (see `Core::adopt_succession`).
+#[cfg(feature = "mls")]
+pub fn adopt_succession(user_id: String, record_json: String, signature: String, cert_json: Option<String>) -> Result<IdentityPub> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed succession record"))?;
+    with(|core| core.adopt_succession(&user_id, &record, &signature, cert_json.as_deref()))
+}
+/// Old primary: the signed record (JSON, `signature` included) for the new identity.
+pub fn sign_succession(user_id: String, published_sign: String, new_sign: String, new_dh: String, at: u64) -> Result<String> {
+    with(|core| Ok(core.sign_succession(&user_id, &published_sign, &new_sign, &new_dh, at)?.to_string()))
+}
+/// Old primary steps down to a companion of the account under `new_identity`.
+pub fn retire_identity(user_id: String, new_identity: IdentityPub, at: u64) -> Result<()> { with(|core| core.retire_identity(&user_id, &new_identity, at)) }
+/// Contact: follows the served `succession` records (a JSON list) from the pinned identity.
+pub fn accept_succession(contact_id: String, records_json: String) -> Result<PeerRecord> {
+    let records: Vec<serde_json::Value> = serde_json::from_str(&records_json).map_err(|_| ChatError::coded("invalid", "malformed succession records"))?;
+    with(|core| core.accept_succession(&contact_id, &records))
+}
+/// New device: installs a link grant (the account's public identity and this device's MLS certificate).
+#[cfg(feature = "mls")]
+pub fn companion_setup(user_id: String, identity: IdentityPub, cert_json: String) -> Result<DeviceCert> { with(|core| core.companion_setup(&user_id, &identity, &cert_json)) }
+/// Primary: the MLS certificate for a linked device's leaf key (only for a device in the last list it signed).
+#[cfg(feature = "mls")]
+pub fn sign_device_cert(user_id: String, device_id: String, platform: String, leaf_sig_key: String, issued_at: u64, now_ms: u64) -> Result<String> {
+    with(|core| core.sign_device_cert(&user_id, &device_id, &platform, &leaf_sig_key, issued_at, now_ms))
+}
+
 // ---------- Groups over MLS (src/mls; API.md "Groups over MLS") ----------
 // Group ids, KeyPackages, Welcomes, ratchet trees, GroupInfos and messages are base64url strings. Contact ids used
 // for 1:1 pins (`note_peer`) must be the user's canonical id for MLS to find that user's pinned account key.
 #[cfg(feature = "mls")]
 pub use crate::mls::cert::DeviceCert;
 #[cfg(feature = "mls")]
-pub use crate::mls::engine::{CommitCheck, Expect, ResolutionSigner, GroupView, MemberView, Outgoing, PendingCommit, Processed};
+pub use crate::mls::engine::{CommitCheck, Expect, GroupInspection, ResolutionSigner, GroupView, MemberView, Outgoing, PendingCommit, Processed};
 #[cfg(feature = "mls")]
 pub use crate::mls::payload::Context as PayloadContext;
 #[cfg(feature = "mls")]
@@ -146,6 +203,34 @@ pub fn mls_init_device(user_id: String, device_id: String, platform: String, iss
         let aik = core.account_signing_key()?;
         let (groups, store) = core.groups()?;
         groups.init_device(store, &user_id, &device_id, &platform, issued_at_ms, &aik)
+    })
+}
+
+/// Whether one of this account's devices holds exactly this leaf key as a current leaf in any of `groups`: what a
+/// new primary requires before it certifies a companion's leaf under the new account key.
+#[cfg(feature = "mls")]
+pub fn mls_leaf_known(device_id: String, leaf_sig_key: String, groups: Vec<String>) -> Result<bool> {
+    let ids = groups.iter().map(|g| crate::mls::engine::group_id(g)).collect::<Result<Vec<_>>>()?;
+    with_groups(|g, store| g.leaf_known(store, &ids, &device_id, &leaf_sig_key))
+}
+
+/// This device's MLS leaf signature key (base64url), made on first use. A new device sends it in its link hello
+/// before it has a certificate.
+#[cfg(feature = "mls")]
+pub fn mls_device_leaf() -> Result<String> { with_groups(|groups, store| groups.device_leaf(store)) }
+
+/// The account a companion core is linked to (user id and pinned public identity); `None` on a primary.
+#[cfg(feature = "mls")]
+pub fn account() -> Result<Option<Account>> { with(|core| core.account()) }
+
+/// The device re-signs its own, unchanged leaf under the identity this core now holds (after a succession, or to
+/// refresh a certificate). A primary only.
+#[cfg(feature = "mls")]
+pub fn mls_recertify(platform: String, issued_at_ms: u64) -> Result<DeviceCert> {
+    with(|core| {
+        let aik = core.account_signing_key()?;
+        let (groups, store) = core.groups()?;
+        groups.recertify_device(store, &platform, issued_at_ms, &aik)
     })
 }
 
@@ -187,7 +272,7 @@ pub fn mls_join(welcome: String, tree: String) -> Result<GroupView> { with_group
 
 /// External join (public channel, own new device, resync after `mls_forget_group`): submit the commit, then `mls_merge_own`.
 #[cfg(feature = "mls")]
-pub fn mls_join_external(group_info: String, tree: String) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree)) }
+pub fn mls_join_external(group_info: String, tree: String, group: String) -> Result<Outgoing> { with_groups(|groups, store| groups.join_external(store, &group_info, &tree, &group)) }
 
 #[cfg(feature = "mls")]
 pub fn mls_forget_group(group_id: String) -> Result<()> {
@@ -219,8 +304,8 @@ pub fn mls_sign_resolution(group_id: String, action: String, seq: u64, digest: S
 }
 /// Verifies a resolution signed by the admin device `by`; see `Groups::verify_resolution`.
 #[cfg(feature = "mls")]
-pub fn mls_verify_resolution(group_id: String, action: String, seq: u64, digest: String, author: String, by: String, signature: String) -> Result<ResolutionSigner> {
-    with_groups(|groups, store| groups.verify_resolution(store, &crate::mls::engine::group_id(&group_id)?, &action, seq, &digest, &author, &by, &signature))
+pub fn mls_verify_resolution(group_id: String, action: String, seq: u64, digest: String, author: String, by: String, by_user: String, signature: String) -> Result<ResolutionSigner> {
+    with_groups(|groups, store| groups.verify_resolution(store, &crate::mls::engine::group_id(&group_id)?, &action, seq, &digest, &author, &by, &by_user, &signature))
 }
 #[cfg(feature = "mls")]
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }
@@ -236,6 +321,16 @@ pub fn mls_roles(group_id: String) -> Result<Roles> { with_groups(|groups, store
 #[cfg(feature = "mls")]
 pub fn mls_group_view(group_id: String) -> Result<GroupView> {
     with_groups(|groups, store| groups.group_view(store, &crate::mls::engine::group_id(&group_id)?))
+}
+
+/// The members of a served GroupInfo/tree after the join validation, without joining (`stale` flags old identities).
+#[cfg(feature = "mls")]
+pub fn mls_inspect_group(group_info: String, tree: String) -> Result<GroupInspection> { with_groups(|groups, store| groups.inspect_group(store, &group_info, &tree)) }
+
+/// Accepts a DM pointer's group only if it is the DM of this account and `peer` and every leaf chains to the pins.
+#[cfg(feature = "mls")]
+pub fn mls_check_dm(group_id: String, peer_user_id: String) -> Result<()> {
+    with_groups(|groups, store| groups.check_dm(store, &crate::mls::engine::group_id(&group_id)?, &peer_user_id))
 }
 
 /// Validates one decrypted payload (v2 schema and the sender's authority); returns its type.

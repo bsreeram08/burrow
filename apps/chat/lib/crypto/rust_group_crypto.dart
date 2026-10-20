@@ -33,7 +33,7 @@ class RustGroupCrypto implements GroupCrypto {
   static GroupCommit _commit(core.MlsOutgoing o) =>
       GroupCommit(groupId: o.groupId, commit: o.commit, welcome: o.welcome, digest: o.digest, epoch: o.epoch.toInt());
   static GroupMember _member(core.MlsMember m) =>
-      GroupMember(leaf: m.leaf, userId: m.userId, deviceId: m.deviceId, platform: m.platform, admin: m.admin);
+      GroupMember(leaf: m.leaf, userId: m.userId, deviceId: m.deviceId, platform: m.platform, admin: m.admin, stale: m.stale);
 
   @override
   Future<GroupDevice> initDevice({required String userId, required String deviceId, required String platform, required int issuedAt}) => _call(() async {
@@ -80,7 +80,8 @@ class RustGroupCrypto implements GroupCrypto {
   Future<GroupView> join(String welcome, String tree) => _call(() async => _view(await core.mlsJoin(welcome: welcome, tree: tree)));
 
   @override
-  Future<GroupCommit> joinExternal(String groupInfo, String tree) => _call(() async => _commit(await core.mlsJoinExternal(groupInfo: groupInfo, tree: tree)));
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group}) =>
+      _call(() async => _commit(await core.mlsJoinExternal(groupInfo: groupInfo, tree: tree, group: group)));
 
   @override
   Future<void> forget(String groupId) => _call(() => core.mlsForgetGroup(groupId: groupId));
@@ -121,8 +122,8 @@ class RustGroupCrypto implements GroupCrypto {
       _call(() => core.mlsSignResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author));
 
   @override
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) =>
-      _call(() async => (await core.mlsVerifyResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author, by: by, signature: signature)).userId);
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature}) =>
+      _call(() async => (await core.mlsVerifyResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author, by: by, byUser: byUser, signature: signature)).userId);
 
   @override
   Future<void> receiveCommit(String pendingId) => _call(() => core.mlsReceiveCommit(pendingId: pendingId));
@@ -137,5 +138,24 @@ class RustGroupCrypto implements GroupCrypto {
   Future<GroupRoles> roles(String groupId) => _call(() async => _fromRoles(await core.mlsRoles(groupId: groupId)));
 
   @override
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree) => _call(() async {
+    final i = await core.mlsInspectGroup(groupInfo: groupInfo, tree: tree);
+    return (groupId: i.groupId, members: [for (final m in i.members) _member(m)]);
+  });
+
+  @override
   Future<GroupView> view(String groupId) => _call(() async => _view(await core.mlsGroupView(groupId: groupId)));
+
+  @override
+  Future<String> deviceLeaf() => _call(core.mlsDeviceLeaf);
+
+  @override
+  Future<void> recertify({required String platform, required int issuedAt}) => _call(() => core.mlsRecertify(platform: platform, issuedAtMs: BigInt.from(issuedAt)));
+
+  @override
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups) =>
+      _call(() => core.mlsLeafKnown(deviceId: deviceId, leafSigKey: leafSigKey, groups: groups));
+
+  @override
+  Future<void> checkDm(String groupId, String peer) => _call(() => core.mlsCheckDm(groupId: groupId, peerUserId: peer));
 }

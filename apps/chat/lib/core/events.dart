@@ -23,7 +23,9 @@ sealed class AccountEvent {
         'presence' => Presence(m['id'] as String, m['online'] as bool),
         'contacts' => const ContactsChanged(),
         'keys' => KeysChanged(m['id'] as String),
-        'devices' => DevicesChanged(m['id'] as String),
+        'devices' => DevicesChanged(m['id'] as String, needsList: m['needsList'] == true),
+        'link' => LinkEvent(m['id'] as String, m['event'] as String),
+        'recert' => RecertEvent(m['id'] as String, deviceId: m['deviceId'] as String?, answered: m['answered'] == true),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
           fromId: (m['from'] as Map)['id'] as String,
@@ -72,6 +74,7 @@ sealed class AccountEvent {
           action: m['action'] as String?,
           author: m['author'] as String?,
           by: m['by'] as String?,
+          byUser: m['byUser'] as String?,
           signature: m['signature'] as String?,
         ),
         'keypackages' => KeyPackagesLow(m['remaining'] as int),
@@ -97,8 +100,26 @@ class Hello extends AccountEvent {
 
 /// An account's device list changed (ours or a contact's): re-verify it.
 class DevicesChanged extends AccountEvent {
-  const DevicesChanged(this.id);
+  const DevicesChanged(this.id, {this.needsList = false});
   final String id;
+
+  /// To the primary after a revocation: publish the next list without the revoked device.
+  final bool needsList;
+}
+
+/// A companion certificate request (to the primary) or its answer (to the companion, [answered]), m5 §5.2.2.
+class RecertEvent extends AccountEvent {
+  const RecertEvent(this.id, {this.deviceId, this.answered = false});
+  final String id;
+  final String? deviceId;
+  final bool answered;
+}
+
+/// A link session of this account moved on: hello, offer, grant or a new sealed message.
+class LinkEvent extends AccountEvent {
+  const LinkEvent(this.id, this.event);
+  final String id;
+  final String event;
 }
 
 class Presence extends AccountEvent {
@@ -204,7 +225,7 @@ class WelcomeEvent extends AccountEvent {
 
 /// A channel changed: joined, invited, updated, left, frozen (+seq, digest), thawed, remove-needed (+deviceId), gap (+oldest).
 class ChannelEvent extends AccountEvent {
-  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.signature});
+  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.byUser, this.signature});
   final String id;
   final String change;
   final int? seq;
@@ -216,6 +237,9 @@ class ChannelEvent extends AccountEvent {
   final String? action;
   final String? author;
   final String? by;
+
+  /// The resolving admin's user id: the signer must be exactly (byUser, by).
+  final String? byUser;
   final String? signature;
 }
 

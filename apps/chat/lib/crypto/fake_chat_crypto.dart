@@ -165,6 +165,18 @@ class FakeChatCrypto implements ChatCrypto {
     }
   }
 
+  /// Tests: the fake accepts a chain whose first record names the pinned key and whose last names the new one.
+  @override
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records) async {
+    final p = _peers[contactId];
+    if (p == null || records.isEmpty || records.first['oldSign'] != p.identity.sign) throw const CryptoException('the chain does not start at the pinned key', code: 'invalid');
+    p.identity = Identity(dh: records.last['newDh'] as String, sign: records.last['newSign'] as String);
+    p
+      ..changed = false
+      ..blocked = false;
+    return PinnedPeer(identity: p.identity, verified: p.verified, changed: false, blocked: false);
+  }
+
   @override
   Future<void> acceptChangeFor(String contactId, Identity shown) async {
     final p = _peers[contactId];

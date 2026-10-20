@@ -75,12 +75,16 @@ class PendingGroupCommit {
 }
 
 class GroupMember {
-  const GroupMember({required this.leaf, required this.userId, required this.deviceId, required this.platform, required this.admin});
+  const GroupMember({required this.leaf, required this.userId, required this.deviceId, required this.platform, required this.admin, this.stale = false});
   final int leaf;
   final String userId;
   final String deviceId;
   final String platform;
   final bool admin;
+
+  /// A device of an identity its user left (recovery, or a succession that did not cover it): it can't act and
+  /// may be removed (m5 §7).
+  final bool stale;
 }
 
 /// One device to remove ([deviceId] null: every device of [userId]).
@@ -140,6 +144,17 @@ abstract class GroupCrypto {
   /// Calling it again returns the same device.
   Future<GroupDevice> initDevice({required String userId, required String deviceId, required String platform, required int issuedAt});
 
+  /// A primary re-signs its own leaf certificate under the account key it now holds (after a succession).
+  Future<void> recertify({required String platform, required int issuedAt});
+
+  /// New primary (m5 §5.2.2): whether a group it holds (of [groups]) already has exactly this leaf key for
+  /// that device of its own account.
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups);
+
+  /// This device's MLS leaf signature key (base64url), made on first use: a new device sends it in its link
+  /// hello before it has a certificate (m5 §1.4).
+  Future<String> deviceLeaf();
+
   /// [count] one-time KeyPackages (1-100), or one last-resort one.
   Future<List<String>> keyPackages(int count, {bool lastResort = false});
 
@@ -152,7 +167,8 @@ abstract class GroupCrypto {
   Future<PendingGroupCommit?> pendingCommit(String groupId);
 
   Future<GroupView> join(String welcome, String tree);
-  Future<GroupCommit> joinExternal(String groupInfo, String tree);
+  /// [group]: the channel we mean to join; a GroupInfo for any other group is refused.
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group});
   Future<void> forget(String groupId);
 
   Future<String> encrypt(String groupId, String plaintext);
@@ -169,12 +185,21 @@ abstract class GroupCrypto {
   /// An admin's resolution of a frozen channel, signed with this device's MLS leaf key (m4-groups §7).
   Future<String> signResolution(String groupId, {required String action, required int seq, required String digest, required String author});
 
-  /// Checks a resolution signed by device [by]: it must be an admin device in this device's own tree. Returns
-  /// the signer's user id; throws [CryptoException] (`auth` bad signature, `invalid` otherwise).
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature});
+  /// Checks a resolution signed by device [by] of user [byUser]: it must be exactly that admin device in this
+  /// device's own tree. Returns the signer's user id; throws [CryptoException] (`auth` bad signature,
+  /// `invalid` otherwise).
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature});
   Future<void> receiveAbort(String pendingId);
 
   Future<List<GroupMember>> members(String groupId);
   Future<GroupRoles> roles(String groupId);
   Future<GroupView> view(String groupId);
+
+  /// The members of a served GroupInfo and tree after whole-group validation, without joining (m5 §3). Throws
+  /// when the core can't check it; callers then join nothing (fail closed).
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree);
+
+  /// m5 §8.3: passes only when [groupId] is the DM of this account and [peer] (DM roles naming exactly the two)
+  /// and every leaf chains to the pinned account keys. Throws otherwise.
+  Future<void> checkDm(String groupId, String peer);
 }

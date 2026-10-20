@@ -41,11 +41,13 @@ class MessageStore {
           await db.execute('CREATE INDEX messages_by_time ON messages (conversation_id, created_at)');
           await _addPhase1Columns(db);
           await _addGroupParts(db);
+          await _addDmParts(db);
         },
         // Additive only: every existing row keeps its content and reads back with the new parts absent.
         onUpgrade: (db, from, _) async {
           if (from < 2) await _addPhase1Columns(db);
           if (from < 3) await _addGroupParts(db);
+          if (from < 4) await _addDmParts(db);
         },
       ),
     );
@@ -55,7 +57,16 @@ class MessageStore {
   /// v2 (phase 1): reply, attachment, link preview, the latest edit and reactions, each as nullable columns.
   /// v3 (M4 groups, docs/m4-groups.md §10): sender, sender name, mentions and read-by of group messages,
   /// system rows, and a `conversations` table for groups.
-  static const schemaVersion = 3;
+  /// v4 (M5, docs/m5-linking.md §8): a 1:1 chat's DM group remembers its peer, whether it was checked, and when the chat moved.
+  static const schemaVersion = 4;
+
+  static Future<void> _addDmParts(DatabaseExecutor db) async {
+    await db.execute('ALTER TABLE conversations ADD COLUMN peer TEXT');
+    await db.execute('ALTER TABLE conversations ADD COLUMN dm_checked_peer TEXT');
+    await db.execute('ALTER TABLE conversations ADD COLUMN moved_at INTEGER');
+    // Channel names and topics from a link bundle (m5 §3 step 3), until this device joins those channels.
+    await db.execute('CREATE TABLE bundle_names (id TEXT PRIMARY KEY, name TEXT NOT NULL, topic TEXT NOT NULL)');
+  }
 
   static Future<void> _addGroupParts(DatabaseExecutor db) async {
     for (final column in ['sender TEXT', 'sender_name TEXT', 'mentions TEXT', 'read_by TEXT']) {
@@ -254,6 +265,50 @@ class MessageStore {
       );
     });
     _changes.add(conversationId);
+  }
+
+  /// History a linked device received in its bundle (m5 §2): records in the shape both clients store
+  /// (`exportRecord`), added where absent, within the device cap; anything malformed is skipped. Returns how many.
+  Future<int> importLinked(List<Object?> records) async {
+    Object? text(Object? value) => value == null ? null : jsonEncode(value);
+    var added = 0;
+    await _db.transaction((tx) async {
+      for (final r in records) {
+        if (r is! Map || await _count(tx) >= maxMessages) continue;
+        try {
+          final m = ChatMessage.fromRow({
+            'id': r['id'], 'conversation_id': r['conversationId'], 'direction': r['direction'], 'text': r['text'],
+            'created_at': r['createdAt'], 'status': r['status'] == 'queued' ? 'uncertain' : r['status'], 'expires_at': r['expiresAt'],
+            'reply_to': text(r['replyTo']), 'attachment': text(r['attachment']), 'link': text(r['link']),
+            'edited_text': r['editedText'], 'edited_at': r['editedAt'], 'reactions': text(r['reactions']),
+            'sender': r['from'], 'sender_name': r['fromName'], 'mentions': text(r['mentions']),
+          });
+          if (m.system || m.expired(_now())) continue;
+          added += await tx.insert('messages', m.toRow(), conflictAlgorithm: ConflictAlgorithm.ignore) > 0 ? 1 : 0;
+        } catch (_) {
+          // Not a record this store accepts: skipped.
+        }
+      }
+    });
+    if (added > 0) _changes.add(null);
+    return added;
+  }
+
+  /// Remembers channel names and topics from a link bundle until this device joins those channels.
+  Future<void> putBundleNames(Map<String, ({String name, String topic})> names) async {
+    await _db.transaction((tx) async {
+      for (final e in names.entries) {
+        await tx.insert('bundle_names', {'id': e.key, 'name': e.value.name, 'topic': e.value.topic}, conflictAlgorithm: ConflictAlgorithm.replace);
+      }
+    });
+  }
+
+  /// The bundle's name and topic for a channel this device is joining, once (then forgotten).
+  Future<({String name, String topic})?> takeBundleName(String id) async {
+    final rows = await _db.query('bundle_names', where: 'id = ?', whereArgs: [id]);
+    if (rows.isEmpty) return null;
+    await _db.delete('bundle_names', where: 'id = ?', whereArgs: [id]);
+    return (name: rows.single['name']! as String, topic: rows.single['topic']! as String);
   }
 
   /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.

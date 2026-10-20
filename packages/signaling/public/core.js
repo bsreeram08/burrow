@@ -126,8 +126,8 @@
         return record;
       },
       safety: (me, contactId, them) => run({ cmd: 'safety', me, contact: contactId, them }),
-      setVerified: (contactId, verified) => run({ cmd: 'setVerified', contact: contactId, verified }),
-      acceptChange: contactId => run({ cmd: 'acceptChange', contact: contactId }),
+      setVerified: (contactId, verified, identity) => run({ cmd: 'setVerified', contact: contactId, verified, ...(identity ? { identity } : {}) }),
+      acceptChange: (contactId, identity) => run({ cmd: 'acceptChange', contact: contactId, ...(identity ? { identity } : {}) }),
       peer: contactId => run({ cmd: 'peer', contact: contactId }),
       forget: contactId => run({ cmd: 'forget', contact: contactId }),
       rotate: contactId => run({ cmd: 'rotate', contact: contactId }),
@@ -192,5 +192,10 @@
     channel.postMessage({ backend: mine });
     return next => channel.postMessage({ backend: next });
   }
-  window.Core = Object.freeze({ box, groupStore, supported, backend, setBackend, hasKeys, guard });
+  /** A test-only local switch (e.g. 'dm-move-test'), honoured only where the server allows test flags (loopback). */
+  async function testFlag(name) {
+    if (!await testFlagsOn()) return null;
+    try { return localStorage.getItem(name); } catch { return null; }
+  }
+  window.Core = Object.freeze({ box, groupStore, supported, backend, setBackend, hasKeys, guard, testFlag });
 })();

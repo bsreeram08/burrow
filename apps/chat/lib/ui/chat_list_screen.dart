@@ -16,6 +16,7 @@ import '../store/message_store.dart' show GroupConversation, GroupKindName, Memb
 import '../theme/theme_prefs.dart';
 import 'channel_browser.dart';
 import 'command_palette.dart';
+import 'devices_screen.dart';
 import 'conversation_view.dart' show messagePreview;
 import 'new_group_sheet.dart';
 import 'security_settings.dart';
@@ -162,6 +163,7 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               'theme' => showThemePicker(context, ref),
               'chats' => showChatSettings(context, ref),
               'security' => showSecuritySettings(context, ref),
+              'devices' => showDevices(context),
               'signout' => app.signOut(),
               'signout-all' => app.signOut(everywhere: true),
               _ => null,
@@ -171,6 +173,7 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               PopupMenuItem(value: 'theme', child: Text('Appearance')),
               PopupMenuItem(value: 'chats', child: Text('Chat settings')),
               PopupMenuItem(value: 'security', child: Text('Security')),
+              PopupMenuItem(value: 'devices', child: Text('Devices')),
               PopupMenuItem(value: 'signout', child: Text('Sign out')),
               PopupMenuItem(value: 'signout-all', child: Text('Sign out everywhere')),
             ],

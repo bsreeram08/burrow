@@ -13,6 +13,14 @@ use crate::sas;
 use crate::EncryptOutcome;
 
 /// Runs one command and wraps the outcome the way every driver reports it.
+/// The optional `identity` of `acceptChange` / `setVerified`: the exact code the user was shown.
+fn shown_identity(command: &Value) -> crate::error::Result<Option<IdentityPub>> {
+    match command.get("identity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map(Some).map_err(|_| ChatError::coded("invalid", "malformed identity")),
+    }
+}
+
 pub fn respond(core: &mut Core, command: &Value) -> Value {
     match run(core, command) {
         Ok(value) => json!({ "ok": value }),
@@ -74,8 +82,8 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
             None => Value::Null,
         }),
         "peer" => Ok(json!(core.peer(&text(command, "contact")?)?)),
-        "setVerified" => { core.set_verified(&text(command, "contact")?, command.get("verified").and_then(Value::as_bool).unwrap_or(true))?; Ok(Value::Null) }
-        "acceptChange" => { core.accept_change(&text(command, "contact")?)?; Ok(Value::Null) }
+        "setVerified" => { core.set_verified_for(&text(command, "contact")?, command.get("verified").and_then(Value::as_bool).unwrap_or(true), shown_identity(command)?.as_ref())?; Ok(Value::Null) }
+        "acceptChange" => { core.accept_change_for(&text(command, "contact")?, shown_identity(command)?.as_ref())?; Ok(Value::Null) }
         "forget" => { core.forget(&text(command, "contact")?)?; Ok(Value::Null) }
         "abort" => { core.abort(&text(command, "pendingId")?); Ok(Value::Null) }
         "notePeer" => {

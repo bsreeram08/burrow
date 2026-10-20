@@ -313,7 +313,12 @@ try {
   // Bob's device rejected it too, so (and only so) Roll back is offered.
   await until(bob, () => !document.getElementById('group-rollback').hidden && /rejects it too/.test(document.getElementById('group-banner-text').textContent), undefined, 60000);
   await shot(bob, 'rollback');
+  const resolved = bob.waitForRequest(request => request.url().endsWith('/resolve'));
   await bob.click('#group-rollback');
+  // The signed rollback names the author bob's own device authenticated: dave's device, not whoever the server says.
+  const daveDevice = await dave.evaluate(async () => (await window.DeviceFormat.deviceKey(window.App.accountId)).deviceId);
+  const signed = JSON.parse((await resolved).postData());
+  if (signed.action !== 'rollback' || signed.author !== daveDevice) throw new Error(`rollback signed for ${signed.author}, dave is ${daveDevice}`);
   await sees(bob, 'You removed dave');
   await until(bob, id => !window.Groups.debug(id).members.includes('dave'), general);
   await until(dave, () => !document.getElementById('group-banner').hidden && /removed/.test(document.getElementById('group-banner-text').textContent));

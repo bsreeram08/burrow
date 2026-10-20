@@ -118,6 +118,7 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 if command.get("commit").and_then(Value::as_bool).unwrap_or(true) { groups.commit_pending(store, &processed.pending_id)?; }
                 ok(processed)
             }
+            "mlsCommitAuthor" => ok(groups.commit_author(store, &group()?, &text(command, "message")?)?),
             "mlsCommitReceived" => { groups.commit_pending(store, &text(command, "pendingId")?)?; Ok(Value::Null) }
             "mlsAbortReceived" => { groups.abort(&text(command, "pendingId")?); Ok(Value::Null) }
             "mlsMembers" => ok(groups.members(store, &group()?)?),

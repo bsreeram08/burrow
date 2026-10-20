@@ -15,13 +15,16 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string } = {}) {
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
   const handlers: Record<string, (command: Cmd) => any> = {
     mlsDeviceLeaf: () => 'leaf', mlsSetDeviceCert: () => ({}), mlsKeyPackages: command => Array(command.count).fill('kp'),
     peer: () => peer, notePeer: command => { const changed = peer && (peer.identity.dh !== command.identity.dh || peer.identity.sign !== command.identity.sign); peer = { identity: command.identity, verified: false, changed, blocked: changed }; return peer; },
-    acceptChange: () => { peer = { ...peer, blocked: false }; return null; }, setVerified: () => null,
+    // Like chatcore: with `identity`, only that exact pinned identity is accepted.
+    acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
+    setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
+    mlsCommitAuthor: () => ({ leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),
     mlsMembers: () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }],
     mlsPending: () => null, mlsCommitReceived: () => null, mlsAbortReceived: () => null, mlsForget: () => null,
@@ -37,7 +40,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
     ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: options.log?.(Number(match[1])) ?? [], more: false, gap: false }]],
     ['GET', /^\/api\/users\/\w+\/identity$/, () => [200, { userId: BOB, username: 'bob', identity: { dh: 'dh2', sign: 'sign2' } }]],
-    ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: BOB_DEV } : { resolved: 'dismiss' }]],
+    ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
     ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
     ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : [202, { frozen: true }]],
@@ -111,9 +114,10 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
   });
 
   const frozenEntry = (message = b64('bad commit')) => ({ seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message, createdAt: Date.now() });
-  async function frozenWorld(receive: () => any, entry = frozenEntry()) {
-    const w = world({ log: after => after === 4 ? [entry] : [] });
+  async function frozenWorld(receive: () => any, entry = frozenEntry(), options: { removeDevice?: string; author?: () => any } = {}) {
+    const w = world({ log: after => after === 4 ? [entry] : [], removeDevice: options.removeDevice });
     w.handlers.mlsReceive = receive;
+    if (options.author) w.handlers.mlsCommitAuthor = options.author;
     await w.start();
     w.Groups.open(G);
     w.Groups.frame({ type: 'channel', id: G, change: 'frozen', seq: 5, digest: sha('bad commit') });
@@ -151,8 +155,24 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.of('mlsCommit')).toEqual([]);
     await w.el('group-rollback').onclick();
     await w.until(() => w.of('mlsCommit').length > 0, 'removal commit');
-    expect(w.requests.find(request => request.path.endsWith('/resolve'))!.body).toMatchObject({ action: 'rollback', seq: 5, digest: sha('bad commit'), signature: 'signature' });
+    expect(w.requests.find(request => request.path.endsWith('/resolve'))!.body).toMatchObject({ action: 'rollback', seq: 5, digest: sha('bad commit'), author: BOB_DEV, signature: 'signature' });
+    expect(w.of('mlsCommitAuthor')[0]).toMatchObject({ message: b64('bad commit') });
     expect(w.of('mlsCommit')[0].removes).toEqual([{ userId: BOB, deviceId: BOB_DEV }]);
+  });
+
+  test('4b. the author is the one this device authenticated: an answer naming another device removes nobody', async () => {
+    const w = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { removeDevice: 'Z'.repeat(22) });
+    await w.el('group-rollback').onclick();
+    await w.until(() => /different device/.test(w.app.status), 'refused');
+    await w.settle();
+    expect(w.of('mlsCommit')).toEqual([]);
+  });
+
+  test('4c. a commit whose author this device can\'t authenticate is never rolled back', async () => {
+    const w = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { author: () => { throw coded('auth', 'commit signature rejected'); } });
+    expect([w.el('group-rollback').hidden, w.el('group-dismiss').hidden]).toEqual([true, false]);
+    await w.el('group-rollback').onclick(); await w.settle();
+    expect(w.requests.filter(request => request.path.endsWith('/resolve'))).toEqual([]);
   });
 
   test('5. a changed code of someone met in a group pauses the group and is only accepted from an explicit review', async () => {
@@ -174,9 +194,26 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.of('acceptChange')).toEqual([]);
     await w.el('group-review').onclick(); await w.settle();
     await w.el('pin-review-verify').onclick(); await w.settle();
-    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB }]);
-    expect(w.of('setVerified')).toEqual([{ cmd: 'setVerified', contact: BOB, verified: true }]);
+    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB, identity: { dh: 'dh2', sign: 'sign2' } }]);
+    expect(w.of('setVerified')).toEqual([{ cmd: 'setVerified', contact: BOB, verified: true, identity: { dh: 'dh2', sign: 'sign2' } }]);
     expect(w.Groups.debug(G).status).not.toBe('paused');
+  });
+
+  test('5c. the review accepts only the code it showed: a newer one pending at the tap is re-reviewed, not accepted', async () => {
+    const w = world({ log: after => after === 0 ? [{ seq: 1, epoch: 3, kind: 'app', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('m'), createdAt: Date.now() }] : [] });
+    w.handlers.mlsReceive = () => { throw coded('invalid', `no pinned account key for user ${BOB}`); };
+    await w.start();
+    await w.until(() => w.Groups.debug(G).status === 'paused', 'paused');
+    w.Groups.open(G);
+    await w.el('group-review').onclick(); await w.settle();
+    const shown = w.el('pin-review-after').textContent;
+    w.setPeer({ identity: { dh: 'dh3', sign: 'sign3' }, verified: false, changed: true, blocked: true }); // changed again behind the sheet
+    await w.el('pin-review-accept').onclick(); await w.settle();
+    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB, identity: { dh: 'dh2', sign: 'sign2' } }]);
+    expect(w.Groups.debug(G).status).toBe('paused');
+    expect(w.el('pin-review').hidden).toBe(false);
+    expect(w.el('pin-review-status').textContent).toContain('changed again');
+    expect(w.el('pin-review-after').textContent).not.toBe(shown);
   });
 
   test('5b. a contact whose key differs from the group store\'s is paused too; only an explicit decision accepts it', async () => {
@@ -189,7 +226,7 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     // Accepting this exact code in the 1:1 safety sheet is the explicit decision; then the group resumes.
     w.handlers.mlsReceive = () => application(text);
     await w.Groups.contactAccepted(BOB);
-    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB }]);
+    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB, identity: { dh: 'dh2', sign: 'sign2' } }]);
     await w.until(() => w.Groups.debug(G).cursor === 1, 'resumed');
   });
 

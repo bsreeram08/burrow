@@ -9,7 +9,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::error::{ChatError, Result};
-use crate::primitives::unb64;
+use crate::primitives::{b64, unb64};
+use sha2::{Digest, Sha256};
 
 pub const LIST_LABEL: &str = "webrtc-bun-devicelist-v1";
 pub const CERT_LABEL: &str = "webrtc-bun-devicecert-v1";
@@ -80,6 +81,17 @@ pub fn parse_list(json: &str) -> Result<DeviceList> {
         out.push(DeviceEntry { device_id: device_id.into(), added_at, meta: meta.into() });
     }
     Ok(DeviceList { user_id: user_id.into(), version, prev_hash: prev_hash.into(), devices: out })
+}
+
+/// SHA-256 of a list's canonical bytes, base64url: the `prevHash` the next list names (the server's `digest`).
+pub fn list_hash(list: &DeviceList) -> String { b64(&Sha256::digest(list_bytes(list))) }
+
+/// The account's current list as the server serves it: the list JSON and the identity key's signature over it.
+/// It need not come from this device; the core only trusts it if the signature verifies under its own key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListHead {
+    pub list_json: String,
+    pub signature: String,
 }
 
 /// TLS-style writer (devices.js `writer`).

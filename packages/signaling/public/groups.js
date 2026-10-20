@@ -204,16 +204,26 @@
     reviewing = userId;
     $('pin-review-title').textContent = `${nameOf(userId)}'s security code changed`;
     $('pin-review-before').textContent = await fingerprint(change?.before);
-    $('pin-review-after').textContent = await fingerprint(change?.after || current?.identity);
+    // The exact code on screen is the only one a tap here accepts (the core checks it, §3).
+    reviewShown = current?.identity || change?.after || null;
+    $('pin-review-after').textContent = await fingerprint(reviewShown);
     $('pin-review-status').textContent = '';
     $('pin-review').hidden = false; $('pin-review-cancel').focus();
   }
-  let reviewing = null;
+  let reviewing = null, reviewShown = null;
   async function decideReview(verified) {
-    const userId = reviewing;
-    if (!userId) return;
-    await run({ cmd: 'acceptChange', contact: userId });
-    if (verified) await run({ cmd: 'setVerified', contact: userId, verified: true });
+    const userId = reviewing, shown = reviewShown;
+    if (!userId || !shown) return;
+    try {
+      await run({ cmd: 'acceptChange', contact: userId, identity: shown });
+      if (verified) await run({ cmd: 'setVerified', contact: userId, verified: true, identity: shown });
+    } catch (error) {
+      if (error.code !== 'mismatch') throw error;
+      // It changed again while the sheet was open: show the new one; nothing was accepted.
+      await openReview(userId);
+      $('pin-review-status').textContent = 'The code changed again while you were looking. Compare this new one.';
+      return;
+    }
     forgetChange(userId);
     reviewing = null; $('pin-review').hidden = true;
     pinsChanged(userId);
@@ -243,7 +253,7 @@
   async function contactAccepted(userId) {
     if (!run || !ctx) return;
     const [mine, theirs] = await Promise.all([run({ cmd: 'peer', contact: userId }).catch(() => null), ctx.box.peer(userId).catch(() => null)]);
-    if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId }); forgetChange(userId); }
+    if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId, identity: theirs.identity }); forgetChange(userId); }
     pinsChanged(userId);
   }
   function pinsChanged(userId) {
@@ -763,12 +773,19 @@
     if (!frozen) return Promise.resolve();
     ch.check = { seq: frozen.seq, digest: frozen.digest, state: 'checking' }; paint(id);
     return enqueue(id, async () => {
-      let state = 'unknown';
+      // `author`: the commit's author device; `authenticated` when this device's own tree verified its signature
+      // (required for a rollback, which cuts that device off). A dismissal removes nobody: the log's word will do.
+      let state = 'unknown', author = null, authenticated = false;
       try {
         const result = await call(`/api/channels/${id}/log?after=${frozen.seq - 1}`);
         const entry = result.status === 200 ? result.body.entries.find(item => item.seq === frozen.seq) : null;
+        if (entry && ID.test(entry.from?.deviceId || '')) author = entry.from.deviceId;
+        if (entry?.kind === 'commit' && entry.from.deviceId !== deviceId) {
+          await ensurePins([entry.from.userId]);
+          try { author = (await run({ cmd: 'mlsCommitAuthor', group: id, message: entry.message })).deviceId; authenticated = true; } catch {}
+        }
         if (!entry || entry.kind !== 'commit' || hex(await crypto.subtle.digest('SHA-256', unb64(entry.message))) !== frozen.digest) state = 'unknown';
-        else if (ch.rejected?.seq === frozen.seq && ch.rejected.digest === frozen.digest) state = 'fails';
+        else if (ch.rejected?.seq === frozen.seq && ch.rejected.digest === frozen.digest) state = authenticated ? 'fails' : 'unknown';
         else if (entry.from.deviceId === deviceId || ch.cursor >= frozen.seq) state = 'ok'; // Built or merged here, after the same validator.
         else {
           await ensurePins([entry.from.userId]);
@@ -776,26 +793,31 @@
           try {
             processed = await run({ cmd: 'mlsReceive', group: id, message: entry.message, commit: false, expect: 'commit' });
             state = 'ok';
-          } catch (error) { state = error.code === 'poison' ? 'fails' : 'unknown'; }
+          } catch (error) { state = error.code === 'poison' && authenticated ? 'fails' : 'unknown'; }
           if (processed) await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {});
         }
       } catch { state = 'unknown'; }
-      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state }; save(); paint(id); }
+      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state, author, authenticated }; save(); paint(id); }
     }).catch(() => {});
   }
   async function resolve(id, action) {
     const ch = channels.get(id);
     if (!ch?.frozen) return;
-    const check = ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check.state : null;
-    if (action === 'rollback' && check !== 'fails') throw new Error('this device did not find that change invalid, so it won\'t roll it back');
-    if (action === 'dismiss' && (!check || check === 'checking')) throw new Error('still checking the change');
+    const check = ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check : null;
+    if (action === 'rollback' && !(check?.state === 'fails' && check.authenticated)) throw new Error('this device did not find that change invalid, so it won\'t roll it back');
+    if (action === 'dismiss' && (!check || check.state === 'checking' || !check.author)) throw new Error('still checking the change');
+    const author = check.author;
     const device = await window.DeviceFormat.deviceKey(me.id);
-    const bytes = new TextEncoder().encode(`webrtc-bun-mlsresolve-v1\n${id}\n${action}\n${ch.frozen.seq}\n${ch.frozen.digest}`);
-    const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, signature: await device.sign(bytes) });
+    // The signature names the author this device authenticated, so the server can't make it cut off someone else.
+    const bytes = new TextEncoder().encode(`webrtc-bun-mlsresolve-v2\n${id}\n${action}\n${ch.frozen.seq}\n${ch.frozen.digest}\n${author}`);
+    const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, author, signature: await device.sign(bytes) });
     ch.status = 'active'; delete ch.frozen; delete ch.check; delete ch.rejected; save(); paint(id);
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
-    // Only the device our own signed rollback names is removed (never one a frame asks for).
-    if (action === 'rollback' && ID.test(answer.removeDevice || '')) removeDevice(id, answer.removeDevice);
+    // Only the author this device authenticated is removed; an answer naming anyone else is refused.
+    if (action === 'rollback') {
+      if (answer.removeDevice !== undefined && answer.removeDevice !== author) status(id, 'The server named a different device to remove than the one that made the change. Nobody was removed; ask another admin to check.');
+      else removeDevice(id, author);
+    }
     flush(id);
   }
 

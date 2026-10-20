@@ -3,6 +3,7 @@
 use std::sync::Mutex;
 
 use crate::core::{Core, Decrypted, EncryptOutcome, PeerRecord, PrekeyUpload, Safety};
+use crate::devicelist::ListHead;
 use crate::error::{ChatError, Result};
 use crate::protocol::{Bundle, IdentityPub, PublishedOneTimePreKey};
 use crate::sas;
@@ -65,6 +66,9 @@ pub fn safety(my_username: String, contact_id: String, their_username: String) -
 pub fn peer(contact_id: String) -> Result<Option<PeerRecord>> { with(|core| core.peer(&contact_id)) }
 pub fn set_verified(contact_id: String, verified: bool) -> Result<()> { with(|core| core.set_verified(&contact_id, verified)) }
 pub fn accept_change(contact_id: String) -> Result<()> { with(|core| core.accept_change(&contact_id)) }
+/// Accept / verify only the identity the user was shown; `mismatch` if the pinned one is different now.
+pub fn accept_change_for(contact_id: String, identity: IdentityPub) -> Result<()> { with(|core| core.accept_change_for(&contact_id, Some(&identity))) }
+pub fn set_verified_for(contact_id: String, verified: bool, identity: IdentityPub) -> Result<()> { with(|core| core.set_verified_for(&contact_id, verified, Some(&identity))) }
 pub fn forget(contact_id: String) -> Result<()> { with(|core| core.forget(&contact_id)) }
 
 /// Records an identity the server published for a contact (key-change events); a change is flagged and blocks sending.
@@ -84,9 +88,10 @@ pub fn prove_identity(user_id: String, device_id: String, challenge: String) -> 
 pub fn reset_identity() -> Result<()> { with(|core| core.reset_identity()) }
 
 /// Signs the account's next DeviceList (JSON, devices.js shape) and its device certificates; see
-/// `Core::sign_device_list`. `published_sign` is the account's identity signing key as the server publishes it.
-pub fn sign_device_list(user_id: String, published_sign: String, list_json: String) -> Result<crate::devicelist::SignedList> {
-    with(|core| core.sign_device_list(&user_id, &published_sign, &list_json))
+/// `Core::sign_device_list`. `published_sign` is the account's identity signing key as the server publishes it;
+/// `head` is the list the server serves now (with its signature), so lists signed by another device are followed.
+pub fn sign_device_list(user_id: String, published_sign: String, list_json: String, head: Option<ListHead>) -> Result<crate::devicelist::SignedList> {
+    with(|core| core.sign_device_list(&user_id, &published_sign, &list_json, head.as_ref()))
 }
 /// The device-meta seed (base64url signature); see `Core::device_meta_signature`.
 pub fn device_meta_signature(user_id: String) -> Result<String> { with(|core| core.device_meta_signature(&user_id)) }
@@ -202,6 +207,10 @@ pub fn mls_encrypt(group_id: String, plaintext: String) -> Result<String> {
 pub fn mls_receive(group_id: String, message: String, expect: Option<Expect>) -> Result<Processed> {
     with_groups(|groups, store| groups.process_as(store, &crate::mls::engine::group_id(&group_id)?, &message, expect))
 }
+#[cfg(feature = "mls")]
+/// Who signed a commit at the current epoch, checked against this device's tree (signature only; changes nothing).
+#[cfg(feature = "mls")]
+pub fn mls_commit_author(group_id: String, message: String) -> Result<MemberView> { with_groups(|groups, store| groups.commit_author(store, &crate::mls::engine::group_id(&group_id)?, &message)) }
 #[cfg(feature = "mls")]
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }
 #[cfg(feature = "mls")]

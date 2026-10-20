@@ -58,6 +58,7 @@ answering `{ rotate: true }`): the core keeps only the session it arrived on, an
 | `safety(my_username, contact_id, their_username)` | `Option<Safety { number, verified, changed, blocked }>`. `number` is 60 digits in 12 groups of 5, the same on both sides. |
 | `peer(contact_id)` | `Option<PeerRecord>` |
 | `set_verified(contact_id, bool)`, `accept_change(contact_id)` | `()`. Either one unblocks sending after a key change. |
+| `set_verified_for(contact_id, bool, identity)`, `accept_change_for(contact_id, identity)` | `()`, only if `identity` is the pinned identity now (the one the user reviewed); else `mismatch`. JSON: `setVerified` / `acceptChange` with optional `identity`. |
 | `forget(contact_id)` | `()`. Drops sessions but keeps the pinned identity. |
 | `note_peer(contact_id, identity)` | `()`. Records a server-published identity (key-change events); a change is flagged and blocks sending. |
 
@@ -204,9 +205,10 @@ row under the wrong group; OpenMLS never sees a panic from a corrupt row.
 | `mls_receive(group_id, message)` / `mls_receive_commit(pending_id)` / `mls_receive_abort(pending_id)` | `Processed` / `()` / `()` |
 | `mls_members(group_id)` / `mls_roles(group_id)` / `mls_group_view(group_id)` | `Vec<MemberView>` / `Roles` / `GroupView` |
 | `mls_validate_payload(payload_json, context)` | the payload type |
+| `mls_commit_author(group_id, message)` | `MemberView`: who signed a commit at the current epoch, verified against this device's tree (signature only; changes nothing). For resolving a reported commit. |
 
 JSON commands: `mlsInitDevice`, `mlsDeviceLeaf`, `mlsSetDeviceCert`, `mlsKeyPackages`, `mlsCreate`, `mlsCommit`,
-`mlsMergeOwn`, `mlsClearOwn`, `mlsPending`, `mlsJoin`, `mlsJoinExternal`, `mlsForget`, `mlsEncrypt`, `mlsReceive`
+`mlsMergeOwn`, `mlsClearOwn`, `mlsPending`, `mlsJoin`, `mlsJoinExternal`, `mlsForget`, `mlsEncrypt`, `mlsReceive`, `mlsCommitAuthor`
 (`commit: false` to stage), `mlsCommitReceived`, `mlsAbortReceived`, `mlsMembers`, `mlsRoles`, `mlsView`,
 `mlsValidate`; fields are the camelCase names of the parameters above (`group`, `adds`, `removes: [{userId, deviceId?}]`,
 `roles`, `update`, `welcome`, `tree`, `groupInfo`, `plaintext`, `message`, `pendingId`).

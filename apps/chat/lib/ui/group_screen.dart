@@ -12,8 +12,9 @@ import '../app/chat_settings.dart';
 import '../core/api.dart';
 import '../messaging/attachments.dart';
 import '../messaging/group_messenger.dart';
+import '../messaging/group_sync.dart' show FrozenVerdict;
 import '../store/message.dart';
-import '../store/message_store.dart' show GroupConversation, GroupKindName, Membership;
+import '../store/message_store.dart' show Frozen, GroupConversation, GroupKindName, Membership;
 import '../theme/theme_prefs.dart';
 import '../theme/tokens.dart';
 import 'command_palette.dart';
@@ -45,6 +46,8 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
   final _view = GlobalKey<ConversationViewState>();
   late final AppLifecycleListener _lifecycle;
   bool _focused = true, _dropping = false;
+  Frozen? _verdictFor;
+  FrozenVerdict? _verdict;
   final List<ChatMessage> _unreported = [];
 
   GroupMessenger? get _groups => _app.groups;
@@ -163,12 +166,26 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
     final frozen = group.frozen;
     if (frozen != null) {
       if (!_admin) return bar('This channel is paused while an admin checks a change.', key: const Key('frozen-banner'));
+      // Rollback only after this admin device checked the reported commit itself and found it bad.
+      if (_verdictFor != frozen) {
+        _verdictFor = frozen;
+        _verdict = null;
+        unawaited(_groups?.sync.checkFrozen(widget.groupId).then((v) {
+          if (mounted && _verdictFor == frozen) setState(() => _verdict = v);
+        }));
+      }
+      final verdict = _verdict;
       return bar(
-        'A change to ${_title(group)} was rejected by a member.',
+        switch (verdict) {
+          FrozenVerdict.fails => 'A change to ${_title(group)} was rejected by a member, and this device rejects it too.',
+          FrozenVerdict.ok => 'A member reported a change to ${_title(group)}, but it checks out on this device.',
+          FrozenVerdict.unknown => "A member reported a change to ${_title(group)}. This device couldn't check it.",
+          null => 'A change to ${_title(group)} was reported by a member. Checking it…',
+        },
         key: const Key('frozen-banner'),
         actions: [
-          TextButton(key: const Key('rollback'), onPressed: () => _resolve(rollback: true), child: const Text('Roll back')),
-          TextButton(key: const Key('dismiss'), onPressed: () => _resolve(rollback: false), child: const Text('Dismiss')),
+          if (verdict == FrozenVerdict.fails) TextButton(key: const Key('rollback'), onPressed: () => _resolve(rollback: true), child: const Text('Roll back')),
+          if (verdict != null) TextButton(key: const Key('dismiss'), onPressed: () => _resolve(rollback: false), child: const Text('Dismiss')),
         ],
       );
     }
@@ -202,7 +219,7 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
     try {
       await _groups!.sync.resolve(widget.groupId, rollback: rollback);
     } catch (e) {
-      if (mounted) showSnack(context, e is ApiException ? e.message : 'Could not resolve: $e');
+      if (mounted) showSnack(context, e is ApiException ? e.message : (e is StoreException ? e.message : 'Could not resolve: $e'));
     }
   }
 

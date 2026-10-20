@@ -59,6 +59,9 @@ class LogEntry {
   );
 }
 
+/// An admin device's own verdict on the commit a channel is frozen on.
+enum FrozenVerdict { fails, ok, unknown }
+
 /// A decrypted application message, handed to the payload layer to validate and store.
 class GroupDelivery {
   const GroupDelivery({required this.group, required this.sender, required this.plaintext, required this.seq, required this.createdAt, this.live = false});
@@ -103,15 +106,13 @@ class GroupSync {
     required this.device,
     required this.platform,
     required this.ensurePinned,
-    Future<String?> Function(Iterable<String> userIds)? pinProblem,
     this.sendCursor,
     this.onDelivery,
     this.onMembership,
     this.ackWelcome,
     int Function()? now,
     Duration Function(int attempt)? backoff,
-  }) : pinProblem = pinProblem ?? ((_) async => null),
-       _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
+  }) : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
        _backoff = backoff ?? commitBackoff;
 
   final Api api;
@@ -122,11 +123,10 @@ class GroupSync {
   final String platform;
 
   /// Pins every listed user that has no pin yet (contacts: their 1:1 identity; anyone else: trust on first
-  /// use from `GET /api/users/:id/identity`). The engine refuses certificates of unpinned users.
-  final Future<void> Function(Iterable<String> userIds) ensurePinned;
-
-  /// The first of these users whose pin is missing, blocked or awaiting review, or null when all are current.
-  final Future<String?> Function(Iterable<String> userIds) pinProblem;
+  /// use from `GET /api/users/:id/identity`); with `force`, also checks the published key again, recording a
+  /// change for review (never accepting it). Returns the users without a usable pin (missing, or a changed
+  /// code awaiting review). The engine refuses certificates of unpinned users.
+  final Future<List<String>> Function(Iterable<String> userIds, {bool force}) ensurePinned;
 
   /// The `cursor` frame on the events socket (falls back to `POST .../cursor`).
   final void Function(String channel, int seq)? sendCursor;
@@ -393,8 +393,11 @@ class GroupSync {
         await crypto.receiveAbort(processed.pendingId);
         return;
       }
+      // Committed only when the payload layer took it as typing; anything else is aborted (never stored).
+      final deliver = onDelivery;
       try {
-        await onDelivery?.call(GroupDelivery(group: group, sender: processed.sender, plaintext: processed.plaintext!, seq: 0, createdAt: event.createdAt, live: true));
+        if (deliver == null) throw StateError('no payload layer');
+        await deliver(GroupDelivery(group: group, sender: processed.sender, plaintext: processed.plaintext!, seq: 0, createdAt: event.createdAt, live: true));
       } catch (_) {
         await crypto.receiveAbort(processed.pendingId);
         return;
@@ -415,17 +418,18 @@ class GroupSync {
     }
     if (!group.active) return;
     final message = event.message;
-    if (message == null || event.seq != group.cursor + 1) return _catchUpNow(event.channel);
+    // A large entry, a gap, or a channel we think is frozen (a missed `thawed`): read the log.
+    if (message == null || event.seq != group.cursor + 1 || group.frozen != null) return _catchUpNow(event.channel);
     await _process(group, LogEntry(seq: event.seq, epoch: event.epoch, kind: event.kind, fromUser: event.fromUserId, fromDevice: event.fromDeviceId, message: message, createdAt: event.createdAt));
   });
 
   /// Reads the channel's log from this device's cursor and processes every entry.
   Future<void> catchUp(String groupId) => _serial(groupId, () => _catchUpNow(groupId));
 
-  void _retryLater(String groupId) {
+  void _retryLater(String groupId, {Duration after = retryAfter}) {
     if (_disposed) return;
     _retries[groupId]?.cancel();
-    _retries[groupId] = Timer(retryAfter, () => unawaited(catchUp(groupId).catchError((_) {})));
+    _retries[groupId] = Timer(after, () => unawaited(catchUp(groupId).catchError((_) {})));
   }
 
   Future<void> _catchUpNow(String groupId) async {
@@ -445,7 +449,12 @@ class GroupSync {
         }
         rethrow;
       }
-      if (log['frozen'] != null) await _markFrozen(groupId, log['frozen']);
+      if (log['frozen'] != null) {
+        await _markFrozen(groupId, log['frozen']);
+      } else if (group.frozen != null) {
+        // Thawed while we weren't listening (nothing is sequenced while frozen).
+        await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
+      }
       final serverSeq = log['seq'] as int? ?? 0;
       if (log['gap'] == true || serverSeq < group.cursor) {
         // Trimmed past us, or we merged a commit that was rolled back: our copy can't continue.
@@ -489,7 +498,12 @@ class GroupSync {
         involved.addAll({for (final m in await api.channelMembers(group.id)) m['userId'] as String});
       } catch (_) {}
     }
-    await ensurePinned(involved.where((u) => u != me.id));
+    // A sender whose key is blocked or changed pauses the channel before anything is received.
+    final unpinned = await ensurePinned(involved.where((u) => u != me.id));
+    if (unpinned.contains(entry.fromUser)) {
+      _pause(group.id, entry.fromUser);
+      return false;
+    }
     final before = entry.kind == 'commit' ? await crypto.members(group.id) : const <GroupMember>[];
     GroupProcessed processed;
     try {
@@ -500,15 +514,20 @@ class GroupSync {
         return false;
       }
       final missing = _unpinned.firstMatch(error.message)?.group(1);
-      if (missing != null && !repinned) {
-        await ensurePinned([missing]);
-        return _process(group, entry, repinned: true);
-      }
-      // Pin problems are local, never poison: pause until the security code is reviewed.
-      final problem = missing ?? await pinProblem(involved.where((u) => u != me.id));
-      if (problem != null && (error.code == 'poison' || error.code == 'invalid')) {
-        _pause(group.id, problem);
+      if (missing != null) {
+        final problems = await ensurePinned([missing], force: true);
+        if (problems.isEmpty && !repinned) return _process(group, entry, repinned: true);
+        _pause(group.id, problems.isEmpty ? missing : problems.first);
         return false;
+      }
+      // Pin problems are local, never poison: before reporting, check every involved key is still the
+      // published one; a change waits for review and pauses the channel.
+      if (error.code == 'poison' || (entry.kind == 'commit' && error.code == 'invalid')) {
+        final problems = await ensurePinned(involved.where((u) => u != me.id), force: true);
+        if (problems.isNotEmpty) {
+          _pause(group.id, problems.first);
+          return false;
+        }
       }
       if (error.code == 'poison') {
         await _reportPoison(group, entry);
@@ -520,6 +539,14 @@ class GroupSync {
       }
       // Permanent for this entry (malformed, auth, replay, a stale epoch): skip it.
       if (error.code != 'replay') _notice('A message in ${_label(group)} could not be decrypted and was skipped.');
+      await _advanceTo(group.id, entry.seq);
+      return true;
+    }
+    // The entry's kind (as the delivery service logged it) must be what the message turned out to be.
+    final expected = entry.kind == 'app' ? processed.kind == ProcessedKind.application : processed.kind != ProcessedKind.application;
+    if (!expected) {
+      await crypto.receiveAbort(processed.pendingId);
+      _notice('A message in ${_label(group)} was not what the server said it was, and was skipped.');
       await _advanceTo(group.id, entry.seq);
       return true;
     }
@@ -735,13 +762,8 @@ class GroupSync {
         await store.updateGroup(event.id, (g) => g.copyWith(clearFrozen: true));
         unawaited(catchUp(event.id).catchError((_) {}));
       case 'remove-needed':
-        // An admin removes a rolled-back commit's author with an ordinary commit.
-        final deviceId = event.deviceId;
-        if (deviceId == null) return;
-        try {
-          final member = (await crypto.members(event.id)).where((m) => m.deviceId == deviceId).firstOrNull;
-          if (member != null && (await crypto.roles(event.id)).isAdmin(me.id)) await remove(event.id, member.userId, deviceId: deviceId);
-        } catch (_) {}
+        // Ignored: the server can't choose whom we remove. Only the device named in our own signed rollback's
+        // answer is removed (see [resolve]).
       case 'left':
         // Confirmed by the log: a removed device can no longer read it.
         unawaited(catchUp(event.id).catchError((_) {}));
@@ -781,29 +803,85 @@ class GroupSync {
     try {
       await api.reportPoison(group.id, entry.seq, digest);
     } on ApiException catch (error) {
-      if (error.body['frozen'] is Map) await _markFrozen(group.id, error.body['frozen']);
+      if (error.body['frozen'] is Map) {
+        await _markFrozen(group.id, error.body['frozen']);
+      } else if (error.status == 409 || error.status == 403) {
+        // Refused (not the latest commit, or not ours to report): this copy can't continue; rejoin.
+        await _resync(group.id);
+      } else {
+        // Rate limited or a server error: stop before the commit and try again later.
+        _retryLater(group.id, after: const Duration(seconds: 30));
+      }
       return;
     } catch (_) {
+      _retryLater(group.id, after: const Duration(seconds: 30));
       return;
     }
+    _reported.add(digest);
     await _markFrozen(group.id, {'seq': entry.seq, 'digest': digest});
     _notice('A change to ${_label(group)} was rejected by this device. It is paused while an admin checks it.');
   }
 
-  /// An admin's decision on a frozen channel: `rollback` (undo the change and remove its author's device)
-  /// or `dismiss` (keep it). Signed with this device's key.
-  Future<void> resolve(String groupId, {required bool rollback}) => _serial(groupId, () async {
+  /// Digests of commits this device reported as poison.
+  final Set<String> _reported = {};
+
+  /// An admin device's own check of the commit a channel is frozen on (m4-groups §7), before it may offer
+  /// Rollback: the logged entry at the reported seq must be a commit whose bytes hash to the reported digest.
+  /// [FrozenVerdict.fails]: this device reported it, or a trial receive rejects it as poison. [FrozenVerdict.ok]:
+  /// we built it, already merged it, or the trial accepts it (then aborted). Anything else is unknown.
+  Future<FrozenVerdict> checkFrozen(String groupId) => _serial(groupId, () async {
     final group = await store.group(groupId);
     final frozen = group?.frozen;
-    if (group == null || frozen == null) return;
-    final action = rollback ? 'rollback' : 'dismiss';
-    final local = await device();
-    await api.resolveChannel(groupId, action: action, seq: frozen.seq, digest: frozen.digest, signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest)));
-    await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
-    // Kept, but this device rejected it: its copy can't follow the group any more, so it rejoins.
-    if (!rollback && group.cursor < frozen.seq) await _resync(groupId);
-    await _catchUpNow(groupId);
+    if (group == null || frozen == null) return FrozenVerdict.unknown;
+    if (_reported.contains(frozen.digest)) return FrozenVerdict.fails;
+    if (group.cursor >= frozen.seq) return FrozenVerdict.ok;
+    try {
+      final log = await api.groupLog(groupId, after: frozen.seq - 1);
+      final raw = (log['entries'] as List).cast<Map<String, dynamic>>().where((e) => e['seq'] == frozen.seq).firstOrNull;
+      if (raw == null) return FrozenVerdict.unknown;
+      final entry = LogEntry.fromJson(raw);
+      if (entry.kind != 'commit' || messageDigest(entry.message) != frozen.digest) return FrozenVerdict.unknown;
+      if (entry.fromDevice == (await device()).deviceId) return FrozenVerdict.ok;
+      try {
+        final trial = await crypto.receive(groupId, entry.message, expect: ProcessedKind.commit);
+        await crypto.receiveAbort(trial.pendingId);
+        return FrozenVerdict.ok;
+      } on CryptoException catch (error) {
+        return error.code == 'poison' ? FrozenVerdict.fails : FrozenVerdict.unknown;
+      }
+    } catch (_) {
+      return FrozenVerdict.unknown;
+    }
   });
+
+  /// An admin's decision on a frozen channel: `rollback` (undo the change and remove its author's device)
+  /// or `dismiss` (keep it). Signed with this device's key. Rollback is signed only when this device's own
+  /// check says the commit fails ([checkFrozen]).
+  Future<void> resolve(String groupId, {required bool rollback}) async {
+    if (rollback && await checkFrozen(groupId) != FrozenVerdict.fails) {
+      throw const StoreException('This device could not confirm that change is bad, so it can only be dismissed.');
+    }
+    String? removeDevice;
+    await _serial(groupId, () async {
+      final group = await store.group(groupId);
+      final frozen = group?.frozen;
+      if (group == null || frozen == null) return;
+      final action = rollback ? 'rollback' : 'dismiss';
+      final local = await device();
+      final answer = await api.resolveChannel(groupId, action: action, seq: frozen.seq, digest: frozen.digest, signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest)));
+      await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
+      if (rollback) removeDevice = answer['removeDevice'] as String?;
+      // Kept, but this device rejected it: its copy can't follow the group any more, so it rejoins.
+      if (!rollback && group.cursor < frozen.seq) await _resync(groupId);
+      await _catchUpNow(groupId);
+    });
+    // The rolled-back commit's author is still a leaf: remove exactly the device our signed answer named.
+    final gone = removeDevice;
+    if (gone != null) {
+      final member = (await crypto.members(groupId)).where((m) => m.deviceId == gone).firstOrNull;
+      if (member != null) await remove(groupId, member.userId, deviceId: gone);
+    }
+  }
 
   Future<void> dispose() async {
     _disposed = true;

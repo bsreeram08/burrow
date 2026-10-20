@@ -221,8 +221,7 @@ void main() {
       me: me,
       device: () async => device,
       platform: 'ios',
-      ensurePinned: (ids) async => groups?.ensurePinned(ids),
-      pinProblem: (ids) async => groups?.pinProblem(ids),
+      ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
       sendCursor: events.cursor,
       ackWelcome: events.ack,
     );

@@ -20,6 +20,9 @@ class FakeDs {
   final Map<String, Set<String>> contacts = {};
   int _ids = 0;
 
+  /// Tests: a different identity than the account's real one, as if its keys changed.
+  final Map<String, Map<String, String>> identityOverride = {};
+
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
 
@@ -111,13 +114,13 @@ class FakeDs {
     if (identity != null) {
       final user = devices.values.where((d) => d.userId == identity[1]).firstOrNull;
       if (user == null) return _error('No such user.', 404);
-      return _json({'userId': user.userId, 'username': user.username, 'identity': {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
+      return _json({'userId': user.userId, 'username': user.username, 'identity': identityOverride[user.userId] ?? {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
     }
     final published = RegExp(r'^/api/keys/([a-z0-9_]+)/identity$').firstMatch(path);
     if (published != null) {
       final user = devices.values.where((d) => d.username == published[1]).firstOrNull;
       if (user == null) return _error('No such user.', 404);
-      return _json({'userId': user.userId, 'identity': {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
+      return _json({'userId': user.userId, 'identity': identityOverride[user.userId] ?? {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
     }
     if (path == '/api/channels/directory' && method == 'GET') {
       return _json({'channels': [for (final c in channels.values) if (c.kind == 'public') {'id': c.id, 'name': c.name, 'members': c.users.length, 'member': c.users.contains(userId)}]});

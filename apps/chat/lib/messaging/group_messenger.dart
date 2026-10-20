@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:crypto/crypto.dart' show sha256;
 import 'package:uuid/uuid.dart';
 
 import '../core/api.dart';
@@ -23,6 +24,13 @@ class GroupPerson {
   final String userId;
   final String username;
   final bool admin;
+}
+
+/// A security-code fingerprint of one identity, to compare a changed code (m4-groups §3): SHA-256 of
+/// `dh|sign`, as 12 groups of 5 digits (bytes 2i and 2i+1 as a big-endian number, zero-padded).
+String identityFingerprint(Identity identity) {
+  final bytes = sha256.convert(utf8.encode('${identity.dh}|${identity.sign}')).bytes;
+  return [for (var i = 0; i < 12; i++) (bytes[2 * i] * 256 + bytes[2 * i + 1]).toString().padLeft(5, '0')].join(' ');
 }
 
 /// Who is typing in a group, for the header and the list: "alice is typing", "alice and bob are typing",
@@ -113,42 +121,58 @@ class GroupMessenger {
     return null;
   }
 
-  /// §3: contacts are pinned through their 1:1 identity (published identity on first contact); everyone
-  /// else on first use from `GET /api/users/:id/identity`. An existing pin is never replaced here.
-  Future<void> ensurePinned(Iterable<String> userIds) async {
+  /// Changed codes of people known only from groups, kept until the user reviews them: what was pinned
+  /// before and what is published now (m4-groups §3). The core's pin already holds the new key, blocked.
+  final Map<String, ({Identity before, Identity after})> pinChanges = {};
+
+  /// §3: contacts are pinned through their 1:1 identity (their published identity on first contact; a change
+  /// goes through the 1:1 review). Anyone else is pinned on first use from `GET /api/users/:id/identity`; with
+  /// [force] their published key is checked again and a different one is recorded as a change awaiting review,
+  /// never accepted. Returns the users without a usable pin.
+  Future<List<String>> ensurePinned(Iterable<String> userIds, {bool force = false}) async {
+    final problems = <String>[];
     for (final id in userIds.toSet()) {
       if (id == me.id) continue;
       try {
-        if (await chatCrypto.safety(me.username, id, nameOf(id)) != null) continue;
+        var pinned = await chatCrypto.peer(id);
+        if (pinned != null && !force) {
+          if (pinned.blocked) problems.add(id);
+          continue;
+        }
         final contact = _contact(id);
-        final Map<String, dynamic> identity;
+        Map<String, dynamic>? published;
         if (contact != null) {
-          identity = await api.publishedIdentity(contact.username);
+          published = await api.publishedIdentity(contact.username);
         } else {
           final user = await api.userIdentity(id);
-          if (user['userId'] != id) continue;
-          if (user['username'] is String) names[id] = user['username'] as String;
-          identity = (user['identity'] as Map).cast<String, dynamic>();
+          if (user['userId'] == id) {
+            if (user['username'] is String) names[id] = user['username'] as String;
+            published = (user['identity'] as Map).cast<String, dynamic>();
+          }
         }
-        await chatCrypto.notePeer(id, Identity.fromJson(identity));
+        if (published != null) {
+          final identity = Identity.fromJson(published);
+          if (pinned != null && pinned.identity != identity && !pinned.blocked && contact == null) {
+            pinChanges[id] = (before: pinChanges[id]?.before ?? pinned.identity, after: identity);
+          }
+          // First sight: trust on first use. A different key: recorded as a change, which blocks until reviewed.
+          if (pinned == null || pinned.identity != identity) await chatCrypto.notePeer(id, identity);
+          pinned = await chatCrypto.peer(id);
+        }
+        if (pinned == null || pinned.blocked) problems.add(id);
       } catch (_) {
-        // No pin: the engine refuses that member, and the channel pauses (pinProblem) instead of poisoning.
+        if (await chatCrypto.peer(id).catchError((_) => null) == null) problems.add(id);
       }
     }
+    return problems;
   }
 
-  /// The first user whose pin is missing or awaiting review.
-  Future<String?> pinProblem(Iterable<String> userIds) async {
-    for (final id in userIds) {
-      if (id == me.id) continue;
-      try {
-        final safety = await chatCrypto.safety(me.username, id, nameOf(id));
-        if (safety == null || safety.blocked) return id;
-      } catch (_) {
-        return id;
-      }
-    }
-    return null;
+  /// The user reviewed a group member's changed code: accept it (and optionally mark it verified), then resume.
+  Future<void> acceptChangedCode(String userId, {bool verified = false}) async {
+    await chatCrypto.acceptChange(userId);
+    if (verified) await chatCrypto.setVerified(userId, true);
+    pinChanges.remove(userId);
+    await sync.resume(userId);
   }
 
   // ---------- Members ----------

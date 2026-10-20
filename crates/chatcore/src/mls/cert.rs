@@ -145,15 +145,22 @@ pub struct Predecessor {
 pub enum Standing {
     /// Signed by the pinned key, or by a predecessor of it before the succession.
     Current,
+    /// Signed by a predecessor of the pinned key and honoured because the leaf was already in a validated tree. It acts
+    /// like a current one, but a Welcome would refuse it, so nobody is added while one remains.
+    Previous,
     /// The user is pinned to another key and this certificate is not a predecessor's: a device of an identity the
     /// user left (recovery, or a succession it was not covered by). It can be removed but can no longer act.
     Stale,
 }
 
+/// Error code for a certificate whose user has no usable pin on this device. It is this device's gap, not a fault of
+/// whoever signed a commit that merely carries the leaf (see `check_commit`).
+pub const UNPINNED: &str = "unpinned";
+
 /// Decodes and verifies the certificate of a credential/signature-key pair against the pinned key (strict: a stale
 /// certificate is an error here; use [`verify_standing`] where stale leaves are tolerated).
 pub fn verify_credential(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8]) -> Result<DeviceCert> {
-    match verify_standing(directory, credential, leaf_sig_key)? {
+    match verify_standing(directory, credential, leaf_sig_key, false)? {
         (cert, Standing::Current) => Ok(cert),
         _ => Err(ChatError::coded("invalid", "device certificate: not signed by the pinned account key")),
     }
@@ -161,22 +168,25 @@ pub fn verify_credential(directory: &mut dyn Directory, credential: &Credential,
 
 /// Like [`verify_credential`], but a certificate that is well formed and signed by the key it names, for a user
 /// pinned to a different key, is `Stale` instead of an error. No pin at all, a bad signature or a leaf key that
-/// does not match is still an error.
-pub fn verify_standing(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8]) -> Result<(DeviceCert, Standing)> {
+/// does not match is still an error. `grandfather` honours predecessor keys (see below) and is for leaves of a tree
+/// this device already validated, never for a leaf a commit or a Welcome introduces.
+pub fn verify_standing(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8], grandfather: bool) -> Result<(DeviceCert, Standing)> {
     let basic = BasicCredential::try_from(credential.clone()).map_err(|_| ChatError::coded("invalid", "not a basic credential"))?;
     let cert = DeviceCert::decode(basic.identity())?;
     // The message names the user so a client can pin them (docs/m4-groups.md §3) and retry.
-    let aik = directory.aik(&cert.user_id)?.ok_or_else(|| ChatError::coded("invalid", &format!("no pinned account key for user {}", cert.user_id)))?;
+    let aik = directory.aik(&cert.user_id)?.ok_or_else(|| ChatError::coded(UNPINNED, &format!("no pinned account key for user {}", cert.user_id)))?;
     let claimed = key32(&cert.aik_sign).ok_or_else(|| ChatError::coded("invalid", "malformed key"))?;
     if claimed == aik {
         cert.verify(&aik, leaf_sig_key)?;
         return Ok((cert, Standing::Current));
     }
-    // Moved on by a signed succession: certificates the old key issued before the succession stay good.
+    // Moved on by a signed succession: certificates the old key issued before the succession stay good, but only for
+    // leaves already in a tree this device validated (`grandfather`). A holder of the retired key could otherwise mint
+    // backdated certificates (issued_at is the signer's word) for new leaves; those must chain to the current key.
     for earlier in directory.previous(&cert.user_id)? {
-        if earlier.aik == claimed && cert.issued_at <= earlier.until {
+        if grandfather && earlier.aik == claimed && cert.issued_at <= earlier.until {
             cert.verify(&earlier.aik, leaf_sig_key)?;
-            return Ok((cert, Standing::Current));
+            return Ok((cert, Standing::Previous));
         }
     }
     cert.verify(&claimed, leaf_sig_key)?;

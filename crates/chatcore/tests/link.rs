@@ -343,3 +343,19 @@ fn the_short_code_variant_commits_before_it_reveals_and_binds_both_device_ids() 
     let _ = me;
     assert_eq!(code_of(retired.link_lookup(&link, &device_n, &b64(&[1u8; 32]), &device_p, now)).as_deref(), Some("companion"), "a companion cannot scan");
 }
+
+#[test]
+fn the_reveal_is_one_shot_so_a_relay_cannot_grind_the_code_by_offering_other_primary_keys() {
+    let (mut p, mut n) = (core(), core());
+    p.identity().unwrap();
+    let (link, device_n, device_p, now) = (id(), id(), id(), 10u64);
+    let commit = n.link_commit(&link, &device_n, now).unwrap();
+    let eph_p = p.link_lookup(&link, &device_n, &commit, &device_p, now).unwrap();
+    let first = n.link_reveal(&link, &eph_p, now).unwrap();
+    // The same key again is harmless and gives the same answer.
+    assert_eq!(n.link_reveal(&link, &eph_p, now).unwrap(), first);
+    // A different primary key after our key and nonce are out ends the link: no second try at a colliding code.
+    assert_eq!(code_of(n.link_reveal(&link, &b64(&[5u8; 32]), now)).as_deref(), Some("auth"));
+    assert_eq!(code_of(n.link_reveal(&link, &eph_p, now)).as_deref(), Some("unknown-link"), "burned");
+    assert!(n.link_complete_code(&link, &eph_p, &device_p, now).is_err());
+}

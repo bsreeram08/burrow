@@ -156,7 +156,8 @@ abstract class GroupCrypto {
   Future<PendingGroupCommit?> pendingCommit(String groupId);
 
   Future<GroupView> join(String welcome, String tree);
-  Future<GroupCommit> joinExternal(String groupInfo, String tree);
+  /// [group]: the channel we mean to join; a GroupInfo for any other group is refused.
+  Future<GroupCommit> joinExternal(String groupInfo, String tree, {required String group});
   Future<void> forget(String groupId);
 
   Future<String> encrypt(String groupId, String plaintext);
@@ -185,5 +186,5 @@ abstract class GroupCrypto {
 
   /// The members of a served GroupInfo and tree after whole-group validation, without joining (m5 §3). Throws
   /// when the core can't check it; callers then join nothing (fail closed).
-  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree);
+  Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree);
 }

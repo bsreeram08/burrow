@@ -238,12 +238,15 @@ Future<MlsPendingCommit?> mlsPendingCommit({required String groupId}) =>
 Future<MlsGroupView> mlsJoin({required String welcome, required String tree}) =>
     RustLib.instance.api.crateApiMlsJoin(welcome: welcome, tree: tree);
 
+/// `group`: the channel id we mean to join; a GroupInfo for any other group is refused.
 Future<MlsOutgoing> mlsJoinExternal({
   required String groupInfo,
   required String tree,
+  required String group,
 }) => RustLib.instance.api.crateApiMlsJoinExternal(
   groupInfo: groupInfo,
   tree: tree,
+  group: group,
 );
 
 Future<void> mlsForgetGroup({required String groupId}) =>
@@ -530,13 +533,26 @@ Future<Peer> acceptSuccession({
   recordsJson: recordsJson,
 );
 
-/// The members of a served GroupInfo/tree after the join validation, without joining.
-Future<List<MlsMember>> mlsInspectGroup({
+Future<MlsGroupInspection> mlsInspectGroup({
   required String groupInfo,
   required String tree,
 }) => RustLib.instance.api.crateApiMlsInspectGroup(
   groupInfo: groupInfo,
   tree: tree,
+);
+
+/// This device's MLS leaf signature key (base64url), made on first use: a new device sends it in its link hello.
+Future<String> mlsDeviceLeaf() => RustLib.instance.api.crateApiMlsDeviceLeaf();
+
+Future<LinkedAccount?> account() => RustLib.instance.api.crateApiAccount();
+
+/// A primary re-signs its own leaf under the identity it now holds (after a succession, or to refresh it).
+Future<MlsDeviceCert> mlsRecertify({
+  required String platform,
+  required BigInt issuedAtMs,
+}) => RustLib.instance.api.crateApiMlsRecertify(
+  platform: platform,
+  issuedAtMs: issuedAtMs,
 );
 
 /// A DM pointer's group passes only if it is the DM of this account and `peer` and every leaf chains to the pins.
@@ -666,6 +682,25 @@ class LinkReveal {
           nonce == other.nonce;
 }
 
+/// The account a companion core is linked to; `None` on a primary.
+class LinkedAccount {
+  final String userId;
+  final Identity identity;
+
+  const LinkedAccount({required this.userId, required this.identity});
+
+  @override
+  int get hashCode => userId.hashCode ^ identity.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LinkedAccount &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          identity == other.identity;
+}
+
 /// The core's verdict on a commit at the current epoch, checked against this device's own tree like the
 /// delivery service does (changes nothing). `class` is `signed-content` only when the author's signature
 /// verifies and what they signed is itself invalid; otherwise `tag` (outside the signature: proves nothing
@@ -743,6 +778,25 @@ class MlsDeviceCert {
 
 /// What a log entry's kind says a message is: a refused mismatch is never decrypted or staged.
 enum MlsExpect { application, commit }
+
+/// A served GroupInfo/tree after the join validation, without joining: its group id and members.
+class MlsGroupInspection {
+  final String groupId;
+  final List<MlsMember> members;
+
+  const MlsGroupInspection({required this.groupId, required this.members});
+
+  @override
+  int get hashCode => groupId.hashCode ^ members.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsGroupInspection &&
+          runtimeType == other.runtimeType &&
+          groupId == other.groupId &&
+          members == other.members;
+}
 
 /// Public state after a change: the signed GroupInfo and the ratchet tree, for the delivery service and joiners.
 class MlsGroupView {

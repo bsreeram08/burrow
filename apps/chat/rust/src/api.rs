@@ -292,7 +292,8 @@ pub fn mls_pending_commit(group_id: String) -> Result<Option<MlsPendingCommit>> 
     Ok(core::mls_pending_commit(group_id)?.map(|p| MlsPendingCommit { digest: p.digest, epoch: p.epoch }))
 }
 pub fn mls_join(welcome: String, tree: String) -> Result<MlsGroupView> { Ok(core::mls_join(welcome, tree)?.into()) }
-pub fn mls_join_external(group_info: String, tree: String) -> Result<MlsOutgoing> { Ok(core::mls_join_external(group_info, tree)?.into()) }
+/// `group`: the channel id we mean to join; a GroupInfo for any other group is refused.
+pub fn mls_join_external(group_info: String, tree: String, group: String) -> Result<MlsOutgoing> { Ok(core::mls_join_external(group_info, tree, group)?.into()) }
 pub fn mls_forget_group(group_id: String) -> Result<()> { Ok(core::mls_forget_group(group_id)?) }
 pub fn mls_encrypt(group_id: String, plaintext: String) -> Result<String> { Ok(core::mls_encrypt(group_id, plaintext)?) }
 /// `expect`: the log entry's kind (`app` → Application, `commit` → Commit), whenever it is known.
@@ -429,7 +430,30 @@ pub fn accept_succession(contact_id: String, records_json: String) -> Result<Pee
     let p = core::accept_succession(contact_id, records_json)?;
     Ok(Peer { identity: p.identity.into(), verified: p.verified, changed: p.changed, blocked: p.blocked })
 }
-/// The members of a served GroupInfo/tree after the join validation, without joining.
-pub fn mls_inspect_group(group_info: String, tree: String) -> Result<Vec<MlsMember>> { Ok(core::mls_inspect_group(group_info, tree)?.into_iter().map(Into::into).collect()) }
+/// A served GroupInfo/tree after the join validation, without joining: its group id and members.
+pub struct MlsGroupInspection {
+    pub group_id: String,
+    pub members: Vec<MlsMember>,
+}
+pub fn mls_inspect_group(group_info: String, tree: String) -> Result<MlsGroupInspection> {
+    let i = core::mls_inspect_group(group_info, tree)?;
+    Ok(MlsGroupInspection { group_id: i.group_id, members: i.members.into_iter().map(Into::into).collect() })
+}
+
+/// This device's MLS leaf signature key (base64url), made on first use: a new device sends it in its link hello.
+pub fn mls_device_leaf() -> Result<String> { Ok(core::mls_device_leaf()?) }
+
+/// The account a companion core is linked to; `None` on a primary.
+pub struct LinkedAccount {
+    pub user_id: String,
+    pub identity: Identity,
+}
+pub fn account() -> Result<Option<LinkedAccount>> { Ok(core::account()?.map(|a| LinkedAccount { user_id: a.user_id, identity: a.identity.into() })) }
+
+/// A primary re-signs its own leaf under the identity it now holds (after a succession, or to refresh it).
+pub fn mls_recertify(platform: String, issued_at_ms: u64) -> Result<MlsDeviceCert> {
+    let cert = core::mls_recertify(platform, issued_at_ms)?;
+    Ok(MlsDeviceCert { user_id: cert.user_id, device_id: cert.device_id, platform: cert.platform, leaf_sig_key: cert.leaf_sig_key, aik_sign: cert.aik_sign, issued_at: cert.issued_at })
+}
 /// A DM pointer's group passes only if it is the DM of this account and `peer` and every leaf chains to the pins.
 pub fn mls_check_dm(group_id: String, peer_user_id: String) -> Result<()> { Ok(core::mls_check_dm(group_id, peer_user_id)?) }

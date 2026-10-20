@@ -173,11 +173,47 @@
         pinned.add(userId); continue;
       }
       if (!mine && !published) { problems.push(userId); continue; }
+      if (mine && published && !same(mine.identity, published)) rememberChange(userId, mine.identity, published);
       if (!mine || (published && !same(mine.identity, published))) { mine = await run({ cmd: 'notePeer', contact: userId, identity: published }); changed = true; }
       if (mine.blocked) { problems.push(userId); continue; }
       pinned.add(userId);
     }
     return { problems, changed };
+  }
+  // A changed code of someone met in a group: what it was and what it is now, kept until the user decides (§3).
+  const changesKey = () => `pin-changes-v1:${instance}`;
+  const readChanges = () => { try { return JSON.parse(localStorage.getItem(changesKey()) || '{}') || {}; } catch { return {}; } };
+  function rememberChange(userId, before, after) {
+    const all = readChanges();
+    all[userId] = { before: all[userId]?.before || before, after };
+    try { localStorage.setItem(changesKey(), JSON.stringify(all)); } catch {}
+  }
+  function forgetChange(userId) { const all = readChanges(); delete all[userId]; try { localStorage.setItem(changesKey(), JSON.stringify(all)); } catch {} }
+  /** A security-code fingerprint: SHA-256 of `dh|sign`, as 12 groups of 5 digits (docs/m4-groups.md §3). */
+  async function fingerprint(identity) {
+    if (!identity?.dh || !identity?.sign) return 'not recorded';
+    const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${identity.dh}|${identity.sign}`)));
+    return Array.from({ length: 12 }, (_, at) => String(bytes[2 * at] * 256 + bytes[2 * at + 1]).padStart(5, '0')).join(' ');
+  }
+  /** The review sheet for someone you only know from groups: old and new code side by side, nothing accepted silently. */
+  async function openReview(userId) {
+    const change = readChanges()[userId], current = await run({ cmd: 'peer', contact: userId }).catch(() => null);
+    reviewing = userId;
+    $('pin-review-title').textContent = `${nameOf(userId)}'s security code changed`;
+    $('pin-review-before').textContent = await fingerprint(change?.before);
+    $('pin-review-after').textContent = await fingerprint(change?.after || current?.identity);
+    $('pin-review-status').textContent = '';
+    $('pin-review').hidden = false; $('pin-review-cancel').focus();
+  }
+  let reviewing = null;
+  async function decideReview(verified) {
+    const userId = reviewing;
+    if (!userId) return;
+    await run({ cmd: 'acceptChange', contact: userId });
+    if (verified) await run({ cmd: 'setVerified', contact: userId, verified: true });
+    forgetChange(userId);
+    reviewing = null; $('pin-review').hidden = true;
+    pinsChanged(userId);
   }
   /** Runs `task`; if the core names a user it can't check, pins them and runs it again (at most 3 times). */
   async function withPins(id, task) {
@@ -340,7 +376,7 @@
       save();
       if (advanced) sendCursor(id, ch.cursor);
       // Nothing is sequenced while a channel is frozen: stop here until it thaws.
-      if (page.frozen && usable(ch)) { ch.status = 'frozen'; ch.frozen = page.frozen; save(); paint(id); return; }
+      if (page.frozen && usable(ch)) { setFrozen(id, page.frozen); return; }
       if (!page.more || !page.entries.length) return;
     }
   }
@@ -367,6 +403,13 @@
         throw error; // Transient: try again later from here.
       }
     }
+    // What the core found must be what the log says it is: an application entry never applies a commit, and a
+    // commit entry never delivers a message. Otherwise the staged state is dropped and the entry skipped.
+    if ((entry.kind === 'app') !== (processed.kind === 'application')) {
+      await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {});
+      await note(id, `drop:${entry.seq}`, `A message from ${nameOf(entry.from.userId)} wasn't what the server said it was, and was skipped.`);
+      return 'ok';
+    }
     try {
       if (processed.kind === 'application') await deliver(id, processed.sender, entry, processed.plaintext);
     } catch (error) {
@@ -388,9 +431,10 @@
     if (channels.get(id)?.status === 'paused') return 'stop';
     const digest = POISON.exec(error.message || '')?.[1];
     const ch = channels.get(id);
+    if (digest) ch.rejected = { seq: entry.seq, digest }; // This device's own verdict, for resolving it later.
     const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }) : { status: 0 };
     if (result.status === 202 || result.status === 200 || (result.status === 409 && result.body.frozen)) {
-      ch.status = 'frozen'; ch.frozen = result.body.frozen || { seq: entry.seq, digest }; save(); paint(id);
+      setFrozen(id, result.body.frozen || { seq: entry.seq, digest });
       return 'stop';
     }
     // The report can't be made (dismissed before, or not the latest commit any more): this device can't follow; rejoin.
@@ -475,9 +519,10 @@
     if (message.change === 'joined' || message.change === 'invited') { if (!ch) refreshChannels().then(() => ctx?.render()).catch(() => {}); }
     else if (message.change === 'updated') { if (ch) members(id).then(() => ctx.render()).catch(() => {}); }
     else if (message.change === 'left') { if (ch) removed(id, true); }
-    else if (message.change === 'frozen') { if (ch) { if (ch.status === 'active') ch.status = 'frozen'; ch.frozen = { seq: message.seq, digest: message.digest }; save(); paint(id); ctx.render(); } }
+    else if (message.change === 'frozen') { if (ch && Number.isSafeInteger(message.seq) && /^[0-9a-f]{64}$/.test(message.digest || '')) { setFrozen(id, { seq: message.seq, digest: message.digest }); ctx.render(); } }
     else if (message.change === 'thawed') { if (ch?.status === 'frozen') { ch.status = 'active'; delete ch.frozen; save(); paint(id); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); } }
-    else if (message.change === 'remove-needed') { if (ch && amAdmin(id) && ID.test(message.deviceId || '')) removeDevice(id, message.deviceId); }
+    // `remove-needed` is not acted on: a frame alone never makes this device remove anyone. The device to remove
+    // comes from this device's own signed rollback (resolve() below).
     else if (message.change === 'gap') { if (usable(ch)) enqueue(id, () => resyncInner(id)).catch(error => failed(id, error)); }
   }
   function onEphemeral(message) {
@@ -485,11 +530,19 @@
     // Live-only and best effort: only when nothing else is running for the channel (§8), and only typing.
     if (!usable(ch) || !idle(id) || message.from?.deviceId === deviceId) return;
     enqueue(id, async () => {
+      // Staged, never committed by default: only an application message whose payload is typing keeps its effect
+      // (a spent key). Anything else is aborted, so a live frame can never move the group outside the sequenced log.
+      let processed = null;
       try {
-        const processed = await run({ cmd: 'mlsReceive', group: id, message: message.message, expect: 'application' });
-        const payload = JSON.parse(processed.plaintext);
-        if (processed.kind === 'application' && window.ChatStore.checkPayload(payload) === 'typing') typing(id, processed.sender.userId, payload);
-      } catch {}
+        processed = await run({ cmd: 'mlsReceive', group: id, message: message.message, commit: false, expect: 'application' });
+        let payload = null;
+        try { payload = JSON.parse(processed.plaintext ?? 'null'); } catch {}
+        let type = null;
+        try { type = processed.kind === 'application' ? window.ChatStore.checkPayload(payload) : null; } catch {}
+        if (type !== 'typing') { await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }); return; }
+        await run({ cmd: 'mlsCommitReceived', pendingId: processed.pendingId });
+        typing(id, processed.sender.userId, payload);
+      } catch { if (processed) await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {}); }
     });
   }
 
@@ -509,7 +562,7 @@
         if (local && local.epoch > result.body.epoch) await resyncInner(id);
         continue;
       }
-      if (result.status === 423) { ch.status = 'frozen'; ch.frozen = result.body.frozen; save(); paint(id); throw coded('stale', 'Frozen'); }
+      if (result.status === 423) { setFrozen(id, result.body.frozen); throw coded('stale', 'Frozen'); }
       if (result.status === 404 || result.status === 403) { removed(id, true); throw coded('stale', 'Removed'); }
       throw new Error(result.body.error || 'Could not send.');
     }
@@ -657,14 +710,64 @@
     await send(id, { v: 1, type: 'meta', id: crypto.randomUUID(), name, topic, at: ch.meta.at });
     paintHeader(); ctx.render();
   }
+  const hex = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+  const unb64 = text => Uint8Array.from(atob(text.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
+  /** A reported commit froze the channel. Record it and, on an admin device, check it before offering a verdict. */
+  function setFrozen(id, frozen) {
+    const ch = channels.get(id);
+    if (!ch) return;
+    if (ch.status === 'active') ch.status = 'frozen';
+    if (frozen && Number.isSafeInteger(frozen.seq) && /^[0-9a-f]{64}$/.test(frozen.digest || '')) {
+      const same = ch.frozen?.seq === frozen.seq && ch.frozen?.digest === frozen.digest;
+      ch.frozen = { seq: frozen.seq, digest: frozen.digest };
+      if (!same) delete ch.check;
+    }
+    save(); paint(id);
+    if (ch.frozen && !ch.check && amAdmin(id)) verifyFrozen(id);
+  }
+  /**
+   * §7: before an admin may sign a rollback, this device re-checks the reported commit itself: the log entry at
+   * the frozen seq, with the reported digest, run through the validator without keeping anything. `fails`: it is
+   * rejected here too (Rollback offered). `ok`: it checks out (only Dismiss). `unknown`: it couldn't be checked.
+   */
+  function verifyFrozen(id) {
+    const ch = channels.get(id), frozen = ch?.frozen;
+    if (!frozen) return Promise.resolve();
+    ch.check = { seq: frozen.seq, digest: frozen.digest, state: 'checking' }; paint(id);
+    return enqueue(id, async () => {
+      let state = 'unknown';
+      try {
+        const result = await call(`/api/channels/${id}/log?after=${frozen.seq - 1}`);
+        const entry = result.status === 200 ? result.body.entries.find(item => item.seq === frozen.seq) : null;
+        if (!entry || entry.kind !== 'commit' || hex(await crypto.subtle.digest('SHA-256', unb64(entry.message))) !== frozen.digest) state = 'unknown';
+        else if (ch.rejected?.seq === frozen.seq && ch.rejected.digest === frozen.digest) state = 'fails';
+        else if (entry.from.deviceId === deviceId || ch.cursor >= frozen.seq) state = 'ok'; // Built or merged here, after the same validator.
+        else {
+          await ensurePins([entry.from.userId]);
+          let processed = null;
+          try {
+            processed = await run({ cmd: 'mlsReceive', group: id, message: entry.message, commit: false, expect: 'commit' });
+            state = 'ok';
+          } catch (error) { state = error.code === 'poison' ? 'fails' : 'unknown'; }
+          if (processed) await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {});
+        }
+      } catch { state = 'unknown'; }
+      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state }; save(); paint(id); }
+    }).catch(() => {});
+  }
   async function resolve(id, action) {
     const ch = channels.get(id);
     if (!ch?.frozen) return;
+    const check = ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check.state : null;
+    if (action === 'rollback' && check !== 'fails') throw new Error('this device did not find that change invalid, so it won\'t roll it back');
+    if (action === 'dismiss' && (!check || check === 'checking')) throw new Error('still checking the change');
     const device = await window.DeviceFormat.deviceKey(me.id);
     const bytes = new TextEncoder().encode(`webrtc-bun-mlsresolve-v1\n${id}\n${action}\n${ch.frozen.seq}\n${ch.frozen.digest}`);
-    await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, signature: await device.sign(bytes) });
-    ch.status = 'active'; delete ch.frozen; save(); paint(id);
+    const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, signature: await device.sign(bytes) });
+    ch.status = 'active'; delete ch.frozen; delete ch.check; delete ch.rejected; save(); paint(id);
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
+    // Only the device our own signed rollback names is removed (never one a frame asks for).
+    if (action === 'rollback' && ID.test(answer.removeDevice || '')) removeDevice(id, answer.removeDevice);
     flush(id);
   }
 
@@ -736,14 +839,23 @@
     if (id !== currentId) return;
     const ch = channels.get(id), banner = $('group-banner');
     const admin = amAdmin(id);
-    const text = !ch ? '' : ch.status === 'frozen' ? (admin && ch.frozen ? `A change to ${title(id)} was rejected by a member's device. Roll it back (and cut off the device that made it), or dismiss the report if you trust it.` : 'This conversation is paused while an admin checks a change. Messages wait on this device.')
+    const check = ch?.frozen && ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check.state : null;
+    const verdict = {
+      checking: `A member's device rejected a change to ${title(id)}. Checking it on this device…`,
+      fails: `A change to ${title(id)} was rejected by a member's device, and this device rejects it too. Roll it back (and cut off the device that made it), or dismiss the report.`,
+      ok: `A member's device rejected a change to ${title(id)}, but it checks out on this device. Dismiss the report to let the conversation go on.`,
+      unknown: `A member's device rejected a change to ${title(id)}. This device couldn't check it, so rolling back isn't offered. Dismiss the report, or ask another admin.`,
+    };
+    const text = !ch ? '' : ch.status === 'frozen' ? (admin && ch.frozen ? verdict[check || 'checking'] : 'This conversation is paused while an admin checks a change. Messages wait on this device.')
       : ch.status === 'paused' ? `${nameOf(ch.pausedFor)}'s security code changed. Review it to keep reading this conversation.`
       : ch.status === 'removed' ? 'You were removed from this conversation. Messages already here stay on this device.'
       : ch.status === 'left' ? 'You left this conversation. Messages already here stay on this device.'
       : ch.status === 'broken' ? 'This device fell out of step with the conversation.' : '';
     banner.hidden = !text;
     $('group-banner-text').textContent = text;
-    $('group-rollback').hidden = $('group-dismiss').hidden = !(ch?.status === 'frozen' && admin && ch.frozen);
+    const deciding = ch?.status === 'frozen' && admin && ch.frozen;
+    $('group-rollback').hidden = !(deciding && check === 'fails');
+    $('group-dismiss').hidden = !(deciding && check && check !== 'checking');
     $('group-review').hidden = ch?.status !== 'paused';
     $('group-rejoin').hidden = ch?.status !== 'broken';
     // Frozen or paused: writing still works and waits on this device; gone or out of step: read-only.
@@ -919,10 +1031,12 @@
       const ch = channels.get(currentId), userId = ch?.pausedFor;
       if (!userId) return;
       if (ctx.contacts().some(contact => contact.id === userId && contact.state === 'mutual')) { ctx.review(userId); return; }
-      // Someone you only know from groups: accept the code the server now publishes (a new device or reinstall).
-      await run({ cmd: 'acceptChange', contact: userId }).catch(() => {});
-      pinsChanged(userId);
+      // Someone you only know from groups: the same explicit review as for contacts, never a silent accept.
+      openReview(userId);
     };
+    $('pin-review-cancel').onclick = () => { reviewing = null; $('pin-review').hidden = true; };
+    $('pin-review-accept').onclick = () => decideReview(false).catch(error => { $('pin-review-status').textContent = `Couldn't accept: ${error.message}`; });
+    $('pin-review-verify').onclick = () => decideReview(true).catch(error => { $('pin-review-status').textContent = `Couldn't save: ${error.message}`; });
     $('conv-info').onclick = () => { $('conv-menu').open = false; openInfo(); };
     $('conv-leave').onclick = () => { $('conv-menu').open = false; $('group-leave-confirm').hidden = false; $('group-leave-cancel').focus(); };
   };

@@ -27,7 +27,7 @@ const build = spawnSync('cargo', ['build', '--quiet', '--manifest-path', join(ap
 if (build.status !== 0) process.exit(1);
 const dylib = join(appDir, 'rust/target/debug', process.platform === 'darwin' ? 'libchatcore_bridge.dylib' : 'libchatcore_bridge.so');
 
-const app = startSignaling({ adminToken: 'x'.repeat(40), origin, hostname: '127.0.0.1', port, dataDir });
+const app = startSignaling({ adminToken: 'x'.repeat(40), origin, hostname: '127.0.0.1', port, dataDir, allowTestFlags: true });
 const testing = app.accounts!.testing;
 const webUser = testing.createUser('webuser'), appUser = testing.createUser('appuser'), thirdUser = testing.createUser('thirduser');
 const cookie = testing.cookie(webUser.id), bearer = testing.bearer(appUser.id, 'ios');
@@ -62,6 +62,8 @@ async function webPage(as = cookie) {
     const [name, value] = as.split('=');
     const context = await browser.newContext();
     await context.addCookies([{ name, value, url: origin }]);
+    // The web never moves a 1:1 chat to MLS itself here: the app is the first sender (m5 §8).
+    await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
     const page = await context.newPage();
     page.on('pageerror', (error: Error) => console.log(`  web pageerror: ${error.message}`));
     await page.goto(origin);
@@ -324,6 +326,30 @@ try {
     step('the app revokes the browser: signed out at once, its leaf removed from the channel, nothing more delivered');
     signal('revoke-seen');
     await laptopContext.close();
+
+    // m5 §8: the 1:1 chat moves to MLS. The web keeps the Double Ratchet (dm-move-test), so the app is the first sender.
+    if (await page.locator('#conv-head').isVisible()) await page.click('#conv-back');
+    await page.click('#contact-list .contact.mutual .row-button');
+    await page.fill('#chat-input', 'before the move'); await page.click('#chat-send');
+    await webUntil('sent before the move', list => list.some(r => r.text === 'before the move' && r.status !== 'queued'));
+    signal('dm-before');
+    const dmChannel = await waitFor('dm-moved', 150000);
+    if ((testing.db.query('SELECT kind FROM channels WHERE id = ?').get(dmChannel) as any)?.kind !== 'dm') throw new Error('the app did not make a DM channel');
+    await webUntil('the pointer note and the app message via MLS', list => list.some(r => r.text === 'first via mls') && list.some(r => r.text?.includes('now use the new encryption')), 90000);
+    await page.waitForFunction(([key, channel]: string[]) => (localStorage.getItem(key) || '').includes(channel), [`dm-moved-v1:${webUser.id}`, dmChannel], { timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb never accepted the pointer: ${JSON.stringify(await page.evaluate((id: string) => (window as any).Groups.debug(id), dmChannel))}`); });
+    await page.fill('#chat-input', 'reply via mls'); await page.click('#chat-send');
+    await webUntil('reply sent', list => list.some(r => r.text === 'reply via mls' && r.status !== 'queued'));
+    for (const end = Date.now() + 20000; !(testing.db.query("SELECT COUNT(*) AS n FROM group_log WHERE channel_id = ? AND kind = 'app' AND sender_user = ?").get(dmChannel, webUser.id) as any).n;) {
+        if (Date.now() > end || failed) throw new Error(`the web reply did not go through the DM group: log ${JSON.stringify(testing.db.query('SELECT seq, kind, sender_user FROM group_log WHERE channel_id = ?').all(dmChannel))}, web ${JSON.stringify(await page.evaluate(([id, peer]: string[]) => ({ group: (window as any).Groups.debug(id), dm: (window as any).Groups.dmChannelWith(peer), active: (window as any).Groups.active() }), [dmChannel, appUser.id]))}`);
+        await Bun.sleep(200);
+    }
+    signal('dm-replied');
+    await waitFor('dm-typing-ready');
+    await page.fill('#chat-input', 'typing in the moved chat');
+    await waitFor('dm-ok', 120000);
+    await page.fill('#chat-input', '');
+    step('a 1:1 chat moves to MLS: the app (first sender) makes the DM group and sends the pointer over the Double Ratchet; the web checks and accepts it; history stays, and replies, read receipts and typing use the group');
     await waitFor('done');
     step('the app adds thirduser (who reads from then on) and removes them; the web sees both');
     code = await dartDone;

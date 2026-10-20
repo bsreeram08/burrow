@@ -313,6 +313,26 @@ void main() {
     await g.send(own.id, 'after revoking the laptop');
     await signal('app-revoked');
     await waitFor('revoke-seen', timeout: const Duration(seconds: 120));
+
+    // 12. The 1:1 chat moves to MLS (m5 §8): the web keeps the Double Ratchet (its test flag), the app is the first
+    // sender. History stays in the chat; the web's reply, its read receipt and its typing come through the DM group.
+    messenger.groups = g;
+    describe = () async => 'messages: ${[for (final m in await messages()) '${m.direction.name} ${m.status.name} "${m.body}"']}\nnotices: $notices';
+    await waitFor('dm-before', timeout: const Duration(seconds: 120));
+    final before = await find('the web message before the move', (m) => m.text == 'before the move');
+    await messenger.send(web, 'first via mls');
+    String? dm;
+    await until(() async => (dm = await g.dmChannelWith(web.id!)) != null, 'the chat moved to its DM group');
+    await find('sent through the DM group', (m) => m.text == 'first via mls' && statusRank(m.status) >= statusRank(MessageStatus.sent));
+    await signal('dm-moved', dm ?? '');
+    await waitFor('dm-replied', timeout: const Duration(seconds: 150));
+    await find('the web reply via MLS', (m) => m.text == 'reply via mls' && !m.outgoing);
+    expect((await messages()).any((m) => m.id == before.id), isTrue, reason: 'history before the move stays');
+    await find('read via the DM group', (m) => m.text == 'first via mls' && m.status == MessageStatus.read);
+    sawTyping = false;
+    await signal('dm-typing-ready');
+    await until(() async => sawTyping, 'typing through the DM group');
+    await signal('dm-ok');
     await g.dispose();
     await signal('done');
     await events.close();

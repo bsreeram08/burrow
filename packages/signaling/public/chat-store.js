@@ -14,6 +14,8 @@
   // records name their sender (`from`, and `fromName` as it was then); `mentions` arrive with the message;
   // `readBy` (user ids) is a later mutation of our own messages. Reactions are kept per person: `me` or a user id.
   const GROUP = ['from', 'fromName', 'mentions', 'readBy'], MAX_MENTIONS = 64, MAX_READERS = 1000, GROUP_KEEP = 500;
+  // `imported: true`: history a linked device received from your other device (docs/m5-linking.md §2), shown as such.
+  const LOCAL = ['imported'];
   const STATUSES = ['queued', 'sent', 'delivered', 'read', 'uncertain'], RANK = { queued: 0, uncertain: 0, sent: 1, delivered: 2, read: 3 };
   const MAX_PAYLOAD = 16384, MAX_BLOB = 25 * 1024 * 1024, MAX_REACTIONS = 20, MAX_READ_IDS = 100;
   const ATTACHMENT_KINDS = ['image', 'video', 'audio', 'voice', 'file'];
@@ -95,7 +97,7 @@
   const voteOk = (value, count) => value === null || Number.isSafeInteger(value) && value >= 0 && value < count;
   function cleanRich(message) {
     const extra = Object.keys(message).filter(key => !FIELDS.includes(key));
-    if (extra.some(key => !OPTIONAL.includes(key) && !CONTENT.includes(key) && !MUTABLE.includes(key) && !GROUP.includes(key))) throw new Error('Invalid chat message.');
+    if (extra.some(key => !OPTIONAL.includes(key) && !CONTENT.includes(key) && !MUTABLE.includes(key) && !GROUP.includes(key) && !LOCAL.includes(key))) throw new Error('Invalid chat message.');
     const out = {};
     if (message.kind === undefined) { if (message.poll !== undefined || message.votes !== undefined) throw new Error('Invalid chat message.'); return out; }
     if (message.direction === 'system' || !['action', 'poll'].includes(message.kind)) throw new Error('Invalid chat message.');
@@ -132,6 +134,10 @@
           !optional(message.mentions, value => userList(value, MAX_MENTIONS)) || !optional(message.readBy, value => message.direction === 'outgoing' && userList(value, MAX_READERS))) throw new Error('Invalid chat message.');
       for (const key of GROUP) if (message[key] !== undefined) rich[key] = Array.isArray(message[key]) ? [...message[key]] : message[key];
     } else if (group && message.direction === 'incoming') throw new Error('Invalid chat message.');
+    if (message.imported !== undefined) {
+      if (message.imported !== true || message.direction === 'system') throw new Error('Invalid chat message.');
+      rich.imported = true;
+    }
     const extra = Object.keys(message).filter(key => CONTENT.includes(key) || MUTABLE.includes(key));
     if (extra.length) {
       if (message.direction === 'system' || rich.kind === 'poll' && (message.attachment !== undefined || message.link !== undefined)) throw new Error('Invalid chat message.');
@@ -308,6 +314,8 @@
       // Groups only (docs/m4-groups.md §5): an admin's name and topic, and "remove me".
       case 'meta': if (size === 6 && typeof payload.name === 'string' && [...payload.name].length <= 64 && !/[\u0000-\u001f]/.test(payload.name) && typeof payload.topic === 'string' && [...payload.topic].length <= 256 && isInt(payload.at, 0, 8640000000000000)) return payload.type; break;
       case 'leave': if (size === 3) return payload.type; break;
+      // The last Double Ratchet message of a 1:1 chat: it continues in this MLS DM group (docs/m5-linking.md §8.2).
+      case 'mls-dm': if (size === 5 && typeof payload.channel === 'string' && USER.test(payload.channel) && isInt(payload.at, 0, 8640000000000000)) return payload.type; break;
     }
     throw bad();
   }

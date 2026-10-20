@@ -18,7 +18,8 @@ int statusRank(MessageStatus s) => switch (s) {
   MessageStatus.read => 3,
 };
 
-enum Direction { incoming, outgoing }
+/// `system` rows are group events written by this device ("alice added bob"): never sent, never counted.
+enum Direction { incoming, outgoing, system }
 
 /// One stored message. Only content and delivery metadata are ever stored:
 /// never tokens, keys or UI state (same rule as chat-store.js). An edit keeps
@@ -40,7 +41,9 @@ class ChatMessage {
     this.editedAt,
     this.reactions = const Reactions(),
     this.sender,
+    this.senderName,
     this.mentions = const [],
+    this.readBy = const [],
   });
 
   final String id;
@@ -57,20 +60,29 @@ class ChatMessage {
   final int? editedAt;
   final Reactions reactions;
 
-  /// Group messages: the author's user id (incoming only; null in 1:1 chats, where it is the peer).
+  /// Incoming group messages (m4-groups §10 `from`): the MLS sender's user id. Null in 1:1 chats.
   final String? sender;
 
-  /// Group messages: the user ids the text mentions (`@name`), for highlighting and notifications.
+  /// Incoming group messages (`fromName`): the sender's username when it arrived, so it still reads right
+  /// after they leave.
+  final String? senderName;
+
+  /// Group messages: the user ids the text mentions (`@username`), for highlighting and notifications.
   final List<String> mentions;
 
+  /// Outgoing group messages: the members whose `read` named this message.
+  final List<String> readBy;
+
   bool get outgoing => direction == Direction.outgoing;
+  bool get system => direction == Direction.system;
+  bool get inGroup => conversationId.length == 22;
   bool expired(int now) => expiresAt != null && expiresAt! <= now;
 
   /// What to show: the latest edit, else the original.
   String get body => editedText ?? text;
   bool get edited => editedAt != null;
 
-  ChatMessage copyWith({MessageStatus? status, String? editedText, int? editedAt, Reactions? reactions}) => ChatMessage(
+  ChatMessage copyWith({MessageStatus? status, String? editedText, int? editedAt, Reactions? reactions, List<String>? readBy}) => ChatMessage(
     id: id,
     conversationId: conversationId,
     direction: direction,
@@ -85,7 +97,9 @@ class ChatMessage {
     editedAt: editedAt ?? this.editedAt,
     reactions: reactions ?? this.reactions,
     sender: sender,
+    senderName: senderName,
     mentions: mentions,
+    readBy: readBy ?? this.readBy,
   );
 
   ChatMessage withStatus(MessageStatus next) => copyWith(status: next);
@@ -105,6 +119,7 @@ class ChatMessage {
       _sameList(mentions, other.mentions);
 
   /// The encrypted wire payload (`{v:1, type:'message', ...}`); optional parts are omitted when absent.
+  /// `mentions` only in groups.
   Map<String, Object?> toPayload() => {
     'v': 1,
     'type': 'message',
@@ -115,6 +130,7 @@ class ChatMessage {
     if (replyTo != null) 'replyTo': replyTo!.toJson(),
     if (attachment != null) 'attachment': attachment!.toJson(),
     if (link != null) 'link': link!.toJson(),
+    if (mentions.isNotEmpty) 'mentions': mentions,
   };
 
   Map<String, Object?> toRow() => {
@@ -132,7 +148,9 @@ class ChatMessage {
     'edited_at': editedAt,
     'reactions': reactions.isEmpty ? null : jsonEncode(reactions.toJson()),
     'sender': sender,
+    'sender_name': senderName,
     'mentions': mentions.isEmpty ? null : jsonEncode(mentions),
+    'read_by': readBy.isEmpty ? null : jsonEncode(readBy),
   };
 
   static ChatMessage fromRow(Map<String, Object?> row) {
@@ -159,7 +177,9 @@ class ChatMessage {
         editedAt: row['edited_at'] as int?,
         reactions: row['reactions'] == null ? const Reactions() : Reactions.fromJson(json('reactions')),
         sender: row['sender'] as String?,
-        mentions: row['mentions'] == null ? const [] : _mentions(json('mentions')),
+        senderName: row['sender_name'] as String?,
+        mentions: row['mentions'] == null ? const [] : _ids(json('mentions'), maxMentions),
+        readBy: row['read_by'] == null ? const [] : _ids(json('read_by'), maxReaders),
       );
     } on FormatException {
       throw const StoreException('Invalid chat message.', code: 'invalid');
@@ -193,22 +213,26 @@ const _maxSafeInt = 9007199254740991;
 final uuidPattern = RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', caseSensitive: false);
 /// A 1:1 pair id (43 characters) or an MLS group id (22).
 final conversationPattern = RegExp(r'^([A-Za-z0-9_-]{43}|[A-Za-z0-9_-]{22})$');
-final _userId = RegExp(r'^[A-Za-z0-9_-]{1,64}$');
+final userIdPattern = RegExp(r'^[A-Za-z0-9_-]{22}$');
+final usernamePattern = RegExp(r'^[a-z0-9_]{3,20}$');
 const maxMentions = 64;
+const maxReaders = 1000;
+
+/// Groups keep their newest 500 messages each (older ones are evicted), within the device-wide cap.
+const groupKeep = 500;
 
 bool _sameList(List<String> a, List<String> b) => a.length == b.length && [for (var i = 0; i < a.length; i++) a[i] == b[i]].every((x) => x);
 
-List<String> _mentions(Object? json) {
-  if (json is! List || json.length > maxMentions || !json.every((v) => v is String && _userId.hasMatch(v))) throw const FormatException('Invalid mentions');
+/// 1–[max] distinct user ids.
+List<String> _ids(Object? json, int max) {
+  if (json is! List || json.isEmpty || json.length > max || !json.every((v) => v is String && userIdPattern.hasMatch(v)) || json.toSet().length != json.length) {
+    throw const FormatException('Invalid user ids');
+  }
   return List<String>.unmodifiable(json.cast<String>());
 }
 
-/// Strict `mentions` from a payload: at most 64 distinct user ids.
-List<String> mentionsFromJson(Object? json) {
-  final list = _mentions(json);
-  if (list.toSet().length != list.length) throw const FormatException('Invalid mentions');
-  return list;
-}
+/// Strict `mentions` from a payload: 1–64 distinct user ids.
+List<String> mentionsFromJson(Object? json) => _ids(json, maxMentions);
 
 /// Message text bounds: at most 4096 UTF-8 bytes, empty only beside an attachment.
 bool validText(String text, {required bool hasAttachment}) => (text.isNotEmpty || hasAttachment) && utf8.encode(text).length <= maxTextBytes;
@@ -231,9 +255,7 @@ ChatMessage validate(ChatMessage message) {
       ((editedText == null) == (editedAt == null)) &&
       (editedText == null || validText(editedText, hasAttachment: message.attachment != null)) &&
       (editedAt == null || validTime(editedAt)) &&
-      (message.sender == null || (_userId.hasMatch(message.sender!) && !message.outgoing)) &&
-      message.mentions.length <= maxMentions &&
-      message.mentions.every(_userId.hasMatch);
+      _groupFieldsOk(message);
   if (!ok) throw const StoreException('Invalid chat message.', code: 'invalid');
   return ChatMessage(
     id: message.id.toLowerCase(),
@@ -250,6 +272,24 @@ ChatMessage validate(ChatMessage message) {
     editedAt: editedAt,
     reactions: message.reactions,
     sender: message.sender,
+    senderName: message.senderName,
     mentions: message.mentions,
+    readBy: message.readBy,
   );
+}
+
+/// m4-groups §10: incoming group rows always name their sender, outgoing ones never; names only on incoming;
+/// mentions and read-by only in groups, read-by only on our own messages; system rows only in groups.
+bool _groupFieldsOk(ChatMessage m) {
+  final group = m.inGroup, incoming = m.direction == Direction.incoming;
+  if (m.system) return group && m.sender == null && m.senderName == null && m.mentions.isEmpty && m.readBy.isEmpty && m.attachment == null;
+  if (!group) return m.sender == null && m.senderName == null && m.mentions.isEmpty && m.readBy.isEmpty;
+  return incoming == (m.sender != null) &&
+      (m.sender == null || userIdPattern.hasMatch(m.sender!)) &&
+      (m.senderName == null || (incoming && usernamePattern.hasMatch(m.senderName!))) &&
+      m.mentions.length <= maxMentions &&
+      m.mentions.every(userIdPattern.hasMatch) &&
+      (m.readBy.isEmpty || m.outgoing) &&
+      m.readBy.length <= maxReaders &&
+      m.readBy.every(userIdPattern.hasMatch);
 }

@@ -71,6 +71,13 @@ sealed class AccountEvent {
           oldest: m['oldest'] as int?,
         ),
         'keypackages' => KeyPackagesLow(m['remaining'] as int),
+        'ephemeral' => GroupEphemeral(
+          channel: m['channel'] as String,
+          fromUserId: (m['from'] as Map)['userId'] as String,
+          fromDeviceId: (m['from'] as Map)['deviceId'] as String,
+          message: m['message'] as String,
+          createdAt: m['createdAt'] as int,
+        ),
         _ => null,
       };
     } catch (_) {
@@ -200,6 +207,16 @@ class ChannelEvent extends AccountEvent {
   final String? digest;
   final String? deviceId;
   final int? oldest;
+}
+
+/// A live-only group message (typing): never logged, processed only when the channel is idle.
+class GroupEphemeral extends AccountEvent {
+  const GroupEphemeral({required this.channel, required this.fromUserId, required this.fromDeviceId, required this.message, required this.createdAt});
+  final String channel;
+  final String fromUserId;
+  final String fromDeviceId;
+  final String message;
+  final int createdAt;
 }
 
 /// This device's one-time KeyPackages are running low.

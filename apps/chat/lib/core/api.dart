@@ -217,6 +217,15 @@ class Api {
   Future<Map<String, dynamic>> postCommit(String id, String message, {String? welcome, List<String>? joiners}) =>
       call('/api/channels/$id/commits', method: 'POST', body: {'message': message, 'welcome': ?welcome, 'joiners': ?joiners});
 
+  /// Public channels: `[{id, name, members, joined}]`, newest first.
+  Future<List<Map<String, dynamic>>> channelDirectory() async => ((await call('/api/channels/directory'))['channels'] as List).cast<Map<String, dynamic>>();
+
+  /// Any account's published identity, for a trust-on-first-use pin of a group member who isn't a contact.
+  Future<Map<String, dynamic>> userIdentity(String userId) => call('/api/users/$userId/identity');
+
+  /// A live-only application message (typing), at most 2 KiB, for the current epoch.
+  Future<Map<String, dynamic>> postEphemeral(String id, String message) => call('/api/channels/$id/ephemeral', method: 'POST', body: {'message': message});
+
   /// An external commit: a public channel, a new device of a member, or a resync.
   Future<Map<String, dynamic>> joinChannel(String id, String message) => call('/api/channels/$id/join', method: 'POST', body: {'message': message});
 

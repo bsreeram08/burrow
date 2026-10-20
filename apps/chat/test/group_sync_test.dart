@@ -88,7 +88,8 @@ void main() {
   });
 
   test('create, add, Welcome, messages both ways, cursors advance', () async {
-    final group = await alice.sync.create(GroupKindName.private, name: 'Team', members: [bob.user.id]);
+    final group = await alice.sync.create(GroupKindName.private, name: 'Team');
+    await alice.sync.add(group.id, [bob.user.id]);
     await until(() => bob.crypto.groups.contains(group.id), 'bob joined from the Welcome');
     await until(() => ds.welcomes[bob.crypto.deviceId]?.isEmpty ?? true, 'the Welcome was removed');
     expect((await bob.store.group(group.id))?.kind, GroupKindName.private);
@@ -116,7 +117,8 @@ void main() {
   });
 
   test('a message sent while the group moved on is rebuilt for the new epoch', () async {
-    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id]);
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id]);
     await until(() => bob.crypto.groups.contains(group.id));
     // Alice's next epoch lands on the server before bob processed it: bob's message is refused, then rebuilt.
     final carol = await Party.join(ds, 'carol');
@@ -129,7 +131,8 @@ void main() {
 
   test('removal: the removed member stops, the others carry on', () async {
     final carol = await Party.join(ds, 'carol');
-    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id, carol.user.id]);
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id, carol.user.id]);
     await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
     await alice.sync.remove(group.id, bob.user.id);
     await until(() => true);
@@ -148,7 +151,8 @@ void main() {
 
   test('a commit every member rejects is reported, freezes the channel, and an admin rolls it back', () async {
     final carol = await Party.join(ds, 'carol');
-    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id, carol.user.id]);
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id, carol.user.id]);
     await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
     // Bob (not an admin) sends a commit removing carol: the delivery service can't tell, every member refuses it.
     final api = ds.client(userId: bob.user.id, username: 'bob', deviceId: bob.crypto.deviceId);

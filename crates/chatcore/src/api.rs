@@ -118,7 +118,7 @@ pub fn sas_code(local_sdp: String, remote_sdp: String, my_nonce: String, peer_no
 #[cfg(feature = "mls")]
 pub use crate::mls::cert::DeviceCert;
 #[cfg(feature = "mls")]
-pub use crate::mls::engine::{Expect, GroupView, MemberView, Outgoing, PendingCommit, Processed};
+pub use crate::mls::engine::{CommitCheck, Expect, GroupView, MemberView, Outgoing, PendingCommit, Processed};
 #[cfg(feature = "mls")]
 pub use crate::mls::payload::Context as PayloadContext;
 #[cfg(feature = "mls")]
@@ -210,7 +210,7 @@ pub fn mls_receive(group_id: String, message: String, expect: Option<Expect>) ->
 #[cfg(feature = "mls")]
 /// Who signed a commit at the current epoch, checked against this device's tree (signature only; changes nothing).
 #[cfg(feature = "mls")]
-pub fn mls_commit_author(group_id: String, message: String) -> Result<MemberView> { with_groups(|groups, store| groups.commit_author(store, &crate::mls::engine::group_id(&group_id)?, &message)) }
+pub fn mls_commit_author(group_id: String, message: String) -> Result<CommitCheck> { with_groups(|groups, store| groups.commit_author(store, &crate::mls::engine::group_id(&group_id)?, &message)) }
 #[cfg(feature = "mls")]
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }
 #[cfg(feature = "mls")]

@@ -174,6 +174,23 @@ with a commit the DS sequences but every member rejects. `Ds::snapshot(group)` b
 `Ds::restore(group, snapshot)` roll the public state back after members report `poison`; the rollback protocol
 (freeze, an admin device re-checks, truncate the log, remove the committer) is the delivery service's (M3).
 
+**Who a rejected commit blames.** A commit's signature covers its content; the membership and confirmation tags are
+*not* covered, and whoever relays the commit can flip them without breaking the signature (the spike's byte-flip probe
+did exactly that). So a commit rejected for its tags says nothing about its author, and removing the author for it would
+let a malicious server get an innocent member removed. A `poison` failure therefore carries a class (`class` beside
+`code` in the JSON error; `ChatError.class`), and `mls_commit_author` / `mlsCommitAuthor` returns the same judgement for
+any commit at the current epoch, computed the way the DS sees it (signature and signed content, no tags):
+
+| Field | Meaning |
+|---|---|
+| `authenticated` | the signature verifies under the author's leaf key in this device's tree |
+| `signedContentInvalid` | authenticated, and the signed content fails validation or policy (invalid proposals or path, a non-admin's add, a bad roles change...) |
+| `class` | `signed-content` iff both are true, otherwise `tag` (a bad tag, a bad signature, anything outside the signature) |
+| `author` | the member who signed it, only when `authenticated` |
+
+Policy: a `tag` failure may be rolled back to unwedge the group but the author is NOT removed (its client sees the
+rollback, resyncs and tries again); only `signed-content` failures justify removing the author. Unknowns default to `tag`.
+
 ## Delivery service (`Ds`, namespace `mlsds`)
 
 `Ds::new(store)`, `pin(userId, aik)`, `create(groupInfo, tree)`, `submit(group, message)` -> `accepted {epoch, digest}`
@@ -205,7 +222,7 @@ row under the wrong group; OpenMLS never sees a panic from a corrupt row.
 | `mls_receive(group_id, message)` / `mls_receive_commit(pending_id)` / `mls_receive_abort(pending_id)` | `Processed` / `()` / `()` |
 | `mls_members(group_id)` / `mls_roles(group_id)` / `mls_group_view(group_id)` | `Vec<MemberView>` / `Roles` / `GroupView` |
 | `mls_validate_payload(payload_json, context)` | the payload type |
-| `mls_commit_author(group_id, message)` | `MemberView`: who signed a commit at the current epoch, verified against this device's tree (signature only; changes nothing). For resolving a reported commit. |
+| `mls_commit_author(group_id, message)` | `CommitCheck { authenticated, signedContentInvalid, class, author? }`: who signed a commit at the current epoch and whether what they signed is valid, judged on this device's tree without the tags (changes nothing). For resolving a reported commit; see "Who a rejected commit blames". |
 
 JSON commands: `mlsInitDevice`, `mlsDeviceLeaf`, `mlsSetDeviceCert`, `mlsKeyPackages`, `mlsCreate`, `mlsCommit`,
 `mlsMergeOwn`, `mlsClearOwn`, `mlsPending`, `mlsJoin`, `mlsJoinExternal`, `mlsForget`, `mlsEncrypt`, `mlsReceive`, `mlsCommitAuthor`

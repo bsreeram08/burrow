@@ -631,3 +631,81 @@ fn a_commit_sent_as_a_private_message_is_never_applied() {
     f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
     f.c1.sync(&f.server, &g);
 }
+
+#[test]
+fn a_rejected_commit_is_classified_by_what_the_authors_signature_covers() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let epoch = f.c1.epoch(&g);
+    let a1_device = f.a1.device.clone();
+
+    // 1. Only a tag is wrong (the last bytes: confirmation tag; the DS cannot see it and relays the commit on). The
+    //    author's signature verifies and the signed content is fine: the failure says nothing about the author.
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    let genuine = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &out.commit).unwrap();
+    let mut seen_tag = 0;
+    for from_end in 1..=40 {
+        let mut bad = genuine.clone();
+        let at = bad.len() - from_end;
+        bad[at] ^= 1;
+        let text = b64(&bad);
+        let Err(err) = f.c1.groups.process(&mut f.c1.store, &gid, &text) else { panic!("a tampered commit was accepted") };
+        if err.code() != Some("poison") { continue; }
+        let check = f.c1.groups.commit_author(&mut f.c1.store, &gid, &text).unwrap();
+        // The DS-visible part is untouched only for the tag bytes; a flip that reaches the signed content or the
+        // signature is not attributable to anyone.
+        if check.authenticated {
+            assert!(!check.signed_content_invalid, "flip {from_end} from the end");
+            assert_eq!(check.author.as_ref().map(|a| a.device_id.as_str()), Some(a1_device.as_str()));
+            assert_eq!((err.class.as_deref(), check.class()), (Some("tag"), "tag"), "flip {from_end} from the end");
+            seen_tag += 1;
+        } else {
+            assert_eq!((err.class.as_deref(), check.class(), check.author.is_none()), (Some("tag"), "tag", true), "flip {from_end} from the end");
+        }
+    }
+    assert!(seen_tag > 0, "some flips hit only the tags");
+    f.a1.groups.clear_own(&mut f.a1.store, &gid).unwrap();
+
+    // 2. A flip in the signed content breaks the signature: not authenticated, so not attributable either.
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    let genuine = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &out.commit).unwrap();
+    let mut unauthenticated = 0;
+    for at in (30..genuine.len().saturating_sub(100)).step_by(17) {
+        let mut bad = genuine.clone();
+        bad[at] ^= 1;
+        let text = b64(&bad);
+        if let Err(err) = f.c1.groups.process(&mut f.c1.store, &gid, &text) {
+            if err.code() != Some("poison") { continue; }
+            assert_eq!(err.class.as_deref(), Some("tag"), "flip at {at}");
+            if let Ok(check) = f.c1.groups.commit_author(&mut f.c1.store, &gid, &text) {
+                assert_eq!(check.class(), "tag");
+                if !check.authenticated { unauthenticated += 1; }
+            }
+        }
+    }
+    assert!(unauthenticated > 0);
+    f.a1.groups.clear_own(&mut f.a1.store, &gid).unwrap();
+
+    // 3. Content the author really signed that policy forbids (a plain member removing another user): signed-content.
+    let evil = f.b1.groups.commit_unchecked(&mut f.b1.store, &gid, &[], &[(f.carol.id.clone(), None)], None, false).unwrap();
+    let err = f.a1.groups.process(&mut f.a1.store, &gid, &evil.commit).unwrap_err();
+    assert_eq!(err.code(), Some("poison"));
+    assert_eq!(err.class.as_deref(), Some("signed-content"), "{err}");
+    let check = f.a1.groups.commit_author(&mut f.a1.store, &gid, &evil.commit).unwrap();
+    assert_eq!((check.authenticated, check.signed_content_invalid, check.class()), (true, true, "signed-content"));
+    assert_eq!(check.author.unwrap().device_id, f.b1.device);
+    // The same commit with its tags corrupted by the relay is still the author's signed content.
+    let mut flipped = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &evil.commit).unwrap();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 1;
+    let check = f.a1.groups.commit_author(&mut f.a1.store, &gid, &b64(&flipped)).unwrap();
+    assert_eq!(check.class(), "signed-content");
+
+    // The group is untouched by all of it, and a commit for another epoch is not judged.
+    assert_eq!(f.c1.epoch(&g), epoch);
+    f.b1.groups.clear_own(&mut f.b1.store, &gid).unwrap();
+    f.a1.accepted(&mut f.server, &g, &[], &[], None, true);
+    f.c1.sync(&f.server, &g);
+    assert!(f.c1.groups.commit_author(&mut f.c1.store, &gid, &evil.commit).is_err());
+}

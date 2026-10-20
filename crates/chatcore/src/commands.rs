@@ -24,7 +24,10 @@ fn shown_identity(command: &Value) -> crate::error::Result<Option<IdentityPub>> 
 pub fn respond(core: &mut Core, command: &Value) -> Value {
     match run(core, command) {
         Ok(value) => json!({ "ok": value }),
-        Err(error) => json!({ "error": error.message, "code": error.code }),
+        Err(error) => match &error.class {
+            Some(class) => json!({ "error": error.message, "code": error.code, "class": class }),
+            None => json!({ "error": error.message, "code": error.code }),
+        },
     }
 }
 

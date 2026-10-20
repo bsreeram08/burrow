@@ -6,10 +6,17 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chatcore::commands::respond;
 use chatcore::core::Core;
-use chatcore::store::MemoryStore;
+use chatcore::store::{MemoryStore, Store};
 use serde_json::{json, Value};
 
 fn id() -> String { URL_SAFE_NO_PAD.encode(rand_core::RngCore::next_u64(&mut rand_core::OsRng).to_be_bytes().repeat(2)) }
+
+/// The account key, read from the identity row (the crate itself offers no accessor to it).
+fn aik_of(core: &mut Core) -> ed25519_dalek::SigningKey {
+    let row = core.store_mut().get("identity").unwrap().unwrap();
+    let identity: chatcore::protocol::Identity = serde_json::from_value(row).unwrap();
+    ed25519_dalek::SigningKey::from_bytes(&identity.sign.0)
+}
 
 fn core() -> Core { Core::new(Box::new(MemoryStore::default())) }
 
@@ -115,7 +122,7 @@ fn a_device_certificate_signed_elsewhere_must_name_the_prepared_key_and_this_cor
 
     // Signed with the account key (as the web client does in WebCrypto): installed.
     let device = id();
-    let signed = chatcore::mls::cert::DeviceCert::issue(&web.account_signing_key().unwrap(), &user, &device, "web", &leaf_bytes, 1).unwrap();
+    let signed = chatcore::mls::cert::DeviceCert::issue(&aik_of(&mut web), &user, &device, "web", &leaf_bytes, 1).unwrap();
     let cert = call(&mut web, json!({ "cmd": "mlsSetDeviceCert", "cert": String::from_utf8(signed.encode()).unwrap() }));
     assert_eq!(cert["deviceId"], device);
     assert_eq!(cert["aikSign"], identity["sign"]);

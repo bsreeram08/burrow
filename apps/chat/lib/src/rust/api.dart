@@ -268,8 +268,7 @@ Future<MlsProcessed> mlsReceive({
   expect: expect,
 );
 
-/// Who signed a commit at the current epoch, verified against this device's own tree (changes nothing).
-Future<MlsMember> mlsCommitAuthor({
+Future<MlsCommitCheck> mlsCommitAuthor({
   required String groupId,
   required String message,
 }) => RustLib.instance.api.crateApiMlsCommitAuthor(
@@ -375,6 +374,41 @@ class Identity {
           runtimeType == other.runtimeType &&
           dh == other.dh &&
           sign == other.sign;
+}
+
+/// The core's verdict on a commit at the current epoch, checked against this device's own tree like the
+/// delivery service does (changes nothing). `class` is `signed-content` only when the author's signature
+/// verifies and what they signed is itself invalid; otherwise `tag` (outside the signature: proves nothing
+/// about the author). `author` is set when the signature verified.
+class MlsCommitCheck {
+  final bool authenticated;
+  final bool signedContentInvalid;
+  final String class_;
+  final MlsMember? author;
+
+  const MlsCommitCheck({
+    required this.authenticated,
+    required this.signedContentInvalid,
+    required this.class_,
+    this.author,
+  });
+
+  @override
+  int get hashCode =>
+      authenticated.hashCode ^
+      signedContentInvalid.hashCode ^
+      class_.hashCode ^
+      author.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsCommitCheck &&
+          runtimeType == other.runtimeType &&
+          authenticated == other.authenticated &&
+          signedContentInvalid == other.signedContentInvalid &&
+          class_ == other.class_ &&
+          author == other.author;
 }
 
 /// This device's group credential: a certificate for its leaf key, signed by the account identity key.

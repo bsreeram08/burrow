@@ -90,6 +90,24 @@ class GroupRemoval {
   final String? deviceId;
 }
 
+/// [GroupCrypto.commitAuthor]'s verdict. A `tag` failure lies outside the author's signature, so a server could
+/// have caused it in transit: it never blames the author.
+class CommitCheck {
+  const CommitCheck({required this.authenticated, required this.signedContentInvalid, required this.cls, this.author});
+  final bool authenticated;
+  final bool signedContentInvalid;
+
+  /// `signed-content` or `tag`.
+  final String cls;
+  final GroupMember? author;
+
+  /// The leaf index the engine reports for an external joiner's commit (not yet a member).
+  static const externalLeaf = 0xFFFFFFFF;
+
+  /// Only an authenticated member whose own signed content is invalid may be blamed (named and removed).
+  GroupMember? get blame => authenticated && cls == 'signed-content' && author != null && author!.leaf != externalLeaf ? author : null;
+}
+
 enum ProcessedKind { application, commit, own, removed }
 
 /// One log entry, authenticated (and decrypted) but not persisted: store what it carries, then
@@ -143,9 +161,10 @@ abstract class GroupCrypto {
   Future<GroupProcessed> receive(String groupId, String message, {ProcessedKind? expect});
   Future<void> receiveCommit(String pendingId);
 
-  /// The authenticated author of a commit for the group's current epoch, checked against this device's own
-  /// tree (signature only; nothing changes).
-  Future<GroupMember> commitAuthor(String groupId, String message);
+  /// The core's verdict on a commit for the group's current epoch, checked against this device's own tree
+  /// (nothing changes): whether its author is authenticated, and whether the failure is in what the author
+  /// signed (`signed-content`) or only in a tag outside the signature (`tag`).
+  Future<CommitCheck> commitAuthor(String groupId, String message);
   Future<void> receiveAbort(String pendingId);
 
   Future<List<GroupMember>> members(String groupId);

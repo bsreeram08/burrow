@@ -9,6 +9,7 @@ import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/fake_group_crypto.dart';
+import 'package:private_chat/crypto/group_crypto.dart';
 import 'package:private_chat/messaging/group_sync.dart';
 import 'package:private_chat/store/message.dart' show StoreException;
 import 'package:private_chat/store/message_store.dart';
@@ -172,7 +173,8 @@ void main() {
     expect(frozen!.frozen, isNotNull);
     final check = await alice.sync.checkFrozen(group.id);
     expect(check.verdict, FrozenVerdict.fails);
-    expect(check.author?.deviceId, bob.crypto.deviceId, reason: 'the author, authenticated on alice\'s device');
+    expect(check.check?.cls, 'signed-content');
+    expect(check.check?.blame?.deviceId, bob.crypto.deviceId, reason: 'the author, authenticated on alice\'s device');
     await alice.sync.resolve(group.id, rollback: true);
     expect(ds.channels[group.id]!.resolved, ['rollback']);
     // Exactly the authenticated author was removed afterwards.
@@ -221,5 +223,52 @@ void main() {
 
   test('resolve bytes v2 name the author (vector shared with channels.ts)', () {
     expect(sha256.convert(resolveBytes('C' * 22, 'rollback', 7, 'd' * 64, 'a' * 22)).toString(), '15911786d65cec6da7b01ae0de4df45929815e2d0073cad52665c981f5710bd3');
+  });
+
+  test('a tag-only failure rolls back removing nobody; the author rejoins and makes its change again', () async {
+    final carol = await Party.join(ds, 'carol');
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id, carol.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id]);
+    await until(() => ds.channels[group.id]!.members.values.every((m) => m.cursor == ds.channels[group.id]!.seq), 'everyone caught up');
+    for (var i = 0; i < 50 && !(await bob.crypto.roles(group.id)).isAdmin(bob.user.id); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    // alice's next commit arrives at bob and carol with a broken tag: they reject it and report it.
+    bob.crypto.tagFailFrom = alice.crypto.deviceId;
+    carol.crypto.tagFailFrom = alice.crypto.deviceId;
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id, carol.user.id]);
+    await until(() => ds.channels[group.id]!.frozen != null, 'reported');
+    var frozen = await bob.store.group(group.id);
+    for (var i = 0; i < 100 && frozen?.frozen == null; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      frozen = await bob.store.group(group.id);
+    }
+    final check = await bob.sync.checkFrozen(group.id);
+    expect(check.verdict, FrozenVerdict.fails);
+    expect(check.check?.cls, 'tag');
+    expect(check.check?.blame, isNull, reason: 'a tag proves nothing about the author');
+    bob.crypto.tagFailFrom = null;
+    carol.crypto.tagFailFrom = null;
+    await bob.sync.resolve(group.id, rollback: true);
+    expect(ds.channels[group.id]!.resolved, ['rollback']);
+    // Nobody removed; alice rejoined and made her change again.
+    for (var i = 0; i < 300 && !(await bob.crypto.roles(group.id)).isAdmin(carol.user.id); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+    }
+    expect((await bob.crypto.roles(group.id)).isAdmin(carol.user.id), isTrue, reason: 'the change was made again');
+    expect({for (final m in await bob.crypto.members(group.id)) m.userId}, {alice.user.id, bob.user.id, carol.user.id});
+    expect((await alice.store.list(group.id)).any((m) => m.system && m.text.contains('made again')), isTrue);
+  });
+
+  test('only an authenticated member whose signed content is invalid is ever blamed', () {
+    const member = GroupMember(leaf: 3, userId: 'u', deviceId: 'd', platform: 'ios', admin: false);
+    const joiner = GroupMember(leaf: CommitCheck.externalLeaf, userId: 'u', deviceId: 'd', platform: 'ios', admin: false);
+    expect(const CommitCheck(authenticated: true, signedContentInvalid: true, cls: 'signed-content', author: member).blame, member);
+    expect(const CommitCheck(authenticated: true, signedContentInvalid: false, cls: 'tag', author: member).blame, isNull);
+    expect(const CommitCheck(authenticated: false, signedContentInvalid: true, cls: 'tag', author: member).blame, isNull);
+    expect(const CommitCheck(authenticated: true, signedContentInvalid: true, cls: 'signed-content', author: joiner).blame, isNull);
+    expect(const CommitCheck(authenticated: true, signedContentInvalid: true, cls: 'signed-content').blame, isNull);
   });
 }

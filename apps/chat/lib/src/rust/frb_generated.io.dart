@@ -34,6 +34,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MlsExpect dco_decode_box_autoadd_mls_expect(dynamic raw);
 
   @protected
+  MlsMember dco_decode_box_autoadd_mls_member(dynamic raw);
+
+  @protected
   MlsPendingCommit dco_decode_box_autoadd_mls_pending_commit(dynamic raw);
 
   @protected
@@ -76,6 +79,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  MlsCommitCheck dco_decode_mls_commit_check(dynamic raw);
+
+  @protected
   MlsDeviceCert dco_decode_mls_device_cert(dynamic raw);
 
   @protected
@@ -116,6 +122,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect? dco_decode_opt_box_autoadd_mls_expect(dynamic raw);
+
+  @protected
+  MlsMember? dco_decode_opt_box_autoadd_mls_member(dynamic raw);
 
   @protected
   MlsPendingCommit? dco_decode_opt_box_autoadd_mls_pending_commit(dynamic raw);
@@ -169,6 +178,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MlsExpect sse_decode_box_autoadd_mls_expect(SseDeserializer deserializer);
 
   @protected
+  MlsMember sse_decode_box_autoadd_mls_member(SseDeserializer deserializer);
+
+  @protected
   MlsPendingCommit sse_decode_box_autoadd_mls_pending_commit(
     SseDeserializer deserializer,
   );
@@ -213,6 +225,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  MlsCommitCheck sse_decode_mls_commit_check(SseDeserializer deserializer);
+
+  @protected
   MlsDeviceCert sse_decode_mls_device_cert(SseDeserializer deserializer);
 
   @protected
@@ -253,6 +268,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsExpect? sse_decode_opt_box_autoadd_mls_expect(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MlsMember? sse_decode_opt_box_autoadd_mls_member(
     SseDeserializer deserializer,
   );
 
@@ -311,6 +331,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_box_autoadd_mls_expect(
     MlsExpect self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_mls_member(
+    MlsMember self,
     SseSerializer serializer,
   );
 
@@ -375,6 +401,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_mls_commit_check(
+    MlsCommitCheck self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_mls_device_cert(MlsDeviceCert self, SseSerializer serializer);
 
   @protected
@@ -422,6 +454,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   @protected
   void sse_encode_opt_box_autoadd_mls_expect(
     MlsExpect? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_member(
+    MlsMember? self,
     SseSerializer serializer,
   );
 

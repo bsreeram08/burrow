@@ -4,7 +4,6 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
-import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/fake_chat_crypto.dart';
 import 'package:private_chat/crypto/fake_group_crypto.dart';
 import 'package:private_chat/messaging/group_messenger.dart';

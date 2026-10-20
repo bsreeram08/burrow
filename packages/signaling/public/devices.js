@@ -125,6 +125,24 @@
   }
   /** The certificate itself, as chatcore decodes it: canonical JSON with its fields in this order. */
   const mlsCertJson = (userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig) => JSON.stringify({ v: 1, userId, deviceId, platform, leafSigKey, aikSign, issuedAt, sig });
+  // ---------- Linking and succession (docs/m5-linking.md §1.3, §5.1) ----------
+  const PLATFORM_OK = value => typeof value === 'string' && PLATFORMS.includes(value);
+  const key32 = value => { const bytes = typeof value === 'string' && KEY.test(value) ? unb64(value) : null; if (!bytes || bytes.length !== 32) fail('Invalid key'); return bytes; };
+  /** What a new device's key signs to open a link: its id, platform and public device key. */
+  function startBytes(deviceId, platform, deviceKey) {
+    if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || !PLATFORM_OK(platform)) fail('Invalid link start');
+    return writer().text16('webrtc-bun-linkstart-v1').text16(deviceId).text16(platform).bytes8(key32(deviceKey)).done();
+  }
+  /** What the new device's key signs to claim its session once the link is granted. */
+  function linkClaimBytes(linkId, deviceId, claim) {
+    if (typeof linkId !== 'string' || !DEVICE_ID.test(linkId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId)) fail('Invalid link claim');
+    return writer().text16('webrtc-bun-linkclaim-v1').text16(linkId).text16(deviceId).bytes8(key32(claim)).done();
+  }
+  /** The record the old account key signs to hand over to a new one (primary transfer): keeps contacts' verification. */
+  function successionBytes(record) {
+    if (!exact(record, ['v', 'userId', 'oldSign', 'newSign', 'newDh', 'at']) || record.v !== 1 || typeof record.userId !== 'string' || !USER_ID.test(record.userId) || !timestamp(record.at)) fail('Invalid succession record');
+    return writer().text16('webrtc-bun-succession-v1').text16(record.userId).bytes8(key32(record.oldSign)).bytes8(key32(record.newSign)).bytes8(key32(record.newDh)).u64(record.at).done();
+  }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -230,5 +248,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

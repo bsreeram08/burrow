@@ -17,12 +17,16 @@ import '../core/devices.dart';
 import '../core/events.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart';
+import '../crypto/link_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
 import '../crypto/rust_group_crypto.dart';
 import '../messaging/attachments.dart';
 import '../messaging/group_messenger.dart';
 import '../messaging/group_sync.dart';
+import '../messaging/linking.dart';
 import '../messaging/messenger.dart';
+import '../messaging/succession.dart';
+import '../store/message.dart' show StoreException;
 import '../store/message_store.dart';
 import '../theme/theme_prefs.dart';
 import 'chat_settings.dart';
@@ -75,6 +79,9 @@ final tokenStoreProvider = Provider<TokenStore>((ref) => SecureTokenStore());
 /// The Rust core (crates/chatcore) through flutter_rust_bridge. Tests and the demo override this
 /// with FakeChatCrypto.
 final cryptoProvider = Provider<ChatCrypto>((ref) => RustChatCrypto());
+
+/// Linking, pin transfer and succession in the same Rust core. Tests override this with FakeLinkCrypto.
+final linkCryptoProvider = Provider<LinkCrypto>((ref) => const RustLinkCrypto());
 
 /// Groups over MLS: the same Rust core (its group engine). Tests and the demo override this with FakeGroupCrypto.
 final groupCryptoProvider = Provider<GroupCrypto>((ref) => const RustGroupCrypto());
@@ -193,6 +200,8 @@ class AppState {
     this.groupTyping = const {},
     this.pausedGroups = const {},
     this.groupsUnavailable,
+    this.companion = false,
+    this.movedChats = const {},
   });
   final AuthPhase phase;
   final User? user;
@@ -226,6 +235,12 @@ class AppState {
   /// Why groups are off on this device, if they are.
   final String? groupsUnavailable;
 
+  /// This install is a linked device of the account (m5 §0): 1:1 chats stay on the primary until they move.
+  final bool companion;
+
+  /// Contacts whose 1:1 chat moved to MLS here (m5 §8).
+  final Set<String> movedChats;
+
   AppState copyWith({
     AuthPhase? phase,
     User? user,
@@ -246,6 +261,8 @@ class AppState {
     Map<String, String>? pausedGroups,
     String? groupsUnavailable,
     bool clearGroupsUnavailable = false,
+    bool? companion,
+    Set<String>? movedChats,
   }) => AppState(
     phase: phase ?? this.phase,
     user: user ?? this.user,
@@ -262,6 +279,8 @@ class AppState {
     groupTyping: groupTyping ?? this.groupTyping,
     pausedGroups: pausedGroups ?? this.pausedGroups,
     groupsUnavailable: clearGroupsUnavailable ? null : groupsUnavailable ?? this.groupsUnavailable,
+    companion: companion ?? this.companion,
+    movedChats: movedChats ?? this.movedChats,
   );
 }
 
@@ -273,6 +292,10 @@ class AppController extends Notifier<AppState> {
   GroupMessenger? groups;
   MessageStore? store;
   String? viewingGroup;
+  final _linkEvents = StreamController<LinkEvent>.broadcast();
+
+  /// `link` frames for this account (hello, offer, grant, message).
+  Stream<LinkEvent> get linkEvents => _linkEvents.stream;
   final _subscriptions = <StreamSubscription<Object?>>[];
   String? viewingContact;
   Timer? _missTimer;
@@ -315,15 +338,53 @@ class AppController extends Notifier<AppState> {
     await _signedIn(result.user, result.token);
   }
 
-  Future<void> _signedIn(User user, String token) async {
+  /// The device-key slot of an install that is linking and doesn't know its account yet.
+  static const _linkOwner = '__link__';
+
+  /// Welcome → "Link to my account" (m5 §1): this install shows a QR (or, with [username], an 8-character code
+  /// for that account). Its key database is a fresh one under a link-scoped name, kept for the account once
+  /// linked; the device key too.
+  Future<NewDeviceLink> startLink({String? username}) async {
+    final device = await localDevice(await ref.read(devicePrefsProvider)(), _linkOwner);
+    await _crypto.init('keys-link-${device.deviceId}');
+    return NewDeviceLink.start(
+      api: _api,
+      link: ref.read(linkCryptoProvider),
+      groups: ref.read(groupCryptoProvider),
+      device: device,
+      platform: _api.client,
+      label: platformLabel(_api.client),
+      username: username?.trim().toLowerCase(),
+    );
+  }
+
+  /// The primary granted the link: check it, keep the core and device key for the account, sign in as a
+  /// linked device, and install the bundle's history and channel names.
+  Future<void> finishLink(NewDeviceLink link) async {
+    final setup = await link.waitGrant();
+    final prefs = await ref.read(devicePrefsProvider)();
+    final key = await prefs.readDevice(_linkOwner);
+    if (key != null) await prefs.writeDevice(setup.user.id, key);
+    await prefs.writeDevice(_linkOwner, 'null'); // The next link starts with a new device.
+    prefs.setPin(setup.user.id, setup.user.id, setup.pin);
+    await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:${setup.user.id}', setup.metaKey);
+    await (await _certKey(setup.user.id)).write(setup.identity.sign); // The grant's certificate is under this key.
+    await (await SharedPreferences.getInstance()).setString('linked-core-v1:${setup.user.id}', 'keys-link-${link.deviceId}');
+    await _signedIn(setup.user, setup.token, linked: setup.bundle);
+  }
+
+  Future<void> _signedIn(User user, String token, {Map<String, Object?>? linked}) async {
     _api.token = token;
     await ref.read(tokenStoreProvider).write(token);
     await ref.read(themePrefsProvider.notifier).load(user.id);
     await ref.read(chatSettingsProvider.notifier).load(user.id);
     final dbStore = await ref.read(storeOpenerProvider)(user.id);
     store = dbStore;
+    var companion = false;
     try {
-      await _crypto.init('keys-${user.id}');
+      // A linked install keeps the key database it linked with.
+      await _crypto.init((await SharedPreferences.getInstance()).getString('linked-core-v1:${user.id}') ?? 'keys-${user.id}');
+      companion = await ref.read(linkCryptoProvider).account() != null;
     } on CryptoException catch (error) {
       if (!error.keysLocked) rethrow;
       // Signed in, but encrypted messaging stays off until the user chooses recovery. Never reset silently.
@@ -345,7 +406,7 @@ class AppController extends Notifier<AppState> {
       rotation: await ref.read(rotationPrefsProvider)(user.id),
       devices: await ref.read(devicePrefsProvider)(),
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
-    );
+    )..companion = companion;
     messenger = m;
     final sync = GroupSync(
       api: _api,
@@ -355,6 +416,8 @@ class AppController extends Notifier<AppState> {
       device: m.device,
       platform: _api.client,
       ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: m.verifiedOwnDevices,
+      companion: companion,
       tagLog: SharedTagRollbackLog(await SharedPreferences.getInstance(), user.id),
       sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
       ackWelcome: events.ack,
@@ -370,6 +433,10 @@ class AppController extends Notifier<AppState> {
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
     );
     groups = g;
+    // Moved 1:1 chats travel through their DM groups (m5 §8).
+    m.groups = g;
+    sync.followIdentity = _followAuthor;
+    _certKeyCached = await _certKey(user.id);
     _subscriptions
       ..add(sync.notices.listen((text) => state = state.copyWith(notice: text)))
       ..add(g.notices.listen((text) => state = state.copyWith(notice: text)))
@@ -385,7 +452,8 @@ class AppController extends Notifier<AppState> {
       ..add(m.activeChanges.listen((active) => state = state.copyWith(inactiveDevice: !active)))
       ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
       ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
-    state = state.copyWith(phase: AuthPhase.signedIn, user: user, clearNotice: true);
+    if (linked != null) await installLinkBundle(linked, dbStore);
+    state = state.copyWith(phase: AuthPhase.signedIn, user: user, companion: companion, clearNotice: true);
     await _loadGroups();
     unawaited(_checkActive());
     await loadContacts();
@@ -400,8 +468,12 @@ class AppController extends Notifier<AppState> {
     final s = store;
     if (s == null) return;
     try {
-      final list = await s.groups();
-      state = state.copyWith(groups: list);
+      // A 1:1 chat's DM group shows as that chat, never as a group.
+      final all = await s.groups();
+      state = state.copyWith(
+        groups: [for (final g in all) if (g.kind != GroupKindName.dm) g],
+        movedChats: {for (final g in all) if (g.kind == GroupKindName.dm && g.active && g.dmChecked && g.movedAt != null) ?g.peer},
+      );
     } catch (_) {}
   }
 
@@ -423,6 +495,144 @@ class AppController extends Notifier<AppState> {
     }
     state = g.unavailable == null ? state.copyWith(clearGroupsUnavailable: true) : state.copyWith(groupsUnavailable: g.unavailable);
     await _loadGroups();
+  }
+
+  // ---------- Primary transfer (m5 §5) ----------
+  /// Reopens the account on this device after a transfer changed what its core holds (primary ↔ linked).
+  Future<void> _reopen() async {
+    final user = state.user, token = _api.token;
+    if (user == null || token == null) return;
+    await _teardown();
+    await _signedIn(user, token);
+  }
+
+  /// This primary takes the QR text of the device taking over.
+  Future<HandOver> handOver(String qr) async {
+    final ctx = linkContext() ?? (throw StateError('Not signed in'));
+    return HandOver.fromQr(ctx, ref.read(groupCryptoProvider), qr, hold: (held) async {
+      final sync = groups?.sync;
+      if (sync == null) return;
+      held ? sync.held = true : await sync.release();
+    });
+  }
+
+  /// The user confirmed on this primary: sign the account over, then continue here as a linked device.
+  Future<void> finishHandOver(HandOver h) async {
+    final userId = state.user?.id;
+    final metaKey = await h.approve();
+    if (userId != null) {
+      await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:$userId', metaKey);
+      final under = h.request?.identity.sign; // The demote's certificate is under the new key.
+      if (under != null) await (await _certKey(userId)).write(under);
+    }
+    await _reopen();
+    await _recommitLeaves();
+  }
+
+  /// This linked device asks to become the primary: it shows a code for the primary to scan.
+  Future<TakeOver> startTakeOver() async {
+    final m = messenger ?? (throw StateError('Not signed in'));
+    return TakeOver.start(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), device: await m.device(), platform: _api.client);
+  }
+
+  /// The primary confirmed: take the account over, then continue here as its primary.
+  Future<void> finishTakeOver(TakeOver t) async {
+    final m = messenger ?? (throw StateError('Not signed in'));
+    final prefs = await SharedPreferences.getInstance(), key = 'device-meta-key-v1:${m.me.id}';
+    final old = prefs.getString(key);
+    await t.run(m, platform: _api.client, markers: await _takeOverMarkers(m.me.id), oldMetaKey: old == null ? null : unb64(old));
+    await prefs.remove(key); // A primary derives its own label key.
+    await _reopen();
+    await _recommitLeaves();
+    unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+  }
+
+  Future<TakeOverMarkers> _takeOverMarkers(String userId) async {
+    final prefs = await SharedPreferences.getInstance(), key = 'takeover-v1:$userId';
+    return (read: () async => prefs.getString(key), write: (String? v) async => v == null ? await prefs.remove(key) : await prefs.setString(key, v));
+  }
+
+  /// A take-over cut short after it was confirmed resumes on the next start (m5 §5.2).
+  Future<bool> _resumeTakeOver() async {
+    final m = messenger;
+    if (m == null) return false;
+    try {
+      final done = await TakeOver.resume(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), messenger: m, platform: _api.client, markers: await _takeOverMarkers(m.me.id));
+      if (done) state = state.copyWith(notice: 'This device finished becoming your primary.');
+      return done;
+    } on StoreException catch (error) {
+      state = state.copyWith(notice: error.message);
+    } catch (_) {
+      // Offline: tried again on the next start.
+    }
+    return false;
+  }
+
+  /// After a succession this device's leaf carries a certificate under the new key: commit it in every group until
+  /// no group sees it as Previous (which blocks adding people, m5 §7), a bounded number of tries each.
+  Future<void> _recommitLeaves() async {
+    final g = groups, s = store;
+    if (g == null || s == null) return;
+    var left = 0;
+    for (final c in await s.groups()) {
+      if (c.active && !await g.sync.recommitLeaf(c.id)) left++;
+    }
+    if (left > 0) state = state.copyWith(notice: "$left ${left == 1 ? 'group still sees' : 'groups still see'} this device's old key. It tries again on the next start.");
+  }
+
+  /// Linked devices following the account to a new key, and the primary certifying their leaves (§5.2.2).
+  OwnSuccession? _ownSuccession() {
+    final m = messenger, s = store, g = groups, user = state.user;
+    if (m == null || s == null || g == null || user == null) return null;
+    return OwnSuccession(
+      api: _api,
+      link: ref.read(linkCryptoProvider),
+      groups: ref.read(groupCryptoProvider),
+      store: s,
+      updateLeaf: g.sync.updateLeaf,
+      me: user,
+      platform: _api.client,
+      chat: _crypto,
+      devices: m.devices,
+      device: m.device,
+      certKey: _certKeyCached,
+    );
+  }
+
+  /// The account key this device's MLS certificate is under, persisted per account (§5.2.2).
+  ({Future<String?> Function() read, Future<void> Function(String sign) write})? _certKeyCached;
+  Future<({Future<String?> Function() read, Future<void> Function(String sign) write})> _certKey(String userId) async {
+    final prefs = await SharedPreferences.getInstance(), key = 'cert-key-v1:$userId';
+    return (read: () async => prefs.getString(key), write: (String sign) async => prefs.setString(key, sign).then((_) {}));
+  }
+
+  /// The author of a commit about to be reported as poison may have moved to a new account key (m5 §5.2): ours
+  /// follows our own chain, a contact's is checked again. True when a pin moved.
+  Future<bool> _followAuthor(String userId) async {
+    if (userId == state.user?.id) return messenger?.companion ?? false ? await _ownSuccession()?.follow() ?? false : false;
+    final before = (await _crypto.peer(userId))?.identity;
+    await _checkIdentity(userId);
+    return (await _crypto.peer(userId))?.identity != before;
+  }
+
+  Future<void> _followSuccession() async {
+    final own = _ownSuccession();
+    if (own == null) return;
+    try {
+      if (await own.follow()) state = state.copyWith(notice: 'Your account moved to a new primary device.');
+      await own.takeRecert();
+    } on StoreException catch (error) {
+      state = state.copyWith(notice: error.message);
+    } catch (_) {
+      // Offline: tried again on the next devices event or start.
+    }
+  }
+
+  /// What linking a device needs (this device as the primary).
+  LinkContext? linkContext() {
+    final m = messenger, s = store;
+    if (m == null || s == null) return null;
+    return LinkContext(api: _api, crypto: _crypto, link: ref.read(linkCryptoProvider), messenger: m, store: s, contacts: () => state.contacts);
   }
 
   void openGroup(String id) {
@@ -470,13 +680,30 @@ class AppController extends Notifier<AppState> {
       case DevicesChanged(:final id):
         // A contact's list: verify it against their pinned security code. Ours: check it still names this device.
         final contact = contactById(id);
-        if (id == state.user?.id) {
+        if (id == state.user?.id && (messenger?.companion ?? false)) {
+          // A linked device: our account may have moved to a new primary (m5 §5.2 step 6).
+          unawaited(_followSuccession());
+          unawaited(groups?.sync.removeDroppedOwnLeaves().catchError((_) => 0));
+        } else if (id == state.user?.id) {
+          // After a revocation the primary publishes the list without the revoked device (m5 §4).
           unawaited(messenger?.syncDevices().catchError((_) => false));
+          if (event.needsList) unawaited(messenger?.publishNextList().then((_) => null, onError: (_) => null));
+          unawaited(groups?.sync.removeDroppedOwnLeaves().catchError((_) => 0));
         } else if (contact != null) {
           unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
         }
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
+      case RecertEvent():
+        // A linked device's certificate under the new key was answered, or (on the primary) one is waiting.
+        if (messenger?.companion ?? false) {
+          unawaited(_followSuccession());
+        } else {
+          unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+        }
+      case LinkEvent():
+        // Screens running a link (the primary's side) wait on these instead of polling.
+        if (!_linkEvents.isClosed) _linkEvents.add(event);
       case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow() || GroupEphemeral():
         unawaited(groups?.onEvent(event).catchError((_) {}));
       case Incoming():
@@ -492,6 +719,17 @@ class AppController extends Notifier<AppState> {
   }
 
   Future<void> _checkActive() async {
+    if (await _resumeTakeOver()) {
+      await _reopen();
+      await _recommitLeaves();
+      return;
+    }
+    if (messenger?.companion ?? false) {
+      // A linked device: groups (and moved chats) only; the account's keys are on the primary.
+      if (!(groups?.ready ?? true)) await _startGroups();
+      await _followSuccession();
+      return;
+    }
     try {
       final active = await messenger?.checkActive();
       if (active != null) state = state.copyWith(inactiveDevice: !active);
@@ -501,6 +739,7 @@ class AppController extends Notifier<AppState> {
           await messenger?.syncDevices();
         } catch (_) {}
         if (!(groups?.ready ?? true)) await _startGroups();
+        unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
       }
     } catch (e) {
       state = state.copyWith(notice: 'Could not check encryption keys: $e');
@@ -532,18 +771,27 @@ class AppController extends Notifier<AppState> {
     await messenger?.takeOver();
   }
 
-  /// "Use this device instead": only ever from the user's tap.
+  /// "Use this device instead" (recovery without a primary, m5 §6): only ever from the user's confirmed tap. This
+  /// device's key becomes the account's (contacts see the code change) and the first list under it names only
+  /// this device: no device of the old key is trusted again.
   Future<void> useThisDevice() async {
-    await messenger?.takeOver();
+    final m = messenger;
+    if (m == null) return;
+    await m.takeOver();
+    await m.publishNewChain(const []);
     state = state.copyWith(inactiveDevice: false);
+    await _checkActive();
   }
 
   Future<void> _checkIdentity(String contactId) async {
     final contact = contactById(contactId);
     if (contact == null) return;
     try {
-      final identity = Identity.fromJson(await _api.publishedIdentity(contact.username));
-      await _crypto.notePeer(contactId, identity);
+      // The devices view also serves any succession chain, so a moved account keeps its verification.
+      final view = await _api.devices(contact.username);
+      final served = view['identity'];
+      if (served is! Map<String, dynamic>) return;
+      await messenger?.followIdentity(contact, Identity.fromJson(served), view['succession']);
       final safety = await _crypto.safety(state.user!.username, contactId, contact.username);
       if (safety != null && (safety.changed || safety.blocked)) state = state.copyWith(keyChanged: {...state.keyChanged, contactId});
       unawaited(messenger?.flush());
@@ -627,14 +875,11 @@ class AppController extends Notifier<AppState> {
 
   /// [shown]: the identity whose code the sheet showed. The decision applies only to that identity; if the
   /// pin changed again meanwhile the core refuses (`mismatch`) and nothing is accepted.
-  Future<void> reviewedKey(String contactId, {required bool verified, Identity? shown}) async {
-    if (shown != null) {
-      verified ? await _crypto.setVerifiedFor(contactId, true, shown) : await _crypto.acceptChangeFor(contactId, shown);
-    } else if (verified) {
-      await _crypto.setVerified(contactId, true);
-    } else {
-      await _crypto.acceptChange(contactId);
-    }
+  /// The user's decision binds to exactly the identity whose code was shown: if another key was pinned
+  /// meanwhile, the core refuses (`mismatch`) and that one goes to review.
+  Future<void> reviewedKey(String contactId, {required bool verified, required Identity? shown}) async {
+    if (shown == null) return; // Nothing pinned yet: nothing to accept.
+    verified ? await _crypto.setVerifiedFor(contactId, true, shown) : await _crypto.acceptChangeFor(contactId, shown);
     state = state.copyWith(keyChanged: {...state.keyChanged}..remove(contactId));
     unawaited(messenger?.flush());
     // Channels paused for this person's security code carry on.

@@ -27,7 +27,7 @@ const build = spawnSync('cargo', ['build', '--quiet', '--manifest-path', join(ap
 if (build.status !== 0) process.exit(1);
 const dylib = join(appDir, 'rust/target/debug', process.platform === 'darwin' ? 'libchatcore_bridge.dylib' : 'libchatcore_bridge.so');
 
-const app = startSignaling({ adminToken: 'x'.repeat(40), origin, hostname: '127.0.0.1', port, dataDir });
+const app = startSignaling({ adminToken: 'x'.repeat(40), origin, hostname: '127.0.0.1', port, dataDir, allowTestFlags: true });
 const testing = app.accounts!.testing;
 const webUser = testing.createUser('webuser'), appUser = testing.createUser('appuser'), thirdUser = testing.createUser('thirduser');
 const cookie = testing.cookie(webUser.id), bearer = testing.bearer(appUser.id, 'ios');
@@ -62,6 +62,8 @@ async function webPage(as = cookie) {
     const [name, value] = as.split('=');
     const context = await browser.newContext();
     await context.addCookies([{ name, value, url: origin }]);
+    // The web never moves a 1:1 chat to MLS itself here: the app is the first sender (m5 §8).
+    await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
     const page = await context.newPage();
     page.on('pageerror', (error: Error) => console.log(`  web pageerror: ${error.message}`));
     await page.goto(origin);
@@ -140,11 +142,10 @@ try {
     signal('web-rich', JSON.stringify({ image: sha(png), file: sha(file) }));
     await waitFor('web-rich-ok');
     await page.fill('#chat-input', '');
-    step('web → app: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive in the app');
+    step('web → app: reply, reactions on/off, edit, image + file (byte-identical) and a link preview arrive in the app (1:1 typing is gone: m5 §9)');
 
     // App → web: the same set.
     const fromApp = JSON.parse(await waitFor('app-rich'));
-    await page.waitForFunction(() => !document.getElementById('typing')!.hidden && document.getElementById('typing-text')!.textContent!.includes('appuser'), null, { timeout: 15000 });
     const list = await webUntil('rich messages from the app', l =>
         l.some(r => r.text === 'app reply' && r.replyTo?.id === fromApp.target) &&
         l.some(r => r.id === fromApp.target && (r.reactions?.peer || []).join() === '❤️') &&
@@ -158,7 +159,7 @@ try {
     // The app's photo decrypts and draws on the web.
     await page.waitForFunction(() => [...document.querySelectorAll('#chat-log img.media-full')].some(i => (i as HTMLImageElement).alt === 'app.png' && (i as HTMLImageElement).naturalWidth === 64), null, { timeout: 20000 });
     signal('app-rich-ok');
-    step('app → web: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive on the web');
+    step('app → web: reply, reactions on/off, edit, image + file (byte-identical) and a link preview arrive on the web');
 
     const appNumber = await waitFor('safety');
     await page.click('#conv-menu summary'); await page.click('#conv-safety');
@@ -282,6 +283,113 @@ try {
     await waitFor('group-removed', 120000);
     await page.waitForFunction((id: string) => !(window as any).Groups.debug(id)?.members.includes('thirduser'), appGroupId, { timeout: 90000 });
     signal('group-removal-seen');
+
+    // M5 linking (docs/m5-linking.md §1): a fresh browser becomes a linked device of the app's account.
+    const laptopContext = await browser.newContext();
+    const laptop = await laptopContext.newPage();
+    laptop.on('pageerror', (error: Error) => console.log(`  laptop pageerror: ${error.message}`));
+    await laptop.goto(origin);
+    await laptop.waitForSelector('#welcome', { state: 'visible', timeout: 20000 });
+    await laptop.click('#signin-link');
+    await laptop.waitForSelector('#link-qr svg', { state: 'visible', timeout: 30000 });
+    signal('web-link-qr', (await laptop.textContent('#link-code'))!.replace(/\s+/g, ''));
+    const appCode = await waitFor('app-link-code', 120000);
+    await laptop.waitForFunction((code: string) => document.getElementById('link-status')!.textContent!.includes(code), appCode, { timeout: 60000 });
+    signal('web-link-code-ok');
+    const laptopDevice = await waitFor('app-link-approved', 120000);
+    await laptop.waitForSelector('#chats', { state: 'visible', timeout: 90000 });
+    const listed = testing.db.query("SELECT state FROM devices WHERE id = ? AND user_id = ?").get(laptopDevice, appUser.id) as any;
+    if (listed?.state !== 'listed') throw new Error(`the linked browser is not a listed device of the app's account: ${JSON.stringify(listed)}`);
+    // It joins the app's private channel by itself (external join), then reads what comes next.
+    const inChannel = () => testing.db.query('SELECT 1 FROM channel_members WHERE channel_id = ? AND device_id = ?').get(appGroupId, laptopDevice);
+    for (const end = Date.now() + 120000; !inChannel();) {
+        if (Date.now() > end || failed) {
+            const state = await laptop.evaluate((id: string) => ({ group: (window as any).Groups?.debug(id), status: document.getElementById('chats-status')?.textContent, enabled: (window as any).Groups?.enabled() }), appGroupId).catch(error => String(error));
+            throw new Error(`the linked browser never joined the app's channel: ${JSON.stringify(state)}`);
+        }
+        await Bun.sleep(300);
+    }
+    step('the app links a fresh browser as a device of its account: QR text across, the same 6 digits on both, list + MLS certificate + sealed grant; the browser joins the channel by itself');
+    signal('laptop-ready');
+    await waitFor('app-sent-laptop', 120000);
+    const laptopRecords = (): Promise<any[]> => laptop.evaluate(async (id: string) => (await (window as any).ChatStore.list()).filter((r: any) => r.conversationId === id), appGroupId);
+    for (const end = Date.now() + 90000; !(await laptopRecords()).some(r => r.text === 'hello laptop');) { if (Date.now() > end || failed) throw new Error(`laptop never read the app's message: ${JSON.stringify((await laptopRecords()).map(r => r.text))}`); await Bun.sleep(300); }
+    step('the linked browser reads the app\'s next channel message');
+    signal('laptop-read');
+
+    // Revocation (§4): the app revokes it; the browser is signed out, its leaf leaves the channel, and it reads nothing more.
+    await waitFor('app-revoked', 150000);
+    await laptop.waitForSelector('#welcome', { state: 'visible', timeout: 60000 });
+    if (inChannel()) throw new Error('the revoked browser is still in the channel');
+    if (testing.db.query("SELECT state FROM devices WHERE id = ?").get(laptopDevice) && (testing.db.query("SELECT state FROM devices WHERE id = ?").get(laptopDevice) as any).state !== 'revoked') throw new Error('the browser is not revoked');
+    if ((await laptopRecords().catch(() => [])).some(r => r.text === 'after revoking the laptop')) throw new Error('a revoked device received a message');
+    step('the app revokes the browser: signed out at once, its leaf removed from the channel, nothing more delivered');
+    signal('revoke-seen');
+    await laptopContext.close();
+
+    // m5 §8: the 1:1 chat moves to MLS. The web keeps the Double Ratchet (dm-move-test), so the app is the first sender.
+    if (await page.locator('#conv-head').isVisible()) await page.click('#conv-back');
+    await page.click('#contact-list .contact.mutual .row-button');
+    await page.fill('#chat-input', 'before the move'); await page.click('#chat-send');
+    await webUntil('sent before the move', list => list.some(r => r.text === 'before the move' && r.status !== 'queued'));
+    signal('dm-before');
+    const dmChannel = await waitFor('dm-moved', 150000);
+    if ((testing.db.query('SELECT kind FROM channels WHERE id = ?').get(dmChannel) as any)?.kind !== 'dm') throw new Error('the app did not make a DM channel');
+    await webUntil('the pointer note and the app message via MLS', list => list.some(r => r.text === 'first via mls') && list.some(r => r.text?.includes('now use the new encryption')), 90000);
+    await page.waitForFunction(([key, channel]: string[]) => (localStorage.getItem(key) || '').includes(channel), [`dm-moved-v1:${webUser.id}`, dmChannel], { timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb never accepted the pointer: ${JSON.stringify(await page.evaluate((id: string) => (window as any).Groups.debug(id), dmChannel))}`); });
+    // The app checks the reply came through the DM group (its log is trimmed once everyone has read it).
+    await page.fill('#chat-input', 'reply via mls'); await page.click('#chat-send');
+    await webUntil('reply sent', list => list.some(r => r.text === 'reply via mls' && r.status !== 'queued'));
+    signal('dm-replied');
+    await waitFor('dm-typing-ready');
+    await page.fill('#chat-input', 'typing in the moved chat');
+    await waitFor('dm-ok', 120000);
+    await page.fill('#chat-input', '');
+    step('a 1:1 chat moves to MLS: the app (first sender) makes the DM group and sends the pointer over the Double Ratchet; the web checks and accepts it; history stays, and replies, read receipts and typing use the group');
+
+    // The app as a linked device of the web account: the web, its primary, takes the app's QR text.
+    const linkQr = await waitFor('app-link-qr', 120000);
+    if (await page.locator('#conv-head').isVisible()) await page.click('#conv-back');
+    await page.click('#account-menu summary'); await page.click('#account-settings');
+    await page.click('#device-link-new');
+    await page.fill('#link-code-input', linkQr); await page.click('#link-code-submit');
+    await page.waitForSelector('#link-match', { state: 'visible', timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb link status: ${await page.textContent('#link-status')}`); });
+    const appSas = await waitFor('app-link-sas', 120000);
+    const webSas = (await page.textContent('#link-sas'))!.replace(/\s+/g, '');
+    if (webSas !== appSas.replace(/\s+/g, '')) throw new Error(`the codes differ: web ${webSas}, app ${appSas}`);
+    await page.click('#link-match');
+    await page.waitForFunction(() => document.getElementById('link-status')!.textContent!.startsWith('Linked'), null, { timeout: 90000 });
+    step('the web links the app as a device of its account: QR text across, the same 6 digits, list + MLS certificate + sealed grant; the app checks it and its Rust core becomes a companion');
+    await waitFor('app-linked-sent', 180000);
+    await page.click('#link-cancel').catch(() => {});
+    await page.waitForFunction(() => (window as any).ChatStore.list().then((all: any[]) => all.some(r => r.text === 'from the linked app' && r.direction === 'outgoing')), null, { timeout: 90000 });
+    signal('linked-seen');
+    step('without the account keys, the linked app joins the web account\'s channels by itself (named from the bundle) and sends in the moved DM through its group; the web stores it as its own');
+
+    // Primary transfer: the linked app takes the web account over; the web confirms and steps down.
+    const takeQr = await waitFor('app-take-qr', 120000);
+    if (!await page.locator('#device-list').isVisible()) { await page.click('#account-menu summary'); await page.click('#account-settings'); }
+    await page.locator('#device-list .device-promote').first().click({ timeout: 60000 });
+    await page.fill('#link-code-input', takeQr); await page.click('#link-code-submit');
+    await page.waitForSelector('#link-match', { state: 'visible', timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb transfer status: ${await page.textContent('#link-status')}`); });
+    const takeSas = await waitFor('app-take-sas', 120000);
+    if ((await page.textContent('#link-sas'))!.replace(/\s+/g, '') !== takeSas.replace(/\s+/g, '')) throw new Error(`the transfer codes differ: web ${await page.textContent('#link-sas')}, app ${takeSas}`);
+    await page.click('#link-match');
+    const newSign = await waitFor('app-took-over', 180000);
+    for (const end = Date.now() + 60000; (testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign !== newSign;) {
+        if (Date.now() > end || failed) throw new Error('the server never served the new account key');
+        await Bun.sleep(300);
+    }
+    // The web reloads as a linked device of the new key and still reads the channel.
+    for (const end = Date.now() + 120000; !(await groupRecords().catch(() => [])).some(r => r.text === 'from the new primary');) {
+        if (Date.now() > end || failed) throw new Error(`the old primary never read the new primary's message: ${JSON.stringify((await groupRecords().catch(() => [])).map(r => r.text))}`);
+        await Bun.sleep(500);
+    }
+    step('primary transfer: the linked app takes the account over (same 6 digits, signed record, new key, list v1, the old primary\'s leaf certified); the web steps down and still reads the channel');
+    signal('takeover-seen');
     await waitFor('done');
     step('the app adds thirduser (who reads from then on) and removes them; the web sees both');
     code = await dartDone;

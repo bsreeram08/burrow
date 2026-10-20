@@ -674,3 +674,13 @@ body:not([data-kind="group"]) :is(#conv-info, #conv-leave) { display: none; }
 #group-info-edit { display: grid; gap: 6px; }
 #group-info-edit button { justify-self: start; }
 #group-info-add button { margin-top: 8px; }
+
+/* ---------- Linking a device (link.js) ---------- */
+.device-link-card { width: min(100%, 420px); }
+.device-link-qr-box { text-align: center; }
+.device-link-qr { width: min(240px, 70vw); margin: 8px auto; background: #fff; border-radius: 12px; padding: 6px; }
+.device-link-qr svg { display: block; width: 100%; height: auto; }
+.device-link-code { font: 600 20px/1.4 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .08em; color: var(--text) !important; margin: 4px 0 12px !important; }
+.device-link-video { width: 100%; border-radius: 12px; background: #000; }
+#device-link-new { margin-top: 8px; }
+.device-link-card input { width: 100%; margin-bottom: 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; padding: 11px 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .06em; }

@@ -137,7 +137,7 @@ export class Device {
     /** An external join: this device (an extra device of a member, or anyone for a public channel) adds itself. */
     async joinExternal(channel: string) {
         const info = await this.must('GET', `/api/channels/${channel}/join-info`);
-        const out = this.client.call({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree });
+        const out = this.client.call({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree, group: channel });
         const result = await this.api('POST', `/api/channels/${channel}/join`, { message: out.commit });
         if (result.status === 201) {
             const view = this.client.call({ cmd: 'mlsMergeOwn', group: channel });

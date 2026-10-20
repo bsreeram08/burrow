@@ -21,13 +21,15 @@
   const stateKey = () => `groups-v1:${instance}`, namesKey = () => `names-v1:${me.id}`;
   function load() {
     try { channels = new Map(Object.entries(JSON.parse(localStorage.getItem(stateKey()) || '{}') || {})); } catch { channels = new Map(); }
+    for (const ch of channels.values()) delete ch.joining; // A join cut short by a reload is tried again.
     try { names = JSON.parse(localStorage.getItem(namesKey()) || '{}') || {}; } catch { names = {}; }
   }
   let saveTimer = null;
-  function save() {
+  function persist() {
     clearTimeout(saveTimer);
-    saveTimer = setTimeout(() => { try { localStorage.setItem(stateKey(), JSON.stringify(Object.fromEntries(channels))); localStorage.setItem(namesKey(), JSON.stringify(names)); } catch {} }, 50);
+    try { localStorage.setItem(stateKey(), JSON.stringify(Object.fromEntries(channels))); localStorage.setItem(namesKey(), JSON.stringify(names)); } catch {}
   }
+  function save() { clearTimeout(saveTimer); saveTimer = setTimeout(persist, 50); }
   function channel(id, defaults = {}) {
     if (!channels.has(id)) channels.set(id, { kind: 'group_dm', serverName: null, meta: null, cursor: 0, status: 'active', unread: 0, mentioned: false, lastAt: 0, members: [], admins: [], ...defaults });
     return channels.get(id);
@@ -51,10 +53,15 @@
 
   // ---------- HTTP ----------
   /** Like account.js api(), but answers with the status instead of throwing (409/423 are part of the protocol). */
-  async function call(path, method = 'GET', payload) {
-    const response = await fetch(path, { method, cache: 'no-store', credentials: 'same-origin', headers: payload === undefined ? {} : { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
-    const body = await response.json().catch(() => ({}));
-    return { status: response.status, body };
+  async function call(path, method = 'GET', payload, { retry = true } = {}) {
+    // A burst (a chat moving to MLS, a device joining its groups) can meet the server's rate limits: those are
+    // momentary, so wait a little and try again rather than failing the operation.
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(path, { method, cache: 'no-store', credentials: 'same-origin', headers: payload === undefined ? {} : { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
+      const body = await response.json().catch(() => ({}));
+      if (response.status !== 429 || !retry || attempt >= 5) return { status: response.status, body };
+      await sleep(250 * 2 ** attempt + Math.random() * 250);
+    }
   }
   async function must(path, method, payload) {
     const result = await call(path, method, payload);
@@ -94,7 +101,14 @@
       navigator.locks.request(`groups:${me.id}`, () => { if (mine !== generation) return; starting = setup(mine); return new Promise(() => {}); });
     });
   }
+  /**
+   * A primary handing the account over (m5 §5.2) reads nothing more until it has stepped down and reloaded: the new
+   * primary's recertifying commits are under a key this store doesn't hold yet, and must not be reported as bad.
+   */
+  let held = false;
+  const hold = () => { held = true; };
   function stop() {
+    held = false;
     generation++; enabled = false; ctx = null; run = null; me = null; currentId = null; channels = new Map(); queues.clear(); pinned.clear();
     for (const timer of cursorTimers.values()) clearTimeout(timer);
     cursorTimers.clear(); typingFrom.clear();
@@ -102,18 +116,24 @@
   async function setup(mine) {
     try {
       const device = await window.DeviceFormat.deviceKey(me.id);
-      const aik = (await ctx.box.identity()).pub.sign;
       deviceId = device.deviceId;
-      // One store per (account, device, account key): a new device id or identity starts clean (§2).
-      instance = `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
+      // A linked device (docs/m5-linking.md §1) keeps the store it was linked with; its certificate came in the grant.
+      const linked = linkedStore(me.id);
+      const aik = linked ? null : (await ctx.box.identity()).pub.sign;
+      // One store per (account, device, account key): a new device id or identity starts clean (m4 §9). A primary
+      // transfer (m5 §5) keeps the store under the new key: its core adopted the succession.
+      const kept = (() => { try { return JSON.parse(localStorage.getItem(`group-instance-v1:${me.id}`) || 'null'); } catch { return null; } })();
+      instance = linked?.instance || (kept?.aik === aik && kept.instance) || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
       run = window.Core.groupStore(me.id, instance);
       load();
+      if (linked) await ctx.followOwnSuccession?.().catch(() => {}); // Our account moved to a new primary meanwhile (m5 §5.2 step 6).
       const certified = `mls-cert-v1:${instance}`;
-      if (localStorage.getItem(certified) !== '1') {
+      if (!linked && localStorage.getItem(certified) !== '1') {
         const leaf = await run({ cmd: 'mlsDeviceLeaf' }), issuedAt = Date.now(), F = window.DeviceFormat;
         const sig = await ctx.signWithIdentity(F.mlsCertBytes(me.id, deviceId, 'web', leaf, aik, issuedAt));
         await run({ cmd: 'mlsSetDeviceCert', cert: F.mlsCertJson(me.id, deviceId, 'web', leaf, aik, issuedAt, sig), aik });
         try { localStorage.setItem(certified, '1'); } catch {}
+        certUnder(aik);
       }
       if (mine !== generation) return;
       const count = await call('/api/mls/keypackages');
@@ -123,17 +143,58 @@
       await refreshChannels();
       await welcomes();
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
+      for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id);
       flushAll();
       ctx.render();
+      removeOwnStale().catch(() => {});
+      ctx.recerts?.(); // Certificates under a new account key: asked for, answered or installed (m5 §5.2.2).
     } catch (error) {
       if (mine !== generation) return;
       reason = `Groups are unavailable on this device: ${error.message || error}`;
       ctx?.render();
     }
   }
+  /**
+   * After this account moved to a new key (m5 §5, §7 "Recertify"): one self-update per group carries this device's
+   * certificate under the new key. Until then the leaf is Previous and the group can't add people. Retried on start.
+   */
+  function recertify(id) {
+    enqueue(id, async () => { await commitInner(id, { update: true }); delete channels.get(id).recertify; save(); }).catch(error => failed(id, error));
+  }
+  /**
+   * The account key moved (m5 §5.2): the core adopts the old key's signed record and `cert`, this device's certificate
+   * under the new key. `before`: on a primary stepping down, the old key and a certificate under it, so the core
+   * becomes a companion first (it then keeps the old key as a predecessor). Every group is marked for recertifying.
+   */
+  async function adoptSuccession({ record, signature, cert, before }) {
+    if (before) await run({ cmd: 'companionSetup', userId: me.id, identity: before.identity, cert: before.cert });
+    if (!certAik()) certUnder(record.oldSign); // Linked before this was recorded: our certificate is under the key we had.
+    const identity = await run({ cmd: 'adoptSuccession', userId: me.id, record, signature, ...(cert ? { cert } : {}) });
+    if (cert) { certUnder(record.newSign); for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true; }
+    persist();
+    return identity;
+  }
+  // The account key this device's MLS certificate is under: a companion whose account moved on asks for a new one (§5.2.2).
+  const certAik = () => { try { return localStorage.getItem(`mls-cert-aik-v1:${instance}`); } catch { return null; } };
+  const certUnder = aik => { try { localStorage.setItem(`mls-cert-aik-v1:${instance}`, aik); } catch {} };
+  /** A companion's certificate under the account's new key arrived (m5 §5.2.2): install it, then recertify everywhere. */
+  async function installCert(identity, cert) {
+    await run({ cmd: 'companionSetup', userId: me.id, identity, cert });
+    certUnder(identity.sign);
+    for (const [id, ch] of channels) if (!['left', 'removed'].includes(ch.status)) { ch.recertify = true; if (usable(ch)) recertify(id); }
+    persist();
+  }
+  /** Is exactly this (device, leaf key) of our account already a leaf in a group this device holds? (m5 §5.2.2) */
+  const leafKnown = (target, leafSigKey) => run({ cmd: 'mlsLeafKnown', deviceId: target, leafSigKey, groups: [...channels].filter(([, ch]) => usable(ch)).map(([id]) => id) });
   /** When this device joins the signed list (or anything about our devices changes), try again. */
   function devicesChanged() { if (ctx && !enabled && run && !reason.includes('another tab')) starting = setup(generation); }
-  async function topUp(count) {
+  // One upload at a time: start-up and a `keypackages` frame racing would both top up and overshoot the cap.
+  let toppingUp = null;
+  function topUp(count) {
+    toppingUp ||= topUpNow(count).finally(() => { toppingUp = null; });
+    return toppingUp;
+  }
+  async function topUpNow(count) {
     count ||= await must('/api/mls/keypackages');
     const want = Math.min(KEYPACKAGES, count.max ?? KEYPACKAGES) - count.oneTime;
     const body = {};
@@ -157,7 +218,7 @@
       if (!ID.test(userId || '') || userId === me.id || (!force && pinned.has(userId))) continue;
       const contact = ctx.contacts().find(value => value.id === userId && value.state === 'mutual');
       let mine = await run({ cmd: 'peer', contact: userId });
-      const theirs = contact ? await ctx.box.peer(userId) : null;
+      const theirs = contact && ctx.box ? await ctx.box.peer(userId) : null; // A linked device has no 1:1 pins: its group store holds them.
       let published = null;
       if (force || (!theirs && !mine)) {
         const found = await call(`/api/users/${userId}/identity`);
@@ -251,7 +312,7 @@
    * the same key here (only if the group store holds exactly the key the 1:1 pin now trusts). Then resume.
    */
   async function contactAccepted(userId) {
-    if (!run || !ctx) return;
+    if (!run || !ctx?.box) return;
     const [mine, theirs] = await Promise.all([run({ cmd: 'peer', contact: userId }).catch(() => null), ctx.box.peer(userId).catch(() => null)]);
     if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId, identity: theirs.identity }); forgetChange(userId); }
     pinsChanged(userId);
@@ -267,9 +328,11 @@
     const seen = new Set();
     for (const row of list) {
       seen.add(row.id);
-      if (!row.member) continue; // Another device of ours is in it; this one isn't (yet).
+      // Another device of ours is in it and this one isn't (a newly linked device): join it (m5 §3), unless we left it here.
+      if (!row.member) { if (!['left', 'removed'].includes(channels.get(row.id)?.status)) joinOwn(row); continue; }
       const known = channels.has(row.id), ch = channel(row.id, { kind: row.kind, serverName: row.name });
       ch.kind = row.kind; ch.serverName = row.name;
+      if (row.kind === 'dm' && row.peer?.id) bindPeer(ch, row.peer.id); // A 1:1 chat on MLS (m5 §8): shown under its contact.
       if (row.frozen && ch.status === 'active') ch.status = 'frozen';
       else if (!row.frozen && ch.status === 'frozen') { ch.status = 'active'; delete ch.frozen; }
       if (!known || !ch.members.length) await members(row.id).catch(() => {});
@@ -278,6 +341,98 @@
     for (const [id, ch] of channels) if (!seen.has(id) && ch.status !== 'left' && ch.status !== 'removed') removed(id, false);
     save();
   }
+  /**
+   * A DM group's contact is set once, from the first server row that names it, and never moved: a server that later
+   * names someone else only costs the check (dmChecked holds the peer id it was checked for, so it must match ch.peer).
+   */
+  function bindPeer(ch, peerId) {
+    if (!ch.peer) ch.peer = peerId;
+    else if (ch.peer !== peerId) ch.dmChecked = false;
+  }
+  // ---------- Own devices (docs/m5-linking.md §3, §4) ----------
+  const linkedStore = userId => { try { const value = JSON.parse(localStorage.getItem(`linked-store-v1:${userId}`) || 'null'); return value?.instance ? value : null; } catch { return null; } };
+  let joinsAt = 0;
+  /** This device joins a channel its account is in (the own-device rule), at most 3 joins a second, retried with backoff. */
+  function joinOwn(row) {
+    const id = row.id, ch = channel(id, { kind: row.kind, serverName: row.name });
+    if (ch.joining) return;
+    ch.joining = true; ch.status = 'join-pending'; save();
+    const attempt = async tries => {
+      const wait = Math.max(0, joinsAt - Date.now()); joinsAt = Math.max(Date.now(), joinsAt) + 350;
+      await sleep(wait);
+      try {
+        await enqueue(id, async () => {
+          // Only a group our account is really in: the tree must hold a current leaf of ours, for a device our verified
+          // signed list names. Otherwise the server could pull this device into any channel (m5 §3).
+          // One fetch: the GroupInfo proven to hold our leaf is the one we join with.
+          const info = await joinInfo(id);
+          if (!await ownLeafProven(id, info)) throw Object.assign(new Error('not one of our groups'), { status: 403 });
+          await run({ cmd: 'mlsForget', group: id }).catch(() => {});
+          const seq = await joinExternal(id, info);
+          Object.assign(ch, { kind: row.kind, serverName: row.name, status: 'active', cursor: seq, lastAt: Date.now() });
+          delete ch.joining; save();
+          // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
+          if (row.kind === 'dm' && row.peer?.id) { bindPeer(ch, row.peer.id); const peer = ch.peer; await run({ cmd: 'mlsCheckDm', group: id, peer }).then(() => { ch.dmChecked = peer; }, () => {}); save(); }
+          await members(id).catch(() => {});
+          await note(id, `own-join:${seq}`, 'This device joined. Earlier messages stay on your other devices.');
+        });
+        ctx?.render();
+      } catch (error) {
+        if (tries >= 5 || [403, 404].includes(error.status) || error.code === 'identity') { delete ch.joining; ch.status = 'join-pending'; save(); ctx?.render(); return; } // Retried on the next start.
+        setTimeout(() => attempt(tries + 1), 1000 * 2 ** tries);
+      }
+    };
+    attempt(0);
+  }
+  async function ownLeafProven(id, info) {
+    const own = await ctx.verifiedOwnDevices?.().catch(() => null);
+    if (!own) return false;
+    try {
+      // The served tree, validated like a join (read-only): it must be this channel's group, holding a leaf of ours.
+      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.groupInfo, tree: info.tree });
+      return view?.groupId === id && Array.isArray(view.members) && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
+    } catch { return false; }
+  }
+  let removedNote = null;
+  /** Commits the removal of one of this account's own devices from one channel (m5 §4). "No such member" means done. */
+  function removeOwnDevice(id, target) {
+    return enqueue(id, async () => {
+      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.userId === me.id && member.deviceId === target);
+      if (!leaf || target === deviceId) return false;
+      try { await commitInner(id, { removes: [{ userId: me.id, deviceId: target }] }); return true; }
+      catch (error) { if (/no such member/i.test(error.message || '') || error.status === 409) return false; throw error; }
+    });
+  }
+  /**
+   * A revoked device of ours must leave the channel: one device of the account does it, after a random 0–3 s. The
+   * frame is only a hint: the device goes only if a verified signed list has dropped it.
+   */
+  function onRemoveDevice(id, target) {
+    if (!ID.test(target || '') || !usable(channels.get(id))) return;
+    setTimeout(async () => {
+      const own = await ctx?.verifiedOwnDevices?.().catch(() => null);
+      if (!own?.dropped.has(target)) return;
+      removeOwnDevice(id, target).then(done => {
+      if (!done) return;
+      removedNote ||= { count: 0 }; removedNote.count++;
+      clearTimeout(removedNote.timer);
+      removedNote.timer = setTimeout(() => { ctx?.notice(`Removed a revoked device from ${removedNote.count} ${removedNote.count === 1 ? 'group' : 'groups'}.`); removedNote = null; }, 2000);
+      }).catch(() => {});
+    }, Math.random() * 3000);
+  }
+  /**
+   * At start: our own leaves go if a verified signed list dropped their device, or if the core finds them stale (a
+   * certificate under an account key we no longer hold, m5 §7). A list we can't verify proves nothing: keep them.
+   */
+  async function removeOwnStale() {
+    const own = await ctx.verifiedOwnDevices?.().catch(() => null);
+    for (const [id, ch] of channels) {
+      if (!usable(ch)) continue;
+      const leaves = await run({ cmd: 'mlsMembers', group: id }).catch(() => []);
+      for (const leaf of leaves) if (leaf.userId === me.id && leaf.deviceId !== deviceId && (leaf.stale || own?.dropped.has(leaf.deviceId))) await removeOwnDevice(id, leaf.deviceId).catch(() => {});
+    }
+  }
+
   /** Members from the server's mirror (usernames), admins from the group's own roles when we hold it. */
   async function members(id) {
     const ch = channel(id);
@@ -317,29 +472,42 @@
     const info = await must(`/api/channels/${id}`).catch(() => ({}));
     const joined = channel(id, { kind: info.kind || 'group_dm', serverName: info.name ?? null });
     Object.assign(joined, { kind: info.kind || joined.kind, serverName: info.name ?? joined.serverName, status: 'active', cursor: full.seq, lastAt: Date.now() });
+    if (info.kind === 'dm' && info.peer?.id) bindPeer(joined, info.peer.id);
     delete joined.pausedFor;
     save();
     await call(`/api/channels/${id}/cursor`, 'POST', { seq: full.seq });
     await call(`/api/mls/welcomes/${welcomeId}`, 'DELETE');
     await members(id).catch(() => {});
-    await note(id, `welcome:${welcomeId}`, `${nameOf(full.from)} added you. You'll see messages from now on.`);
+    if (joined.kind === 'dm') ctx.dmJoined?.(id); // A 1:1 chat moving to MLS: its pointer may be waiting (m5 §8.3).
+    else await note(id, `welcome:${welcomeId}`, `${nameOf(full.from)} added you. You'll see messages from now on.`);
     ctx.render();
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
   }
   /** External join: a public channel from the directory, or this device's resync of a channel it is in. */
-  async function joinExternal(id) {
-    let info;
+  /**
+   * The DS refuses a commit when a member's registry key moved without a signed succession or a recorded identity
+   * change: that needs a person to compare codes, so it is reported, never retried as a race.
+   */
+  const identityConflict = result => result.status === 409 && result.body.code === 'identity';
+  const refused = (result, fallback) => identityConflict(result)
+    ? coded('identity', `${result.body.error} Compare security codes with the people here before changing this group.`)
+    : Object.assign(new Error(result.body.error || fallback), { status: result.status });
+  async function joinInfo(id) {
     for (let attempt = 0; ; attempt++) {
       const result = await call(`/api/channels/${id}/join-info`);
-      if (result.status === 200) { info = result.body; break; }
+      if (result.status === 200) return result.body;
       if (result.status !== 409 || attempt >= 5) throw Object.assign(new Error(result.body.error || 'Could not join.'), { status: result.status });
       await sleep(500 * 2 ** attempt); // Between epochs: the committer uploads the new GroupInfo right after merging.
     }
+  }
+  async function joinExternal(id, info) {
+    info ||= await joinInfo(id);
     const list = await call(`/api/channels/${id}/members`);
     if (list.status === 200) await ensurePins(list.body.members.map(member => member.userId));
-    const out = await withPins(id, () => run({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree }));
+    // The core refuses a GroupInfo for any other group than the one we mean to join.
+    const out = await withPins(id, () => run({ cmd: 'mlsJoinExternal', groupInfo: info.groupInfo, tree: info.tree, group: id }));
     const result = await call(`/api/channels/${id}/join`, 'POST', { message: out.commit });
-    if (result.status !== 201) { await run({ cmd: 'mlsClearOwn', group: id }).catch(() => {}); throw Object.assign(new Error(result.body.error || 'Could not join.'), { status: result.status }); }
+    if (result.status !== 201) { await run({ cmd: 'mlsClearOwn', group: id }).catch(() => {}); throw refused(result, 'Could not join.'); }
     const view = await run({ cmd: 'mlsMergeOwn', group: id });
     await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
     return result.body.seq;
@@ -362,6 +530,7 @@
   // ---------- Receiving (§6) ----------
   /** Frames from account.js's event stream. */
   function frame(message) {
+    if (held) return;
     if (!enabled) { if (message.type === 'devices') devicesChanged(); return; }
     if (message.type === 'group') onGroup(message);
     else if (message.type === 'welcome') enqueue('welcome', () => takeWelcome(message.id, message)).catch(() => {});
@@ -384,10 +553,21 @@
       } else await syncInner(id);
     }).catch(error => failed(id, error));
   }
+  /**
+   * A 403 because this device isn't in the account's signed list (yet, or for a moment: a primary transfer re-lists
+   * every device under the new key) removes nothing: groups pause and start again when the list changes.
+   */
+  function unlisted(result) {
+    if (result.status !== 403 || !/signed device list/.test(result.body?.error || '')) return false;
+    enabled = false; reason = 'Groups start once this device is in your signed device list.'; ctx?.render();
+    return true;
+  }
   async function syncInner(id) {
+    if (held) return;
     const ch = channels.get(id);
     for (let pages = 0; pages < 400 && usable(ch); pages++) {
       const result = await call(`/api/channels/${id}/log?after=${ch.cursor}`);
+      if (unlisted(result)) return;
       if (result.status === 404 || result.status === 403) { removed(id, true); return; }
       if (result.status !== 200) throw new Error(result.body.error || 'Could not read the conversation.');
       const page = result.body;
@@ -452,6 +632,10 @@
   }
   /** A rejected commit may only mean a pin moved (a changed key, a person met for the first time): check first. */
   async function pinsMoved(id, entry) {
+    // The author's account may have moved to a new key with a signed record (m5 §5): follow that first, so a
+    // recertifying commit that arrives before the 'devices'/'keys' frame isn't taken for a change, or reported.
+    const author = entry.from?.userId;
+    if (author === me.id ? await ctx.followOwnSuccession?.().catch(() => false) : await ctx.followContact?.(author).catch(() => false)) return true;
     const { problems, changed } = await ensurePins([entry.from.userId, ...memberIds(id), ...(await call(`/api/channels/${id}/members`).then(r => r.status === 200 ? r.body.members.map(m => m.userId) : [], () => []))], true);
     if (problems.length) { pause(id, problems[0]); return false; }
     return changed;
@@ -461,7 +645,8 @@
     const digest = POISON.exec(error.message || '')?.[1];
     const ch = channels.get(id);
     if (digest) ch.rejected = { seq: entry.seq, digest }; // This device's own verdict, for resolving it later.
-    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }) : { status: -1, body: {} };
+    // A report's 429 is a once-a-minute rule, not a burst: no automatic retry here.
+    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }, { retry: false }) : { status: -1, body: {} };
     if (result.status === 202 || result.status === 200 || (result.status === 409 && result.body.frozen)) {
       // 202 answers `{ frozen: true }`; 409 names the commit the channel is frozen on.
       setFrozen(id, typeof result.body.frozen === 'object' ? result.body.frozen : { seq: entry.seq, digest });
@@ -472,7 +657,13 @@
       setTimeout(() => { if (usable(channels.get(id))) enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); }, 30000);
       return 'stop';
     }
-    // The report can't be made (dismissed before, or not the latest commit any more): this device can't follow; rejoin.
+    // Not the latest commit any more: it may simply have been rolled back meanwhile. Then the log goes on without it.
+    if (result.status === 409 && digest) {
+      const now = await call(`/api/channels/${id}/log?after=${entry.seq - 1}`);
+      const same = now.status === 200 && now.body.entries.some(item => item.seq === entry.seq && item.message === entry.message);
+      if (!same) { setTimeout(() => { if (usable(channels.get(id))) enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); }, 0); return 'stop'; }
+    }
+    // The report can't be made (dismissed before, or the commit stays and can't be reported): this device can't follow; rejoin.
     await resyncInner(id).catch(() => {});
     return 'stop';
   }
@@ -494,11 +685,37 @@
     for (const user of ch.leaving || []) if (amAdmin(id)) queueRemoval(id, user);
   }
   /** One decrypted application payload: the Phase 1 shapes plus `meta` and `leave` (§5). */
+  /**
+   * A message in a 1:1 chat that moved to MLS (m5 §8.4): stored in the chat's own conversation (its pairId), with the
+   * 1:1 meaning of every payload. Only the two people are accepted, and only after this device has checked that the
+   * group is exactly the DM of us two, chained to the pinned account keys (mlsCheckDm, §8.3).
+   */
+  async function deliverDm(id, ch, from, type, payload) {
+    const peer = ch.peer, mine = from === me.id;
+    if (!peer || (from !== peer && !mine)) return;
+    if (ch.dmChecked !== peer) { await run({ cmd: 'mlsCheckDm', group: id, peer }); ch.dmChecked = peer; save(); }
+    const conversation = await ctx.pairIdOf(peer);
+    if (type === 'message') {
+      if (mine) { const record = { id: payload.id, conversationId: conversation, direction: 'outgoing', text: payload.text, createdAt: payload.createdAt, status: 'sent', expiresAt: payload.expiresAt }; for (const field of ['kind', 'replyTo', 'attachment', 'link']) if (payload[field] !== undefined) record[field] = payload[field]; await window.ChatStore.put(record); }
+      else if (await window.ChatStore.receive(conversation, payload) === 'stored') { ctx.dmIncoming?.(peer); ctx.dmTyping?.(peer, null); }
+    }
+    else if (type === 'react') await window.ChatStore.react(conversation, payload.target, mine ? 'me' : 'peer', payload.emoji, payload.on);
+    else if (type === 'edit') await window.ChatStore.edit(conversation, payload.target, mine ? 'me' : 'peer', payload.text, Math.min(payload.editedAt, Date.now() + 300000));
+    else if (type === 'read') await window.ChatStore.markRead(conversation, payload.ids, mine ? 'incoming' : 'outgoing');
+    else if (type === 'typing') { if (!mine) ctx.dmTyping?.(peer, payload); }
+    else if (type === 'vote') await window.ChatStore.vote(conversation, payload.poll, mine ? 'me' : 'peer', payload.option);
+    ctx.dmChanged?.(peer);
+  }
   async function deliver(id, sender, entry, plaintext) {
     let payload, type;
     try { payload = JSON.parse(plaintext); type = window.ChatStore.checkPayload(payload); }
     catch { await note(id, `drop:${entry.seq}`, `A message from ${nameOf(sender.userId)} had invalid content and was skipped.`); return; }
     const ch = channels.get(id), from = sender.userId, viewing = ctx.viewing(id);
+    if (ch.kind === 'dm') {
+      try { await deliverDm(id, ch, from, type, payload); }
+      catch (error) { if (!error.code || error.code === 'storage') throw error; } // Anything else is dropped, like a bad 1:1 envelope.
+      return;
+    }
     try {
       if (type === 'message') {
         const fromName = nameOf(from) === 'someone' ? undefined : nameOf(from);
@@ -558,6 +775,7 @@
     else if (message.change === 'thawed') { if (ch?.status === 'frozen') { ch.status = 'active'; delete ch.frozen; save(); paint(id); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); } }
     // `remove-needed` is not acted on: a frame alone never makes this device remove anyone. The device to remove
     // comes from this device's own signed rollback (resolve() below).
+    else if (message.change === 'remove-device') { if (ch) onRemoveDevice(id, message.deviceId); }
     else if (message.change === 'rolled-back') { if (ch) rolledBack(id, message); }
     else if (message.change === 'gap') { if (usable(ch)) enqueue(id, () => resyncInner(id)).catch(error => failed(id, error)); }
   }
@@ -599,6 +817,7 @@
         continue;
       }
       if (result.status === 423) { setFrozen(id, result.body.frozen); throw coded('stale', 'Frozen'); }
+      if (unlisted(result)) throw coded('stale', 'Unlisted');
       if (result.status === 404 || result.status === 403) { removed(id, true); throw coded('stale', 'Removed'); }
       throw new Error(result.body.error || 'Could not send.');
     }
@@ -643,7 +862,7 @@
         return result.body;
       }
       await run({ cmd: 'mlsClearOwn', group: id });
-      if (result.status !== 409) throw Object.assign(new Error(result.body.error || 'The change was refused.'), { status: result.status });
+      if (result.status !== 409 || identityConflict(result)) throw refused(result, 'The change was refused.');
       await sleep(500 * 2 ** attempt);
     }
     throw new Error('The group kept changing. Try again in a moment.');
@@ -671,7 +890,7 @@
     const fresh = keyPackages.filter(item => !(item.userId === me.id && item.deviceId === deviceId));
     if (fresh.some(item => item.userId !== me.id)) {
       await commitInner(id, {}, fresh);
-      await sendMetaInner(id);
+      if (channels.get(id)?.kind !== 'dm') await sendMetaInner(id); // A DM has no name or topic.
     }
     return users.filter(user => !reachable.has(user));
   }
@@ -689,11 +908,42 @@
       await commitInner(id, { removes: [{ userId }] });
     }).catch(() => {});
   }
-  function removeDevice(id, device) {
+  /** Removes exactly one leaf: the device of that user (never another user's leaf that claims the same device id). */
+  function removeDevice(id, userId, device) {
+    if (!ID.test(userId || '') || !ID.test(device || '')) return;
     enqueue(id, async () => {
-      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.deviceId === device);
-      if (leaf) await commitInner(id, { removes: [{ userId: leaf.userId, deviceId: device }] });
+      const leaf = (await run({ cmd: 'mlsMembers', group: id })).find(member => member.userId === userId && member.deviceId === device);
+      if (leaf) await commitInner(id, { removes: [{ userId, deviceId: device }] });
     }).catch(error => failed(id, error));
+  }
+  /**
+   * m5 §8.2: the first sender moves a 1:1 chat to a DM group of the two of us (every listed device of both). Resolves
+   * the channel id, or null when the other side already made one (they are the first sender; wait for their pointer).
+   */
+  async function createDm(peer) {
+    if (!enabled) throw new Error(reason || 'Groups are not ready yet.');
+    const id = window.DeviceFormat.b64(crypto.getRandomValues(new Uint8Array(16))), users = [me.id, peer.id].sort();
+    const view = await run({ cmd: 'mlsCreate', group: id, roles: { v: 1, kind: 'dm', admins: users, joinPolicy: 'invite', dm: users } });
+    const made = await call('/api/channels', 'POST', { id, kind: 'dm', peer: peer.username, groupInfo: view.groupInfo, tree: view.tree });
+    if (made.status !== 201) { await run({ cmd: 'mlsForget', group: id }).catch(() => {}); if (made.status === 409) return null; throw new Error(made.body.error || 'Could not move this chat.'); }
+    const ch = channel(id, { kind: 'dm' });
+    Object.assign(ch, { kind: 'dm', peer: peer.id, cursor: 0, status: 'active', lastAt: Date.now(), dmChecked: false }); save();
+    await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
+    await enqueue(id, () => addInner(id, [peer.id], true));
+    await enqueue(id, async () => { await run({ cmd: 'mlsCheckDm', group: id, peer: peer.id }); ch.dmChecked = peer.id; save(); });
+    return id;
+  }
+  /** Is this DM group ours with that contact, joined and checked (or checkable) here? Used before accepting a pointer. */
+  async function acceptDm(id, peerId) {
+    const ch = channels.get(id);
+    if (!ch || ch.kind !== 'dm' || ch.peer !== peerId || !usable(ch)) return false;
+    try { await enqueue(id, () => run({ cmd: 'mlsCheckDm', group: id, peer: peerId })); ch.dmChecked = peerId; save(); return true; } catch { return false; }
+  }
+  /** Sends one Phase 1 payload in a moved 1:1 chat; typing goes live-only (m5 §9). */
+  function sendDm(id, payload) {
+    if (payload?.type !== 'typing') return send(id, payload);
+    if (!usable(channels.get(id)) || !idle(id)) return Promise.resolve();
+    return enqueue(id, async () => { const message = await run({ cmd: 'mlsEncrypt', group: id, plaintext: JSON.stringify(payload) }); await call(`/api/channels/${id}/ephemeral`, 'POST', { message }); });
   }
   async function create({ kind, name, users }) {
     if (!enabled) throw new Error(reason || 'Groups are not ready yet.');
@@ -769,7 +1019,7 @@
       // The notice alone proves nothing (the server sends it): an admin of this group, as this device's own copy of
       // the group knows it, must have signed this exact resolution with its leaf key...
       try {
-        await run({ cmd: 'mlsVerifyResolution', group: id, action: 'rollback', seq: notice.seq, digest: notice.digest, author: typeof notice.author === 'string' ? notice.author : '', by: notice.by, signature: notice.signature });
+        await run({ cmd: 'mlsVerifyResolution', group: id, action: 'rollback', seq: notice.seq, digest: notice.digest, author: typeof notice.author === 'string' ? notice.author : '', by: notice.by, byUser: notice.byUser, signature: notice.signature });
       } catch { return; }
       // ...and the channel must really be back before our commit: at its epoch, without it in the log.
       const info = await call(`/api/channels/${id}`);
@@ -780,7 +1030,7 @@
       delete ch.lastCommit; save();
       for (let attempt = 0; ; attempt++) {
         try { await resyncInner(id); break; }
-        catch (error) { if (attempt >= 4) throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
+        catch (error) { if (attempt >= 4 || error.code === 'identity') throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
       }
       if (mine.adds.length) await addInner(id, mine.adds.filter(user => user !== me.id));
       else await commitInner(id, { removes: mine.removes || undefined, roles: mine.roles || undefined, update: mine.update });
@@ -889,7 +1139,7 @@
     // Only the author this device authenticated, for content it signed, is removed; any other answer removes nobody.
     if (action === 'rollback' && author) {
       if (answer.removeDevice !== author) status(id, 'The server named a different device to remove than the one that made the change. Nobody was removed; ask another admin to check.');
-      else removeDevice(id, author);
+      else removeDevice(id, check.authorUser, author);
     }
     flush(id);
   }
@@ -907,6 +1157,9 @@
     else if (typingOn) { typingOn = false; typingSent = 0; post(false); }
   }
   function typing(id, userId, payload) {
+    const dm = channels.get(id);
+    // A 1:1 group's typing is the contact's only, and only once the group checked out as the DM of the two of us.
+    if (dm?.kind === 'dm') { if (dm.peer && userId === dm.peer && dm.dmChecked === dm.peer) ctx.dmTyping?.(dm.peer, payload); return; }
     const people = typingFrom.get(id) || new Map();
     clearTimeout(people.get(userId));
     people.delete(userId);
@@ -1121,7 +1374,7 @@
   // ---------- Sidebar data for account.js ----------
   function sections() {
     const rows = [];
-    for (const [id, ch] of channels) rows.push({ id, kind: ch.kind, channel: isChannel(ch), title: title(id), unread: ch.unread, mentioned: ch.mentioned, status: ch.status, lastAt: ch.lastAt, topic: ch.meta?.topic || '' });
+    for (const [id, ch] of channels) if (ch.kind !== 'dm') rows.push({ id, kind: ch.kind, channel: isChannel(ch), title: title(id), unread: ch.unread, mentioned: ch.mentioned, status: ch.status, lastAt: ch.lastAt, topic: ch.meta?.topic || '' });
     return { rows, enabled, reason };
   }
   /** For app.js: who is who in the open group. */
@@ -1181,11 +1434,26 @@
     { id: 'action:new-group', group: 'Actions', label: 'New group', keywords: 'people start chat', run: () => openNew('group_dm') },
     { id: 'action:new-channel', group: 'Actions', label: 'New channel', keywords: 'topic public private', run: () => openNew('channel') },
     { id: 'action:browse', group: 'Actions', label: 'Browse channels', keywords: 'join public directory', run: openBrowser },
-    ...[...channels].filter(([, ch]) => ch.status !== 'left').map(([id, ch]) => ({ id: `group:${id}`, group: 'Conversations', label: `${isChannel(ch) ? '# ' : ''}${title(id)}`, hint: ch.unread ? `${ch.unread} unread` : '', run: () => { ctx.openGroup(id); } })),
+    ...[...channels].filter(([, ch]) => ch.status !== 'left' && ch.kind !== 'dm').map(([id, ch]) => ({ id: `group:${id}`, group: 'Conversations', label: `${isChannel(ch) ? '# ' : ''}${title(id)}`, hint: ch.unread ? `${ch.unread} unread` : '', run: () => { ctx.openGroup(id); } })),
   ]);
 
   window.Groups = Object.freeze({
-    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
+    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, createDm, acceptDm, sendDm,
+    /** A contact's verified succession chain (m5 §5.3): the group store moves its pin and keeps the old key as a predecessor. */
+    async contactSucceeded(contactId, records) {
+      if (!run || !enabled) return;
+      if (!await run({ cmd: 'peer', contact: contactId }).catch(() => null)) return; // Not pinned here yet: the next pin takes the new key.
+      await run({ cmd: 'acceptSuccession', contact: contactId, records });
+      pinsChanged(contactId);
+    },
+    /** The DM group this device holds with a contact, if any (m5 §8). */
+    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked === peerId && usable(ch))?.[0] || null,
+    /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
+    /** For a primary transfer (m5 §5): this store's name, its leaf key, its pins, and adopting the new account key. */
+    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown, certAik, hold,
+    linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
+    /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
+    bundleChannels: () => [...channels].filter(([, ch]) => ['active', 'frozen', 'paused'].includes(ch.status) && ch.kind !== 'dm').map(([id, ch]) => ({ id, kind: ch.kind, name: ch.meta?.name || ch.serverName || null, topic: ch.meta?.topic || null })), sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
     active: () => currentId, enabled: () => enabled, flush: () => currentId && flush(currentId),
     onReact: (target, emoji, on) => send(currentId, { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }),
     async onEdit(record, text) {
@@ -1197,6 +1465,8 @@
     },
     onDisplayed, onTyping,
     // For tests and diagnostics: the state of one channel on this device.
-    debug: id => { const ch = channels.get(id); return ch && { status: ch.status, cursor: ch.cursor, kind: ch.kind, members: ch.members.map(member => member.username), admins: ch.admins }; },
+    /** For tests and diagnostics: the devices in this device's copy of a group's tree. */
+    leaves: id => run ? run({ cmd: 'mlsMembers', group: id }).then(list => list.map(member => ({ userId: member.userId, deviceId: member.deviceId, stale: Boolean(member.stale) }))) : Promise.resolve([]),
+    debug: id => { const ch = channels.get(id); return ch && { status: ch.status, cursor: ch.cursor, kind: ch.kind, recertify: Boolean(ch.recertify), members: ch.members.map(member => member.username), admins: ch.admins }; },
   });
 })();

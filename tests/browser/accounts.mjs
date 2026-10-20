@@ -37,6 +37,8 @@ async function person() {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
   await context.grantPermissions(['camera', 'microphone'], { origin });
   if (wasm) await context.addInitScript(() => localStorage.setItem('core-backend-test', 'wasm'));
+  // This suite tests the 1:1 Double Ratchet protocol itself: chats stay on it (m5 §8 moves them; linking.mjs covers that).
+  await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
   const page = await context.newPage(); pages.push(page);
   page.on('pageerror', error => { throw error; }); page.on('console', message => { if (message.text().includes('JOINDEBUG')) console.log(message.text()); });
   const cdp = await context.newCDPSession(page);

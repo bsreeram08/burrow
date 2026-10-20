@@ -172,6 +172,12 @@ class RustChatCrypto implements ChatCrypto {
   Future<void> setVerified(String contactId, bool verified) => _call(() => core.setVerified(contactId: contactId, verified: verified));
 
   @override
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records) => _call(() async {
+    final p = await core.acceptSuccession(contactId: contactId, recordsJson: jsonEncode(records));
+    return PinnedPeer(identity: Identity(dh: p.identity.dh, sign: p.identity.sign), verified: p.verified, changed: p.changed, blocked: p.blocked);
+  });
+
+  @override
   Future<void> acceptChangeFor(String contactId, Identity shown) =>
       _call(() => core.acceptChangeFor(contactId: contactId, identity: core.Identity(dh: shown.dh, sign: shown.sign)));
 

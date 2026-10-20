@@ -79,7 +79,19 @@ class Api {
 
   Uri uri(String path) => base.resolve(path);
 
+  /// A 429 means the server did nothing: wait and try again a few times (0.5, 1, 2 s) before giving up.
   Future<Map<String, dynamic>> call(String path, {String method = 'GET', Object? body}) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _callOnce(path, method: method, body: body);
+      } on ApiException catch (error) {
+        if (error.status != 429 || attempt >= 3) rethrow;
+        await Future<void>.delayed(Duration(milliseconds: 500 * (1 << attempt)));
+      }
+    }
+  }
+
+  Future<Map<String, dynamic>> _callOnce(String path, {required String method, Object? body}) async {
     final request = http.Request(method, uri(path))..headers['Accept'] = 'application/json';
     if (token != null) request.headers['Authorization'] = 'Bearer $token';
     if (body != null) {
@@ -166,6 +178,125 @@ class Api {
     method: 'POST',
     body: {'deviceId': deviceId, 'deviceKey': deviceKey, 'challenge': challenge, 'signature': signature, 'identityProof': ?identityProof},
   );
+
+  // ---- Linking, revocation, succession, DM capability (docs/m5-linking.md §10.2) ----
+  /// Starts a link (no session needed for `link`; a listed device's own session for `transfer`). Code mode
+  /// names the account ([username]) and answers with the 8-character code too: `{linkId, claim, expiresAt, code?}`.
+  Future<Map<String, dynamic>> linkStart({
+    required String purpose,
+    required String deviceId,
+    required String deviceKey,
+    required String platform,
+    required String signature,
+    String mode = 'qr',
+    String? username,
+  }) => call(
+    '/api/link/start',
+    method: 'POST',
+    body: {'purpose': purpose, 'mode': mode, 'username': ?username, 'deviceId': deviceId, 'deviceKey': deviceKey, 'platform': platform, 'signature': signature},
+  );
+
+  /// Code mode, new device: its commitment to the ephemeral key it will reveal later.
+  Future<void> linkCommit(String linkId, String commit, {required String claim}) async {
+    await _linkCall('/api/link/$linkId/commit', method: 'POST', body: {'commit': commit}, claim: claim);
+  }
+
+  /// Code mode, new device: opens the commitment once the primary's key is in.
+  Future<void> linkReveal(String linkId, {required String eph, required String nonce, required String claim}) async {
+    await _linkCall('/api/link/$linkId/reveal', method: 'POST', body: {'eph': eph, 'nonce': nonce}, claim: claim);
+  }
+
+  /// Code mode, primary: `{linkId, deviceId, platform, commit, expiresAt}` for a typed code (404 for anything wrong).
+  Future<Map<String, dynamic>> linkLookup(String code) => call('/api/link/lookup', method: 'POST', body: {'code': code});
+
+  /// The primary offers its ephemeral key: `{deviceId, platform, purpose, mode}`.
+  Future<Map<String, dynamic>> linkOffer(String linkId, String eph) => call('/api/link/$linkId/offer', method: 'POST', body: {'eph': eph});
+
+  /// `{state, purpose, mode, platform, expiresAt}` plus, for the new device ([claim]), `eph` and `offerDeviceId`
+  /// once offered; for the primary, `deviceId`, `commit?`, `reveal?`.
+  Future<Map<String, dynamic>> linkState(String linkId, {String? claim}) => _linkCall('/api/link/$linkId', claim: claim);
+
+  /// Posts one sealed message in this side's own direction; returns its seq.
+  Future<int> linkSend(String linkId, String data, {String? claim}) async =>
+      (await _linkCall('/api/link/$linkId/messages', method: 'POST', body: {'data': data}, claim: claim))['seq'] as int;
+
+  /// The other side's sealed messages after [after] (exclusive), in order.
+  Future<List<({int seq, String data})>> linkMessages(String linkId, {int after = 0, String? claim}) async {
+    final data = await _linkCall('/api/link/$linkId/messages?after=$after', claim: claim);
+    return [for (final m in (data['messages'] as List? ?? const []).cast<Map>()) (seq: m['seq'] as int, data: m['data'] as String)];
+  }
+
+  /// The primary: the list naming the new device is published and the grant sent.
+  Future<void> linkGrant(String linkId) async {
+    await call('/api/link/$linkId/grant', method: 'POST', body: const {});
+  }
+
+  /// The new device claims its session (no session yet): `{user, session: {token, expiresAt}}`.
+  Future<({User user, String token})> linkClaim(String linkId, {required String claim, required String signature}) async =>
+      _session(await _linkCall('/api/link/$linkId/claim', method: 'POST', body: {'claim': claim, 'signature': signature}));
+
+  Future<void> linkCancel(String linkId, {String? claim}) async {
+    await _linkCall('/api/link/$linkId', method: 'DELETE', claim: claim);
+  }
+
+  Future<Map<String, dynamic>> _linkCall(String path, {String method = 'GET', Object? body, String? claim}) async {
+    if (claim == null) return call(path, method: method, body: body);
+    final request = http.Request(method, uri(path))
+      ..headers['Accept'] = 'application/json'
+      ..headers['X-Link-Claim'] = claim;
+    if (token != null) request.headers['Authorization'] = 'Bearer $token';
+    if (body != null) {
+      request.headers['Content-Type'] = 'application/json';
+      request.body = jsonEncode(body);
+    }
+    final response = await http.Response.fromStream(await _client.send(request).timeout(const Duration(seconds: 15)));
+    lastStatus = response.statusCode;
+    Map<String, dynamic> data = const {};
+    try {
+      final decoded = jsonDecode(response.body);
+      if (decoded is Map<String, dynamic>) data = decoded;
+    } catch (_) {}
+    if (response.statusCode < 200 || response.statusCode >= 300) throw ApiException(data['error'] as String? ?? 'Something went wrong. Try again.', response.statusCode, data);
+    return data;
+  }
+
+  /// Cuts one of the account's devices off at once (any session of the account; not the primary).
+  Future<List<String>> revokeDevice(String deviceId) async =>
+      ((await call('/api/devices/$deviceId/revoke', method: 'POST', body: const {}))['revoked'] as List? ?? const []).cast<String>();
+
+  Future<void> publishSuccession(Map<String, dynamic> record, String signature) async {
+    await call('/api/devices/succession', method: 'PUT', body: {'record': record, 'signature': signature});
+  }
+
+  // Companion certificates under a new primary's key (m5 §5.2.2).
+  /// Companion: asks the primary to certify this leaf under the account's current key.
+  Future<void> askRecert({required String platform, required String leafSigKey}) async {
+    await call('/api/devices/recert', method: 'PUT', body: {'platform': platform, 'leafSigKey': leafSigKey});
+  }
+
+  /// Primary: listed devices waiting for a certificate, `[{deviceId, platform, leafSigKey}]`.
+  Future<List<Map<String, dynamic>>> recertRequests() async => ((await call('/api/devices/recert'))['requests'] as List? ?? const []).cast<Map<String, dynamic>>();
+
+  /// Primary: the certificate (DeviceCert JSON) answering one request.
+  Future<void> answerRecert(String deviceId, String cert) async {
+    await call('/api/devices/recert/$deviceId', method: 'PUT', body: {'cert': cert});
+  }
+
+  /// Companion: its answer, or null until there is one (404 if it never asked).
+  Future<String?> myRecert() async => (await call('/api/devices/recert/mine'))['cert'] as String?;
+
+  Future<void> dropRecert() async {
+    await call('/api/devices/recert', method: 'DELETE');
+  }
+
+  /// `{userId, devices, channel}`: the contact's MLS-capable devices and our DM channel with them, if any.
+  Future<Map<String, dynamic>> mlsCapability(String username) => call('/api/mls/capability/$username');
+
+  /// Removes one of our devices: a pending one (or ourselves), or a listed one with the next signed list
+  /// without it (`{list, signature, certs}`) from the primary.
+  Future<void> removeDevice(String deviceId, [Map<String, dynamic> signed = const {}]) async {
+    await call('/api/devices/$deviceId', method: 'DELETE', body: signed);
+  }
 
   /// A contact's (or our own) served device list: `{userId, identity, list, signature, certs}`.
   Future<Map<String, dynamic>> devices(String username) => call('/api/devices/$username');

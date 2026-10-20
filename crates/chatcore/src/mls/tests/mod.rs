@@ -4,4 +4,5 @@ mod harness;
 mod persistence;
 mod policy;
 mod scenarios;
+mod succession;
 mod units;

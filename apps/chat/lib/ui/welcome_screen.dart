@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app/app_controller.dart';
 import '../core/api.dart';
+import 'link/link_this_device_screen.dart';
 
 class WelcomeScreen extends ConsumerStatefulWidget {
   const WelcomeScreen({super.key, this.invite});
@@ -81,6 +82,14 @@ class _WelcomeScreenState extends ConsumerState<WelcomeScreen> {
                       minimumSize: const Size.fromHeight(54),
                       textStyle: const TextStyle(fontSize: 17, fontWeight: FontWeight.w600),
                     ),
+                  ),
+                  const SizedBox(height: 12),
+                  OutlinedButton.icon(
+                    key: const Key('link-this-device'),
+                    onPressed: _busy ? null : () => showLinkThisDevice(context),
+                    icon: const Icon(Icons.devices),
+                    label: const Text('Link to my account'),
+                    style: OutlinedButton.styleFrom(minimumSize: const Size.fromHeight(48)),
                   ),
                   const SizedBox(height: 12),
                   TextButton(onPressed: _busy ? null : () => setState(() => _registering = true), child: const Text('Have an invite? Create an account')),

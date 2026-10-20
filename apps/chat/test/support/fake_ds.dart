@@ -26,8 +26,23 @@ class FakeDs {
   /// Tests: replace the admin's leaf signature in `rolled-back` (a server forging the notice).
   String? forgeRollback;
 
+  /// Tests: a different user id on `rolled-back` than the resolving admin's.
+  String? forgeByUser;
+
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
+
+  /// join-info answers per channel.
+  final Map<String, int> joinInfos = {};
+
+  /// Tests: commits answered 409 `code: 'identity'` (a member's key doesn't match the record), and how many came.
+  bool identityConflict = false;
+  int commitsSeen = 0;
+
+  /// 1:1 envelopes posted (`{to, envelope}`).
+  final List<Map<String, Object?>> envelopes = [];
+
+  Map<String, String> _identity(String userId) => identityOverride[userId] ?? {'dh': 'dh-$userId', 'sign': 'sign-$userId'};
 
   /// A client for one device of one user.
   Api client({required String userId, required String username, required String deviceId}) {
@@ -101,12 +116,47 @@ class FakeDs {
       }
       return _json(w);
     }
+    // 1:1 messaging (enough for a chat's move to MLS, m5 §8): keys, envelopes, MLS capability.
+    if (path == '/api/keys/count') return _json({'oneTimePreKeys': 50, 'signedPreKeyId': 1, 'identity': _identity(userId)});
+    if (path == '/api/keys' && method == 'PUT') return _json({});
+    final bundle = RegExp(r'^/api/keys/([a-z0-9_]+)$').firstMatch(path);
+    if (bundle != null) {
+      final user = devices.values.where((d) => d.username == bundle[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      return _json({'userId': user.userId, 'identity': _identity(user.userId), 'signedPreKey': {'id': 1}});
+    }
+    if (path == '/api/messages' && method == 'POST') {
+      final to = devices.values.where((d) => d.username == body['to']).firstOrNull;
+      if (to == null) return _error('No such user.', 404);
+      envelopes.add(body);
+      _notifyUser(
+        to.userId,
+        EnvelopeEvent(id: 'E${(++_ids).toString().padLeft(21, '0')}', fromId: userId, fromUsername: devices[deviceId]!.username, envelope: body['envelope']! as String, createdAt: 1),
+      );
+      return _json({'id': 'm', 'createdAt': 1}, 201);
+    }
+    final capability = RegExp(r'^/api/mls/capability/([a-z0-9_]+)$').firstMatch(path);
+    if (capability != null) {
+      final user = devices.values.where((d) => d.username == capability[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      final dm = channels.values.where((c) => c.dm != null && c.dm!.containsKey(userId) && c.dm!.containsKey(user.userId)).firstOrNull;
+      final capable = devices.entries.where((d) => d.value.userId == user.userId && (keyPackages[d.key]?.isNotEmpty ?? false)).length;
+      return _json({'userId': user.userId, 'devices': capable, 'channel': dm?.id});
+    }
     if (path == '/api/channels' && method == 'POST') {
       final id = body['id']! as String;
       if (channels.containsKey(id)) return _error('That channel id is taken.', 409);
+      Map<String, String>? dm;
+      if (body['kind'] == 'dm') {
+        final peer = devices.values.where((d) => d.username == body['peer']).firstOrNull;
+        if (peer == null) return _error('No such user.', 404);
+        if (channels.values.any((c) => c.dm != null && c.dm!.containsKey(userId) && c.dm!.containsKey(peer.userId))) return _error('You already have a conversation with them.', 409);
+        dm = {userId: devices[deviceId]!.username, peer.userId: peer.username};
+      }
       final info = _mls(body['groupInfo']! as String);
       channels[id] = FakeChannel(id, body['kind']! as String, body['name'] as String?, info['epoch']! as int)
         ..members[deviceId] = FakeMember(userId, 0, 0, admin: true)
+        ..dm = dm
         ..groupInfo = body['groupInfo'] as String;
       return _json({'id': id, 'epoch': 0, 'seq': 0}, 201);
     }
@@ -164,6 +214,8 @@ class FakeDs {
         if (channel.frozen != null) return _error('frozen', 423, {'frozen': channel.frozen});
         final message = body['message']! as String;
         final commit = _mls(message);
+        if (!external) commitsSeen++;
+        if (identityConflict && !external) return _error("A member's identity key does not match.", 409, {'code': 'identity', 'userId': userId});
         if (conflicts > 0 && !external) {
           conflicts--;
           return _error('The group moved on.', 409, {'epoch': channel.epoch, 'seq': channel.seq});
@@ -205,6 +257,7 @@ class FakeDs {
         _fanOut(channel, seq);
         return _json({'epoch': channel.epoch, 'seq': seq, 'digest': digest(message)}, 201);
       case ('join-info', 'GET'):
+        joinInfos[channel.id] = (joinInfos[channel.id] ?? 0) + 1;
         if (channel.groupInfo == null || channel.groupInfoEpoch != channel.epoch) return _error('between epochs', 409, {'epoch': channel.epoch});
         return _json({'epoch': channel.epoch, 'seq': channel.seq, 'groupInfo': channel.groupInfo, 'tree': 'tree'});
       case ('group-info', 'PUT'):
@@ -255,7 +308,7 @@ class FakeDs {
         }
         for (final u in channel.users) {
           if (body['action'] == 'rollback') {
-            _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String, action: 'rollback', author: author, by: deviceId, signature: (forgeRollback ?? body['leafSignature']) as String));
+            _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String, action: 'rollback', author: author, by: deviceId, byUser: forgeByUser ?? userId, signature: (forgeRollback ?? body['leafSignature']) as String));
           }
           _notifyUser(u, ChannelEvent(id: channel.id, change: 'thawed'));
         }
@@ -311,6 +364,9 @@ class FakeChannel {
   int? groupInfoEpoch = 0;
   Map<String, Object?>? frozen;
   Map<String, FakeMember>? previous;
+
+  /// A DM channel's two users (id → username).
+  Map<String, String>? dm;
   final List<String> resolved = [];
   final Map<String, FakeMember> members = {};
   final List<Map<String, Object?>> log = [];
@@ -333,5 +389,6 @@ class FakeChannel {
     'member': members.containsKey(deviceId),
     'cursor': members[deviceId]?.cursor,
     'admin': members.values.any((m) => m.userId == userId && m.admin),
+    if (dm != null) 'peer': {for (final e in dm!.entries) if (e.key != userId) ...{'id': e.key, 'username': e.value}},
   };
 }

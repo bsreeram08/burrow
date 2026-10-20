@@ -18,6 +18,9 @@ const keyPackageLow = 20;
 
 /// Conflicts (409) rebuild and retry: at most 5 tries, backing off 0.5, 1, 2, 4 s (§4).
 const commitAttempts = 5;
+/// Tries to commit this device's re-signed leaf in one group after a succession (m5 §7).
+const recommitAttempts = 5;
+
 Duration commitBackoff(int attempt) => Duration(milliseconds: 500 * (1 << attempt));
 
 /// At most this many users per KeyPackage claim (§4).
@@ -58,6 +61,14 @@ class LogEntry {
     message: json['message'] as String,
     createdAt: json['createdAt'] as int,
   );
+}
+
+/// This account's verified device list: the devices it names, and the ones an earlier pinned list named and
+/// a later one dropped (the pin's tombstones: proven absent).
+class OwnDeviceList {
+  const OwnDeviceList({required this.listed, required this.dropped});
+  final Set<String> listed;
+  final Set<String> dropped;
 }
 
 /// Where an admin device keeps its tag-only rollbacks per author device (timestamps, ms).
@@ -134,6 +145,8 @@ class GroupSync {
     required this.device,
     required this.platform,
     required this.ensurePinned,
+    this.verifiedOwnDevices,
+    this.companion = false,
     TagRollbackLog? tagLog,
     this.sendCursor,
     this.onDelivery,
@@ -164,8 +177,37 @@ class GroupSync {
 
   /// This admin device's record of tag-only rollbacks per author device (kept on the device).
   final TagRollbackLog tagLog;
+
+  /// This account's own signed device list, verified under our account key against our pin (and moving it
+  /// forward): the devices it names, and the ones a pinned list dropped. Null when it can't be verified; then
+  /// no own leaf is removed and no channel is auto-joined (m5 §3, §4).
+  final Future<OwnDeviceList?> Function()? verifiedOwnDevices;
+
+  /// A linked device (m5 §1): its MLS certificate came with the link grant, signed by the primary; it never
+  /// makes one itself.
+  final bool companion;
+
+  /// The random 0–3 s wait before acting on our own revoked leaves, so devices don't all commit at once.
+  Duration Function() removalJitter = () => Duration(milliseconds: math.Random().nextInt(3000));
   DeliveryHandler? onDelivery;
   Future<void> Function(MembershipChange change)? onMembership;
+
+  /// The author of a commit this device would report as poison: follow their identity (ours: our account's
+  /// succession chain; a contact's: their served identity and chain). True when a pin moved, so it is retried.
+  Future<bool> Function(String userId)? followIdentity;
+
+  /// While this primary hands the account over (m5 §5.2): no group traffic is processed (the new primary's
+  /// commits are under a key this device doesn't pin yet). Released with [release].
+  bool held = false;
+
+  /// Ends [held] and reads every channel's log from where it stopped.
+  Future<void> release() async {
+    held = false;
+    await refresh().catchError((_) {});
+  }
+
+  /// This device joined a 1:1 chat's DM group (m5 §8.3): a pointer waiting for it can be tried now.
+  void Function(String groupId)? onDmJoined;
   final int Function() _now;
   final Duration Function(int attempt) _backoff;
 
@@ -220,7 +262,7 @@ class GroupSync {
 
   Future<void> _setUp() async {
     final local = await device();
-    await crypto.initDevice(userId: me.id, deviceId: local.deviceId, platform: platform, issuedAt: _now());
+    if (!companion) await crypto.initDevice(userId: me.id, deviceId: local.deviceId, platform: platform, issuedAt: _now());
     await topUpKeyPackages();
   }
 
@@ -259,6 +301,47 @@ class GroupSync {
     return store.putGroup(GroupConversation(id: id, kind: kind, name: name, createdAt: _now()));
   }
 
+  /// m5 §8.2: the first sender moves a 1:1 chat to a DM group of the two of us, with every listed device of
+  /// both. Returns the group id, or null when the other side already made one (409: they are the first sender;
+  /// wait for their pointer).
+  Future<String?> createDm(String peerId, String peerUsername) async {
+    await ensureReady();
+    final id = newGroupId();
+    final users = [me.id, peerId]..sort();
+    final view = await crypto.create(id, GroupRoles(kind: GroupKind.dm, admins: users, joinPolicy: JoinPolicy.invite, dm: users));
+    try {
+      await api.createChannel(id: id, kind: GroupKindName.dm.wire, groupInfo: view.groupInfo, tree: view.tree, peer: peerUsername);
+    } catch (error) {
+      await crypto.forget(id);
+      if (error is ApiException && error.status == 409) return null;
+      rethrow;
+    }
+    unawaited(_publishGroupInfo(id, view));
+    await store.putGroup(GroupConversation(id: id, kind: GroupKindName.dm, createdAt: _now(), peer: peerId));
+    await add(id, [peerId, me.id]);
+    await checkDm(id);
+    return id;
+  }
+
+  /// m5 §8.3: whether this DM group is exactly ours with its peer, chained to the pinned keys; remembered.
+  Future<bool> checkDm(String groupId) => _serial(groupId, () => checkDmNow(groupId));
+
+  /// [checkDm] from inside the channel's queue (a delivery).
+  Future<bool> checkDmNow(String groupId) async {
+    final group = await store.group(groupId);
+    final peer = group?.peer;
+    if (group == null || !group.active || group.kind != GroupKindName.dm || peer == null) return false;
+    if (group.dmChecked) return true;
+    try {
+      await crypto.checkDm(groupId, peer);
+    } on CryptoException catch (error) {
+      if (error.keysLocked) rethrow;
+      return false;
+    }
+    await store.updateGroup(groupId, (g) => g.peer == peer ? g.copyWith(dmCheckedPeer: peer) : g);
+    return true;
+  }
+
   /// Adds every listed device of [userIds] in one commit (KeyPackages claimed 16 users at a time). Returns
   /// the users who have no device that can join yet (`missing`), who are skipped.
   Future<Set<String>> add(String groupId, List<String> userIds) => _serial(groupId, () async {
@@ -276,6 +359,9 @@ class GroupSync {
         }
       }
       missing.removeAll({for (final p in packages) p['userId']});
+      // Our own other devices may be added too (a DM, m5 §8.2), never this one.
+      final local = await device();
+      packages.removeWhere((p) => p['userId'] == me.id && p['deviceId'] == local.deviceId);
     }
 
     await claim();
@@ -296,6 +382,26 @@ class GroupSync {
     if (!(await crypto.members(groupId)).any((m) => m.userId == userId && (deviceId == null || m.deviceId == deviceId))) return;
     await _commit(groupId, () => crypto.commit(groupId, removes: [GroupRemoval(userId, deviceId)]), redo: () => remove(groupId, userId, deviceId: deviceId));
   });
+
+  /// Commits this device's own leaf again (its new certificate, m5 §5.2.2), so the group stops seeing it as
+  /// Previous.
+  Future<void> updateLeaf(String groupId) => _serial(groupId, () => _commit(groupId, () => crypto.commit(groupId, update: true), redo: () => updateLeaf(groupId)));
+
+  /// [updateLeaf] until the group holds no stale leaf of this device, at most [attempts] times with backoff.
+  /// Returns whether it got there.
+  Future<bool> recommitLeaf(String groupId, {int attempts = recommitAttempts}) async {
+    final self = (await device()).deviceId;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(_backoff(attempt - 1) * 2);
+      try {
+        await updateLeaf(groupId);
+        if (!(await crypto.members(groupId)).any((m) => m.userId == me.id && m.deviceId == self && m.stale)) return true;
+      } catch (_) {
+        // A conflict or a lost connection: try again.
+      }
+    }
+    return false;
+  }
 
   /// Changes the group's admins (admins only).
   Future<void> setAdmins(String groupId, List<String> admins) => _serial(groupId, () async {
@@ -321,6 +427,7 @@ class GroupSync {
         accepted = await api.postCommit(groupId, out.commit, welcome: out.welcome, joiners: out.welcome == null ? null : joiners?.call());
       } on ApiException catch (error) {
         await crypto.clearOwn(groupId);
+        if (_identityConflict(error)) rethrow;
         if (error.status == 409 && attempt + 1 < commitAttempts) {
           await Future<void>.delayed(_backoff(attempt));
           await _catchUpNow(groupId);
@@ -349,11 +456,18 @@ class GroupSync {
     }
   }
 
+  /// Joiners (new devices of members, public channel members) need the current epoch's GroupInfo: retry a
+  /// failed upload a few times (1, 2, 4, 8 s). A 409 means the group already moved on: the next committer
+  /// publishes that epoch's.
   Future<void> _publishGroupInfo(String groupId, GroupView view) async {
-    try {
-      await api.putGroupInfo(groupId, view.epoch, view.groupInfo);
-    } catch (_) {
-      // Best effort: the next committer publishes it; joiners wait for a current one.
+    for (var attempt = 0; attempt < 5 && !_disposed; attempt++) {
+      try {
+        await api.putGroupInfo(groupId, view.epoch, view.groupInfo);
+        return;
+      } on ApiException catch (error) {
+        if (error.status == 409 || error.status == 404 || error.status == 403) return;
+      } catch (_) {}
+      await Future<void>.delayed(Duration(seconds: 1 << attempt));
     }
   }
 
@@ -426,7 +540,7 @@ class GroupSync {
 
   /// An `ephemeral` frame: processed only while the channel's queue is idle; anything wrong is dropped.
   Future<void> onEphemeral(GroupEphemeral event) async {
-    if ((_busy[event.channel] ?? 0) > 0 || keysLocked) return;
+    if ((_busy[event.channel] ?? 0) > 0 || keysLocked || held) return;
     final group = await store.group(event.channel);
     final local = await device();
     if (group == null || !group.active || event.fromDeviceId == local.deviceId) return;
@@ -518,10 +632,11 @@ class GroupSync {
   }
 
   /// Processes one entry (§6). Returns false when processing must stop here (retry later, paused, ended).
-  Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false}) async {
+  Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false, bool refollowed = false}) async {
     if (entry.seq <= group.cursor) return true;
+    if (held) return false; // A hand-over in progress: the cursor stays until it is done.
     final local = await device();
-    if (entry.fromDevice == local.deviceId) {
+    if (entry.fromUser == me.id && entry.fromDevice == local.deviceId) {
       // Never our own application messages; our own commit only while one is pending (the answer was lost).
       if (entry.kind == 'commit' && await crypto.pendingCommit(group.id) != null) {
         try {
@@ -576,6 +691,12 @@ class GroupSync {
         }
       }
       if (error.code == 'poison') {
+        // A recertify commit under a new account key can arrive before the devices or keys frame: follow the
+        // author's identity (our own succession chain, or a contact's) and try once more before blaming it.
+        final follow = followIdentity;
+        if (!refollowed && follow != null && await follow(entry.fromUser).catchError((_) => false)) {
+          return _process(group, entry, repinned: repinned, refollowed: true);
+        }
         await _reportPoison(group, entry);
         return false;
       }
@@ -691,11 +812,16 @@ class GroupSync {
     final info = await _channelInfo(event.channel);
     await store.putGroup(
       (known ?? GroupConversation(id: event.channel, kind: info.kind, createdAt: _now(), name: info.name ?? ''))
-          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, clearFrozen: true),
+          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, peer: info.peer, clearDmCheck: _otherPeer(known, info.peer), clearFrozen: true),
     );
     _dropWelcome(event.id);
     _changed(event.channel);
     await _catchUpNow(event.channel);
+    if (info.kind == GroupKindName.dm) {
+      // A linked device never sees the pointer: the checked DM group it was added to as our device is the proof.
+      if (companion && await checkDmNow(event.channel)) await store.updateGroup(event.channel, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
+      onDmJoined?.call(event.channel);
+    }
   });
 
   void _dropWelcome(String id) {
@@ -721,12 +847,17 @@ class GroupSync {
     }
   }
 
-  Future<({GroupKindName kind, String? name})> _channelInfo(String id) async {
+  /// A server row naming another peer than the one a DM is bound to: the peer stays, its check is dropped.
+  static bool _otherPeer(GroupConversation? known, String? named) => known?.peer != null && named != null && named != known?.peer;
+
+  /// The server's view of a channel; a DM channel names its other person (`peer: {id, username}`).
+  Future<({GroupKindName kind, String? name, String? peer})> _channelInfo(String id) async {
     try {
       final info = await api.channel(id);
-      return (kind: GroupKindName.fromWire(info['kind'] as String), name: info['name'] as String?);
+      final peer = info['peer'];
+      return (kind: GroupKindName.fromWire(info['kind'] as String), name: info['name'] as String?, peer: peer is Map ? peer['id'] as String? : null);
     } catch (_) {
-      return (kind: GroupKindName.private, name: null);
+      return (kind: GroupKindName.private, name: null, peer: null);
     }
   }
 
@@ -746,11 +877,13 @@ class GroupSync {
     _notice('This device rejoined a group after missing part of its history.');
   }
 
-  Future<void> _externalJoin(String groupId) async {
+  /// With [checked] (a join-info the caller already inspected), exactly that GroupInfo is joined, once: a retry
+  /// must inspect again.
+  Future<void> _externalJoin(String groupId, {Map<String, dynamic>? checked}) async {
     for (var attempt = 0; ; attempt++) {
       final Map<String, dynamic> info;
       try {
-        info = await api.joinInfo(groupId);
+        info = checked ?? await api.joinInfo(groupId);
       } on ApiException catch (error) {
         // Between epochs (e.g. right after a rollback, before the admin uploads the restored GroupInfo): wait
         // for a member to publish it, 0.5, 1, 2, 4 s.
@@ -763,14 +896,15 @@ class GroupSync {
       try {
         await ensurePinned({for (final m in await api.channelMembers(groupId)) m['userId'] as String}.where((u) => u != me.id));
       } catch (_) {}
-      final out = await crypto.joinExternal(info['groupInfo'] as String, info['tree'] as String);
+      final out = await crypto.joinExternal(info['groupInfo'] as String, info['tree'] as String, group: groupId);
       Map<String, dynamic> accepted;
       try {
         accepted = await api.joinChannel(groupId, out.commit);
       } on ApiException catch (error) {
         await crypto.clearOwn(groupId);
         await crypto.forget(groupId).catchError((_) {});
-        if (error.status == 409 && attempt + 1 < commitAttempts) {
+        if (_identityConflict(error)) rethrow;
+        if (error.status == 409 && checked == null && attempt + 1 < commitAttempts) {
           await Future<void>.delayed(_backoff(attempt));
           continue;
         }
@@ -781,9 +915,11 @@ class GroupSync {
       final channel = await _channelInfo(groupId);
       final existing = await store.group(groupId);
       final seq = accepted['seq'] as int;
+      // Names from a link bundle (m5 §3 step 3) for a first join; later `meta` overrides them.
+      final named = existing == null ? await store.takeBundleName(groupId) : null;
       await store.putGroup(
-        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? ''))
-            .copyWith(membership: Membership.active, cursor: seq, clearFrozen: true),
+        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? named?.name ?? '', topic: named?.topic ?? '', peer: channel.peer))
+            .copyWith(membership: Membership.active, cursor: seq, clearDmCheck: _otherPeer(existing, channel.peer), clearFrozen: true),
       );
       _reportCursor(groupId, seq);
       _changed(groupId);
@@ -825,10 +961,20 @@ class GroupSync {
         if (own == null || own.seq != event.seq || own.digest != event.digest) return;
         if (!await _verifiedRollback(event, own.seq, own.digest, own.epoch)) return;
         _lastOwn.remove(event.id);
-        await _serial(event.id, () async {
-          await crypto.forget(event.id);
-          await _externalJoin(event.id);
-        });
+        // A rollback that names this device removes it: nothing to redo.
+        if (event.author == (await device()).deviceId) {
+          _notice('An admin undid a change you made and removed this device from the group.');
+          return;
+        }
+        try {
+          await _serial(event.id, () async {
+            await crypto.forget(event.id);
+            await _externalJoin(event.id);
+          });
+        } catch (_) {
+          _notice("A change you made was undone, and this device couldn't rejoin the group to make it again.");
+          return;
+        }
         final redo = own.redo;
         if (redo != null) {
           await redo();
@@ -843,6 +989,9 @@ class GroupSync {
       case 'left':
         // Confirmed by the log: a removed device can no longer read it.
         unawaited(catchUp(event.id).catchError((_) {}));
+      case 'remove-device':
+        // A hint only: we remove our own leaf only if our verified list dropped that device.
+        unawaited(removeDroppedOwnLeaves(groupId: event.id).catchError((_) => 0));
       case 'gap':
         unawaited(_serial(event.id, () => _resync(event.id)).catchError((_) {}));
       case 'joined' || 'invited' || 'updated':
@@ -861,10 +1010,12 @@ class GroupSync {
   /// m4-groups §7: an admin of our own copy signed it with its leaf key, the channel is back at the commit's
   /// pre-commit epoch, and the log holds no commit with that digest.
   Future<bool> _verifiedRollback(ChannelEvent event, int seq, String digest, int epoch) async {
-    final by = event.by, signature = event.signature, author = event.author;
-    if (event.action != 'rollback' || by == null || signature == null || author == null) return false;
+    final by = event.by, byUser = event.byUser, signature = event.signature, author = event.author;
+    if (event.action != 'rollback' || by == null || byUser == null || signature == null || author == null) return false;
     try {
-      await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, signature: signature);
+      // The signer is matched as (user, device), never by device id alone.
+      final signer = await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, byUser: byUser, signature: signature);
+      if (signer != byUser) throw const CryptoException('the resolution was signed by another user', code: 'invalid');
     } catch (_) {
       _notice('A rollback notice for a group could not be verified and was ignored.');
       return false;
@@ -890,6 +1041,113 @@ class GroupSync {
     all[deviceId] = next.length > 20 ? next.sublist(next.length - 20) : next;
     tagLog.write(all);
   }
+
+  // ---------- Our own devices' leaves (m5 §3, §4) ----------
+  /// Removes our own leaves for devices a verified signed list dropped (the pin's tombstones), and leaves the
+  /// core marks stale. A device that is merely missing, or an unverifiable list, removes nothing. Matches
+  /// (userId, deviceId). Treats "no such member" and conflicts as done.
+  Future<int> removeDroppedOwnLeaves({String? groupId}) async {
+    final own = verifiedOwnDevices == null ? null : await verifiedOwnDevices!();
+    final local = await device();
+    var removed = 0;
+    final groups = groupId == null ? await store.groups() : [?await store.group(groupId)];
+    for (final group in groups) {
+      if (!group.active) continue;
+      List<GroupMember> members;
+      try {
+        members = await crypto.members(group.id);
+      } catch (_) {
+        continue;
+      }
+      final targets = [
+        for (final m in members)
+          if (m.userId == me.id && m.deviceId != local.deviceId && (m.stale || (own?.dropped.contains(m.deviceId) ?? false))) m,
+      ];
+      for (final m in targets) {
+        await Future<void>.delayed(removalJitter());
+        try {
+          await remove(group.id, me.id, deviceId: m.deviceId);
+          removed++;
+        } on CryptoException catch (e) {
+          // "No such member": another device of ours already did it. Anything else is retried next time.
+          if (!e.message.contains('no such member')) _notice("Couldn't remove a revoked device from ${_label(group)} yet: ${e.message}");
+        } on ApiException catch (e) {
+          if (e.status != 409) _notice("Couldn't remove a revoked device from ${_label(group)} yet: ${e.message}");
+        }
+      }
+    }
+    if (removed > 0) _notice('Removed a revoked device of yours from $removed ${removed == 1 ? 'group' : 'groups'}.');
+    return removed;
+  }
+
+  /// Joins, by external commit, channels the server lists for this account that this device isn't in yet, but
+  /// only where the served tree (checked by the core, [GroupCrypto.inspectGroup]) holds a current leaf of ours
+  /// for another device our verified list names. Never one this device left; at most about 3 per second.
+  Future<int> joinOwnChannels({int attempts = 5}) async {
+    final own = verifiedOwnDevices == null ? null : await verifiedOwnDevices!();
+    if (own == null) return 0;
+    final local = await device();
+    var joined = 0;
+    var pending = [for (final c in await api.channels()) if (c['member'] != true) c];
+    for (var attempt = 0; attempt < attempts && pending.isNotEmpty; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(_backoff(attempt - 1) * 4);
+      final failed = <Map<String, dynamic>>[];
+      for (final c in pending) {
+        final id = c['id'] as String;
+        final known = await store.group(id);
+        if (known?.membership == Membership.left) continue;
+        try {
+          // One join-info, inspected and then joined as is (409 "between epochs" is retried, not "not ours").
+          final info = await _joinInfo(id);
+          final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
+          // The served GroupInfo must be for this very channel.
+          if (inspected.groupId != id) continue;
+          final ours = inspected.members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
+          if (!ours) continue;
+          await _serial(id, () async {
+            await ensureReady();
+            await _externalJoin(id, checked: info);
+            await _catchUpNow(id);
+          });
+          // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
+          // Our account moved it; this device never sees the pointer.
+          if (c['kind'] == GroupKindName.dm.wire && await checkDm(id)) await store.updateGroup(id, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
+          joinErrors.remove(id);
+          joined++;
+          await Future<void>.delayed(const Duration(milliseconds: 350));
+        } catch (error) {
+          // Fail closed: an unchecked or failed join is retried with backoff, then on the next start.
+          joinErrors[id] = '$error';
+          failed.add(c);
+        }
+      }
+      pending = failed;
+    }
+    return joined;
+  }
+
+  Future<Map<String, dynamic>> _joinInfo(String id) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await api.joinInfo(id);
+      } on ApiException catch (error) {
+        if (error.status != 409 || attempt + 1 >= commitAttempts) rethrow;
+        await Future<void>.delayed(commitBackoff(attempt));
+      }
+    }
+  }
+
+  /// A commit or join refused because a member's identity key doesn't match the server's record (409 `code:
+  /// 'identity'`): not a race. It needs a security-code review, so it is reported once and never retried.
+  bool _identityConflict(ApiException error) {
+    if (error.status != 409 || error.body['code'] != 'identity') return false;
+    _notice("A member's security code changed. Review it before changing this group.");
+    return true;
+  }
+
+  /// Why joining one of our own channels last failed (channel id → error), for diagnostics.
+  final Map<String, String> joinErrors = {};
+
 
   /// Whether this device's MLS state still has a leaf in the group.
   Future<bool> _holds(String groupId) async {
@@ -954,7 +1212,7 @@ class GroupSync {
       if (raw != null) entry = LogEntry.fromJson(raw);
     } catch (_) {}
     if (entry == null || entry.kind != 'commit' || messageDigest(entry.message) != frozen.digest) return const FrozenCheck(FrozenVerdict.unknown);
-    if (entry.fromDevice == (await device()).deviceId || group.cursor >= frozen.seq) return const FrozenCheck(FrozenVerdict.ok);
+    if ((entry.fromUser == me.id && entry.fromDevice == (await device()).deviceId) || group.cursor >= frozen.seq) return const FrozenCheck(FrozenVerdict.ok);
     CommitCheck? check;
     try {
       check = await crypto.commitAuthor(groupId, entry.message);

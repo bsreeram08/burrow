@@ -9,13 +9,13 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 // remove-needed, a changed code of someone met in a group).
 const read = (name: string) => readFileSync(new URL(`../../packages/signaling/public/${name}`, import.meta.url), 'utf8');
 const sources = [read('chat-store.js'), read('groups.js')];
-const DEV2 = 'F'.repeat(22), G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
+const PAIR = 'p'.repeat(43), DEV2 = 'F'.repeat(22), G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
 const coded = (code: string | null, message: string) => Object.assign(new Error(message), { code });
 const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[]; joinInfo?: () => [number, any]; commit?: () => [number, any] } = {}) {
   const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
@@ -26,6 +26,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
     setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
     mlsSignResolution: () => 'L'.repeat(86),
+    mlsInspectGroup: command => ({ groupId: G, members: options.tree ?? [] }), // chatcore: { groupId, members: [{ leaf, userId, deviceId, platform, admin, stale }] }
     mlsVerifyResolution: command => { if (command.signature !== 'L'.repeat(86) || command.by !== DEV2) throw coded('auth', 'bad resolution signature'); return { userId: ME, deviceId: DEV2 }; },
     mlsCommitAuthor: () => ({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false } }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),
@@ -38,18 +39,18 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const core = async (command: Cmd) => { calls.push(command); const handler = handlers[command.cmd]; if (!handler) throw new Error(`unexpected ${command.cmd}`); return handler(command); };
   const routes: [string, RegExp, (body: any, match: RegExpExecArray) => [number, any]][] = [
     ['GET', /^\/api\/mls\/keypackages$/, () => [200, { oneTime: 100, lastResort: true, low: false, max: 100 }]],
-    ['GET', /^\/api\/channels$/, () => [200, { channels: [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
+    ['GET', /^\/api\/channels$/, () => [200, { channels: options.channels ?? [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
     ['GET', /^\/api\/channels\/[\w-]{22}$/, () => [200, { id: G, kind: 'private', name: null, epoch: options.epoch ?? 3, seq: 5, frozen: false, member: true, cursor: 5, admin: true }]],
     ['GET', /^\/api\/channels\/\w+\/members$/, () => [200, { members: [{ userId: ME, username: 'me', deviceId: DEV, admin: true }, { userId: BOB, username: 'bob', deviceId: BOB_DEV, admin: false }] }]],
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
     ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: log.current?.(Number(match[1])) ?? [], more: false, gap: false }]],
     ['GET', /^\/api\/users\/\w+\/identity$/, () => [200, { userId: BOB, username: 'bob', identity: { dh: 'dh2', sign: 'sign2' } }]],
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
-    ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
+    ['POST', /^\/api\/channels\/\w+\/commits$/, () => options.commit?.() ?? [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
-    ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : [202, { frozen: true }]],
+    ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : options.poison === 409 ? [409, { error: 'That is not the latest sequenced commit.' }] : [202, { frozen: true }]],
     ['POST', /^\/api\/channels\/\w+\/cursor$/, () => [200, {}]],
-    ['GET', /^\/api\/channels\/\w+\/join-info$/, () => [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
+    ['GET', /^\/api\/channels\/\w+\/join-info$/, () => options.joinInfo?.() ?? [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
     ['POST', /^\/api\/channels\/\w+\/join$/, () => [201, { epoch: 4, seq: 7, digest: sha('join') }]],
   ];
   async function fetch(path: string, init: any = {}) {
@@ -72,16 +73,20 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     Core: { supported: () => true, groupStore: () => core },
     DeviceFormat: { deviceKey: async () => ({ deviceId: DEV, sign: async () => 'signature' }), mlsCertBytes: () => new Uint8Array(1), mlsCertJson: () => '{}', b64: (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url') },
   };
+  context.Math = Object.assign(Object.create(Math), { random: () => 0 }); // No 0–3 s jitter in tests.
   context.window = context;
   for (const source of sources) runInNewContext(source, context);
   const Groups = context.Groups;
   const dm = { peer: options.dmPeer ?? null };
   const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
-    contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {} };
+    contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {},
+    // Our devices as a verified signed list proves them (account.js); null: nothing verifiable.
+    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping(_peer: string, _payload?: unknown) {}, followOwnSuccession: async () => false,
+    verifiedOwnDevices: async () => { const own = options.own === undefined ? { listed: [DEV], dropped: [] } : options.own; return own && { listed: new Set(own.listed), dropped: new Set(own.dropped) }; } };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
   const settle = () => Bun.sleep(60);
-  return { log, storage, dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
+  return { storeList: () => context.ChatStore.list(), log, storage, dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
     async start() { Groups.start(ctx); await until(() => Groups.enabled(), 'groups enabled'); await settle(); },
     of: (name: string) => calls.filter(command => command.cmd === name) };
 }
@@ -339,5 +344,201 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.Groups.debug(G)).toMatchObject({ status: 'active', cursor: 0 }); // still before the commit, to report it again
     expect(w.of('mlsForget')).toEqual([]);
     expect(w.requests.filter(request => request.path.endsWith('/join-info') || request.path.endsWith('/join'))).toEqual([]);
+  });
+
+  test('8. a device joins its account\'s channels by external commit only when the tree proves our account is in it (m5 §3)', async () => {
+    const H = 'h'.repeat(22), OTHER = 'O'.repeat(22);
+    const rows = [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }, { id: H, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }];
+    const ourLeaf = { userId: ME, deviceId: OTHER, stale: false };
+    const cases: [string, any, any[], boolean][] = [
+      ['our other listed device is in the tree', { listed: [DEV, OTHER], dropped: [] }, [ourLeaf], true],
+      ['the tree has no leaf of ours', { listed: [DEV, OTHER], dropped: [] }, [{ userId: BOB, deviceId: BOB_DEV, stale: false }], false],
+      ['our leaf is for a device the verified list does not name', { listed: [DEV], dropped: [] }, [ourLeaf], false],
+      ['our leaf is stale', { listed: [DEV, OTHER], dropped: [] }, [{ ...ourLeaf, stale: true }], false],
+      ['our device list cannot be verified', null, [ourLeaf], false],
+    ];
+    for (const [what, own, tree, joins] of cases) {
+      const w = world({ channels: rows, own, tree });
+      w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 });
+      w.storage.set(`groups-v1:${ME}-${DEV}-${'A'.repeat(12)}`, JSON.stringify({ [H]: { kind: 'private', status: 'left', cursor: 0, members: [], admins: [], unread: 0, lastAt: 0 } }));
+      await w.start();
+      await Bun.sleep(300);
+      expect([what, w.requests.filter(request => request.path.endsWith('/join')).map(request => request.path)]).toEqual([what, joins ? [`/api/channels/${G}/join`] : []]);
+      expect(w.Groups.debug(H).status).toBe('left'); // never one we left
+    }
+  });
+
+  test('8b. the GroupInfo proven to hold our leaf is the one joined with; "between epochs" is waited out, not taken as "not ours"', async () => {
+    const OTHER = 'O'.repeat(22);
+    const rows = [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: false, cursor: null, admin: false }];
+    const answers: [number, any][] = [[409, { error: 'Between epochs.' }], [409, { error: 'Between epochs.' }], [200, { epoch: 4, seq: 6, groupInfo: 'gi-4', tree: 't-4' }], [200, { epoch: 5, seq: 8, groupInfo: 'gi-5', tree: 't-5' }]];
+    const w = world({ channels: rows, own: { listed: [DEV, OTHER], dropped: [] }, tree: [{ userId: ME, deviceId: OTHER, stale: false }], joinInfo: () => answers.shift()! });
+    w.handlers.mlsJoinExternal = () => ({ groupId: G, commit: b64('join'), digest: sha('join'), epoch: 4 });
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/join')), 'joined');
+    expect(w.requests.filter(request => request.path.endsWith('/join-info'))).toHaveLength(3);
+    expect(w.of('mlsInspectGroup').map(command => command.groupInfo)).toEqual(['gi-4']);
+    expect(w.of('mlsJoinExternal').map(command => [command.groupInfo, command.tree, command.group])).toEqual([['gi-4', 't-4', G]]);
+  });
+
+  test('9. own leaves go only when a verified signed list dropped them (or the core finds them stale); frames are hints', async () => {
+    const GONE = 'Z'.repeat(22), KEPT = 'K'.repeat(22);
+    const ours = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }, { leaf: 3, userId: ME, deviceId: KEPT, admin: true }];
+    // The server's word alone (an unverifiable list) removes nothing.
+    const unverified = world({ own: null });
+    unverified.handlers.mlsMembers = ours;
+    await unverified.start(); await unverified.settle();
+    unverified.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: GONE });
+    await Bun.sleep(150);
+    expect(unverified.of('mlsCommit')).toEqual([]);
+    // A verified list that dropped GONE: it goes at start; KEPT (merely missing, not dropped) stays.
+    const w = world({ own: { listed: [DEV], dropped: [GONE] } });
+    w.handlers.mlsMembers = ours;
+    await w.start();
+    await w.until(() => w.of('mlsCommit').length === 1, 'removed at start');
+    await w.settle();
+    expect(w.of('mlsCommit').map(command => command.removes)).toEqual([[{ userId: ME, deviceId: GONE }]]);
+    // A frame for a device the verified list still names (or never dropped) is ignored.
+    w.Groups.frame({ type: 'channel', id: G, change: 'remove-device', deviceId: KEPT });
+    await Bun.sleep(150);
+    expect(w.of('mlsCommit')).toHaveLength(1);
+  });
+
+  test('9b. a commit refused because a member\'s account key moved without a record is reported, not retried as a race', async () => {
+    const GONE = 'Z'.repeat(22);
+    const w = world({ own: { listed: [DEV], dropped: [GONE] }, commit: () => [409, { error: 'A member\'s identity key does not match the one this channel was built on.', code: 'identity', userId: BOB }] });
+    w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }];
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/commits')), 'committed');
+    await Bun.sleep(900); // a race would be retried after 500 ms
+    expect(w.requests.filter(request => request.path.endsWith('/commits'))).toHaveLength(1);
+  });
+
+  test('10. a rollback removes the authenticated (user, device) only, never another user\'s leaf claiming the same device id', async () => {
+    const EVE = 'V'.repeat(22);
+    const evil = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); });
+    evil.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 4, userId: EVE, deviceId: BOB_DEV, admin: false }];
+    await evil.el('group-rollback').onclick(); await evil.settle(); await Bun.sleep(100);
+    expect(evil.of('mlsCommit')).toEqual([]); // bob's leaf is gone; eve's look-alike stays
+    const both = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); });
+    both.handlers.mlsMembers = () => [{ leaf: 1, userId: BOB, deviceId: BOB_DEV, admin: false }, { leaf: 4, userId: EVE, deviceId: BOB_DEV, admin: false }];
+    await both.el('group-rollback').onclick();
+    await both.until(() => both.of('mlsCommit').length === 1, 'removal');
+    expect(both.of('mlsCommit')[0].removes).toEqual([{ userId: BOB, deviceId: BOB_DEV }]);
+  });
+
+  test('11. a 1:1 chat on MLS lands in its own conversation, as 1:1, only once checked, and only from the two of us (m5 §8)', async () => {
+    const EVE = 'V'.repeat(22);
+    const rows = [{ id: G, kind: 'dm', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true, peer: { id: BOB, username: 'bob' } }];
+    const entry = (seq: number) => ({ type: 'group', channel: G, seq, epoch: 3, kind: 'app', from: { userId: BOB, deviceId: BOB_DEV }, message: b64(`m${seq}`), createdAt: Date.now() });
+    const w = world({ channels: rows });
+    await w.start();
+    expect(w.Groups.sections().rows).toEqual([]); // not a group: shown under its contact
+    // A check that fails (not our DM) stores nothing.
+    w.handlers.mlsCheckDm = () => { throw coded('invalid', 'not a DM of these two'); };
+    w.handlers.mlsReceive = () => application({ ...text, id: crypto.randomUUID(), text: 'unchecked' });
+    w.Groups.frame(entry(1));
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    // Checked: bob's message lands under the pair, incoming, without group fields.
+    w.handlers.mlsCheckDm = () => null;
+    const hello = { ...text, id: crypto.randomUUID(), text: 'hello over MLS' };
+    w.handlers.mlsReceive = () => application(hello);
+    w.Groups.frame(entry(2));
+    await w.until(() => w.Groups.debug(G).cursor === 2, 'processed');
+    // Someone else in the group (never in a real DM) is ignored.
+    w.handlers.mlsReceive = () => ({ ...application({ ...text, id: crypto.randomUUID(), text: 'from eve' }), sender: { leaf: 2, userId: EVE, deviceId: 'Q'.repeat(22) } });
+    w.Groups.frame(entry(3));
+    await w.until(() => w.Groups.debug(G).cursor === 3, 'processed');
+    const stored = await w.storeList();
+    expect(stored.map((record: any) => [record.conversationId, record.direction, record.text, record.from])).toEqual([[PAIR, 'incoming', 'hello over MLS', undefined]]);
+    expect(w.of('mlsCheckDm').length).toBe(2);
+  });
+
+  test('12. a DM group\'s contact never moves; its typing is that contact\'s only, once checked; a renamed peer costs the check', async () => {
+    const EVE = 'V'.repeat(22);
+    const rows = [{ id: G, kind: 'dm', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true, peer: { id: BOB, username: 'bob' } }];
+    const w = world({ channels: rows });
+    const typed: string[] = [];
+    w.ctx.dmTyping = (peer: string) => { typed.push(peer); };
+    await w.start();
+    const typingFrom = async (userId: string) => {
+      w.calls.length = 0;
+      w.handlers.mlsReceive = () => ({ ...application(typing), sender: { leaf: 1, userId, deviceId: BOB_DEV, platform: 'web', admin: false } });
+      w.Groups.frame(live);
+      await w.until(() => w.of('mlsAbortReceived').length + w.of('mlsCommitReceived').length > 0, 'decision');
+      await w.settle();
+    };
+    await typingFrom(BOB); // not checked yet
+    expect(typed).toEqual([]);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(null);
+    w.handlers.mlsCheckDm = command => { if (command.peer !== BOB) throw coded('invalid', 'not a DM of these two'); return null; };
+    expect(await w.Groups.acceptDm(G, BOB)).toBe(true);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(G);
+    await typingFrom(EVE); // another leaf in the group
+    await typingFrom(ME);
+    await typingFrom(BOB);
+    expect(typed).toEqual([BOB]);
+    // The server now names eve as the peer: the group stays bob's, unchecked until checked again, and is never eve's.
+    rows[0].peer = { id: EVE, username: 'eve' };
+    await w.start();
+    await w.until(() => w.requests.filter(request => request.path === '/api/channels').length === 2, 'refreshed');
+    await w.settle();
+    expect(w.Groups.dmChannelWith(BOB)).toBe(null);
+    expect(w.Groups.dmChannelWith(EVE)).toBe(null);
+    expect(await w.Groups.acceptDm(G, EVE)).toBe(false);
+    expect(w.of('mlsCheckDm').filter(command => command.peer === EVE)).toEqual([]);
+    await typingFrom(EVE); await typingFrom(BOB);
+    expect(typed).toEqual([BOB]);
+    expect(await w.Groups.acceptDm(G, BOB)).toBe(true);
+    expect(w.Groups.dmChannelWith(BOB)).toBe(G);
+  });
+
+  test('13. a commit from our own account under its new key follows the account\'s succession first and is not reported (m5 §5)', async () => {
+    const w = world();
+    let followed = 0, received = 0;
+    w.ctx.followOwnSuccession = async () => { followed++; return true; };
+    await w.start();
+    w.handlers.mlsReceive = () => {
+      if (received++ === 0) throw coded('poison', `poison ${sha('recert')}: device certificate: not signed by the pinned account key`);
+      return { pendingId: 'p1', kind: 'commit', sender: { leaf: 0, userId: ME, deviceId: DEV2 }, epoch: 4, digest: sha('recert') };
+    };
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV2 }, message: b64('recert'), createdAt: Date.now() });
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    expect(followed).toBe(1);
+    expect(w.requests.filter(request => request.path.endsWith('/poison'))).toEqual([]);
+  });
+
+  test('14. a primary handing the account over reads nothing more until it has stepped down', async () => {
+    const w = world();
+    await w.start();
+    w.Groups.hold();
+    w.calls.length = 0;
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV2 }, message: b64('recert'), createdAt: Date.now() });
+    w.Groups.frame(live);
+    await Bun.sleep(150);
+    expect(w.of('mlsReceive')).toEqual([]);
+    expect(w.Groups.debug(G).cursor).toBe(0);
+  });
+
+  test('3e. a report refused because the commit was rolled back meanwhile reads on; it never rejoins (or retries a 429 report)', async () => {
+    const bad = { seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('bad commit'), createdAt: Date.now() };
+    const w = world({ poison: 409 });
+    let rolledBack = false;
+    w.log.current = after => (rolledBack ? [] : after <= 4 ? [bad] : []);
+    w.handlers.mlsReceive = () => { rolledBack = true; throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    w.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false });
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/poison')), 'reported');
+    await w.settle();
+    expect(w.requests.filter(request => /\/join(-info)?$/.test(request.path))).toEqual([]);
+    expect(w.of('mlsForget')).toEqual([]);
+    expect(w.Groups.debug(G).status).toBe('active');
+    const limited = world({ log: after => after <= 4 ? [bad] : [], poison: 429 });
+    limited.handlers.mlsReceive = () => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    limited.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false });
+    await limited.start();
+    await limited.until(() => limited.requests.some(request => request.path.endsWith('/poison')), 'reported');
+    await Bun.sleep(400);
+    expect(limited.requests.filter(request => request.path.endsWith('/poison'))).toHaveLength(1); // no burst retries of a 429 report
   });
 });

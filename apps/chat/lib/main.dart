@@ -239,7 +239,22 @@ class InactiveDeviceBanner extends ConsumerWidget {
             const SizedBox(width: 8),
             FilledButton(
               key: const Key('use-this-device'),
-              onPressed: () => ref.read(appProvider.notifier).useThisDevice(),
+              onPressed: () async {
+                final yes = await showDialog<bool>(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('Start over on this device?'),
+                    content: const Text(
+                      'Do this only if your primary device is lost. This device makes new keys for your account: everyone you talk to sees that your security code changed, and your other devices stop working until you link them again.',
+                    ),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+                      FilledButton(key: const Key('use-this-device-confirm'), onPressed: () => Navigator.pop(context, true), child: const Text('Start over here')),
+                    ],
+                  ),
+                );
+                if (yes == true) await ref.read(appProvider.notifier).useThisDevice();
+              },
               child: const Text('Use this device instead'),
             ),
           ],

@@ -43,7 +43,7 @@ fn ok<T: serde::Serialize>(value: T) -> Result<Value> { Ok(serde_json::to_value(
 /// `None`: not an MLS command.
 pub fn run(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> {
     #[cfg(feature = "mls")]
-    if cmd.starts_with("mls") { return run_mls(core, cmd, command); }
+    if cmd.starts_with("mls") || matches!(cmd, "companionSetup" | "signDeviceCert" | "adoptSuccession") { return run_mls(core, cmd, command); }
     #[cfg(feature = "ds")]
     if cmd.starts_with("ds") { return run_ds(core, cmd, command); }
     let _ = (core, cmd, command);
@@ -76,12 +76,33 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 // AIK in WebCrypto and runs MLS in a store of its own) takes the account key from its caller, once:
                 // the certificate must verify under it, and a store that holds a certificate never changes account.
                 let aik = if core.has_identity()? {
-                    core.account_signing_key()?.verifying_key().to_bytes()
+                    core.account_aik_bytes()?
                 } else {
                     command.get("aik").and_then(Value::as_str).and_then(crate::mls::cert::key32).ok_or_else(|| ChatError::coded("invalid", "aik: the account key is needed"))?
                 };
                 let (groups, store) = core.groups()?;
                 return ok(groups.set_device_cert(store, &text(command, "cert")?, &aik)?);
+            }
+            // Linked devices (docs/m5-linking.md §1).
+            "companionSetup" => {
+                let identity: crate::protocol::IdentityPub = serde_json::from_value(command.get("identity").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid identity"))?;
+                return ok(core.companion_setup(&text(command, "userId")?, &identity, &text(command, "cert")?)?);
+            }
+            "adoptSuccession" => {
+                let record = command.get("record").ok_or_else(|| ChatError::coded("invalid", "record is required"))?;
+                return ok(core.adopt_succession(&text(command, "userId")?, record, &text(command, "signature")?, command.get("cert").and_then(Value::as_str))?);
+            }
+            "signDeviceCert" => {
+                let issued_at = command.get("issuedAt").and_then(Value::as_u64).ok_or_else(|| ChatError::coded("invalid", "issuedAt must be a number"))?;
+                return ok(core.sign_device_cert(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "platform")?, &text(command, "leafSigKey")?, issued_at, command.get("now").and_then(Value::as_u64).unwrap_or(0))?);
+            }
+            // The primary signs a fresh certificate for its own, unchanged leaf under the identity it now holds
+            // (after a succession, §5.2).
+            "mlsRecertify" => {
+                let aik = core.account_signing_key()?;
+                let (groups, store) = core.groups()?;
+                let issued_at = command.get("issuedAt").and_then(Value::as_u64).unwrap_or(0);
+                return ok(groups.recertify_device(store, &text(command, "platform")?, issued_at, &aik)?);
             }
             _ => {}
         }
@@ -120,13 +141,21 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 let (action, digest, author) = (text(command, "action")?, text(command, "digest")?, command.get("author").and_then(Value::as_str).unwrap_or("").to_string());
                 let seq = command.get("seq").and_then(Value::as_u64).ok_or_else(|| ChatError::coded("invalid", "seq must be a number"))?;
                 if cmd == "mlsSignResolution" { ok(groups.sign_resolution(store, &group()?, &action, seq, &digest, &author)?) }
-                else { ok(groups.verify_resolution(store, &group()?, &action, seq, &digest, &author, &text(command, "by")?, &text(command, "signature")?)?) }
+                else { ok(groups.verify_resolution(store, &group()?, &action, seq, &digest, &author, &text(command, "by")?, &text(command, "byUser")?, &text(command, "signature")?)?) }
             }
+            "mlsInspectGroup" => ok(groups.inspect_group(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "mlsLeafKnown" => {
+                let listed = command.get("groups").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "groups must be a list"))?;
+                if listed.len() > 1000 { return Err(ChatError::coded("invalid", "too many groups")); }
+                let ids = listed.iter().map(|g| g.as_str().ok_or_else(|| ChatError::coded("invalid", "group ids are strings")).and_then(group_id)).collect::<Result<Vec<_>>>()?;
+                ok(groups.leaf_known(store, &ids, &text(command, "deviceId")?, &text(command, "leafSigKey")?)?)
+            }
+            "mlsCheckDm" => { groups.check_dm(store, &group()?, &text(command, "peer")?)?; Ok(Value::Null) }
             "mlsMergeOwn" => ok(groups.merge_own(store, &group()?)?),
             "mlsClearOwn" => { groups.clear_own(store, &group()?)?; Ok(Value::Null) }
             "mlsPending" => ok(groups.pending_commit(store, &group()?)?),
             "mlsJoin" => ok(groups.join(store, &text(command, "welcome")?, &text(command, "tree")?)?),
-            "mlsJoinExternal" => ok(groups.join_external(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "mlsJoinExternal" => ok(groups.join_external(store, &text(command, "groupInfo")?, &text(command, "tree")?, &text(command, "group")?)?),
             "mlsForget" => { groups.forget_group(store, &group()?)?; Ok(Value::Null) }
             "mlsEncrypt" => ok(groups.encrypt(store, &group()?, &text(command, "plaintext")?)?),
             "mlsReceive" => {
@@ -156,6 +185,12 @@ fn run_ds(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> 
         match cmd {
             "dsPin" => { ds.pin(store, &text(command, "userId")?, &text(command, "aik")?)?; Ok(Value::Null) }
             "dsCreate" => Ok(ds.create(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "dsRepin" => { ds.repin(store, &text(command, "userId")?, &text(command, "aik")?)?; Ok(Value::Null) }
+            "dsSucceed" => {
+                let records = command.get("records").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "records must be a list"))?;
+                ds.succeed(store, &text(command, "userId")?, records)?;
+                Ok(Value::Null)
+            }
             "dsKeyPackage" => ok(ds.key_package(store, &text(command, "keyPackage")?)?),
             "dsMembers" => ok(ds.members(store, &group()?)?),
             "dsSubmit" => ok(ds.submit_as(store, &group()?, &text(command, "message")?, expect(command)?)?),

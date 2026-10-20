@@ -104,6 +104,42 @@ const MIGRATIONS: ((db: Database) => void)[] = [
             CREATE INDEX mls_welcomes_channel ON mls_welcomes (channel_id, seq);
         `);
     },
+    // 4 (M5): device linking (a blind relay between a new device and the primary), succession records.
+    db => {
+        db.exec(`
+            -- One linking session. The server never sees the link secret, the code or what the devices exchange.
+            -- state: waiting (new device started), offered (primary answered), granted (list published, bundle sent),
+            -- claimed (the new device took its session). mode: 'qr' or 'code' (short-code rendezvous).
+            CREATE TABLE link_requests (id TEXT PRIMARY KEY, purpose TEXT NOT NULL CHECK (purpose IN ('link', 'transfer')), mode TEXT NOT NULL CHECK (mode IN ('qr', 'code')),
+                device_id TEXT NOT NULL, device_key TEXT NOT NULL, platform TEXT NOT NULL, claim_hash TEXT NOT NULL,
+                expect_user TEXT, code_hash TEXT UNIQUE, commit_hash TEXT, reveal TEXT, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, offer_device_id TEXT, eph TEXT,
+                state TEXT NOT NULL CHECK (state IN ('waiting', 'offered', 'granted', 'claimed')), strikes INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE INDEX link_requests_expiry ON link_requests (expires_at);
+            CREATE TABLE link_messages (link_id TEXT NOT NULL REFERENCES link_requests(id) ON DELETE CASCADE, dir TEXT NOT NULL CHECK (dir IN ('n2p', 'p2n')),
+                seq INTEGER NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (link_id, dir, seq));
+            -- Signed hand-overs from one account identity key to the next (docs/m5-linking.md §5), oldest first.
+            CREATE TABLE identity_succession (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+                old_sign TEXT NOT NULL, new_sign TEXT NOT NULL, new_dh TEXT NOT NULL, at INTEGER NOT NULL, signature TEXT NOT NULL, created_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, seq));
+        `);
+    },
+    // 5: the authenticated events that let the delivery service's validator replace a pinned account key.
+    db => {
+        db.exec(`
+            -- The last time an authenticated path changed the user's identity key (PUT /api/keys with a new identity), and to what.
+            -- The MLS validator re-pins a key only to the one recorded here (or follows a verified succession chain).
+            CREATE TABLE identity_changes (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, aik TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL);
+        `);
+    },
+    // 6: after a primary transfer each companion asks the new primary for a certificate under the new account key.
+    db => {
+        db.exec(`
+            CREATE TABLE recert_requests (device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL, leaf_sig_key TEXT NOT NULL, cert TEXT, created_at INTEGER NOT NULL);
+            CREATE INDEX recert_requests_user ON recert_requests (user_id);
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

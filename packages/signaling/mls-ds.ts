@@ -84,6 +84,7 @@ type Deps = {
     eligible(userId: string, deviceId: string | null): boolean;
     sessionDevice(session: string): string | null;
     aikOf(userId: string): string | null;
+    identityChange?(userId: string): { aik: string; event: string } | null;
     mutual(a: string, b: string): boolean;
     notify(userId: string, event: object): void;
 };
@@ -91,12 +92,29 @@ type Caller = { id: string; session: string };
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' } });
 
 /** Pins the account keys the registry holds for `userIds`, so the validator can check certificates against them. */
-export function pinAccounts(deps: Pick<Deps, 'aikOf'>, call: Call, userIds: Iterable<string>) {
+export function pinAccounts(deps: Pick<Deps, 'aikOf'> & { successions?(userId: string): object[]; identityChange?(userId: string): { aik: string; event: string } | null }, call: Call, userIds: Iterable<string>) {
     for (const userId of new Set(userIds)) {
         const aik = deps.aikOf(userId);
         if (!aik) throw new Abort(409, 'A member has not published an identity key.');
         try { call({ cmd: 'dsPin', userId, aik }); }
-        catch (error) { if (error instanceof DsError) throw new Abort(409, 'A member\'s identity changed; their old devices are no longer valid here.'); throw error; }
+        catch (error) {
+            if (!(error instanceof DsError)) throw error;
+            // The registry's key moved. Follow the signed succession records from the pinned key if they lead to it
+            // (older devices stay valid for what they were certified before). Otherwise the key is replaced only if an
+            // authenticated identity change to exactly this key was recorded (PUT /api/keys; the user recovered under a
+            // new key and their old devices are stale: removable, unable to act). Anything else keeps the 409.
+            const records = deps.successions?.(userId) ?? [];
+            let followed = false;
+            if (records.length) { try { call({ cmd: 'dsSucceed', userId, records }); followed = true; } catch (inner) { if (!(inner instanceof DsError)) throw inner; } }
+            try { call({ cmd: 'dsPin', userId, aik }); }
+            catch (inner) {
+                if (!(inner instanceof DsError)) throw inner;
+                const change = deps.identityChange?.(userId);
+                if (!change || change.aik !== aik) throw new Abort(409, 'A member\'s identity key does not match the one this channel was built on.', { code: 'identity', userId });
+                call({ cmd: 'dsRepin', userId, aik });
+            }
+            void followed;
+        }
     }
 }
 

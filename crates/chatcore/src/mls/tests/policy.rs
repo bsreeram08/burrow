@@ -350,7 +350,7 @@ fn oversize_inputs_are_refused_before_parsing() {
     assert!(err.message.contains("exceeds"), "{err}");
     let dave = Account::new();
     let mut d1 = f.admit(&dave, "web");
-    let err = d1.groups.join_external(&mut d1.store, &junk(64 * 1024 + 1), &junk(1)).unwrap_err();
+    let err = d1.groups.join_external(&mut d1.store, &junk(64 * 1024 + 1), &junk(1), &b64(&[1u8; 16])).unwrap_err();
     assert!(err.message.contains("exceeds"), "{err}");
     let err = f.server.ds.create(&mut f.server.store, &junk(64 * 1024 + 1), &junk(1)).unwrap_err();
     assert!(err.message.contains("exceeds"), "{err}");
@@ -426,14 +426,25 @@ fn unpinning_a_member_fails_the_group_closed_on_load_and_repinning_restores_it()
 }
 
 #[test]
-fn a_pin_for_another_key_fails_every_certificate() {
+fn a_pin_for_another_key_makes_that_users_devices_stale_not_the_group_unusable() {
     let mut f = Fixture::new(JoinPolicy::Invite);
-    let gid = group_id(&f.group).unwrap();
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
     let impostor = Account::new();
+    f.a1.send(&mut f.server, &g, "from alice before");
     f.b1.store.put(&format!("peer:{}", f.alice.id), serde_json::json!({ "aik": impostor.pin() })).unwrap();
     f.b1.restart();
-    let err = f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").unwrap_err();
-    assert!(err.message.contains("not signed by the pinned account key"), "{err}");
+    // Bob keeps writing; Alice's two devices are shown as devices of an identity she left.
+    f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").unwrap();
+    let stale: Vec<_> = f.b1.members(&g).into_iter().filter(|m| m.stale).map(|m| m.user_id).collect();
+    assert_eq!(stale, vec![f.alice.id.clone(), f.alice.id.clone()]);
+    // What they say no longer counts (the first log entry is Alice's message), and they cannot commit.
+    let err = f.b1.groups.process(&mut f.b1.store, &gid, &f.server.log[&g][1]).unwrap_err();
+    assert_eq!(err.code(), Some("stale"), "{err}");
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    let err = f.b1.groups.process(&mut f.b1.store, &gid, &out.commit).unwrap_err();
+    assert_eq!((err.code(), err.class.as_deref()), (Some("poison"), Some("signed-content")), "{err}");
+    assert!(err.message.contains("outdated") || err.message.contains("left"), "{err}");
 }
 
 #[test]
@@ -525,6 +536,13 @@ fn a_pin_that_changes_after_verification_fails_the_next_gated_call() {
     ] {
         match &row { Some(value) => f.b1.store.put(&key, value.clone()).unwrap(), None => f.b1.store.delete(&key).unwrap() }
         // No restart: the cached verification must not survive the pin change.
+        if name == "changed" {
+            // A different key is not an unknown one: Carol's device is now stale, and the group goes on.
+            assert!(f.b1.groups.members(&mut f.b1.store, &gid).unwrap().iter().any(|m| m.user_id == f.carol.id && m.stale));
+            f.b1.store.put(&key, serde_json::json!({ "aik": f.carol.pin() })).unwrap();
+            assert!(f.b1.groups.members(&mut f.b1.store, &gid).unwrap().iter().all(|m| !m.stale));
+            continue;
+        }
         assert!(f.b1.groups.encrypt(&mut f.b1.store, &gid, "x").is_err(), "{name}");
         assert!(f.b1.groups.members(&mut f.b1.store, &gid).is_err(), "{name}");
         assert!(f.b1.groups.process(&mut f.b1.store, &gid, &f.server.log[&g][0]).is_err(), "{name}");
@@ -538,8 +556,10 @@ fn a_pin_that_changes_after_verification_fails_the_next_gated_call() {
     let pin = format!("mlsdsx:pin:{}", f.carol.id);
     f.server.store.delete(&pin).unwrap();
     assert!(f.server.submit(&g, &msg).unwrap_err().message.contains("no pinned account key"));
+    // A registry key that differs is a user who moved on, not an unknown one: their devices go stale and the group carries on.
     f.server.store.put(&pin, serde_json::json!({ "aik": Account::new().pin() })).unwrap();
-    assert!(f.server.submit(&g, &msg).is_err());
+    assert!(f.server.submit(&g, &msg).is_ok());
+    assert!(f.server.ds.members(&mut f.server.store, &group_id(&g).unwrap()).unwrap().members.iter().any(|m| m.user_id == f.carol.id && m.stale));
     f.server.store.put(&pin, serde_json::json!({ "aik": f.carol.pin() })).unwrap();
     assert!(f.server.submit(&g, &msg).is_ok());
 
@@ -768,18 +788,18 @@ fn a_resolution_is_signed_with_a_leaf_key_every_member_can_check_and_only_admins
     // An admin device signs; every other member's device verifies it against its own tree, learning who signed.
     let signature = sign(&mut f.a2, "rollback", 7, &digest, &author).unwrap();
     for verifier in [&mut f.b1, &mut f.b2, &mut f.c1, &mut f.a1] {
-        let who = verifier.groups.verify_resolution(&mut verifier.store, &gid, "rollback", 7, &digest, &author, &f.a2.device, &signature).unwrap();
+        let who = verifier.groups.verify_resolution(&mut verifier.store, &gid, "rollback", 7, &digest, &author, &f.a2.device, &f.alice.id, &signature).unwrap();
         assert_eq!((who.user_id.as_str(), who.device_id.as_str()), (f.alice.id.as_str(), f.a2.device.as_str()));
     }
     // An empty author (a rollback that removes nobody) and a dismissal sign too.
     let keep = sign(&mut f.a1, "rollback", 7, &digest, "").unwrap();
-    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "rollback", 7, &digest, "", &f.a1.device, &keep).is_ok());
+    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "rollback", 7, &digest, "", &f.a1.device, &f.alice.id, &keep).is_ok());
     let dismiss = sign(&mut f.a1, "dismiss", 7, &digest, "").unwrap();
-    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "dismiss", 7, &digest, "", &f.a1.device, &dismiss).is_ok());
+    assert!(f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "dismiss", 7, &digest, "", &f.a1.device, &f.alice.id, &dismiss).is_ok());
 
     // Every signed part matters: a different action, seq, digest, author, signer or signature is `auth`.
-    let verify = |dev: &mut Dev, action: &str, seq: u64, digest: &str, author: &str, by: &str, sig: &str| dev.groups.verify_resolution(&mut dev.store, &gid, action, seq, digest, author, by, sig);
-    let (a2, a1) = (f.a2.device.clone(), f.a1.device.clone());
+    let (a2, a1, alice, bob) = (f.a2.device.clone(), f.a1.device.clone(), f.alice.id.clone(), f.bob.id.clone());
+    let verify = |dev: &mut Dev, action: &str, seq: u64, digest: &str, author: &str, by: &str, sig: &str| dev.groups.verify_resolution(&mut dev.store, &gid, action, seq, digest, author, by, if by == a1 || by == a2 { &alice } else { &bob }, sig);
     for (name, result) in [
         ("action", verify(&mut f.c1, "dismiss", 7, &digest, &author, &a2, &signature)),
         ("seq", verify(&mut f.c1, "rollback", 8, &digest, &author, &a2, &signature)),
@@ -816,4 +836,86 @@ fn a_resolution_is_signed_with_a_leaf_key_every_member_can_check_and_only_admins
     assert!(sign(&mut f.b2, "rollback", 7, &digest, &author).is_err());
     // The commands spell it the same way.
     let _ = &mut f.server;
+}
+
+#[test]
+fn a_device_id_names_one_leaf_of_a_group() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let digest = "ab".repeat(32);
+
+    // The signer of a resolution is named by user and device: a device id under another user is not that leaf.
+    let signature = f.a2.groups.sign_resolution(&mut f.a2.store, &gid, "rollback", 3, &digest, "").unwrap();
+    let who = f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "rollback", 3, &digest, "", &f.a2.device, &f.alice.id, &signature).unwrap();
+    assert_eq!(who.device_id, f.a2.device);
+    let err = f.c1.groups.verify_resolution(&mut f.c1.store, &gid, "rollback", 3, &digest, "", &f.a2.device, &f.bob.id, &signature).unwrap_err();
+    assert!(err.message.contains("not in this group"), "{err}");
+
+    // Carol certifies a leaf with Alice's laptop's device id under her own account key. Adding it is refused by the
+    // adding device, by the DS and by members.
+    let (laptop, carol_id) = (f.a1.device.clone(), f.carol.id.clone());
+    let carol_aik = f.carol.aik.clone();
+    let clash = f.c1.groups.scratch(&mut f.c1.store, |p, _, _| {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        signer.store(p.storage()).unwrap();
+        let key = key32(&b64(signer.public())).unwrap();
+        let cert = DeviceCert::issue(&carol_aik, &carol_id, &laptop, "web", &key, 0).unwrap();
+        let credential = CredentialWithKey { credential: BasicCredential::new(cert.encode()).into(), signature_key: signer.public().into() };
+        let bundle = KeyPackage::builder().leaf_node_capabilities(capabilities()).build(CS, p, &signer, credential).unwrap();
+        tls(&MlsMessageOut::from(bundle.key_package().clone()))
+    });
+    let err = f.a1.groups.commit(&mut f.a1.store, &gid, &[clash.clone()], &[], None, false).unwrap_err();
+    assert!(err.message.contains("already taken"), "{err}");
+    let evil = f.a1.groups.commit_unchecked(&mut f.a1.store, &gid, &[clash], &[], None, false).unwrap();
+    expect_rejected(&mut f, &evil.commit, "already taken");
+    f.a1.groups.clear_own(&mut f.a1.store, &gid).unwrap();
+
+    // The same through an external join by Carol with that device id.
+    let (info, tree) = (f.a1.view(&g).group_info, f.server.tree(&g));
+    let (info_bytes, tree_bytes) = (base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &info).unwrap(), base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &tree).unwrap());
+    let (laptop, carol_id, carol_aik) = (f.a1.device.clone(), f.carol.id.clone(), f.carol.aik.clone());
+    let joined = f.c1.groups.scratch(&mut f.c1.store, |p, _, _| {
+        let signer = SignatureKeyPair::new(SignatureScheme::ED25519).unwrap();
+        signer.store(p.storage()).unwrap();
+        let key = key32(&b64(signer.public())).unwrap();
+        let cert = DeviceCert::issue(&carol_aik, &carol_id, &laptop, "web", &key, 0).unwrap();
+        let credential = CredentialWithKey { credential: BasicCredential::new(cert.encode()).into(), signature_key: signer.public().into() };
+        let MlsMessageBodyIn::GroupInfo(info) = MlsMessageIn::tls_deserialize_exact(info_bytes.as_slice()).unwrap().extract() else { panic!("not a GroupInfo") };
+        let tree = RatchetTreeIn::tls_deserialize_exact(tree_bytes.as_slice()).unwrap();
+        let (_g, bundle) = MlsGroup::external_commit_builder().with_ratchet_tree(tree).with_config(crate::mls::engine::join_config())
+            .build_group(p, info, credential).unwrap()
+            .leaf_node_parameters(LeafNodeParameters::builder().with_capabilities(capabilities()).build())
+            .load_psks(p.storage()).unwrap().build(p.rand(), p.crypto(), &signer, |_| true).unwrap().finalize(p).unwrap();
+        tls(bundle.commit())
+    });
+    let err = f.server.submit(&g, &joined).unwrap_err();
+    assert!(err.message.contains("already taken"), "{err}");
+    // A real resync keeps working: the same user's same device replaces its own leaf.
+    f.b2.groups.forget_group(&mut f.b2.store, &gid).unwrap();
+    let info = f.a1.view(&g).group_info;
+    f.b2.join_external(&mut f.server, &g, &info).unwrap();
+    assert_eq!(f.a1.members(&g).len(), 5);
+}
+
+#[test]
+fn a_missing_pin_is_blamed_on_the_author_only_for_a_leaf_the_commit_introduces() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    // The commit adds a device of a user nobody pinned: the author put that leaf in, so the author is blamed.
+    let mallory = Account::new();
+    let mut m1 = Dev::new(&mallory, "web", &[&mallory]);
+    let kp = m1.kp(1);
+    let out = f.a1.groups.commit_unchecked(&mut f.a1.store, &gid, &kp, &[], None, false).unwrap();
+    let check = f.c1.groups.commit_author(&mut f.c1.store, &gid, &out.commit).unwrap();
+    assert!(check.authenticated && check.signed_content_invalid, "{check:?}");
+    assert_eq!(check.author.as_ref().map(|a| a.device_id.as_str()), Some(f.a1.device.as_str()));
+    f.a1.groups.clear_own(&mut f.a1.store, &gid).unwrap();
+
+    // A leaf the group already held whose user this device has no pin for is this device's gap: the load gate fails
+    // closed with a typed `unpinned` error and nobody is blamed.
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    f.c1.store.delete(&format!("peer:{}", f.bob.id)).unwrap();
+    assert_eq!(f.c1.groups.commit_author(&mut f.c1.store, &gid, &out.commit).unwrap_err().code(), Some("unpinned"));
 }

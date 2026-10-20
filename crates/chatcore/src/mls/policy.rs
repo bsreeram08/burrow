@@ -10,11 +10,17 @@ use std::collections::{HashMap, HashSet};
 use openmls::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::cert::{canonical_id, verify_credential, DeviceCert, Directory};
+use super::cert::{canonical_id, UNPINNED, verify_credential, verify_standing, DeviceCert, Directory, Standing};
 use super::{limits, ROLES_EXT};
 use crate::error::{ChatError, Result};
 
 fn policy(message: impl Into<String>) -> ChatError { ChatError::coded("invalid", &message.into()) }
+
+/// A leaf a commit introduces or changes: if its user is unpinned here the author is still to blame (they put it in),
+/// so the error is a plain `invalid`. Only a leaf the group already held may be `unpinned` (this device's gap).
+fn blame_author(result: Result<DeviceCert>) -> Result<DeviceCert> {
+    result.map_err(|error| if error.code.as_deref() == Some(UNPINNED) { ChatError::coded("invalid", &error.message) } else { error })
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -106,20 +112,37 @@ pub fn validate_context(extensions: &Extensions<GroupContext>) -> Result<Roles> 
     Roles::decode(raw)
 }
 
+/// Where a group may hold stale leaves (certificates of an identity the user left, see [`Standing`]).
+#[derive(Clone, Copy, Debug)]
+pub enum Stale<'a> {
+    /// Never: a group someone else built and invites us to (Welcome) must be entirely current, or a forged leaf could
+    /// pass for a member.
+    Reject,
+    /// Only this user's own: a device of ours joining externally after we changed identity.
+    Own(&'a str),
+    /// A group we are already in, or the DS's copy: identities change over a group's life.
+    Any,
+}
+
 /// Whole-group check wherever a device or the DS adopts a group it did not build: Welcome, external join,
 /// load after restart, DS bootstrap/restore. Every member must carry a valid certificate; size is bounded;
 /// a DM may only hold devices of its two users.
-pub fn validate_group_state(extensions: &Extensions<GroupContext>, members: impl Iterator<Item = Member>, directory: &mut dyn Directory) -> Result<(Roles, Vec<(LeafNodeIndex, DeviceCert)>)> {
+pub fn validate_group_state(extensions: &Extensions<GroupContext>, members: impl Iterator<Item = Member>, directory: &mut dyn Directory, stale: Stale) -> Result<(Roles, Vec<(LeafNodeIndex, DeviceCert)>)> {
     let roles = validate_context(extensions)?;
     let mut certs = Vec::new();
     for member in members {
-        let cert = verify_credential(directory, &member.credential, &member.signature_key)?;
+        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key, matches!(stale, Stale::Any))?;
+        let allowed = match (standing, stale) { (Standing::Current | Standing::Previous, _) | (_, Stale::Any) => true, (_, Stale::Own(user)) => cert.user_id == user, (_, Stale::Reject) => false };
+        if !allowed { return Err(policy("device certificate: not signed by the pinned account key")); }
         if let Some(users) = &roles.dm {
             if !users.contains(&cert.user_id) { return Err(policy("a DM holds a device of a third user")); }
         }
         certs.push((member.index, cert));
         if certs.len() > limits::MAX_LEAVES { return Err(policy("group exceeds the leaf limit")); }
     }
+    // A device id names one leaf: clients find leaves by it (removal, resolutions), so two must never share one.
+    let mut seen = HashSet::new();
+    if !certs.iter().all(|(_, cert)| seen.insert(cert.device_id.as_str())) { return Err(policy("two devices in this group share a device id")); }
     Ok((roles, certs))
 }
 
@@ -141,16 +164,34 @@ pub fn validate_staged(
     // in this very commit never authorizes the other proposals bundled with it.
     let roles = validate_context(extensions)?;
     let mut tree: HashMap<LeafNodeIndex, DeviceCert> = HashMap::new();
+    let mut members_by_leaf: HashMap<LeafNodeIndex, Member> = HashMap::new();
+    let mut stale_leaves: HashSet<LeafNodeIndex> = HashSet::new();
+    let mut previous_leaves: HashSet<LeafNodeIndex> = HashSet::new();
     for member in members {
-        tree.insert(member.index, verify_credential(directory, &member.credential, &member.signature_key)?);
+        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key, true)?;
+        if standing == Standing::Stale { stale_leaves.insert(member.index); }
+        if standing == Standing::Previous { previous_leaves.insert(member.index); }
+        tree.insert(member.index, cert);
+        members_by_leaf.insert(member.index, member);
     }
+    // A leaf that keeps its credential and signature key was checked above (a predecessor's certificate is honoured
+    // there); anything new must chain to the current key.
+    let renewed = |directory: &mut dyn Directory, leaf: &LeafNode, index: &LeafNodeIndex| -> Result<DeviceCert> {
+        match members_by_leaf.get(index) {
+            Some(old) if old.credential == *leaf.credential() && old.signature_key == leaf.signature_key().as_slice() => Ok(tree[index].clone()),
+            _ => blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())),
+        }
+    };
     let users: HashSet<String> = tree.values().map(|c| c.user_id.clone()).collect();
 
     let (committer, external) = match sender {
-        Sender::Member(index) => (tree.get(index).cloned().ok_or_else(|| policy("committer is not in the tree"))?, false),
+        Sender::Member(index) => {
+            if stale_leaves.contains(index) { return Err(policy("a device of an identity this user left cannot commit")); }
+            (tree.get(index).cloned().ok_or_else(|| policy("committer is not in the tree"))?, false)
+        }
         Sender::NewMemberCommit => {
             let leaf = staged.update_path_leaf_node().ok_or_else(|| policy("external commit without a path"))?;
-            (verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?, true)
+            (blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice()))?, true)
         }
         _ => return Err(policy("commits are only accepted from members or external joiners")),
     };
@@ -165,14 +206,18 @@ pub fn validate_staged(
     }
 
     // The committer's new leaf (UpdatePath) must stay the same user and device.
-    if let Some(leaf) = staged.update_path_leaf_node() {
-        let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+    if let (Some(leaf), Sender::Member(index)) = (staged.update_path_leaf_node(), sender) {
+        let cert = renewed(directory, leaf, index)?;
         if cert.user_id != committer.user_id || cert.device_id != committer.device_id {
             return Err(policy("an update path may not change the leaf's user or device"));
         }
     }
 
     let (mut count, mut adds, mut removes) = (0usize, 0usize, 0usize);
+    let mut removed_leaves: HashSet<LeafNodeIndex> = HashSet::new();
+    // Leaves this commit introduces (Adds, an external joiner): their device ids must be new to the group.
+    let mut introduced: Vec<DeviceCert> = Vec::new();
+    if external { introduced.push(committer.clone()); }
     for queued in staged.queued_proposals() {
         count += 1;
         if count > limits::MAX_PROPOSALS { return Err(policy("too many proposals in one commit")); }
@@ -184,7 +229,8 @@ pub fn validate_staged(
             Proposal::Add(add) => {
                 adds += 1;
                 let leaf = add.key_package().leaf_node();
-                let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+                let cert = blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice()))?;
+                introduced.push(cert.clone());
                 match roles.kind {
                     Kind::Dm => {
                         if !roles.dm.as_ref().is_some_and(|u| u.contains(&cert.user_id)) { return Err(policy("nobody else can be added to a DM")); }
@@ -198,6 +244,7 @@ pub fn validate_staged(
             }
             Proposal::Remove(remove) => {
                 removes += 1;
+                removed_leaves.insert(remove.removed());
                 let target = tree.get(&remove.removed()).ok_or_else(|| policy("remove of an empty leaf"))?;
                 if target.user_id != committer.user_id && (roles.kind == Kind::Dm || !admin) {
                     return Err(policy("only admins remove other users"));
@@ -207,7 +254,7 @@ pub fn validate_staged(
                 let Sender::Member(index) = queued.sender() else { return Err(policy("update from a non-member")) };
                 let old = tree.get(index).ok_or_else(|| policy("update for an empty leaf"))?;
                 let leaf = update.leaf_node();
-                let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+                let cert = renewed(directory, leaf, index)?;
                 if cert.user_id != old.user_id || cert.device_id != old.device_id { return Err(policy("an update may not change the leaf's user or device")); }
             }
             Proposal::GroupContextExtensions(change) => {
@@ -219,6 +266,11 @@ pub fn validate_staged(
             other => return Err(policy(format!("{:?} proposals are not accepted", other.proposal_type()))),
         }
     }
+    let mut taken: HashSet<&str> = tree.iter().filter(|(leaf, _)| !removed_leaves.contains(leaf)).map(|(_, cert)| cert.device_id.as_str()).collect();
+    if !introduced.iter().all(|cert| taken.insert(cert.device_id.as_str())) { return Err(policy("a device id in this group is already taken")); }
+    // Welcomes must be entirely current (see Stale::Reject): whoever adds people first removes the devices of identities their users left.
+    if adds > 0 && stale_leaves.iter().any(|leaf| !removed_leaves.contains(leaf)) { return Err(policy("remove devices of an identity their user left before adding people")); }
+    if adds > 0 && previous_leaves.iter().any(|leaf| !removed_leaves.contains(leaf)) { return Err(policy("devices on a previous account key must recertify or go before adding people")); }
     let after = tree.len() + adds + usize::from(external);
     if after.saturating_sub(removes) > limits::MAX_LEAVES { return Err(policy("the group would exceed the leaf limit")); }
     Ok(())

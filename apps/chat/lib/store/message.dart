@@ -279,10 +279,10 @@ ChatMessage validate(ChatMessage message) {
 }
 
 /// m4-groups §10: incoming group rows always name their sender, outgoing ones never; names only on incoming;
-/// mentions and read-by only in groups, read-by only on our own messages; system rows only in groups.
+/// mentions and read-by only in groups, read-by only on our own messages. System rows: group lines, and a 1:1 chat's move to MLS (m5 §8).
 bool _groupFieldsOk(ChatMessage m) {
   final group = m.inGroup, incoming = m.direction == Direction.incoming;
-  if (m.system) return group && m.sender == null && m.senderName == null && m.mentions.isEmpty && m.readBy.isEmpty && m.attachment == null;
+  if (m.system) return m.sender == null && m.senderName == null && m.mentions.isEmpty && m.readBy.isEmpty && m.attachment == null;
   if (!group) return m.sender == null && m.senderName == null && m.mentions.isEmpty && m.readBy.isEmpty;
   return incoming == (m.sender != null) &&
       (m.sender == null || userIdPattern.hasMatch(m.sender!)) &&

@@ -33,6 +33,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity dco_decode_box_autoadd_identity(dynamic raw);
 
   @protected
+  MlsPendingCommit dco_decode_box_autoadd_mls_pending_commit(dynamic raw);
+
+  @protected
+  MlsRoles dco_decode_box_autoadd_mls_roles(dynamic raw);
+
+  @protected
   Safety dco_decode_box_autoadd_safety(dynamic raw);
 
   @protected
@@ -45,7 +51,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Decrypted dco_decode_decrypted(dynamic raw);
 
   @protected
+  int dco_decode_i_32(dynamic raw);
+
+  @protected
   Identity dco_decode_identity(dynamic raw);
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw);
+
+  @protected
+  List<MlsMember> dco_decode_list_mls_member(dynamic raw);
+
+  @protected
+  List<MlsRemoval> dco_decode_list_mls_removal(dynamic raw);
 
   @protected
   List<int> dco_decode_list_prim_u_8_loose(dynamic raw);
@@ -54,10 +72,46 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List dco_decode_list_prim_u_8_strict(dynamic raw);
 
   @protected
+  MlsDeviceCert dco_decode_mls_device_cert(dynamic raw);
+
+  @protected
+  MlsGroupView dco_decode_mls_group_view(dynamic raw);
+
+  @protected
+  MlsJoinPolicy dco_decode_mls_join_policy(dynamic raw);
+
+  @protected
+  MlsKind dco_decode_mls_kind(dynamic raw);
+
+  @protected
+  MlsMember dco_decode_mls_member(dynamic raw);
+
+  @protected
+  MlsOutgoing dco_decode_mls_outgoing(dynamic raw);
+
+  @protected
+  MlsPendingCommit dco_decode_mls_pending_commit(dynamic raw);
+
+  @protected
+  MlsProcessed dco_decode_mls_processed(dynamic raw);
+
+  @protected
+  MlsRemoval dco_decode_mls_removal(dynamic raw);
+
+  @protected
+  MlsRoles dco_decode_mls_roles(dynamic raw);
+
+  @protected
   String? dco_decode_opt_String(dynamic raw);
 
   @protected
   Identity? dco_decode_opt_box_autoadd_identity(dynamic raw);
+
+  @protected
+  MlsPendingCommit? dco_decode_opt_box_autoadd_mls_pending_commit(dynamic raw);
+
+  @protected
+  MlsRoles? dco_decode_opt_box_autoadd_mls_roles(dynamic raw);
 
   @protected
   Safety? dco_decode_opt_box_autoadd_safety(dynamic raw);
@@ -66,10 +120,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   SessionInfo? dco_decode_opt_box_autoadd_session_info(dynamic raw);
 
   @protected
+  List<String>? dco_decode_opt_list_String(dynamic raw);
+
+  @protected
   Safety dco_decode_safety(dynamic raw);
 
   @protected
   SessionInfo dco_decode_session_info(dynamic raw);
+
+  @protected
+  int dco_decode_u_32(dynamic raw);
 
   @protected
   BigInt dco_decode_u_64(dynamic raw);
@@ -90,6 +150,14 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer);
 
   @protected
+  MlsPendingCommit sse_decode_box_autoadd_mls_pending_commit(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MlsRoles sse_decode_box_autoadd_mls_roles(SseDeserializer deserializer);
+
+  @protected
   Safety sse_decode_box_autoadd_safety(SseDeserializer deserializer);
 
   @protected
@@ -102,7 +170,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Decrypted sse_decode_decrypted(SseDeserializer deserializer);
 
   @protected
+  int sse_decode_i_32(SseDeserializer deserializer);
+
+  @protected
   Identity sse_decode_identity(SseDeserializer deserializer);
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer);
+
+  @protected
+  List<MlsMember> sse_decode_list_mls_member(SseDeserializer deserializer);
+
+  @protected
+  List<MlsRemoval> sse_decode_list_mls_removal(SseDeserializer deserializer);
 
   @protected
   List<int> sse_decode_list_prim_u_8_loose(SseDeserializer deserializer);
@@ -111,10 +191,48 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Uint8List sse_decode_list_prim_u_8_strict(SseDeserializer deserializer);
 
   @protected
+  MlsDeviceCert sse_decode_mls_device_cert(SseDeserializer deserializer);
+
+  @protected
+  MlsGroupView sse_decode_mls_group_view(SseDeserializer deserializer);
+
+  @protected
+  MlsJoinPolicy sse_decode_mls_join_policy(SseDeserializer deserializer);
+
+  @protected
+  MlsKind sse_decode_mls_kind(SseDeserializer deserializer);
+
+  @protected
+  MlsMember sse_decode_mls_member(SseDeserializer deserializer);
+
+  @protected
+  MlsOutgoing sse_decode_mls_outgoing(SseDeserializer deserializer);
+
+  @protected
+  MlsPendingCommit sse_decode_mls_pending_commit(SseDeserializer deserializer);
+
+  @protected
+  MlsProcessed sse_decode_mls_processed(SseDeserializer deserializer);
+
+  @protected
+  MlsRemoval sse_decode_mls_removal(SseDeserializer deserializer);
+
+  @protected
+  MlsRoles sse_decode_mls_roles(SseDeserializer deserializer);
+
+  @protected
   String? sse_decode_opt_String(SseDeserializer deserializer);
 
   @protected
   Identity? sse_decode_opt_box_autoadd_identity(SseDeserializer deserializer);
+
+  @protected
+  MlsPendingCommit? sse_decode_opt_box_autoadd_mls_pending_commit(
+    SseDeserializer deserializer,
+  );
+
+  @protected
+  MlsRoles? sse_decode_opt_box_autoadd_mls_roles(SseDeserializer deserializer);
 
   @protected
   Safety? sse_decode_opt_box_autoadd_safety(SseDeserializer deserializer);
@@ -125,10 +243,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  List<String>? sse_decode_opt_list_String(SseDeserializer deserializer);
+
+  @protected
   Safety sse_decode_safety(SseDeserializer deserializer);
 
   @protected
   SessionInfo sse_decode_session_info(SseDeserializer deserializer);
+
+  @protected
+  int sse_decode_u_32(SseDeserializer deserializer);
 
   @protected
   BigInt sse_decode_u_64(SseDeserializer deserializer);
@@ -140,9 +264,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_decode_unit(SseDeserializer deserializer);
 
   @protected
-  int sse_decode_i_32(SseDeserializer deserializer);
-
-  @protected
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
@@ -150,6 +271,18 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_identity(Identity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_mls_pending_commit(
+    MlsPendingCommit self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_box_autoadd_mls_roles(
+    MlsRoles self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_safety(Safety self, SseSerializer serializer);
@@ -167,7 +300,25 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_decrypted(Decrypted self, SseSerializer serializer);
 
   @protected
+  void sse_encode_i_32(int self, SseSerializer serializer);
+
+  @protected
   void sse_encode_identity(Identity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_list_mls_member(
+    List<MlsMember> self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_list_mls_removal(
+    List<MlsRemoval> self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_list_prim_u_8_loose(List<int> self, SseSerializer serializer);
@@ -179,11 +330,56 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_mls_device_cert(MlsDeviceCert self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_group_view(MlsGroupView self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_join_policy(MlsJoinPolicy self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_kind(MlsKind self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_member(MlsMember self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_outgoing(MlsOutgoing self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_pending_commit(
+    MlsPendingCommit self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_mls_processed(MlsProcessed self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_removal(MlsRemoval self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_mls_roles(MlsRoles self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer);
 
   @protected
   void sse_encode_opt_box_autoadd_identity(
     Identity? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_pending_commit(
+    MlsPendingCommit? self,
+    SseSerializer serializer,
+  );
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_roles(
+    MlsRoles? self,
     SseSerializer serializer,
   );
 
@@ -200,10 +396,16 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_list_String(List<String>? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_safety(Safety self, SseSerializer serializer);
 
   @protected
   void sse_encode_session_info(SessionInfo self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer);
 
   @protected
   void sse_encode_u_64(BigInt self, SseSerializer serializer);
@@ -213,9 +415,6 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_unit(void self, SseSerializer serializer);
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer);
 }
 
 // Section: wire_class

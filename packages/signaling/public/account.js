@@ -184,6 +184,23 @@
     return { list, signature: await signWithIdentity(Devices.listBytes(list)), certs };
   }
   /** After publishing: advance our own pin (version, hash and tombstones for dropped devices) through the same checks contacts run. */
+  /**
+   * This account's devices as a verified signed list proves them (m5 §3, §4): the list must verify under our own
+   * account key (held here, or pinned at link time on a linked device) and move forward from our pin. `dropped`:
+   * devices an earlier pinned list named and a later verified one dropped (the only absence that is proven).
+   * null when nothing can be verified: then nothing is removed or joined on the server's word.
+   */
+  async function verifiedOwnDevices() {
+    const aikSign = linked ? linked.identity?.sign : box ? (await box.prekeys()).identity.sign : null;
+    if (!me || !aikSign) return null;
+    const view = await api(`/api/devices/${me.username}`).catch(() => null);
+    const pins = readPins(), pin = pins[me.id];
+    if (!view?.list) return null;
+    const check = await Devices.verifyView({ userId: me.id, aikSign, list: view.list, signature: view.signature, certs: view.certs, pin });
+    if (!check.ok) return null;
+    pins[me.id] = check.pin; writePins(pins);
+    return { listed: new Set(check.pin.devices), dropped: new Set(check.pin.revoked) };
+  }
   async function pinOwn(signed) {
     const pins = readPins(), own = (await box.prekeys()).identity;
     const after = await Devices.verifyView({ userId: me.id, aikSign: own.sign, ...signed, pin: pins[me.id] });
@@ -976,7 +993,7 @@
       me, backend: backendName, box, signWithIdentity, contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
       viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
       looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
-      socket: () => events, openGroup,
+      socket: () => events, openGroup, verifiedOwnDevices,
     };
   }
   $('channels-new').onclick = () => window.Groups?.openNew('channel');

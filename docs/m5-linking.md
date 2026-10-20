@@ -112,10 +112,11 @@ The account identity N pins comes from the QR-authenticated primary, not from th
 
 For every channel in the bundle (and `GET /api/channels` as the source of truth; a channel the bundle lists but the server does not is dropped):
 
-1. Pin every member's identity (m4 §3), then `GET /api/channels/:id/join-info` and **external join** (the own-device rule: a user already in the channel may join a device by external commit): `mlsJoinExternal`, `POST .../join`, `mlsMergeOwn`, `PUT .../group-info`, cursor. N keeps no history from before its join point (server `joined_seq` rule).
-2. Names/topics from the bundle's `channels` apply immediately; later `meta` payloads override them.
-3. N uploads KeyPackages (100 one-time + 1 last-resort) so others can add it to new groups.
-4. DMs: N is a leaf of every migrated DM group via the same rule (§8); unmigrated 1:1 chats stay on the primary until migration.
+1. **Only a group the account is really in.** Before joining, check the served GroupInfo and tree read-only (`mlsInspectGroup { groupInfo, tree }`: the whole-group validation of a join, under today's pins, changing nothing). It must hold a non-stale leaf of this account for a device in our **verified** signed list (the list must verify under our own account key and move forward from our pin, as [devices.md](devices.md) "Pinning"). Otherwise don't join: the server could otherwise pull this device into any channel by listing it. Never rejoin a channel this device left.
+2. Pin every member's identity (m4 §3), then `GET /api/channels/:id/join-info` and **external join** (the own-device rule: a user already in the channel may join a device by external commit): `mlsJoinExternal`, `POST .../join`, `mlsMergeOwn`, `PUT .../group-info`, cursor. N keeps no history from before its join point (server `joined_seq` rule).
+3. Names/topics from the bundle's `channels` apply immediately; later `meta` payloads override them.
+4. N uploads KeyPackages (100 one-time + 1 last-resort) so others can add it to new groups.
+5. DMs: N is a leaf of every migrated DM group via the same rule (§8); unmigrated 1:1 chats stay on the primary until migration.
 
 Joins are retried with backoff; at most 3 per second (server limit). A failed join leaves the channel marked "Join pending" and retries on the next start.
 
@@ -126,7 +127,7 @@ Joins are retried with backoff; at most 3 per second (server limit). A failed jo
 - Server: the device becomes `revoked`; its sessions end (streams close 4401), push tokens, KeyPackages, Welcomes and 1:1 inbox rows go; it leaves every channel mirror. The primary cannot be revoked this way (transfer, §5). Answer `{ revoked: [deviceId] }`.
 - Frames: the account's streams get `devices` and, for each channel the device was in, `channel { id, change: 'remove-device', deviceId }`; the primary also gets `devices { id, needsList: true }`.
 - **List.** The primary publishes version + 1 without the device (its client does this when it sees `needsList` or finds a listed device the server calls revoked in `GET /api/devices/<me>`). Until it does, other accounts still see the device in the signed list but not in any group fan-out.
-- **Leaves.** Removal needs an MLS commit by a member: when a device of the same account sees `remove-device` (or on start finds a leaf of `me` whose deviceId is not `listed`), exactly one device acts: the primary if online, else the listed device with the smallest `deviceId` among those with an open stream (a client cannot know; it just tries after a random 0-3 s delay and treats "no such member" / 409 as done). It commits `mlsCommit { removes: [{ userId: me, deviceId }] }` in each such channel (own devices may always be removed, m4 §4), then PUTs the GroupInfo. Retry until the leaf is gone; show "Removed <label> from N groups".
+- **Leaves.** Removal needs an MLS commit by a member. A device of the same account removes an own leaf only when its absence is **proven**: a verified signed list (under our own account key, moving forward from our pin) dropped that device, i.e. it is in the pin's tombstones (devices an earlier pinned list named and a later one dropped). A device merely missing from an unverifiable or unpinned list proves nothing, and the `remove-device` frame is only a hint to re-fetch and verify. Leaves the core reports `stale` (§7) may also go. Leaves are always matched on `(userId, deviceId)`, never on the device id alone. Exactly one device acts: the primary if online, else the listed device with the smallest `deviceId` among those with an open stream (a client cannot know; it just tries after a random 0-3 s delay and treats "no such member" / 409 as done). It commits `mlsCommit { removes: [{ userId: me, deviceId }] }` in each such channel (own devices may always be removed, m4 §4), then PUTs the GroupInfo. Retry until the leaf is gone; show "Removed <label> from N groups".
 - A revoked device that still holds its keys can no longer reach the server (no session), and members drop its messages once it is removed. Messages it sent before are not retracted.
 
 ## 5. Primary transfer (succession)
@@ -238,6 +239,7 @@ Duplicate pointers (both sides migrating at once) are ignored once `migrated`. S
 | `acceptSuccession { contact, records }` | §5.3: verifies the chain from the pin, moves the pin, keeps `verified`. |
 | `mlsMembers` | now includes `stale`. |
 | `mlsCheckDm { group, peer }` | §8.3 step 3. |
+| `mlsInspectGroup { groupInfo, tree }` | §3 step 1: the members `{ userId, deviceId, stale }` of a served GroupInfo/tree after the whole-group validation of a join; changes nothing. |
 | `dsRepin { userId, aik }` / `dsSucceed { userId, record, signature }` | §7, DS side. |
 
 ### 10.2 Server

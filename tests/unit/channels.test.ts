@@ -1007,7 +1007,7 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         do { change = await watch.next('channel'); seen.push(change.change); if (change.change === 'rolled-back') rolled = change; } while (change.change !== 'thawed');
         expect(seen).toContain('rolled-back');
         expect(seen).not.toContain('remove-needed');
-        expect(rolled).toMatchObject({ action: 'rollback', seq, digest, author: '', by: w.a2.deviceId, signature: 'L'.repeat(86) });
+        expect(rolled).toMatchObject({ action: 'rollback', seq, digest, author: '', by: w.a2.deviceId, byUser: w.alice.id, signature: 'L'.repeat(86) });
 
         // The resolving admin publishes the restored epoch's GroupInfo; the author's device is still a member and
         // rejoins with it (its own copy had merged the rolled-back commit), then goes on.

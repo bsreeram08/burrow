@@ -350,7 +350,7 @@ class AppController extends Notifier<AppState> {
         if (contact != null && id != state.user?.id) unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
-      case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow():
+      case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow() || GroupEphemeral():
         break;
       case Incoming():
         _incoming(event);

@@ -12,12 +12,19 @@ import '../crypto/group_crypto.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
 
-/// KeyPackages: keep 100 one-time ones on the server, top up below 20 (architecture §2).
+/// KeyPackages: keep 100 one-time ones on the server, top up below 20 (docs/m4-groups.md §2).
 const keyPackageTarget = 100;
 const keyPackageLow = 20;
 
-/// Conflicts (409) rebuild and retry at most this many times, with backoff.
+/// Conflicts (409) rebuild and retry: at most 5 tries, backing off 0.5, 1, 2, 4 s (§4).
 const commitAttempts = 5;
+Duration commitBackoff(int attempt) => Duration(milliseconds: 500 * (1 << attempt));
+
+/// At most this many users per KeyPackage claim (§4).
+const claimBatch = 16;
+
+/// A transient failure stops a channel's queue; it is retried on the next frame or after this.
+const retryAfter = Duration(seconds: 15);
 
 /// What an admin device signs to resolve a frozen channel (channels.ts `resolveBytes`).
 Uint8List resolveBytes(String channelId, String action, int seq, String digest) =>
@@ -25,6 +32,8 @@ Uint8List resolveBytes(String channelId, String action, int seq, String digest) 
 
 /// SHA-256 (hex) of a base64url MLS message: the delivery service's and the engine's commit digest.
 String messageDigest(String message) => sha256.convert(base64Url.decode(base64Url.normalize(message))).toString();
+
+final _unpinned = RegExp(r'no pinned account key for user ([A-Za-z0-9_-]+)');
 
 /// One log entry as the server sends it (a `group` frame or a `/log` page entry).
 class LogEntry {
@@ -52,11 +61,26 @@ class LogEntry {
 
 /// A decrypted application message, handed to the payload layer to validate and store.
 class GroupDelivery {
-  const GroupDelivery({required this.group, required this.sender, required this.plaintext, required this.seq, required this.createdAt});
+  const GroupDelivery({required this.group, required this.sender, required this.plaintext, required this.seq, required this.createdAt, this.live = false});
   final GroupConversation group;
   final GroupMember sender;
   final String plaintext;
   final int seq;
+  final int createdAt;
+
+  /// An `ephemeral` frame (typing): never logged, nothing to store.
+  final bool live;
+}
+
+/// A commit that changed the group, as this device merged it.
+class MembershipChange {
+  const MembershipChange({required this.group, required this.sender, required this.added, required this.removed, required this.createdAt});
+  final GroupConversation group;
+  final GroupMember sender;
+
+  /// User ids that gained their first device in the group, and those that lost their last one.
+  final Set<String> added;
+  final Set<String> removed;
   final int createdAt;
 }
 
@@ -65,11 +89,11 @@ class GroupDelivery {
 /// is retried later and the cursor stays.
 typedef DeliveryHandler = Future<void> Function(GroupDelivery delivery);
 
-/// The MLS transport for groups and channels: this device's group identity and KeyPackages, creating
-/// groups, commits with the 409 rebuild-and-retry loop, Welcomes, processing each channel's log strictly
-/// in order with a persisted cursor, external joins (public channels, resync after a gap), and the
-/// poison-commit protocol (report, frozen state, admin rollback or dismiss). Payloads are not its
-/// business: application plaintext goes to [onDelivery].
+/// The MLS transport for groups and channels (docs/m4-groups.md §2–§8): this device's group identity and
+/// KeyPackages, creating groups, commits with the 409 rebuild-and-retry loop, Welcomes, each channel's log
+/// processed strictly in order with a persisted cursor, external joins (public channels, resync after a
+/// gap), leaving, live-only typing, pins (TOFU for non-contacts; a pin problem pauses, never poisons), and
+/// the poison-commit protocol. Payloads are not its business: plaintext goes to [onDelivery].
 class GroupSync {
   GroupSync({
     required this.api,
@@ -79,13 +103,16 @@ class GroupSync {
     required this.device,
     required this.platform,
     required this.ensurePinned,
+    Future<String?> Function(Iterable<String> userIds)? pinProblem,
     this.sendCursor,
     this.onDelivery,
+    this.onMembership,
     this.ackWelcome,
     int Function()? now,
     Duration Function(int attempt)? backoff,
-  }) : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
-       _backoff = backoff ?? ((attempt) => Duration(milliseconds: 200 * (1 << attempt) + math.Random().nextInt(200)));
+  }) : pinProblem = pinProblem ?? ((_) async => null),
+       _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
+       _backoff = backoff ?? commitBackoff;
 
   final Api api;
   final GroupCrypto crypto;
@@ -94,14 +121,18 @@ class GroupSync {
   final Future<LocalDevice> Function() device;
   final String platform;
 
-  /// Makes sure every listed user has a pinned account key in the core (mutual contacts: their published,
-  /// verified identity). The engine refuses certificates of unpinned users.
+  /// Pins every listed user that has no pin yet (contacts: their 1:1 identity; anyone else: trust on first
+  /// use from `GET /api/users/:id/identity`). The engine refuses certificates of unpinned users.
   final Future<void> Function(Iterable<String> userIds) ensurePinned;
+
+  /// The first of these users whose pin is missing, blocked or awaiting review, or null when all are current.
+  final Future<String?> Function(Iterable<String> userIds) pinProblem;
 
   /// The `cursor` frame on the events socket (falls back to `POST .../cursor`).
   final void Function(String channel, int seq)? sendCursor;
   final void Function(String welcomeId)? ackWelcome;
   DeliveryHandler? onDelivery;
+  Future<void> Function(MembershipChange change)? onMembership;
   final int Function() _now;
   final Duration Function(int attempt) _backoff;
 
@@ -112,35 +143,59 @@ class GroupSync {
   bool keysLocked = false;
   bool _disposed = false;
   final Map<String, Future<void>> _chains = {};
-  bool _ready = false;
+  final Map<String, int> _busy = {};
+  final Map<String, Timer> _retries = {};
+  Future<void>? _ready;
+
+  /// Channels paused because a member's security code needs review (group id → that user's id).
+  final Map<String, String> paused = {};
+  final _pausedChanges = StreamController<Map<String, String>>.broadcast();
+  Stream<Map<String, String>> get pausedChanges => _pausedChanges.stream;
+
+  final _membershipChanges = StreamController<String>.broadcast();
+
+  /// A group's members, roles or this device's membership changed.
+  Stream<String> get membershipChanges => _membershipChanges.stream;
 
   void _notice(String text) {
     if (!_notices.isClosed) _notices.add(text);
+  }
+
+  void _changed(String groupId) {
+    if (!_membershipChanges.isClosed) _membershipChanges.add(groupId);
   }
 
   /// Runs [work] after everything already queued for [groupId]: one channel's log, commits and sends
   /// never interleave.
   Future<T> _serial<T>(String groupId, Future<T> Function() work) {
     final previous = _chains[groupId] ?? Future.value();
+    _busy[groupId] = (_busy[groupId] ?? 0) + 1;
     final run = previous.then((_) => work());
-    _chains[groupId] = run.then((_) {}, onError: (_) {});
+    _chains[groupId] = run.then((_) {}, onError: (_) {}).whenComplete(() {
+      final left = (_busy[groupId] ?? 1) - 1;
+      left <= 0 ? _busy.remove(groupId) : _busy[groupId] = left;
+    });
     return run;
   }
 
   // ---------- This device ----------
   /// Creates this device's group identity (once) and keeps KeyPackages stocked. Needs a listed device.
-  Future<void> ensureReady() async {
-    if (_ready) return;
+  Future<void> ensureReady() => _ready ??= _setUp().catchError((Object error) {
+    _ready = null;
+    throw error;
+  });
+
+  Future<void> _setUp() async {
     final local = await device();
     await crypto.initDevice(userId: me.id, deviceId: local.deviceId, platform: platform, issuedAt: _now());
     await topUpKeyPackages();
-    _ready = true;
   }
 
+  /// Uploads `100 - oneTime` when fewer than 20 are left, and a last-resort package when there is none.
   Future<void> topUpKeyPackages() async {
     final count = await api.keyPackageCount();
     final oneTime = count['oneTime'] as int? ?? 0;
-    final hasLastResort = count['lastResort'] == true;
+    final hasLastResort = count['lastResort'] == true || (count['lastResort'] is int && (count['lastResort'] as int) > 0);
     if (oneTime >= keyPackageLow && hasLastResort) return;
     await api.uploadKeyPackages(
       oneTime: oneTime < keyPackageLow ? await crypto.keyPackages(keyPackageTarget - oneTime) : null,
@@ -154,46 +209,59 @@ class GroupSync {
     return base64Url.encode(List<int>.generate(16, (_) => source.nextInt(256))).replaceAll('=', '');
   }
 
-  /// Creates a group on this device, registers it with the delivery service, then adds [members] (user ids).
-  Future<GroupConversation> create(GroupKindName kind, {String name = '', String? publicName, List<String> members = const [], String? dmPeer}) async {
+  /// Creates a group on this device and registers it with the delivery service ([name] is the public
+  /// channel's server-visible name; group and private names travel only in `meta`).
+  Future<GroupConversation> create(GroupKindName kind, {String name = ''}) async {
     await ensureReady();
     final id = newGroupId();
-    final roles = kind == GroupKindName.public ? GroupRoles.group([me.id], joinPolicy: JoinPolicy.open) : GroupRoles.group([me.id]);
+    final roles = GroupRoles.group([me.id], joinPolicy: kind == GroupKindName.public ? JoinPolicy.open : JoinPolicy.invite);
     final view = await crypto.create(id, roles);
     try {
-      await api.createChannel(id: id, kind: kind.wire, groupInfo: view.groupInfo, tree: view.tree, name: kind == GroupKindName.public ? publicName ?? name : null, peer: dmPeer);
+      await api.createChannel(id: id, kind: kind.wire, groupInfo: view.groupInfo, tree: view.tree, name: kind == GroupKindName.public ? name : null);
     } catch (_) {
       await crypto.forget(id);
       rethrow;
     }
-    final record = await store.putGroup(GroupConversation(id: id, kind: kind, name: name, createdAt: _now()));
-    if (members.isNotEmpty) await add(id, members);
-    return record;
+    unawaited(_publishGroupInfo(id, view));
+    return store.putGroup(GroupConversation(id: id, kind: kind, name: name, createdAt: _now()));
   }
 
-  /// Adds every listed device of [userIds] (KeyPackages claimed from the server).
-  Future<void> add(String groupId, List<String> userIds) => _serial(groupId, () async {
+  /// Adds every listed device of [userIds] in one commit (KeyPackages claimed 16 users at a time). Returns
+  /// the users who have no device that can join yet (`missing`), who are skipped.
+  Future<Set<String>> add(String groupId, List<String> userIds) => _serial(groupId, () async {
     await ensurePinned(userIds);
-    final claimed = await api.claimKeyPackages(userIds);
-    final packages = (claimed['keyPackages'] as List).cast<Map<String, dynamic>>();
-    if (packages.isEmpty) throw const StoreException("They have no device that can join groups yet. Ask them to open the app, then try again.");
+    var packages = <Map<String, dynamic>>[];
+    final missing = <String>{};
+    Future<void> claim() async {
+      packages = [];
+      missing.clear();
+      for (var i = 0; i < userIds.length; i += claimBatch) {
+        final claimed = await api.claimKeyPackages(userIds.sublist(i, math.min(i + claimBatch, userIds.length)));
+        packages.addAll((claimed['keyPackages'] as List).cast<Map<String, dynamic>>());
+        for (final m in (claimed['missing'] as List? ?? const []).cast<Map<String, dynamic>>()) {
+          missing.add(m['userId'] as String);
+        }
+      }
+      missing.removeAll({for (final p in packages) p['userId']});
+    }
+
+    await claim();
+    if (packages.isEmpty) return {...userIds};
     await _commit(
       groupId,
       () => crypto.commit(groupId, adds: [for (final p in packages) p['keyPackage'] as String]),
-      joiners: [for (final p in packages) p['deviceId'] as String],
-      // A claimed one-time KeyPackage is spent once: a rebuild claims fresh ones.
-      reclaim: () async {
-        final again = ((await api.claimKeyPackages(userIds))['keyPackages'] as List).cast<Map<String, dynamic>>();
-        packages
-          ..clear()
-          ..addAll(again);
-      },
+      joiners: () => [for (final p in packages) p['deviceId'] as String],
+      // A one-time KeyPackage is spent by the claim: a rebuild claims fresh ones.
+      rebuild: claim,
     );
+    return {...missing, ...userIds.where((u) => !packages.any((p) => p['userId'] == u))};
   });
 
   /// Removes every device of [userId] (or one device).
-  Future<void> remove(String groupId, String userId, {String? deviceId}) =>
-      _serial(groupId, () => _commit(groupId, () => crypto.commit(groupId, removes: [GroupRemoval(userId, deviceId)])));
+  Future<void> remove(String groupId, String userId, {String? deviceId}) => _serial(groupId, () async {
+    if (!(await crypto.members(groupId)).any((m) => m.userId == userId && (deviceId == null || m.deviceId == deviceId))) return;
+    await _commit(groupId, () => crypto.commit(groupId, removes: [GroupRemoval(userId, deviceId)]));
+  });
 
   /// Changes the group's admins (admins only).
   Future<void> setAdmins(String groupId, List<String> admins) => _serial(groupId, () async {
@@ -201,36 +269,39 @@ class GroupSync {
     await _commit(groupId, () => crypto.commit(groupId, roles: roles.withAdmins(admins)));
   });
 
-  /// Submits a commit and settles it: accepted → merge and publish the GroupInfo; 409 → drop it, catch up
-  /// on the log and rebuild (at most [commitAttempts] times); no answer → look for it in the log.
-  Future<void> _commit(String groupId, Future<GroupCommit> Function() build, {List<String>? joiners, Future<void> Function()? reclaim}) async {
+  /// Submits a commit and settles it (§4): accepted → merge and publish the GroupInfo; 409 → drop it, catch
+  /// up on the log and rebuild; no answer → leave it pending and let the log decide.
+  Future<void> _commit(String groupId, Future<GroupCommit> Function() build, {List<String> Function()? joiners, Future<void> Function()? rebuild}) async {
     await _catchUpNow(groupId);
     for (var attempt = 0; ; attempt++) {
       final out = await build();
       Map<String, dynamic> accepted;
       try {
-        accepted = await api.postCommit(groupId, out.commit, welcome: out.welcome, joiners: out.welcome == null ? null : joiners);
+        accepted = await api.postCommit(groupId, out.commit, welcome: out.welcome, joiners: out.welcome == null ? null : joiners?.call());
       } on ApiException catch (error) {
         await crypto.clearOwn(groupId);
         if (error.status == 409 && attempt + 1 < commitAttempts) {
           await Future<void>.delayed(_backoff(attempt));
           await _catchUpNow(groupId);
-          await reclaim?.call();
+          await rebuild?.call();
           continue;
         }
         if (error.status == 423) await _markFrozen(groupId, error.body['frozen']);
         rethrow;
       } catch (_) {
-        // Unknown outcome (timeout, connection lost): the log says whether it was sequenced.
+        // Unknown outcome (timeout, connection lost): the log says whether it was sequenced. Our own entry
+        // merges it; if the group moved past its epoch without it, drop it and rebuild.
         await _catchUpNow(groupId);
-        if (await crypto.pendingCommit(groupId) == null) return; // Found in the log and merged as our own.
+        if (await crypto.pendingCommit(groupId) == null) return;
         await crypto.clearOwn(groupId);
         if (attempt + 1 >= commitAttempts) rethrow;
+        await rebuild?.call();
         continue;
       }
       final view = await crypto.mergeOwn(groupId);
       unawaited(_publishGroupInfo(groupId, view));
       await _advanceTo(groupId, accepted['seq'] as int?, onlyIfNext: true);
+      _changed(groupId);
       return;
     }
   }
@@ -259,10 +330,30 @@ class GroupSync {
     }
   }
 
+  // ---------- Leaving ----------
+  /// §4 Leave: hand over the admin role if this is the only admin, say `leave` (an admin's device removes
+  /// us), forget the group, and keep it as "You left".
+  Future<void> leave(String groupId, {required String leavePayload}) => _serial(groupId, () async {
+    await _catchUpNow(groupId);
+    final members = await crypto.members(groupId);
+    final roles = await crypto.roles(groupId);
+    final others = members.where((m) => m.userId != me.id).toList()..sort((a, b) => a.leaf.compareTo(b.leaf));
+    if (others.isNotEmpty && roles.admins.every((a) => a == me.id)) {
+      final heir = others.first.userId;
+      await _commit(groupId, () => crypto.commit(groupId, roles: roles.withAdmins([...roles.admins, heir])));
+    }
+    if (others.isNotEmpty) await _sendNow(groupId, leavePayload);
+    await crypto.forget(groupId);
+    await store.updateGroup(groupId, (g) => g.copyWith(membership: Membership.left));
+    _changed(groupId);
+  });
+
   // ---------- Sending ----------
   /// Encrypts [plaintext] for the group's current epoch and posts it; a 409 (the group moved on) catches
   /// up and re-encrypts. Returns the log seq.
-  Future<int> send(String groupId, String plaintext) => _serial(groupId, () async {
+  Future<int> send(String groupId, String plaintext) => _serial(groupId, () => _sendNow(groupId, plaintext));
+
+  Future<int> _sendNow(String groupId, String plaintext) async {
     for (var attempt = 0; ; attempt++) {
       final message = await crypto.encrypt(groupId, plaintext);
       try {
@@ -279,13 +370,50 @@ class GroupSync {
         rethrow;
       }
     }
-  });
+  }
+
+  /// A live-only message (typing) for the current epoch; dropped on any problem.
+  Future<void> sendEphemeral(String groupId, String plaintext) async {
+    if ((_busy[groupId] ?? 0) > 0) return; // Never race the queue for an epoch.
+    try {
+      final message = await crypto.encrypt(groupId, plaintext);
+      await api.postEphemeral(groupId, message);
+    } catch (_) {}
+  }
+
+  /// An `ephemeral` frame: processed only while the channel's queue is idle; anything wrong is dropped.
+  Future<void> onEphemeral(GroupEphemeral event) async {
+    if ((_busy[event.channel] ?? 0) > 0 || keysLocked) return;
+    final group = await store.group(event.channel);
+    final local = await device();
+    if (group == null || !group.active || event.fromDeviceId == local.deviceId) return;
+    try {
+      final processed = await crypto.receive(event.channel, event.message);
+      if (processed.kind != ProcessedKind.application || processed.plaintext == null) {
+        await crypto.receiveAbort(processed.pendingId);
+        return;
+      }
+      try {
+        await onDelivery?.call(GroupDelivery(group: group, sender: processed.sender, plaintext: processed.plaintext!, seq: 0, createdAt: event.createdAt, live: true));
+      } catch (_) {
+        await crypto.receiveAbort(processed.pendingId);
+        return;
+      }
+      await crypto.receiveCommit(processed.pendingId);
+    } catch (_) {}
+  }
 
   // ---------- Receiving ----------
   /// A `group` frame: the next entry, processed in order; a gap or a large entry reads the log instead.
   Future<void> onGroupFrame(GroupEvent event) => _serial(event.channel, () async {
     final group = await store.group(event.channel);
-    if (group == null || !group.active || event.seq <= group.cursor) return;
+    if (group == null || event.seq <= group.cursor) return;
+    if (group.membership == Membership.left) {
+      // Acknowledged without processing: this device left.
+      await _advanceTo(event.channel, event.seq);
+      return;
+    }
+    if (!group.active) return;
     final message = event.message;
     if (message == null || event.seq != group.cursor + 1) return _catchUpNow(event.channel);
     await _process(group, LogEntry(seq: event.seq, epoch: event.epoch, kind: event.kind, fromUser: event.fromUserId, fromDevice: event.fromDeviceId, message: message, createdAt: event.createdAt));
@@ -294,25 +422,33 @@ class GroupSync {
   /// Reads the channel's log from this device's cursor and processes every entry.
   Future<void> catchUp(String groupId) => _serial(groupId, () => _catchUpNow(groupId));
 
+  void _retryLater(String groupId) {
+    if (_disposed) return;
+    _retries[groupId]?.cancel();
+    _retries[groupId] = Timer(retryAfter, () => unawaited(catchUp(groupId).catchError((_) {})));
+  }
+
   Future<void> _catchUpNow(String groupId) async {
     for (var page = 0; page < 200; page++) {
       final group = await store.group(groupId);
-      if (group == null || !group.active || keysLocked || _disposed) return;
+      if (group == null || !group.active || keysLocked || _disposed || paused.containsKey(groupId)) return;
       final Map<String, dynamic> log;
       try {
         log = await api.groupLog(groupId, after: group.cursor);
       } on ApiException catch (error) {
         // The server no longer counts this device in the group: it was removed (the removing commit is
         // never delivered to the removed device).
-        if (error.status == 404 || (error.status == 403 && error.body['frozen'] == null)) {
-          await store.updateGroup(groupId, (g) => g.copyWith(membership: Membership.removed));
-          _membershipChanges.add(groupId);
+        if (error.status == 404) {
+          await store.updateGroup(groupId, (g) => g.active ? g.copyWith(membership: Membership.removed) : g);
+          _changed(groupId);
           return;
         }
         rethrow;
       }
       if (log['frozen'] != null) await _markFrozen(groupId, log['frozen']);
-      if (log['gap'] == true) {
+      final serverSeq = log['seq'] as int? ?? 0;
+      if (log['gap'] == true || serverSeq < group.cursor) {
+        // Trimmed past us, or we merged a commit that was rolled back: our copy can't continue.
         await _resync(groupId);
         return;
       }
@@ -326,29 +462,35 @@ class GroupSync {
     }
   }
 
-  /// Processes one entry. Returns false when processing must stop here (retry later, or the group ended).
-  Future<bool> _process(GroupConversation group, LogEntry entry) async {
+  /// Processes one entry (§6). Returns false when processing must stop here (retry later, paused, ended).
+  Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false}) async {
     if (entry.seq <= group.cursor) return true;
     final local = await device();
     if (entry.fromDevice == local.deviceId) {
-      // Never our own application messages; our own commit only if it is still pending here (the answer was lost).
-      final pending = entry.kind == 'commit' ? await crypto.pendingCommit(group.id) : null;
-      if (pending != null && pending.digest == messageDigest(entry.message)) {
-        final own = await crypto.receive(group.id, entry.message);
-        await crypto.receiveCommit(own.pendingId);
-        final view = await crypto.view(group.id);
-        unawaited(_publishGroupInfo(group.id, view));
+      // Never our own application messages; our own commit only while one is pending (the answer was lost).
+      if (entry.kind == 'commit' && await crypto.pendingCommit(group.id) != null) {
+        try {
+          final own = await crypto.receive(group.id, entry.message);
+          await crypto.receiveCommit(own.pendingId);
+          unawaited(_publishGroupInfo(group.id, await crypto.view(group.id)));
+          _changed(group.id);
+        } on CryptoException {
+          // Not ours after all (another pending commit): the epoch moved without it.
+          await crypto.clearOwn(group.id);
+        }
       }
       await _advanceTo(group.id, entry.seq);
       return true;
     }
+    final involved = <String>{entry.fromUser};
     if (entry.kind == 'commit') {
       // A commit may add people: pin everyone the server lists before checking their certificates.
       try {
-        final members = await api.channelMembers(group.id);
-        await ensurePinned({for (final m in members) m['userId'] as String});
+        involved.addAll({for (final m in await api.channelMembers(group.id)) m['userId'] as String});
       } catch (_) {}
     }
+    await ensurePinned(involved.where((u) => u != me.id));
+    final before = entry.kind == 'commit' ? await crypto.members(group.id) : const <GroupMember>[];
     GroupProcessed processed;
     try {
       processed = await crypto.receive(group.id, entry.message);
@@ -357,11 +499,25 @@ class GroupSync {
         keysLocked = true;
         return false;
       }
-      if (error.code == 'poison') {
-        await _reportPoison(group, entry, error.message);
+      final missing = _unpinned.firstMatch(error.message)?.group(1);
+      if (missing != null && !repinned) {
+        await ensurePinned([missing]);
+        return _process(group, entry, repinned: true);
+      }
+      // Pin problems are local, never poison: pause until the security code is reviewed.
+      final problem = missing ?? await pinProblem(involved.where((u) => u != me.id));
+      if (problem != null && (error.code == 'poison' || error.code == 'invalid')) {
+        _pause(group.id, problem);
         return false;
       }
-      if (error.code == null) return false; // Transient: retry later, the cursor stays.
+      if (error.code == 'poison') {
+        await _reportPoison(group, entry);
+        return false;
+      }
+      if (error.code == null) {
+        _retryLater(group.id);
+        return false; // Transient: the cursor stays.
+      }
       // Permanent for this entry (malformed, auth, replay, a stale epoch): skip it.
       if (error.code != 'replay') _notice('A message in ${_label(group)} could not be decrypted and was skipped.');
       await _advanceTo(group.id, entry.seq);
@@ -371,51 +527,64 @@ class GroupSync {
       case ProcessedKind.application:
         try {
           final text = processed.plaintext;
-          if (text != null) {
-            await onDelivery?.call(GroupDelivery(group: group, sender: processed.sender, plaintext: text, seq: entry.seq, createdAt: entry.createdAt));
-          }
+          if (text != null) await onDelivery?.call(GroupDelivery(group: group, sender: processed.sender, plaintext: text, seq: entry.seq, createdAt: entry.createdAt));
         } on StoreException catch (error) {
-          if (error.code == null) {
-            await crypto.receiveAbort(processed.pendingId);
-            return false;
-          }
-          if (error.code != 'replay') _notice('A message in ${_label(group)} was invalid and was skipped.');
+          if (error.code == null) return _abort(group.id, processed.pendingId);
         } on CryptoException catch (error) {
-          if (error.code == null) {
-            await crypto.receiveAbort(processed.pendingId);
-            return false;
-          }
+          if (error.code == null) return _abort(group.id, processed.pendingId);
         } catch (_) {
-          await crypto.receiveAbort(processed.pendingId);
-          return false;
+          return _abort(group.id, processed.pendingId);
         }
+        // A payload that failed validation is acknowledged and dropped all the same: the key is spent.
         await crypto.receiveCommit(processed.pendingId);
       case ProcessedKind.commit || ProcessedKind.own:
         await crypto.receiveCommit(processed.pendingId);
-        _membershipChanges.add(group.id);
+        final after = await crypto.members(group.id);
+        final had = {for (final m in before) m.userId}, has = {for (final m in after) m.userId};
+        _changed(group.id);
+        await onMembership?.call(MembershipChange(group: group, sender: processed.sender, added: has.difference(had), removed: had.difference(has), createdAt: entry.createdAt));
       case ProcessedKind.removed:
         await crypto.receiveCommit(processed.pendingId);
         await store.updateGroup(group.id, (g) => g.copyWith(membership: Membership.removed, cursor: entry.seq));
         _notice('You were removed from ${_label(group)}.');
-        _membershipChanges.add(group.id);
+        _changed(group.id);
         return false;
     }
     await _advanceTo(group.id, entry.seq);
     return true;
   }
 
-  final _membershipChanges = StreamController<String>.broadcast();
+  Future<bool> _abort(String groupId, String pendingId) async {
+    await crypto.receiveAbort(pendingId);
+    _retryLater(groupId);
+    return false;
+  }
 
-  /// A group's members or roles changed (a commit was merged here).
-  Stream<String> get membershipChanges => _membershipChanges.stream;
+  void _pause(String groupId, String userId) {
+    paused[groupId] = userId;
+    if (!_pausedChanges.isClosed) _pausedChanges.add(Map.of(paused));
+  }
 
-  String _label(GroupConversation group) => group.name.isEmpty ? 'a group' : group.name;
+  /// After a security-code review: resume the channels it paused.
+  Future<void> resume([String? userId]) async {
+    final groups = [for (final e in paused.entries) if (userId == null || e.value == userId) e.key];
+    for (final g in groups) {
+      paused.remove(g);
+    }
+    if (!_pausedChanges.isClosed) _pausedChanges.add(Map.of(paused));
+    for (final g in groups) {
+      unawaited(catchUp(g).catchError((_) {}));
+    }
+  }
+
+  String _label(GroupConversation group) => group.name.isEmpty ? 'a group' : (group.kind.isChannel ? '#${group.name}' : group.name);
 
   // ---------- Welcomes and joins ----------
-  /// A Welcome for this device: join, record the group, then acknowledge it.
+  /// A Welcome for this device: pin the members, join, record the group, then acknowledge it.
   Future<void> onWelcome(WelcomeEvent event) => _serial(event.channel, () async {
-    if (await store.group(event.channel) case final known? when known.active) {
-      ackWelcome?.call(event.id);
+    final known = await store.group(event.channel);
+    if (known != null && known.active && await _holds(event.channel)) {
+      _dropWelcome(event.id);
       return;
     }
     var welcome = event.welcome, tree = event.tree;
@@ -425,45 +594,55 @@ class GroupSync {
       tree = full['tree'] as String;
     }
     await ensureReady();
+    final users = <String>{event.from};
     try {
-      final members = await api.channelMembers(event.channel);
-      await ensurePinned({event.from, for (final m in members) m['userId'] as String});
+      users.addAll({for (final m in await api.channelMembers(event.channel)) m['userId'] as String});
     } catch (_) {}
+    await ensurePinned(users.where((u) => u != me.id));
     try {
       await crypto.join(welcome, tree);
     } on CryptoException catch (error) {
       if (error.keysLocked || error.code == null) rethrow;
-      // A Welcome this device can't accept (an unpinned member, a bad certificate): drop it, say so.
-      _notice('An invitation to a group could not be verified and was declined.');
-      ackWelcome?.call(event.id);
-      unawaited(api.deleteWelcome(event.id).catchError((_) {}));
-      return;
+      final missing = _unpinned.firstMatch(error.message)?.group(1);
+      if (missing == null) {
+        // A Welcome this device can't accept (a bad certificate, a blocked pin): decline it, say so.
+        _notice('An invitation to a group could not be verified and was declined.');
+        _dropWelcome(event.id);
+        return;
+      }
+      await ensurePinned([missing]);
+      await crypto.join(welcome, tree);
     }
     final info = await _channelInfo(event.channel);
-    final existing = await store.group(event.channel);
     await store.putGroup(
-      (existing ?? GroupConversation(id: event.channel, kind: info.kind, createdAt: _now(), name: info.name ?? ''))
-          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? existing?.name),
+      (known ?? GroupConversation(id: event.channel, kind: info.kind, createdAt: _now(), name: info.name ?? ''))
+          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, clearFrozen: true),
     );
-    ackWelcome?.call(event.id);
-    unawaited(api.deleteWelcome(event.id).catchError((_) {}));
-    _membershipChanges.add(event.channel);
+    _dropWelcome(event.id);
+    _changed(event.channel);
     await _catchUpNow(event.channel);
   });
 
-  /// Welcomes that waited while this device was offline (the socket also replays them).
+  void _dropWelcome(String id) {
+    ackWelcome?.call(id);
+    unawaited(api.deleteWelcome(id).catchError((_) {}));
+  }
+
+  /// Welcomes that waited while this device was offline.
   Future<void> fetchWelcomes() async {
     for (final w in await api.welcomes()) {
-      await onWelcome(WelcomeEvent(
-        id: w['id'] as String,
-        channel: w['channel'] as String,
-        from: w['from'] as String,
-        epoch: w['epoch'] as int,
-        seq: w['seq'] as int,
-        welcome: null,
-        tree: null,
-        createdAt: w['createdAt'] as int,
-      ));
+      try {
+        await onWelcome(WelcomeEvent(
+          id: w['id'] as String,
+          channel: w['channel'] as String,
+          from: w['from'] as String,
+          epoch: w['epoch'] as int,
+          seq: w['seq'] as int,
+          welcome: null,
+          tree: null,
+          createdAt: w['createdAt'] as int,
+        ));
+      } catch (_) {}
     }
   }
 
@@ -476,15 +655,16 @@ class GroupSync {
     }
   }
 
-  /// Joins a public channel (an external commit), or rejoins one this device fell out of.
-  Future<GroupConversation> joinPublic(String channelId, {String? name}) => _serial(channelId, () async {
+  /// Joins a public channel from the directory (an external commit), then reads the log from there.
+  Future<GroupConversation> joinPublic(String channelId) => _serial(channelId, () async {
     await ensureReady();
     await _externalJoin(channelId);
+    await _catchUpNow(channelId);
     return (await store.group(channelId))!;
   });
 
-  /// After a log gap (trimmed past this device) or a broken local copy: drop the local group and join it
-  /// again externally with the same leaf. History stays; what was trimmed is gone.
+  /// After a log gap or a broken local copy: drop the local group and join it again externally with the
+  /// same leaf. History stays as stored; what was trimmed is gone.
   Future<void> _resync(String groupId) async {
     await crypto.forget(groupId);
     await _externalJoin(groupId);
@@ -495,8 +675,7 @@ class GroupSync {
     for (var attempt = 0; ; attempt++) {
       final info = await api.joinInfo(groupId);
       try {
-        final members = await api.channelMembers(groupId);
-        await ensurePinned({for (final m in members) m['userId'] as String});
+        await ensurePinned({for (final m in await api.channelMembers(groupId)) m['userId'] as String}.where((u) => u != me.id));
       } catch (_) {}
       final out = await crypto.joinExternal(info['groupInfo'] as String, info['tree'] as String);
       Map<String, dynamic> accepted;
@@ -515,40 +694,39 @@ class GroupSync {
       unawaited(_publishGroupInfo(groupId, view));
       final channel = await _channelInfo(groupId);
       final existing = await store.group(groupId);
+      final seq = accepted['seq'] as int;
       await store.putGroup(
         (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? ''))
-            .copyWith(membership: Membership.active, cursor: accepted['seq'] as int, clearFrozen: true),
+            .copyWith(membership: Membership.active, cursor: seq, clearFrozen: true),
       );
-      _reportCursor(groupId, accepted['seq'] as int);
-      _membershipChanges.add(groupId);
+      _reportCursor(groupId, seq);
+      _changed(groupId);
       return;
     }
   }
 
-  /// Every channel the server says this account is in: records the ones this device belongs to and
-  /// catches each one up (after sign-in and reconnects).
+  /// Every channel the server says this account is in: catches up the ones this device belongs to
+  /// (after sign-in and reconnects).
   Future<void> refresh() async {
     final channels = await api.channels();
     for (final c in channels) {
       final id = c['id'] as String;
       final local = await store.group(id);
-      if (local == null || c['member'] != true) continue;
+      if (local == null) continue;
+      if (c['member'] != true) {
+        if (local.active) await store.updateGroup(id, (g) => g.copyWith(membership: Membership.removed));
+        continue;
+      }
       await store.updateGroup(id, (g) {
-        var next = c['kind'] == 'public' && c['name'] is String ? g.copyWith(name: c['name'] as String) : g;
+        var next = c['kind'] == 'public' && c['name'] is String && g.name.isEmpty ? g.copyWith(name: c['name'] as String) : g;
         if (c['frozen'] != true && g.frozen != null) next = next.copyWith(clearFrozen: true);
         return next;
       });
-      if (c['frozen'] == true && local.frozen == null) {
-        try {
-          final log = await api.groupLog(id, after: local.cursor);
-          if (log['frozen'] != null) await _markFrozen(id, log['frozen']);
-        } catch (_) {}
-      }
       unawaited(catchUp(id).catchError((_) {}));
     }
   }
 
-  // ---------- Channel changes and poison commits ----------
+  // ---------- Channel changes and poison commits (§7) ----------
   Future<void> onChannel(ChannelEvent event) async {
     switch (event.change) {
       case 'frozen':
@@ -557,7 +735,7 @@ class GroupSync {
         await store.updateGroup(event.id, (g) => g.copyWith(clearFrozen: true));
         unawaited(catchUp(event.id).catchError((_) {}));
       case 'remove-needed':
-        // Admins remove a rolled-back commit's author with an ordinary commit.
+        // An admin removes a rolled-back commit's author with an ordinary commit.
         final deviceId = event.deviceId;
         if (deviceId == null) return;
         try {
@@ -573,12 +751,12 @@ class GroupSync {
         final local = await store.group(event.id);
         if (local != null) {
           // Back in after a rollback: this device's copy of the group never left it.
-          if (!local.active && local.membership == Membership.removed && await _holds(event.id)) {
+          if (local.membership == Membership.removed && await _holds(event.id)) {
             await store.updateGroup(event.id, (g) => g.copyWith(membership: Membership.active));
           }
           unawaited(catchUp(event.id).catchError((_) {}));
         }
-        _membershipChanges.add(event.id);
+        _changed(event.id);
     }
   }
 
@@ -598,7 +776,7 @@ class GroupSync {
     await store.updateGroup(groupId, (g) => g.frozen == state ? g : g.copyWith(frozen: state));
   }
 
-  Future<void> _reportPoison(GroupConversation group, LogEntry entry, String reason) async {
+  Future<void> _reportPoison(GroupConversation group, LogEntry entry) async {
     final digest = messageDigest(entry.message);
     try {
       await api.reportPoison(group.id, entry.seq, digest);
@@ -609,29 +787,31 @@ class GroupSync {
       return;
     }
     await _markFrozen(group.id, {'seq': entry.seq, 'digest': digest});
-    _notice('A change to ${_label(group)} was rejected by this device. The group is paused until an admin resolves it.');
+    _notice('A change to ${_label(group)} was rejected by this device. It is paused while an admin checks it.');
   }
 
-  /// An admin's decision on a frozen channel: `rollback` (undo the commit and remove its author) or
-  /// `dismiss` (keep it). Signed with this device's key.
+  /// An admin's decision on a frozen channel: `rollback` (undo the change and remove its author's device)
+  /// or `dismiss` (keep it). Signed with this device's key.
   Future<void> resolve(String groupId, {required bool rollback}) => _serial(groupId, () async {
     final group = await store.group(groupId);
     final frozen = group?.frozen;
-    if (frozen == null) return;
+    if (group == null || frozen == null) return;
     final action = rollback ? 'rollback' : 'dismiss';
     final local = await device();
     await api.resolveChannel(groupId, action: action, seq: frozen.seq, digest: frozen.digest, signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest)));
     await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
-    if (!rollback) {
-      // Kept: if this device rejected it, its copy can't follow the group any more; rejoin.
-      if (group!.cursor < frozen.seq) await _resync(groupId);
-    }
+    // Kept, but this device rejected it: its copy can't follow the group any more, so it rejoins.
+    if (!rollback && group.cursor < frozen.seq) await _resync(groupId);
     await _catchUpNow(groupId);
   });
 
   Future<void> dispose() async {
     _disposed = true;
+    for (final t in _retries.values) {
+      t.cancel();
+    }
     await _notices.close();
     await _membershipChanges.close();
+    await _pausedChanges.close();
   }
 }

@@ -219,6 +219,7 @@ class Messenger {
       final Map<String, Object?> payload;
       try {
         payload = checkPayload(decrypted.plaintextJson);
+        if (payload['type'] == 'message' && payload.containsKey('mentions')) throw const PayloadException();
       } on PayloadException {
         throw const CryptoException('Invalid message', code: 'invalid');
       }
@@ -250,6 +251,8 @@ class Messenger {
             if (readReceipts()) await store.markRead(conversationId, (payload['ids'] as List).cast<String>(), direction: Direction.outgoing);
           case 'typing':
             break; // Typing travels only as an ephemeral envelope; a stored one is stale.
+          case 'meta' || 'leave':
+            break; // Group payloads mean nothing in a 1:1 chat.
           default:
             if (await store.receive(conversationId, payload) == ReceiveResult.stored) {
               if (untrusted) flagged.add((payload['id'] as String).toLowerCase());

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:sqflite/sqflite.dart';
+import 'package:uuid/uuid.dart';
 
 import 'conversation.dart';
 import 'message.dart';
@@ -9,6 +10,8 @@ import 'message.dart';
 export 'conversation.dart';
 
 enum ReceiveResult { stored, duplicate, expired }
+
+String _uuidV4() => const Uuid().v4();
 
 /// Device-local message history (SQLite). Port of chat-store.js: the same
 /// validation, the 2,000-message device cap and the 500-incoming-per-conversation
@@ -50,11 +53,12 @@ class MessageStore {
   }
 
   /// v2 (phase 1): reply, attachment, link preview, the latest edit and reactions, each as nullable columns.
-  /// v3 (M4 groups): the author and mentions of group messages, and a `conversations` table for groups.
+  /// v3 (M4 groups, docs/m4-groups.md §10): sender, sender name, mentions and read-by of group messages,
+  /// system rows, and a `conversations` table for groups.
   static const schemaVersion = 3;
 
   static Future<void> _addGroupParts(DatabaseExecutor db) async {
-    for (final column in ['sender TEXT', 'mentions TEXT']) {
+    for (final column in ['sender TEXT', 'sender_name TEXT', 'mentions TEXT', 'read_by TEXT']) {
       await db.execute('ALTER TABLE messages ADD COLUMN $column');
     }
     await db.execute('''
@@ -110,6 +114,7 @@ class MessageStore {
           editedText: previous.editedText,
           editedAt: previous.editedAt,
           reactions: previous.reactions.isEmpty ? null : previous.reactions,
+          readBy: previous.readBy.isEmpty ? null : previous.readBy,
         );
       }
       await tx.insert('messages', next.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
@@ -121,10 +126,14 @@ class MessageStore {
 
   /// Stores one decrypted incoming payload, idempotent by id. Deterministic
   /// rejections are coded (see [StoreException.code]); nothing is ever evicted.
-  Future<ReceiveResult> receive(String conversationId, Map<String, Object?> payload) async {
+  /// In a group (22-character id) [sender] and [senderName] are the MLS sender and their username, never
+  /// payload fields; `mentions` is allowed only there, and the group keeps its newest [groupKeep] messages.
+  Future<ReceiveResult> receive(String conversationId, Map<String, Object?> payload, {String? sender, String? senderName}) async {
     final now = _now();
+    final group = conversationId.length == 22;
     ChatMessage message;
     try {
+      if (!group && payload.containsKey('mentions')) throw const FormatException('mentions outside a group');
       final expiresAt = payload['expiresAt'];
       final text = payload['text']! as String;
       message = validate(
@@ -139,6 +148,9 @@ class MessageStore {
           replyTo: payload.containsKey('replyTo') ? ReplyTo.fromJson(payload['replyTo']) : null,
           attachment: payload.containsKey('attachment') ? Attachment.fromJson(payload['attachment']) : null,
           link: payload.containsKey('link') ? LinkPreview.fromJson(payload['link'], text) : null,
+          sender: group ? sender : null,
+          senderName: group ? senderName : null,
+          mentions: payload.containsKey('mentions') ? mentionsFromJson(payload['mentions']) : const [],
         ),
       );
     } on StoreException {
@@ -154,6 +166,20 @@ class MessageStore {
       if (previous != null) {
         if (!previous.sameContent(message)) throw const StoreException('A message identifier was reused with different content.', code: 'conflict');
         return ReceiveResult.duplicate;
+      }
+      if (group) {
+        // A group keeps its newest 500: the oldest go instead of refusing the new one, within the device cap.
+        final mine = await _count(tx, 'conversation_id = ?', [conversationId]);
+        final over = [0, mine + 1 - groupKeep, await _count(tx) + 1 - maxMessages].reduce((a, b) => a > b ? a : b);
+        if (over > mine) throw const StoreException('This device holds 2,000 messages. Clear chat history to receive more.', code: 'full');
+        if (over > 0) {
+          await tx.rawDelete(
+            'DELETE FROM messages WHERE rowid IN (SELECT rowid FROM messages WHERE conversation_id = ? ORDER BY created_at, id LIMIT ?)',
+            [conversationId, over],
+          );
+        }
+        await tx.insert('messages', message.toRow());
+        return ReceiveResult.stored;
       }
       if (await _count(tx, "conversation_id = ? AND direction = 'incoming'", [conversationId]) >= maxPerConversation) {
         throw const StoreException('This conversation holds 500 incoming messages.', code: 'conversation-full');
@@ -199,12 +225,45 @@ class MessageStore {
     return changed;
   }
 
+  /// A group member read these messages of ours: [reader] joins each one's read-by (unknown ids and other
+  /// people's messages are ignored). Returns the ids that changed.
+  Future<List<String>> markReadBy(String conversationId, Iterable<String> ids, String reader) async {
+    if (conversationId.length != 22 || !userIdPattern.hasMatch(reader)) throw const StoreException('Invalid read receipt.', code: 'invalid');
+    final changed = await _db.transaction((tx) async {
+      final out = <String>[];
+      for (final id in ids.map((i) => i.toLowerCase()).toSet()) {
+        final previous = await _get(tx, conversationId, id);
+        if (previous == null || !previous.outgoing || previous.readBy.contains(reader) || previous.readBy.length >= maxReaders) continue;
+        await tx.update('messages', {'read_by': jsonEncode([...previous.readBy, reader])}, where: 'conversation_id = ? AND id = ?', whereArgs: [conversationId, id]);
+        out.add(id);
+      }
+      return out;
+    });
+    if (changed.isNotEmpty) _changes.add(conversationId);
+    return changed;
+  }
+
+  /// A system line in a group ("alice added bob"), dated [at].
+  Future<void> note(String conversationId, String text, {int? at}) async {
+    await _db.transaction((tx) async {
+      final over = await _count(tx) + 1 - maxMessages;
+      if (over > 0) return; // Never evict history for a notice.
+      await tx.insert(
+        'messages',
+        validate(ChatMessage(id: _uuidV4(), conversationId: conversationId, direction: Direction.system, text: text, createdAt: at ?? _now(), status: MessageStatus.delivered)).toRow(),
+      );
+    });
+    _changes.add(conversationId);
+  }
+
   /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.
   Future<bool> react(String conversationId, String target, {required String who, required String emoji, required bool on}) async {
-    if (!Reactions.validWho(who) || !isReactionEmoji(emoji)) throw const StoreException('Invalid reaction.', code: 'invalid');
+    final group = conversationId.length == 22;
+    final person = who == 'me' || (group ? userIdPattern.hasMatch(who) : who == 'peer');
+    if (!person || !isReactionEmoji(emoji)) throw const StoreException('Invalid reaction.', code: 'invalid');
     final changed = await _db.transaction((tx) async {
       final previous = await _get(tx, conversationId, target.toLowerCase());
-      if (previous == null) return false;
+      if (previous == null || previous.system) return false;
       final next = previous.reactions.toggle(who, emoji, on);
       if (next == null) return false;
       await tx.update(
@@ -221,11 +280,13 @@ class MessageStore {
 
   /// Applies an edit by the message's [author] only, last [editedAt] wins. Unknown targets, someone
   /// else's message, attachments' text and older edits are ignored (false); bad text is `invalid`.
-  Future<bool> edit(String conversationId, String target, {required String text, required int editedAt, required Direction author}) async {
+  /// In a group, [sender] must be the target's stored sender (the payload's MLS sender).
+  Future<bool> edit(String conversationId, String target, {required String text, required int editedAt, required Direction author, String? sender}) async {
     if (!validTime(editedAt)) throw const StoreException('Invalid edit.', code: 'invalid');
     final changed = await _db.transaction((tx) async {
       final previous = await _get(tx, conversationId, target.toLowerCase());
       if (previous == null || previous.direction != author || previous.attachment != null) return false;
+      if (author == Direction.incoming && previous.sender != sender) return false;
       if (!validText(text, hasAttachment: false)) throw const StoreException('Invalid edit.', code: 'invalid');
       if (previous.editedAt != null && previous.editedAt! >= editedAt) return false;
       final next = validate(previous.copyWith(editedText: text, editedAt: editedAt));

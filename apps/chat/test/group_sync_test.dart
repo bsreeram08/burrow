@@ -415,5 +415,20 @@ void main() {
       await Future<void>.delayed(Duration.zero);
       expect(notices.single, contains('security code changed'));
     });
+
+    test("after a succession our leaf is recommitted until no group sees it stale, a bounded number of times", () async {
+      final group = await alice.sync.create(GroupKindName.private);
+      alice.crypto.staleDevices.add(alice.crypto.deviceId);
+      ds.commitsSeen = 0;
+      expect(await alice.sync.recommitLeaf(group.id), isTrue);
+      expect(ds.commitsSeen, 1);
+      expect(alice.crypto.staleDevices, isEmpty);
+      // Refused every time: it gives up after the bound instead of looping.
+      alice.crypto.staleDevices.add(alice.crypto.deviceId);
+      ds.identityConflict = true;
+      ds.commitsSeen = 0;
+      expect(await alice.sync.recommitLeaf(group.id, attempts: 3), isFalse);
+      expect(ds.commitsSeen, 3);
+    });
   });
 }

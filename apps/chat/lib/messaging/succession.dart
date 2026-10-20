@@ -138,6 +138,9 @@ class HandOver {
   }
 }
 
+/// Where a confirmed take-over stands (JSON), persisted per account so it survives a crash.
+typedef TakeOverMarkers = ({Future<String?> Function() read, Future<void> Function(String? value) write});
+
 /// This linked device takes over as the account's primary (m5 §5.2, N): it shows a code to the primary, mints
 /// a new account key, and only after the primary signed the account over publishes the record, its keys and
 /// the first list under the new key, then certifies the old primary's leaf (`demote`).
@@ -195,7 +198,7 @@ class TakeOver {
   /// After the primary confirmed: check the record, publish it, hold the new key, publish keys and list v1, then
   /// certify the old primary's leaf under the new key and tell it to step down.
   /// [oldMetaKey]: the account's device-label key from the link grant, to carry labels over (else platform names).
-  Future<void> run(Messenger messenger, {required String platform, Uint8List? oldMetaKey, Duration timeout = const Duration(minutes: 10)}) async {
+  Future<void> run(Messenger messenger, {required String platform, required TakeOverMarkers markers, Uint8List? oldMetaKey, Duration timeout = const Duration(minutes: 10)}) async {
     final minted = _minted ?? (throw StateError('waitOffer first'));
     final m = await _inbox.next('succession', const {'v', 'type', 'record', 'signature', 'leafSigKey'}, timeout: timeout);
     final record = m['record'], signature = m['signature'], primaryLeaf = m['leafSigKey'];
@@ -215,28 +218,136 @@ class TakeOver {
     if (p0 == null) throw const StoreException("Your primary device isn't in your device list. Nothing changed.");
     String platformOf(({String deviceId, int addedAt, Map<String, String>? described}) d) =>
         d.described?['platform'] ?? rows.firstWhere((row) => row['id'] == d.deviceId)['platform'] as String? ?? 'web';
-    await _api.publishSuccession(r, signature);
-    await _link.successionComplete(jsonEncode(r), signature);
+    final self = (await messenger.device()).deviceId;
+    // The point of no return is the record's publication: from here every step is persisted and resumable.
+    final marker = <String, Object?>{
+      'v': 1,
+      'userId': me.id,
+      'newSign': minted.sign,
+      'newDh': minted.dh,
+      'record': r,
+      'signature': signature,
+      'linkId': linkId,
+      'claim': claim,
+      'primary': {'deviceId': p0.deviceId, 'platform': platformOf(p0), 'leafSigKey': primaryLeaf},
+      'keep': [
+        for (final d in owned)
+          if (d.deviceId != self && listed(d.deviceId)) {'deviceId': d.deviceId, 'addedAt': d.addedAt, 'label': d.described?['label'] ?? platformLabel(platformOf(d)), 'platform': platformOf(d)},
+      ],
+      'step': 'publish',
+    };
+    await markers.write(jsonEncode(marker));
+    await finish(marker, api: _api, link: _link, groups: _groups, messenger: messenger, platform: platform, markers: markers);
+  }
+
+  /// A take-over cut short after it was confirmed (a crash, a lost connection): resumes it if the persisted marker
+  /// is for this account and its key, else drops it. Returns whether one was finished.
+  static Future<bool> resume({required Api api, required LinkCrypto link, required GroupCrypto groups, required Messenger messenger, required String platform, required TakeOverMarkers markers}) async {
+    final raw = await markers.read();
+    if (raw == null) return false;
+    Map<String, dynamic> marker;
+    try {
+      marker = (jsonDecode(raw) as Map).cast<String, dynamic>();
+    } catch (_) {
+      await markers.write(null);
+      return false;
+    }
+    if (marker['v'] != 1 || marker['userId'] != messenger.me.id || marker['newSign'] is! String) {
+      await markers.write(null);
+      return false;
+    }
+    await finish(marker, api: api, link: link, groups: groups, messenger: messenger, platform: platform, markers: markers);
+    return true;
+  }
+
+  /// The remaining steps, each skipped when already done, so a resume repeats nothing: the record, the key held
+  /// here, the keys served, list v1 under the new key (only while no pin exists for it), our leaf re-signed, then
+  /// the old primary's certificate (`demote`). Clears the marker at the end.
+  static Future<void> finish(
+    Map<String, Object?> start, {
+    required Api api,
+    required LinkCrypto link,
+    required GroupCrypto groups,
+    required Messenger messenger,
+    required String platform,
+    required TakeOverMarkers markers,
+  }) async {
+    var marker = start;
+    final me = messenger.me, newSign = marker['newSign']! as String;
+    final record = (marker['record']! as Map).cast<String, dynamic>(), signature = marker['signature']! as String;
+    final view = await api.devices(me.username);
+    if (!(view['succession'] as List? ?? const []).any((x) => x is Map && x['newSign'] == newSign)) {
+      try {
+        await api.publishSuccession(record, signature);
+      } on ApiException catch (error) {
+        // Refused (not a lost connection): nothing moved, so there is nothing to resume.
+        if (error.status >= 400 && error.status < 500) await markers.write(null);
+        rethrow;
+      }
+    }
+    if (await link.account() != null) await link.successionComplete(jsonEncode(record), signature);
+    // The marker is bound to the key this core now holds; another key means it isn't ours to finish.
+    if ((await messenger.crypto.identity()).sign != newSign) {
+      await markers.write(null);
+      throw const StoreException('This device holds another account key than the take-over it was finishing. Nothing more was changed.');
+    }
     // From here this device holds the account key: 1:1 messaging, the device list, certificates.
     messenger.companion = false;
-    await messenger.takeOver();
-    final self = (await messenger.device()).deviceId;
-    final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
-    final keep = <Map<String, Object?>>[
-      for (final d in owned)
-        if (d.deviceId != self && listed(d.deviceId))
-          {
-            'deviceId': d.deviceId,
-            'addedAt': d.addedAt,
-            'meta': sealMeta(metaKey, me.id, d.deviceId, label: d.described?['label'] ?? platformLabel(platformOf(d)), platform: platformOf(d)),
-          },
-    ];
-    await messenger.publishNewChain(keep);
-    final now = DateTime.now().millisecondsSinceEpoch;
-    await _groups.recertify(platform: platform, issuedAt: now);
-    final cert = await _link.signDeviceCert(userId: me.id, deviceId: p0.deviceId, platform: platformOf(p0), leafSigKey: primaryLeaf, issuedAt: now);
-    await _api.linkSend(linkId, await _link.seal(linkId, jsonEncode({'v': 1, 'type': 'demote', 'identity': minted.toJson(), 'cert': cert, 'metaKey': b64(metaKey)})), claim: claim);
-    await _link.end(linkId);
+    if ((await api.keyCount()).identity?['sign'] != newSign) {
+      await messenger.takeOver();
+    } else {
+      messenger.markActive();
+    }
+    // List v1 is honoured only while no pin exists for the new key (and not already published by this marker).
+    if (marker['step'] == 'publish' && messenger.devices.pin(me.id, me.id)?.aik != newSign) {
+      final served = await api.devices(me.username);
+      final check = verifyView(userId: me.id, aikSign: newSign, list: served['list'], signature: served['signature'], certs: served['certs']);
+      if (check.ok) {
+        messenger.devices.setPin(me.id, me.id, check.pin!); // Published before the cut: pin it.
+      } else {
+        final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
+        await messenger.publishNewChain([
+          for (final d in (marker['keep'] as List? ?? const []).cast<Map>())
+            {'deviceId': d['deviceId'], 'addedAt': d['addedAt'], 'meta': sealMeta(metaKey, me.id, d['deviceId'] as String, label: d['label'] as String, platform: d['platform'] as String)},
+        ]);
+      }
+    }
+    if (marker['step'] == 'publish') {
+      marker = {...marker, 'step': 'listed'};
+      await markers.write(jsonEncode(marker));
+    }
+    if (marker['step'] != 'demoted') {
+      final now = DateTime.now().millisecondsSinceEpoch;
+      if (marker['step'] != 'recertified') {
+        await groups.recertify(platform: platform, issuedAt: now);
+        marker = {...marker, 'step': 'recertified'};
+        await markers.write(jsonEncode(marker));
+      }
+      final linkId = marker['linkId']! as String;
+      // Sealed once and kept: a resend after a lost connection is the same message (the link's counters move on
+      // every seal, so sealing again would leave a gap the old primary refuses).
+      var sealed = marker['demote'] as String?;
+      if (sealed == null) {
+        final p0 = (marker['primary']! as Map).cast<String, dynamic>();
+        final cert = await link.signDeviceCert(userId: me.id, deviceId: p0['deviceId'] as String, platform: p0['platform'] as String, leafSigKey: p0['leafSigKey'] as String, issuedAt: now);
+        final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
+        final demote = {'v': 1, 'type': 'demote', 'identity': {'dh': marker['newDh'], 'sign': newSign}, 'cert': cert, 'metaKey': b64(metaKey)};
+        sealed = await link.seal(linkId, jsonEncode(demote));
+        marker = {...marker, 'demote': sealed};
+        await markers.write(jsonEncode(marker));
+      }
+      try {
+        await api.linkSend(linkId, sealed, claim: marker['claim'] as String?);
+      } on ApiException catch (error) {
+        // The link is gone (expired while this device was away): the old primary sees the served key and follows
+        // the chain as a linked device; its leaf gets a certificate through the recert relay. A lost connection
+        // (not an answer) is retried on the next start instead.
+        if (error.status < 400 || error.status >= 500) rethrow;
+      }
+      await markers.write(jsonEncode({...marker, 'step': 'demoted'}));
+      await link.end(linkId).catchError((_) {});
+    }
+    await markers.write(null);
   }
 
   Future<void> cancel() async {

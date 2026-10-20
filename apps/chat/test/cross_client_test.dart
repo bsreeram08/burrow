@@ -416,7 +416,9 @@ void main() {
     final take = await TakeOver.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: await companion.device(), platform: 'macos');
     await signal('app-take-qr', take.qr);
     await signal('app-take-sas', await take.waitOffer(timeout: const Duration(minutes: 2)));
-    await take.run(companion, platform: 'macos', timeout: const Duration(minutes: 2));
+    String? takeMarker;
+    await take.run(companion, platform: 'macos', markers: (read: () async => takeMarker, write: (String? v) async => takeMarker = v), timeout: const Duration(minutes: 2));
+    expect(takeMarker, isNull, reason: 'the resume marker is cleared once the take-over is done');
     final newKey = await crypto.identity();
     expect((await linkApi.keyCount()).identity?['sign'], newKey.sign, reason: 'the server serves the new account key');
     expect(await const RustLinkCrypto().account(), isNull, reason: 'the core holds the account key now');

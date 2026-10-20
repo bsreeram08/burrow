@@ -838,7 +838,7 @@ suite('review fixes', () => {
         const w = await populated();
         run('INSERT INTO mls_welcomes (id, device_id, channel_id, sender_id, epoch, seq, welcome, tree, created_at) VALUES (?, ?, ?, ?, 1, 1, x\'00\', x\'00\', ?)', 'E'.repeat(22), w.c1.deviceId, w.channel, w.alice.id, clock);
         await w.b1.send(w.channel, 'secret');
-        run("UPDATE devices SET state = 'pending' WHERE id = ?", w.c1.deviceId);
+        run("UPDATE devices SET state = 'revoked' WHERE id = ?", w.c1.deviceId);
         const watch = w.c1.events(); await watch.opened; await watch.next('hello');
         await w.b1.send(w.channel, 'more');
         await Bun.sleep(150);
@@ -852,7 +852,7 @@ suite('review fixes', () => {
         expect(rows('SELECT 1 FROM mls_welcomes WHERE device_id = ?', w.c1.deviceId)).toEqual([]);
         watch.socket.close();
         // A device that never reconnects is cleaned by the sweep.
-        run("UPDATE devices SET state = 'pending' WHERE id = ?", w.b2.deviceId);
+        run("UPDATE devices SET state = 'revoked' WHERE id = ?", w.b2.deviceId);
         run('INSERT INTO mls_welcomes (id, device_id, channel_id, sender_id, epoch, seq, welcome, tree, created_at) VALUES (?, ?, ?, ?, 1, 1, x\'00\', x\'00\', ?)', 'F'.repeat(22), w.b2.deviceId, w.channel, w.alice.id, clock);
         app.channels!.sweep(true);
         expect(rows('SELECT 1 FROM channel_members WHERE device_id = ?', w.b2.deviceId)).toEqual([]);
@@ -1087,5 +1087,22 @@ suite('recertifying a companion after a transfer (docs/m5-linking.md §5.2.2)', 
         expect(known(served.leafSigKey)).toBe(false); // the swapped key: refused, nothing is certified
         expect(known(leaf, w.b1.deviceId)).toBe(false); // the right key under another device's id
         expect(known(leaf)).toBe(true); // what the group really holds for that device
+    });
+});
+
+suite('an identity change keeps the account\'s places (docs/m5-linking.md §5.3)', () => {
+    test('while the list is void (devices pending) the sweep and the stream withhold, but do not forget, the account\'s devices; a revoked one still loses its place', async () => {
+        const w = await populated();
+        const before = rows('SELECT device_id FROM channel_members WHERE channel_id = ? ORDER BY device_id', w.channel);
+        // What identityChanged does for the account: lists void, devices pending until list v1 under the new key.
+        run("UPDATE devices SET state = 'pending' WHERE user_id = ?", w.bob.id);
+        run('DELETE FROM device_lists WHERE user_id = ?', w.bob.id);
+        app.channels!.sweep(true);
+        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? ORDER BY device_id', w.channel)).toEqual(before);
+        // A device that is actually revoked still loses its place.
+        run("UPDATE devices SET state = 'revoked' WHERE id = ?", w.b2.deviceId);
+        app.channels!.sweep(true);
+        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? AND device_id = ?', w.channel, w.b2.deviceId)).toEqual([]);
+        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? AND device_id = ?', w.channel, w.b1.deviceId).length).toBe(1);
     });
 });

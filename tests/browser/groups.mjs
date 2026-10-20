@@ -321,7 +321,7 @@ try {
   await sees(carol, 'After the rollback').catch(async error => { console.error('carol:', JSON.stringify(await carol.evaluate(id => ({ state: window.Groups.debug(id), banner: document.getElementById('group-banner-text').textContent, status: document.getElementById('chat-status').textContent }), general))); throw error; });
   await dave.waitForTimeout(3000);
   if (await message(dave, 'After the rollback').count()) throw new Error('the rolled-back author still receives');
-  step('dave\'s corrupted commit is sequenced, then rejected by bob's and carol's devices and reported; bob\'s device confirms it fails, rolls it back, removes dave\'s device; the channel goes on without him');
+  step('dave\'s corrupted commit is sequenced, then rejected by bob\'s and carol\'s devices and reported; bob\'s device confirms it fails, rolls it back, removes dave\'s device; the channel goes on without him');
 
 
   console.log('GROUPS E2E PASSED');

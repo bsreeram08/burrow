@@ -219,8 +219,9 @@ fn inspecting_a_served_group_validates_it_without_joining_and_reports_stale_leav
     let g = f.group.clone();
     let view = f.a1.view(&g);
     let seen = f.c1.groups.inspect_group(&mut f.c1.store, &view.group_info, &view.tree).unwrap();
-    assert_eq!(seen.len(), 5);
-    assert!(seen.iter().all(|m| !m.stale));
+    assert_eq!(seen.group_id, g, "the group id comes back");
+    assert_eq!(seen.members.len(), 5);
+    assert!(seen.members.iter().all(|m| !m.stale));
     assert!(f.c1.groups.members(&mut f.c1.store, &group_id(&g).unwrap()).is_ok(), "c1 was already a member; nothing changed");
     // A stranger device that is not in the group stores nothing either.
     let dave = Account::new();
@@ -228,12 +229,12 @@ fn inspecting_a_served_group_validates_it_without_joining_and_reports_stale_leav
     d1.store.put(&format!("peer:{}", f.alice.id), json!({ "aik": f.alice.pin() })).unwrap();
     d1.store.put(&format!("peer:{}", f.bob.id), json!({ "aik": f.bob.pin() })).unwrap();
     d1.store.put(&format!("peer:{}", f.carol.id), json!({ "aik": f.carol.pin() })).unwrap();
-    assert_eq!(d1.groups.inspect_group(&mut d1.store, &view.group_info, &view.tree).unwrap().len(), 5);
+    assert_eq!(d1.groups.inspect_group(&mut d1.store, &view.group_info, &view.tree).unwrap().members.len(), 5);
     assert!(d1.groups.members(&mut d1.store, &group_id(&g).unwrap()).is_err(), "not joined");
     // Stale leaves are reported, a tampered tree or GroupInfo is refused, an unknown identity is refused.
     let bob = f.bob.rekeyed();
     point(&mut d1, &f.bob, &bob, None);
-    let stale: Vec<_> = d1.groups.inspect_group(&mut d1.store, &view.group_info, &view.tree).unwrap().into_iter().filter(|m| m.stale).map(|m| m.user_id).collect();
+    let stale: Vec<_> = d1.groups.inspect_group(&mut d1.store, &view.group_info, &view.tree).unwrap().members.into_iter().filter(|m| m.stale).map(|m| m.user_id).collect();
     assert_eq!(stale, vec![f.bob.id.clone(), f.bob.id.clone()]);
     let mut tree = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &view.tree).unwrap();
     let at = tree.len() / 2;
@@ -242,4 +243,17 @@ fn inspecting_a_served_group_validates_it_without_joining_and_reports_stale_leav
     assert!(d1.groups.inspect_group(&mut d1.store, "AAAA", &view.tree).is_err());
     d1.store.delete(&format!("peer:{}", f.carol.id)).unwrap();
     assert!(d1.groups.inspect_group(&mut d1.store, &view.group_info, &view.tree).unwrap_err().message.contains("no pinned account key"));
+}
+
+#[test]
+fn an_external_join_names_the_group_it_means_and_refuses_a_groupinfo_for_another() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let mut b3 = Dev::new(&f.bob, "web", &[&f.alice, &f.bob, &f.carol]);
+    let info = f.a1.view(&g).group_info;
+    let tree = f.server.tree(&g);
+    let other = b64(&[7u8; 16]);
+    let err = b3.groups.join_external(&mut b3.store, &info, &tree, Some(&other)).unwrap_err();
+    assert!(err.message.contains("another group"), "{err}");
+    b3.groups.join_external(&mut b3.store, &info, &tree, Some(&g)).unwrap();
 }

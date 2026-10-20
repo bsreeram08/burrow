@@ -212,7 +212,7 @@ export function startSignaling(options: SignalingOptions) {
             const source = requestSource(server.requestIP(request)?.address, request.headers, options.trustProxy);
             const requestOrigin = request.headers.get('origin');
             if (requestOrigin && requestOrigin !== options.origin) return json({ error: 'Origin denied' }, 403);
-            if (request.method === 'GET' && ['/', '/app.js', '/account.js', '/devices.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/chat-store.js', '/signal.js', '/verify.js', '/markdown.js', '/files.js', '/palette.js', '/core.js', '/core-worker.js', '/vendor/simplewebauthn-browser.js', '/style.css', '/install.js', '/sw.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(url.pathname)) {
+            if (request.method === 'GET' && ['/', '/app.js', '/account.js', '/devices.js', '/groups.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/chat-store.js', '/signal.js', '/verify.js', '/markdown.js', '/files.js', '/palette.js', '/core.js', '/core-worker.js', '/vendor/simplewebauthn-browser.js', '/style.css', '/install.js', '/sw.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(url.pathname)) {
                 const path = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
                 return new Response(Bun.file(new URL(`./public/${path}`, import.meta.url)), { headers: {
                     'Content-Security-Policy': PAGE_CSP,

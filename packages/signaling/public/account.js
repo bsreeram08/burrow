@@ -912,8 +912,29 @@
     const contact = contactById(contactId);
     if (!contact || !box) return;
     const { identity } = await api(`/api/keys/${contact.username}/identity`);
+    const before = await box.peer(contactId);
+    if (before && (before.identity.dh !== identity.dh || before.identity.sign !== identity.sign) && await followSuccession(contact, before, identity)) { if (current?.id === contactId) updateBanner(); return; }
     await box.notePeer(contactId, identity);
     if (current?.id === contactId) updateBanner();
+  }
+  /**
+   * m5 §5.3: a contact moved their account to a new primary device. If a chain of records, each signed by the key
+   * before it, leads from the key we pinned to the one served now, the new key is theirs: the pin moves and keeps
+   * its verification, and a soft notice replaces the security-code review. Anything else: the usual review.
+   */
+  async function followSuccession(contact, before, served) {
+    const view = await api(`/api/devices/${contact.username}`).catch(() => null);
+    const path = view?.succession?.length ? await Devices.verifySuccession(contact.id, before.identity, served, view.succession) : null;
+    if (!path) return false;
+    await window.Groups?.contactSucceeded(contact.id, path).catch(() => {}); // The group store keeps the old key as a predecessor.
+    await box.notePeer(contact.id, served);
+    await box.acceptChange(contact.id); // Accepted because the old key signed it over, not on the server's word.
+    if (before.verified) await box.setVerified(contact.id, true);
+    const text = `${contact.username} moved to a new device. Verification kept.`;
+    await window.ChatStore.note(await pairId(contact.id), crypto.randomUUID(), text).catch(() => {});
+    say('chats-status', text);
+    if (current?.id === contact.id) App.refreshHistory();
+    return true;
   }
   // Cross-check a changed identity against the server's published one; a mismatch is suspicious.
   async function identityChanged(contactId) {

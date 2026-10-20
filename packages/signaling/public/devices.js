@@ -143,6 +143,26 @@
     if (!exact(record, ['v', 'userId', 'oldSign', 'newSign', 'newDh', 'at']) || record.v !== 1 || typeof record.userId !== 'string' || !USER_ID.test(record.userId) || !timestamp(record.at)) fail('Invalid succession record');
     return writer().text16('webrtc-bun-succession-v1').text16(record.userId).bytes8(key32(record.oldSign)).bytes8(key32(record.newSign)).bytes8(key32(record.newDh)).u64(record.at).done();
   }
+  /**
+   * m5 §5.3: does a served succession chain lead from the key we pinned to the key served now? Each record (oldest
+   * first, at most 8) must be signed by the previous key, the first by the pinned one, and the last must name the
+   * served identity. Resolves the records that make the path, or null.
+   */
+  async function verifySuccession(userId, pinned, served, records) {
+    if (!Array.isArray(records) || records.length > 8 || !pinned?.sign || !served?.sign || !served?.dh) return null;
+    const start = records.findIndex(record => record?.oldSign === pinned.sign);
+    if (start < 0) return null;
+    let key = pinned.sign;
+    const path = records.slice(start);
+    for (const record of path) {
+      if (record?.userId !== userId || record.oldSign !== key) return null;
+      const { signature, ...body } = record;
+      try { if (!await verifyBytes(key, successionBytes(body), signature)) return null; } catch { return null; }
+      key = record.newSign;
+    }
+    const last = path.at(-1);
+    return last.newSign === served.sign && last.newDh === served.dh ? path : null;
+  }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -273,5 +293,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

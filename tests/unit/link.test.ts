@@ -28,4 +28,22 @@ describe('link and succession bytes (shared vectors)', () => {
     const sealed = await F.sealMeta(primary, 'user_1', 'd'.repeat(22), { label: 'Chrome on Mac', platform: 'web' });
     expect(await F.openMeta(await F.metaKeyFromBytes(raw), 'user_1', 'd'.repeat(22), sealed)).toEqual({ label: 'Chrome on Mac', platform: 'web' });
   });
+  test('a succession chain is followed only from the pinned key to the served one, each record signed by the key before it', async () => {
+    const key = async () => { const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']) as unknown as CryptoKeyPair; return { pair, pub: Buffer.from(await crypto.subtle.exportKey('raw', pair.publicKey)).toString('base64url') }; };
+    const [k0, k1, k2] = [await key(), await key(), await key()];
+    const record = async (from: any, to: any, at: number, userId = 'user_1') => {
+      const body = { v: 1, userId, oldSign: from.pub, newSign: to.pub, newDh: b64(9), at };
+      return { ...body, signature: Buffer.from(await crypto.subtle.sign('Ed25519', from.pair.privateKey, new Uint8Array(F.successionBytes(body)))).toString('base64url') };
+    };
+    const chain = [await record(k0, k1, 1), await record(k1, k2, 2)];
+    const served = { sign: k2.pub, dh: b64(9) };
+    expect(await F.verifySuccession('user_1', { sign: k0.pub }, served, chain)).toHaveLength(2);
+    expect(await F.verifySuccession('user_1', { sign: k1.pub }, served, chain)).toHaveLength(1); // pinned mid-chain
+    expect(await F.verifySuccession('user_1', { sign: k2.pub }, { sign: k1.pub, dh: b64(9) }, chain)).toBeNull(); // must end at the served key
+    expect(await F.verifySuccession('user_2', { sign: k0.pub }, served, chain)).toBeNull();
+    const forged = [chain[0], { ...chain[1], signature: chain[0].signature }];
+    expect(await F.verifySuccession('user_1', { sign: k0.pub }, served, forged)).toBeNull();
+    const stranger = await key();
+    expect(await F.verifySuccession('user_1', { sign: stranger.pub }, served, chain)).toBeNull(); // must start at our pin
+  });
 });

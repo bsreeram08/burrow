@@ -1356,6 +1356,13 @@
 
   window.Groups = Object.freeze({
     start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, createDm, acceptDm, sendDm,
+    /** A contact's verified succession chain (m5 §5.3): the group store moves its pin and keeps the old key as a predecessor. */
+    async contactSucceeded(contactId, records) {
+      if (!run || !enabled) return;
+      if (!await run({ cmd: 'peer', contact: contactId }).catch(() => null)) return; // Not pinned here yet: the next pin takes the new key.
+      await run({ cmd: 'acceptSuccession', contact: contactId, records });
+      pinsChanged(contactId);
+    },
     /** The DM group this device holds with a contact, if any (m5 §8). */
     dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */

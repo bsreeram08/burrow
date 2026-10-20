@@ -97,7 +97,9 @@ function describe(record, flagged) {
   const delivery = groupChat ? { queued: 'Queued on this device', sent: readers ? `Sent · read by ${readers}` : 'Sent to everyone', delivered: 'Sent to everyone', read: 'Read by everyone', uncertain: 'Restored · delivery unconfirmed' }[status]
     : { queued: 'Queued on this device', sent: 'Sent · delivery unconfirmed', delivered: 'Delivered to device', read: 'Read', uncertain: 'Restored · delivery unconfirmed' }[status];
   const detail = `${record.direction === 'outgoing' ? 'You' : groupChat ? record.fromName || 'Someone' : peerName === 'the other participant' ? 'Other participant' : peerName} · ${new Date(record.createdAt).toLocaleString()} · ${delivery}${record.editedAt ? ` · Edited ${new Date(record.editedAt).toLocaleString()}` : ''}${record.expiresAt ? ' · Disappears ' + new Date(record.expiresAt).toLocaleString() : ''}`;
-  return flagged ? `${detail} · Sent under a new security code` : detail;
+  // History a linked device got from your other device (m5 §2): shown as such, never as something it received itself.
+  const origin = record.imported ? `${detail} · From your other device` : detail;
+  return flagged ? `${origin} · Sent under a new security code` : origin;
 }
 /** Markdown subset with custom emoji in its plain runs; DOM nodes only. */
 function renderText(container, text, record) {
@@ -157,7 +159,7 @@ function paintRow(row, record) {
   // Messages that arrived under a changed security code stay marked until the code is reviewed.
   const flagged = Boolean(window.App?.flagged?.(record)), status = groupStatus(record) === 'read' && !readReceiptsOn() ? 'delivered' : groupStatus(record);
   const quoted = record.replyTo ? shown.get(record.replyTo.id)?.direction || '-' : '';
-  const key = `${status}|${flagged}|${record.createdAt}|${shownText(record)}|${record.editedAt || ''}|${JSON.stringify(record.votes || null)}|${JSON.stringify(record.reactions || null)}|${quoted}|${peerName}|${(record.readBy || []).length}|${record.fromName || ''}|${window.Emoji?.revision || 0}`;
+  const key = `${status}|${flagged}|${record.createdAt}|${shownText(record)}|${record.editedAt || ''}|${JSON.stringify(record.votes || null)}|${JSON.stringify(record.reactions || null)}|${quoted}|${peerName}|${(record.readBy || []).length}|${record.fromName || ''}|${record.imported ? 'i' : ''}|${window.Emoji?.revision || 0}`;
   if (row.dataset.paint === key) return;
   row.dataset.paint = key; row.dataset.status = status; row.classList.toggle('flagged', flagged);
   const body = row.querySelector('.message-text'), text = shownText(record);
@@ -179,7 +181,7 @@ function paintRow(row, record) {
   const reactions = row.querySelector('.reactions'); if (reactions) paintReactions(reactions, record);
   const label = describe(record, flagged); row.title = label;
   const meta = row.querySelector('.message-meta'); meta.setAttribute('aria-label', label);
-  meta.querySelector('.meta-text').textContent = `${flagged ? '⚠ ' : ''}${record.expiresAt ? '⏱ ' : ''}${record.editedAt ? 'edited · ' : ''}${clock(record.createdAt)}${record.direction === 'outgoing' && record.status === 'uncertain' ? ' ?' : ''}`;
+  meta.querySelector('.meta-text').textContent = `${record.imported ? 'from your other device · ' : ''}${flagged ? '⚠ ' : ''}${record.expiresAt ? '⏱ ' : ''}${record.editedAt ? 'edited · ' : ''}${clock(record.createdAt)}${record.direction === 'outgoing' && record.status === 'uncertain' ? ' ?' : ''}`;
 }
 function buildRow(record, animate) {
   const row = document.createElement('li'); row.className = record.direction;

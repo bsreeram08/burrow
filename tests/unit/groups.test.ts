@@ -26,7 +26,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
     setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
     mlsSignResolution: () => 'L'.repeat(86),
-    mlsInspectGroup: () => ({ groupId: G, epoch: 3, members: options.tree ?? [] }),
+    mlsInspectGroup: () => options.tree ?? [], // chatcore: [{ leaf, userId, deviceId, platform, admin, stale }]
     mlsVerifyResolution: command => { if (command.signature !== 'L'.repeat(86) || command.by !== DEV2) throw coded('auth', 'bad resolution signature'); return { userId: ME, deviceId: DEV2 }; },
     mlsCommitAuthor: () => ({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false } }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),

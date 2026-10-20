@@ -29,7 +29,7 @@
       await sleep(POLL);
     }
   }
-  const spacedCode = code => `${code.slice(0, 3)} ${code.slice(3)}`;
+  const spacedCode = code => { const digits = String(code).replace(/\s+/g, ''); return `${digits.slice(0, 3)} ${digits.slice(3)}`; };
 
   // ---------- N: this browser joins an account ----------
   async function linkThisBrowser() {
@@ -185,7 +185,7 @@
     await call(`/api/link/${linkId}/grant`, 'POST', {});
     for (const [i, data] of chunks.entries()) await send({ v: 1, type: 'bundle', i, of: chunks.length, data });
     await window.Groups.linkCore({ cmd: 'linkEnd', linkId }).catch(() => {});
-    ui.done(`Linked ${label}. It joins your groups and channels by itself; 1:1 chats stay here until they move to the new encryption.`);
+    ui.done(`Linked ${label}. It joins your groups, channels and chats on the new encryption by itself; other 1:1 chats stay on this device until they move.`);
     ctx.devicesChanged();
   }
   /** §2: pins (not changed or blocked ones), channel names, and (if asked) recent history. Never a key. */

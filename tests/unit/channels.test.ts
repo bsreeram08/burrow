@@ -655,10 +655,14 @@ suite('poison commits', () => {
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: w.seq, digest: w.digest })).body).toEqual({ frozen: true });
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: w.seq, digest: '1'.repeat(64) })).status).toBe(409);
 
-        // The admin's own copy of the group authenticates who signed the commit (signature only; nothing changes).
-        const author = w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: entry.message });
-        expect(author).toMatchObject({ userId: w.alice.id, deviceId: w.a1.deviceId });
-        expect(() => w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: flip(entry.message, 40) })).toThrow();
+        // The admin's own copy of the group authenticates who signed the commit (nothing changes). A broken tag is
+        // outside the signature: class 'tag', which never justifies removing the author (the client then signs no author).
+        const check = w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: entry.message });
+        expect(check).toMatchObject({ authenticated: true, class: 'tag', author: { userId: w.alice.id, deviceId: w.a1.deviceId } });
+        let tampered: any = null;
+        try { tampered = w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: flip(entry.message, 40) }); } catch {}
+        expect(tampered?.authenticated ?? false).toBe(false);
+        // The server mechanics of a rollback with a removal (the client asks for one only for class 'signed-content').
         // Only an admin device, with its own signature over exactly this resolution, naming the commit's author.
         const a = w.a1.deviceId;
         const resolve = (device: Device, action: string, signature?: string, named = a) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq: w.seq, digest: w.digest, author: named, signature: signature ?? device.resolution(w.channel, action as any, w.seq, w.digest, named) });
@@ -700,7 +704,7 @@ suite('poison commits', () => {
         const seq = honest.body.seq, digest = honest.body.digest;
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202); // a faulty or hostile report
         expect((await w.a1.send(w.channel, 'x')).status).toBe(423);
-        const resolve = (device: Device, action: string) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq, digest, author: w.a1.deviceId, signature: device.resolution(w.channel, action as any, seq, digest, w.a1.deviceId) });
+        const resolve = (device: Device, action: string) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq, digest, author: '', signature: device.resolution(w.channel, action as any, seq, digest, '') });
         expect((await resolve(w.c1, 'dismiss')).status).toBe(403);
         expect((await resolve(w.a2, 'dismiss')).body).toEqual({ resolved: 'dismiss' });
         expect(one('SELECT frozen_seq FROM channels WHERE id = ?', w.channel).frozen_seq).toBeNull();
@@ -738,7 +742,7 @@ suite('review fixes', () => {
         const honest = await w.a1.commit(w.channel, { update: true });
         const { seq, digest } = honest.body;
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
-        const dismiss = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'dismiss', seq, digest, author: w.a1.deviceId, signature: w.a2.resolution(w.channel, 'dismiss', seq, digest, w.a1.deviceId) });
+        const dismiss = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'dismiss', seq, digest, author: '', signature: w.a2.resolution(w.channel, 'dismiss', seq, digest, '') });
         expect(dismiss.status).toBe(200);
         // The same commit is not reportable any more...
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(409);
@@ -904,5 +908,32 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         core.call({ cmd: 'acceptChange', contact, identity: second });
         core.call({ cmd: 'setVerified', contact, verified: true, identity: second });
         expect(core.call({ cmd: 'peer', contact })).toMatchObject({ blocked: false, verified: true, identity: second });
+    });
+
+    test('a rollback without a removal restores the state and removes nobody; a dismissal names no author', async () => {
+        const w = await populated();
+        const out = w.a1.client.call({ cmd: 'mlsCommit', group: w.channel, update: true });
+        const result = await w.a1.api('POST', `/api/channels/${w.channel}/commits`, { message: flip(out.commit, -1) });
+        expect(result.status).toBe(201);
+        const { seq, digest } = result.body;
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
+        const watch = w.c1.events(); await watch.opened;
+        const sign = (author: string, action = 'rollback') => ({ action, seq, digest, author, signature: w.a2.resolution(w.channel, action as any, seq, digest, author) });
+        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, sign(w.a1.deviceId, 'dismiss'))).status).toBe(400); // a dismissal removes nobody
+        const done = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, sign(''));
+        expect(done.status).toBe(200);
+        expect(done.body).toEqual({ resolved: 'rollback', epoch: 1, seq: seq - 1 });
+        expect(rows('SELECT device_id FROM channel_bans WHERE channel_id = ?', w.channel)).toEqual([]);
+        let change: any; const seen: string[] = [];
+        do { change = await watch.next('channel'); seen.push(change.change); } while (change.change !== 'thawed');
+        expect(seen).toContain('rolled-back');
+        expect(seen).not.toContain('remove-needed');
+        // The resolving admin publishes the restored epoch's GroupInfo; the author's device is still a member and
+        // rejoins with it (its own copy had merged the rolled-back commit), then goes on.
+        const view = w.a2.client.call({ cmd: 'mlsView', group: w.channel });
+        expect((await w.a2.api('PUT', `/api/channels/${w.channel}/group-info`, { epoch: view.epoch, groupInfo: view.groupInfo })).status).toBe(200);
+        w.a1.client.call({ cmd: 'mlsForget', group: w.channel });
+        expect((await w.a1.joinExternal(w.channel)).status).toBe(201);
+        watch.socket.close();
     });
 });

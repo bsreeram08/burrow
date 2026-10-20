@@ -315,6 +315,8 @@
           const seq = await joinExternal(id);
           Object.assign(ch, { kind: row.kind, serverName: row.name, status: 'active', cursor: seq, lastAt: Date.now() });
           delete ch.joining; save();
+          // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
+          if (row.kind === 'dm' && row.peer?.id) { ch.peer = row.peer.id; await run({ cmd: 'mlsCheckDm', group: id, peer: ch.peer }).then(() => { ch.dmChecked = true; }, () => {}); save(); }
           await members(id).catch(() => {});
           await note(id, `own-join:${seq}`, 'This device joined. Earlier messages stay on your other devices.');
         });
@@ -332,8 +334,10 @@
     const info = await call(`/api/channels/${id}/join-info`);
     if (info.status !== 200) return false;
     try {
-      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
-      return view.groupId === id && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
+      // The served tree, validated like a join (read-only): its members. (A GroupInfo for another group can't be used
+      // to join this channel: the delivery service refuses the commit.)
+      const members = await run({ cmd: 'mlsInspectGroup', groupInfo: info.body.groupInfo, tree: info.body.tree });
+      return Array.isArray(members) && members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
     } catch { return false; }
   }
   let removedNote = null;
@@ -1346,7 +1350,7 @@
   window.Groups = Object.freeze({
     start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, createDm, acceptDm, sendDm,
     /** The DM group this device holds with a contact, if any (m5 §8). */
-    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && usable(ch))?.[0] || null,
+    dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
@@ -1362,6 +1366,8 @@
     },
     onDisplayed, onTyping,
     // For tests and diagnostics: the state of one channel on this device.
+    /** For tests and diagnostics: the devices in this device's copy of a group's tree. */
+    leaves: id => run ? run({ cmd: 'mlsMembers', group: id }).then(list => list.map(member => ({ userId: member.userId, deviceId: member.deviceId, stale: Boolean(member.stale) }))) : Promise.resolve([]),
     debug: id => { const ch = channels.get(id); return ch && { status: ch.status, cursor: ch.cursor, kind: ch.kind, members: ch.members.map(member => member.username), admins: ch.admins }; },
   });
 })();

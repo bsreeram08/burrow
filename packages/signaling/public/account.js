@@ -566,8 +566,11 @@
   const readMoved = () => readJson(movedKey(), {});
   /** The DM group of a moved chat, if this device holds it (a linked device that hasn't joined yet doesn't). */
   async function dmChannel(contact) {
-    const moved = readMoved()[await pairId(contact.id)];
-    return moved && window.Groups?.dmChannelWith(contact.id) === moved.channel ? moved.channel : null;
+    const channel = window.Groups?.dmChannelWith(contact.id) || null;
+    if (!channel) return null;
+    // A linked device never sees the pointer: the checked DM group it joined as our own device is the proof.
+    if (linked) return channel;
+    return readMoved()[await pairId(contact.id)]?.channel === channel ? channel : null;
   }
   async function markMoved(contact, channel) {
     const all = readMoved(); all[await pairId(contact.id)] = { channel, at: Date.now() }; writeJson(movedKey(), all);

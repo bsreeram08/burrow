@@ -24,10 +24,10 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     // Like chatcore: with `identity`, only that exact pinned identity is accepted.
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
     setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
-    mlsCommitAuthor: () => ({ leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }),
+    mlsCommitAuthor: () => ({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false } }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),
     mlsMembers: () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }],
-    mlsPending: () => null, mlsCommitReceived: () => null, mlsAbortReceived: () => null, mlsForget: () => null,
+    mlsPending: () => null, mlsClearOwn: () => null, mlsView: () => ({ groupId: G, epoch: 3, groupInfo: 'gi', tree: 't' }), mlsCommitReceived: () => null, mlsAbortReceived: () => null, mlsForget: () => null,
     mlsCommit: () => ({ groupId: G, commit: b64('commit'), digest: sha('commit'), epoch: 3 }),
     mlsMergeOwn: () => ({ groupId: G, epoch: 4, groupInfo: 'gi', tree: 't' }),
     mlsReceive: () => { throw coded('invalid', 'no script'); },
@@ -45,6 +45,8 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
     ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : [202, { frozen: true }]],
     ['POST', /^\/api\/channels\/\w+\/cursor$/, () => [200, {}]],
+    ['GET', /^\/api\/channels\/\w+\/join-info$/, () => [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
+    ['POST', /^\/api\/channels\/\w+\/join$/, () => [201, { epoch: 4, seq: 7, digest: sha('join') }]],
   ];
   async function fetch(path: string, init: any = {}) {
     const method = init.method || 'GET', body = init.body ? JSON.parse(init.body) : undefined;
@@ -168,11 +170,36 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.of('mlsCommit')).toEqual([]);
   });
 
-  test('4c. a commit whose author this device can\'t authenticate is never rolled back', async () => {
-    const w = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { author: () => { throw coded('auth', 'commit signature rejected'); } });
-    expect([w.el('group-rollback').hidden, w.el('group-dismiss').hidden]).toEqual([true, false]);
-    await w.el('group-rollback').onclick(); await w.settle();
-    expect(w.requests.filter(request => request.path.endsWith('/resolve'))).toEqual([]);
+  test('4c. a failure outside what the author signed (a tag the server could corrupt) rolls back but removes nobody', async () => {
+    for (const author of [() => ({ authenticated: true, signedContentInvalid: false, class: 'tag', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV } }), () => { throw coded('auth', 'commit signature rejected'); }]) {
+      const w = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { author });
+      expect(w.el('group-banner-text').textContent).toContain('nobody is removed');
+      expect([w.el('group-rollback').hidden, w.el('group-dismiss').hidden]).toEqual([false, false]);
+      await w.el('group-rollback').onclick(); await w.settle();
+      expect(w.requests.find(request => request.path.endsWith('/resolve'))!.body).toMatchObject({ action: 'rollback', author: '' });
+      expect(w.of('mlsCommit')).toEqual([]);
+      // The restored epoch's GroupInfo is published, so the author can rejoin.
+      expect(w.requests.some(request => request.method === 'PUT' && request.path.endsWith('/group-info'))).toBe(true);
+    }
+  });
+
+  test('4d. the author of a rolled-back commit rejoins and makes the same change again; others ignore the notice', async () => {
+    const w = world();
+    let joined = 0;
+    w.handlers.mlsJoinExternal = () => { joined++; return { groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 }; };
+    await w.start();
+    w.Groups.open(G);
+    // This device removes bob (a commit of its own), and the server later reports that very commit rolled back.
+    await w.Groups.removeMember(G, BOB);
+    const own = w.requests.filter(request => request.path.endsWith('/commits')).length;
+    w.Groups.frame({ type: 'channel', id: G, change: 'rolled-back', seq: 99, digest: 'f'.repeat(64) }); // not ours
+    await w.settle();
+    expect(joined).toBe(0);
+    w.Groups.frame({ type: 'channel', id: G, change: 'rolled-back', seq: 6, digest: sha('commit') });
+    await w.until(() => w.requests.filter(request => request.path.endsWith('/commits')).length === own + 1, 'redone');
+    expect(joined).toBe(1);
+    expect(w.of('mlsForget').length).toBeGreaterThan(0);
+    expect(w.of('mlsCommit').at(-1).removes).toEqual([{ userId: BOB }]);
   });
 
   test('5. a changed code of someone met in a group pauses the group and is only accepted from an explicit review', async () => {

@@ -80,7 +80,7 @@ async function say(page, text) {
   // Sent: sequenced by the delivery service (not just saved on this device).
   await until(page, async text => (await window.ChatStore.list()).some(record => record.direction === 'outgoing' && record.text === text && record.status !== 'queued'), text);
 }
-const sees = (page, text) => message(page, text).waitFor({ state: 'visible', timeout: TIMEOUT });
+const sees = (page, text, timeout = TIMEOUT) => message(page, text).waitFor({ state: 'visible', timeout });
 const ready = page => until(page, () => window.Groups?.enabled(), undefined, 60000);
 const groupState = (page, id) => page.evaluate(id => window.Groups.debug(id), id);
 
@@ -296,37 +296,33 @@ try {
   if (await message(alice, 'Back to normal').count()) throw new Error('a member who left still receives');
   step('carol reports the commit: #general freezes, bob\'s device re-checks it ("checks out", no Roll back), he dismisses it, and the queued message goes out');
 
-  // ---------- A commit every member rejects: reported, checked, rolled back, its author's device removed ----------
+  // ---------- A commit damaged in transit: reported, checked, rolled back, nobody removed, its author redoes it ----------
   // Dave's device sends a commit whose last byte (inside the membership tag) is flipped on the way: the delivery
   // service can't check that tag, so it sequences it; every member's device rejects it as poison and reports it.
+  // The damage is outside what dave signed (a server could do this), so the rollback removes nobody.
   await dave.route('**/api/channels/*/commits', async route => {
     const body = JSON.parse(route.request().postData());
     const bytes = Buffer.from(body.message, 'base64url'); bytes[bytes.length - 1] ^= 1;
     await route.continue({ postData: JSON.stringify({ ...body, message: bytes.toString('base64url') }) });
-  });
+  }, { times: 1 });
   await dave.click('#conv-menu summary'); await dave.click('#conv-info'); await visible(dave, '#group-info');
   await dave.locator('#group-info-people label', { hasText: 'alice' }).locator('input').check();
   await dave.click('#group-info-add-button');
   await until(dave, () => /Added/.test(document.getElementById('group-info-status').textContent), undefined, 60000);
-  await dave.unroute('**/api/channels/*/commits');
   await dave.click('#group-info-close');
-  // Bob's device rejected it too, so (and only so) Roll back is offered.
-  await until(bob, () => !document.getElementById('group-rollback').hidden && /rejects it too/.test(document.getElementById('group-banner-text').textContent), undefined, 60000);
+  await until(bob, () => !document.getElementById('group-rollback').hidden && /nobody is removed/.test(document.getElementById('group-banner-text').textContent), undefined, 60000);
   await shot(bob, 'rollback');
   const resolved = bob.waitForRequest(request => request.url().endsWith('/resolve'));
   await bob.click('#group-rollback');
-  // The signed rollback names the author bob's own device authenticated: dave's device, not whoever the server says.
-  const daveDevice = await dave.evaluate(async () => (await window.DeviceFormat.deviceKey(window.App.accountId)).deviceId);
   const signed = JSON.parse((await resolved).postData());
-  if (signed.action !== 'rollback' || signed.author !== daveDevice) throw new Error(`rollback signed for ${signed.author}, dave is ${daveDevice}`);
-  await sees(bob, 'You removed dave');
-  await until(bob, id => !window.Groups.debug(id).members.includes('dave'), general);
-  await until(dave, () => !document.getElementById('group-banner').hidden && /removed/.test(document.getElementById('group-banner-text').textContent));
+  if (signed.action !== 'rollback' || signed.author !== '') throw new Error(`a tag-only failure named an author to remove: ${signed.author}`);
+  // Dave's device sees its commit rolled back, rejoins at the restored epoch and adds alice again, this time intact.
+  await sees(dave, 'It was made again', 60000);
+  await until(bob, id => { const state = window.Groups.debug(id); return state.members.includes('alice') && state.members.includes('dave'); }, general, 60000);
   await say(bob, 'After the rollback');
-  await sees(carol, 'After the rollback').catch(async error => { console.error('carol:', JSON.stringify(await carol.evaluate(id => ({ state: window.Groups.debug(id), banner: document.getElementById('group-banner-text').textContent, status: document.getElementById('chat-status').textContent }), general))); throw error; });
-  await dave.waitForTimeout(3000);
-  if (await message(dave, 'After the rollback').count()) throw new Error('the rolled-back author still receives');
-  step('dave\'s corrupted commit is sequenced, then rejected by bob\'s and carol\'s devices and reported; bob\'s device confirms it fails, rolls it back, removes dave\'s device; the channel goes on without him');
+  await sees(carol, 'After the rollback'); await sees(dave, 'After the rollback');
+  await openGroup(alice, 'general'); await sees(alice, 'After the rollback');
+  step('dave\'s commit is damaged in transit: rejected and reported; bob\'s device sees the damage is outside what dave signed and rolls it back removing nobody; dave rejoins and re-adds alice; everyone reads #general');
 
 
   console.log('GROUPS E2E PASSED');

@@ -556,6 +556,7 @@
     else if (message.change === 'thawed') { if (ch?.status === 'frozen') { ch.status = 'active'; delete ch.frozen; save(); paint(id); enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); flush(id); } }
     // `remove-needed` is not acted on: a frame alone never makes this device remove anyone. The device to remove
     // comes from this device's own signed rollback (resolve() below).
+    else if (message.change === 'rolled-back') { if (ch && Number.isSafeInteger(message.seq)) rolledBack(id, message.seq, message.digest); }
     else if (message.change === 'gap') { if (usable(ch)) enqueue(id, () => resyncInner(id)).catch(error => failed(id, error)); }
   }
   function onEphemeral(message) {
@@ -634,6 +635,9 @@
         const view = await run({ cmd: 'mlsMergeOwn', group: id });
         await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo });
         await describe(id, `commit:${result.body.seq}:${result.body.digest}`, me.id, false, before, rolesBefore);
+        // Kept until the next commit: if an admin rolls this one back, this device makes the same change again.
+        channels.get(id).lastCommit = { seq: result.body.seq, digest: result.body.digest, removes: change.removes || null, roles: change.roles || null, update: Boolean(change.update), adds: [...new Set(claimed.map(item => item.userId))] };
+        save();
         return result.body;
       }
       await run({ cmd: 'mlsClearOwn', group: id });
@@ -672,6 +676,8 @@
     if (!ch.meta) ch.meta = { name: '', topic: '', at: Date.now() };
     await sendInner(id, { v: 1, type: 'meta', id: crypto.randomUUID(), name: ch.meta.name, topic: ch.meta.topic, at: ch.meta.at });
   }
+  /** An admin removes every device of one person. */
+  const removeMember = (id, userId) => enqueue(id, () => commitInner(id, { removes: [{ userId }] }));
   function queueRemoval(id, userId) {
     enqueue(id, async () => {
       if (!(await treeUsers(id)).includes(userId)) return;
@@ -745,6 +751,27 @@
   }
   const hex = bytes => [...new Uint8Array(bytes)].map(byte => byte.toString(16).padStart(2, '0')).join('');
   const unb64 = text => Uint8Array.from(atob(text.replace(/-/g, '+').replace(/_/g, '/')), character => character.charCodeAt(0));
+  /**
+   * An admin rolled a commit back. If it was ours, this device had already merged it: rejoin at the restored epoch
+   * and make the same change again (§7). Anyone else's copy never merged it (every member rejected it).
+   */
+  function rolledBack(id, seq, digest) {
+    const ch = channels.get(id), mine = ch?.lastCommit;
+    if (!mine || mine.seq !== seq || mine.digest !== digest) return;
+    delete ch.lastCommit; save();
+    enqueue(id, async () => {
+      for (let attempt = 0; ; attempt++) {
+        try { await resyncInner(id); break; }
+        catch (error) { if (attempt >= 4) throw error; await sleep(1000 * 2 ** attempt); } // The admin publishes the restored GroupInfo.
+      }
+      if (mine.adds.length) {
+        const users = mine.adds.filter(user => user !== me.id);
+        const { keyPackages } = await claim(users);
+        if (keyPackages.length) await commitInner(id, {}, keyPackages);
+      } else await commitInner(id, { removes: mine.removes || undefined, roles: mine.roles || undefined, update: mine.update });
+      await note(id, `redo:${seq}`, 'An admin undid a change you made that other devices couldn\'t read. It was made again.');
+    }).catch(error => failed(id, error));
+  }
   async function thawIfResolved(id) {
     const ch = channels.get(id), info = await call(`/api/channels/${id}`);
     if (info.status !== 200 || info.body.frozen || ch?.status !== 'frozen') return;
@@ -773,19 +800,25 @@
     if (!frozen) return Promise.resolve();
     ch.check = { seq: frozen.seq, digest: frozen.digest, state: 'checking' }; paint(id);
     return enqueue(id, async () => {
-      // `author`: the commit's author device; `authenticated` when this device's own tree verified its signature
-      // (required for a rollback, which cuts that device off). A dismissal removes nobody: the log's word will do.
-      let state = 'unknown', author = null, authenticated = false;
+      // `author`: the commit's author device, `authenticated` when this device's own tree verified its signature.
+      // `blame`: 'signed-content' when what the author signed is itself invalid (only then is the author removed);
+      // 'tag' when the failure lies outside the signature, which the server could have caused in transit.
+      let state = 'unknown', author = null, authenticated = false, blame = 'tag';
       try {
         const result = await call(`/api/channels/${id}/log?after=${frozen.seq - 1}`);
         const entry = result.status === 200 ? result.body.entries.find(item => item.seq === frozen.seq) : null;
         if (entry && ID.test(entry.from?.deviceId || '')) author = entry.from.deviceId;
         if (entry?.kind === 'commit' && entry.from.deviceId !== deviceId) {
           await ensurePins([entry.from.userId]);
-          try { author = (await run({ cmd: 'mlsCommitAuthor', group: id, message: entry.message })).deviceId; authenticated = true; } catch {}
+          try {
+            const checked = await run({ cmd: 'mlsCommitAuthor', group: id, message: entry.message });
+            authenticated = checked.authenticated === true && ID.test(checked.author?.deviceId || '');
+            if (authenticated) author = checked.author.deviceId;
+            blame = authenticated && checked.class === 'signed-content' ? 'signed-content' : 'tag';
+          } catch {}
         }
         if (!entry || entry.kind !== 'commit' || hex(await crypto.subtle.digest('SHA-256', unb64(entry.message))) !== frozen.digest) state = 'unknown';
-        else if (ch.rejected?.seq === frozen.seq && ch.rejected.digest === frozen.digest) state = authenticated ? 'fails' : 'unknown';
+        else if (ch.rejected?.seq === frozen.seq && ch.rejected.digest === frozen.digest) state = 'fails';
         else if (entry.from.deviceId === deviceId || ch.cursor >= frozen.seq) state = 'ok'; // Built or merged here, after the same validator.
         else {
           await ensurePins([entry.from.userId]);
@@ -793,29 +826,32 @@
           try {
             processed = await run({ cmd: 'mlsReceive', group: id, message: entry.message, commit: false, expect: 'commit' });
             state = 'ok';
-          } catch (error) { state = error.code === 'poison' && authenticated ? 'fails' : 'unknown'; }
+          } catch (error) { state = error.code === 'poison' ? 'fails' : 'unknown'; }
           if (processed) await run({ cmd: 'mlsAbortReceived', pendingId: processed.pendingId }).catch(() => {});
         }
       } catch { state = 'unknown'; }
-      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state, author, authenticated }; save(); paint(id); }
+      if (ch.frozen?.seq === frozen.seq && ch.frozen.digest === frozen.digest) { ch.check = { seq: frozen.seq, digest: frozen.digest, state, author, authenticated, blame }; save(); paint(id); }
     }).catch(() => {});
   }
   async function resolve(id, action) {
     const ch = channels.get(id);
     if (!ch?.frozen) return;
     const check = ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check : null;
-    if (action === 'rollback' && !(check?.state === 'fails' && check.authenticated)) throw new Error('this device did not find that change invalid, so it won\'t roll it back');
-    if (action === 'dismiss' && (!check || check.state === 'checking' || !check.author)) throw new Error('still checking the change');
-    const author = check.author;
+    if (action === 'rollback' && check?.state !== 'fails') throw new Error('this device did not find that change invalid, so it won\'t roll it back');
+    if (action === 'dismiss' && (!check || check.state === 'checking')) throw new Error('still checking the change');
+    // Named (and so removed) only when its author signed invalid content and this device authenticated that author.
+    const author = action === 'rollback' && check.blame === 'signed-content' && check.authenticated && ID.test(check.author || '') ? check.author : '';
     const device = await window.DeviceFormat.deviceKey(me.id);
     // The signature names the author this device authenticated, so the server can't make it cut off someone else.
     const bytes = new TextEncoder().encode(`webrtc-bun-mlsresolve-v2\n${id}\n${action}\n${ch.frozen.seq}\n${ch.frozen.digest}\n${author}`);
     const answer = await must(`/api/channels/${id}/resolve`, 'POST', { action, seq: ch.frozen.seq, digest: ch.frozen.digest, author, signature: await device.sign(bytes) });
     ch.status = 'active'; delete ch.frozen; delete ch.check; delete ch.rejected; save(); paint(id);
+    // A rollback restores the epoch before the commit: publish its GroupInfo so devices can rejoin (the author's).
+    if (action === 'rollback') enqueue(id, async () => { const view = await run({ cmd: 'mlsView', group: id }); await call(`/api/channels/${id}/group-info`, 'PUT', { epoch: view.epoch, groupInfo: view.groupInfo }); }).catch(() => {});
     enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
-    // Only the author this device authenticated is removed; an answer naming anyone else is refused.
-    if (action === 'rollback') {
-      if (answer.removeDevice !== undefined && answer.removeDevice !== author) status(id, 'The server named a different device to remove than the one that made the change. Nobody was removed; ask another admin to check.');
+    // Only the author this device authenticated, for content it signed, is removed; any other answer removes nobody.
+    if (action === 'rollback' && author) {
+      if (answer.removeDevice !== author) status(id, 'The server named a different device to remove than the one that made the change. Nobody was removed; ask another admin to check.');
       else removeDevice(id, author);
     }
     flush(id);
@@ -892,7 +928,9 @@
     const check = ch?.frozen && ch.check?.seq === ch.frozen.seq && ch.check.digest === ch.frozen.digest ? ch.check.state : null;
     const verdict = {
       checking: `A member's device rejected a change to ${title(id)}. Checking it on this device…`,
-      fails: `A change to ${title(id)} was rejected by a member's device, and this device rejects it too. Roll it back (and cut off the device that made it), or dismiss the report.`,
+      fails: ch?.check?.blame === 'signed-content'
+        ? `A change to ${title(id)} was rejected by a member's device, and this device rejects it too: what its author signed is invalid. Roll it back (and cut off the device that made it), or dismiss the report.`
+        : `A change to ${title(id)} was rejected by a member's device, and this device rejects it too, but it was damaged outside what its author signed (that can happen on the way). Roll it back: nobody is removed, and its author makes the change again.`,
       ok: `A member's device rejected a change to ${title(id)}, but it checks out on this device. Dismiss the report to let the conversation go on.`,
       unknown: `A member's device rejected a change to ${title(id)}. This device couldn't check it, so rolling back isn't offered. Dismiss the report, or ask another admin.`,
     };
@@ -1005,7 +1043,7 @@
         remove.setAttribute('aria-label', `Remove ${member.username}`);
         remove.onclick = async () => {
           remove.disabled = true;
-          try { await enqueue(id, () => commitInner(id, { removes: [{ userId: member.userId }] })); } catch (error) { $('group-info-status').textContent = `Couldn't remove: ${error.message}`; }
+          try { await removeMember(id, member.userId); } catch (error) { $('group-info-status').textContent = `Couldn't remove: ${error.message}`; }
           finally { remove.disabled = false; paintInfo(); }
         };
         row.append(remove);
@@ -1099,7 +1137,7 @@
   ]);
 
   window.Groups = Object.freeze({
-    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
+    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
     active: () => currentId, enabled: () => enabled, flush: () => currentId && flush(currentId),
     onReact: (target, emoji, on) => send(currentId, { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }),
     async onEdit(record, text) {

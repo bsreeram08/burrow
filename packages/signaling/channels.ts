@@ -29,8 +29,10 @@ const json = (value: unknown, status = 200) => Response.json(value, { status, he
 
 /**
  * What an admin device signs to resolve a frozen channel: its device key over these exact UTF-8 bytes. `author` is
- * the commit's author device as the admin's own copy of the group authenticated it (its signature), so the server
- * can neither swap whose device a rollback cuts off nor apply the signature to another commit.
+ * empty unless the rollback removes the commit's author: then it is that device as the admin's own copy of the
+ * group authenticated it, and only when the failure lay in what the author signed (a tag the server could have
+ * corrupted in transit proves nothing about the author). The server can neither choose whom a rollback cuts off
+ * nor apply the signature to another commit.
  */
 export const resolveBytes = (channelId: string, action: string, seq: number, digest: string, author: string) => Buffer.from(`webrtc-bun-mlsresolve-v2\n${channelId}\n${action}\n${seq}\n${digest}\n${author}`);
 
@@ -502,14 +504,15 @@ export function createChannels(deps: Deps) {
         if (!member.admin) return json({ error: 'Only an admin device resolves a frozen channel.' }, 403);
         if (!allowPoison(user.id)) return json({ error: 'Rate limited' }, 429);
         const body = await readJson(request, 2048);
-        if (!body || !['rollback', 'dismiss'].includes(body.action) || !Number.isSafeInteger(body.seq) || typeof body.digest !== 'string' || !DIGEST.test(body.digest) || typeof body.author !== 'string' || !ID.test(body.author)) return json({ error: 'Invalid resolution' }, 400);
+        if (!body || !['rollback', 'dismiss'].includes(body.action) || !Number.isSafeInteger(body.seq) || typeof body.digest !== 'string' || !DIGEST.test(body.digest) || typeof body.author !== 'string' || !(body.author === '' || (body.action === 'rollback' && ID.test(body.author)))) return json({ error: 'Invalid resolution' }, 400);
         if (channel.frozen_seq === null || channel.frozen_seq !== body.seq || channel.frozen_digest !== body.digest) return json({ error: 'That commit is not the one this channel is frozen on.' }, 409);
         // The admin device signs exactly what it resolves: the server cannot do this on its own.
         const key = deps.sigKey(deviceId!);
         if (!key || !ed25519Verify(key, resolveBytes(channelId, body.action, body.seq, body.digest, body.author), body.signature)) return json({ error: 'The resolution is not signed by this device.' }, 403);
-        // The admin's device names the author it authenticated; it must be the device that sent that commit.
+        // A removal names the author the admin's device authenticated; it must be the device that sent that commit.
+        const removing = body.author !== '';
         const reported = db.query<{ sender_device: string }, [string, number]>('SELECT sender_device FROM group_log WHERE channel_id = ? AND seq = ?').get(channelId, body.seq);
-        if (!reported || reported.sender_device !== body.author) return json({ error: 'That is not the author of the frozen commit.' }, 409);
+        if (removing && (!reported || reported.sender_device !== body.author)) return json({ error: 'That is not the author of the frozen commit.' }, 409);
         if (body.action === 'dismiss') {
             // The dismissed commit can't be reported again: the rollback state it needed is dropped with the report.
             db.query('UPDATE channels SET frozen_seq = NULL, frozen_digest = NULL, frozen_by = NULL, frozen_at = NULL, prev_state = NULL, prev_epoch = NULL WHERE id = ?').run(channelId);
@@ -529,7 +532,7 @@ export function createChannels(deps: Deps) {
                 db.query('DELETE FROM group_log WHERE channel_id = ? AND seq = ?').run(channelId, body.seq);
                 db.query('DELETE FROM mls_welcomes WHERE channel_id = ? AND seq = ?').run(channelId, body.seq);
                 db.query('UPDATE channels SET epoch = ?, seq = ?, prev_state = NULL, prev_epoch = NULL, group_info_epoch = NULL, frozen_seq = NULL, frozen_digest = NULL, frozen_by = NULL, frozen_at = NULL WHERE id = ?').run(fresh.prev_epoch, body.seq - 1, channelId);
-                db.query('INSERT OR IGNORE INTO channel_bans (channel_id, device_id, banned_at) VALUES (?, ?, ?)').run(channelId, author, now());
+                if (removing) db.query('INSERT OR IGNORE INTO channel_bans (channel_id, device_id, banned_at) VALUES (?, ?, ?)').run(channelId, author, now());
                 const restored = { ...fresh, epoch: fresh.prev_epoch, seq: body.seq - 1 };
                 ({ added, removed } = mirror(restored, treeOf(call, channelId), body.seq - 1));
             });
@@ -539,11 +542,15 @@ export function createChannels(deps: Deps) {
             throw error;
         }
         announce(channelId, { added, removed });
-        // Sequencing resumes for everyone (members who reported it are waiting for this, as after a dismissal).
+        // Everyone learns which commit is gone (its author, if it stays, rejoins and makes the change again); then
+        // sequencing resumes (members who reported it are waiting for this, as after a dismissal).
+        for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'rolled-back', seq: body.seq, digest: body.digest });
         for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'thawed' });
+        const restored = { resolved: 'rollback', epoch: channelRow(channelId)!.epoch, seq: body.seq - 1 };
+        if (!removing) return json(restored);
         // The author is still a leaf in the restored tree: an admin removes it with an ordinary commit.
         for (const admin of usersOf(members(channelId).filter(row => row.admin))) deps.notify(admin, { type: 'channel', id: channelId, change: 'remove-needed', deviceId: author! });
-        return json({ resolved: 'rollback', epoch: channelRow(channelId)!.epoch, seq: body.seq - 1, removeDevice: author! });
+        return json({ ...restored, removeDevice: author! });
     }
 
     // ---------- Fan-out ----------

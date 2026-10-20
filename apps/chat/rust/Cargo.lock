@@ -307,7 +307,9 @@ dependencies = [
 name = "chatcore_bridge"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "chatcore",
+ "ed25519-dalek",
  "flutter_rust_bridge",
  "serde_json",
 ]

@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
@@ -24,6 +25,15 @@ class FakeChatCrypto implements ChatCrypto {
 
   /// Tests: make the next [init] fail as a locked key database.
   bool locked = false;
+
+  /// Device records signed so far (tests); the fake key can't make a verifiable signature.
+  final List<Uint8List> signedRecords = [];
+
+  @override
+  Future<String> signDeviceRecord(Uint8List bytes) async {
+    signedRecords.add(bytes);
+    return base64Url.encode(sha256.convert([...utf8.encode(me.sign), ...bytes]).bytes + List.filled(32, 0)).replaceAll('=', '');
+  }
 
   @override
   Future<void> init(String dbPath) async {

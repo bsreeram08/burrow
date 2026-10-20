@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => 1979869076;
+  int get rustContentHash => -1802068516;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -231,6 +231,12 @@ abstract class RustLibApi extends BaseApi {
   Future<void> crateApiSetVerified({
     required String contactId,
     required bool verified,
+  });
+
+  Future<String> crateApiSignDeviceRecord({
+    required String dbPath,
+    required List<int> storeKey,
+    required List<int> bytes,
   });
 }
 
@@ -1486,6 +1492,42 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   TaskConstMeta get kCrateApiSetVerifiedConstMeta => const TaskConstMeta(
     debugName: "set_verified",
     argNames: ["contactId", "verified"],
+  );
+
+  @override
+  Future<String> crateApiSignDeviceRecord({
+    required String dbPath,
+    required List<int> storeKey,
+    required List<int> bytes,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(dbPath, serializer);
+          sse_encode_list_prim_u_8_loose(storeKey, serializer);
+          sse_encode_list_prim_u_8_loose(bytes, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 41,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiSignDeviceRecordConstMeta,
+        argValues: [dbPath, storeKey, bytes],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiSignDeviceRecordConstMeta => const TaskConstMeta(
+    debugName: "sign_device_record",
+    argNames: ["dbPath", "storeKey", "bytes"],
   );
 
   @protected

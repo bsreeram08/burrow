@@ -448,9 +448,13 @@ class AppController extends Notifier<AppState> {
         // Our own id: another device may have taken over this account's encryption.
         unawaited(id == state.user?.id ? _checkActive() : _checkIdentity(id));
       case DevicesChanged(:final id):
-        // A contact's list: verify it against their pinned security code. (Ours: the app does not sign lists yet.)
+        // A contact's list: verify it against their pinned security code. Ours: check it still names this device.
         final contact = contactById(id);
-        if (contact != null && id != state.user?.id) unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
+        if (id == state.user?.id) {
+          unawaited(messenger?.syncDevices().catchError((_) => false));
+        } else if (contact != null) {
+          unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
+        }
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
       case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow() || GroupEphemeral():
@@ -471,7 +475,13 @@ class AppController extends Notifier<AppState> {
     try {
       final active = await messenger?.checkActive();
       if (active != null) state = state.copyWith(inactiveDevice: !active);
-      if (active == true && !(groups?.ready ?? true)) await _startGroups();
+      if (active == true) {
+        // Groups need this device in the account's signed device list (docs/m4-groups.md §2).
+        try {
+          await messenger?.syncDevices();
+        } catch (_) {}
+        if (!(groups?.ready ?? true)) await _startGroups();
+      }
     } catch (e) {
       state = state.copyWith(notice: 'Could not check encryption keys: $e');
     }

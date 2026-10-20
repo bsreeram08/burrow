@@ -1,6 +1,8 @@
 // RustChatCrypto against the real Rust core on the host (the dylib `cargo build` produces in rust/).
 // Skipped when it has not been built: `cargo build --manifest-path rust/Cargo.toml`.
+import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
@@ -45,6 +47,23 @@ void main() {
     // Never a general signing oracle: a malformed challenge, device or account is refused.
     for (final args in [['user_1', device, 'short'], ['user_1', 'nope', challenge], ['no spaces', device, challenge]]) {
       await expectLater(core.proveIdentity(args[0], args[1], args[2]), throwsA(isA<CryptoException>()));
+    }
+  }, skip: skip);
+
+  test('the core signs device lists and certificates with the identity key, and nothing else', () async {
+    final core = crypto(MemoryStoreKeys());
+    await core.init('lists');
+    final identity = await core.identity();
+    const user = 'uuuuuuuuuuuuuuuuuuuuuu', device = 'dddddddddddddddddddddd';
+    final entry = {'deviceId': device, 'addedAt': 1700000000000, 'meta': ''};
+    final list = {'v': 1, 'userId': user, 'version': 1, 'prevHash': '', 'devices': [entry]};
+    final signature = await core.signDeviceRecord(listBytes(list));
+    final cert = await core.signDeviceRecord(certBytes(user, entry));
+    final check = verifyView(userId: user, aikSign: identity.sign, list: list, signature: signature, certs: {device: cert});
+    expect(check.ok, isTrue, reason: check.reason);
+    // Never a general signing oracle: claim bytes, bind bytes and arbitrary bytes are refused.
+    for (final bytes in [claimBytes(user, device, 'B' * 42 + 'A'), bindBytes(user, device, 'B' * 42 + 'A'), Uint8List.fromList(utf8.encode('hello'))]) {
+      await expectLater(core.signDeviceRecord(bytes), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'invalid')));
     }
   }, skip: skip);
 

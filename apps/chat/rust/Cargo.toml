@@ -12,6 +12,9 @@ crate-type = ["cdylib", "staticlib"]
 chatcore = { path = "../../../crates/chatcore" }
 flutter_rust_bridge = "=2.13.0"
 serde_json = { version = "=1.0.140", features = ["preserve_order"] }
+# Device-list signing with the account key (sign_device_record); the same pins as chatcore.
+ed25519-dalek = { version = "=2.2.0", features = ["zeroize"] }
+base64 = "=0.22.1"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }

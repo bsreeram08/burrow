@@ -29,12 +29,16 @@ const dylib = join(appDir, 'rust/target/debug', process.platform === 'darwin' ? 
 
 const app = startSignaling({ adminToken: 'x'.repeat(40), origin, hostname: '127.0.0.1', port, dataDir });
 const testing = app.accounts!.testing;
-const webUser = testing.createUser('webuser'), appUser = testing.createUser('appuser');
+const webUser = testing.createUser('webuser'), appUser = testing.createUser('appuser'), thirdUser = testing.createUser('thirduser');
 const cookie = testing.cookie(webUser.id), bearer = testing.bearer(appUser.id, 'ios');
 const call = (path: string, init: RequestInit) => fetch(new URL(path, origin), init).then(async response => { if (!response.ok) throw new Error(`${path} → ${response.status} ${await response.text()}`); });
 await call('/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: cookie }, body: JSON.stringify({ username: 'appuser' }) });
 await call('/api/contacts/webuser/accept', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: '{}' });
-step('two accounts (web and app) are mutual contacts');
+// A third account (a web browser) that the app adds to a group and removes again.
+const thirdCookie = testing.cookie(thirdUser.id);
+await call('/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: thirdCookie }, body: JSON.stringify({ username: 'appuser' }) });
+await call('/api/contacts/thirduser/accept', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: '{}' });
+step('two accounts (web and app) are mutual contacts, and a third is the app\'s contact');
 
 const signal = (name: string, body = '') => writeFileSync(join(sync, `web-${name}`), body);
 async function waitFor(name: string, timeout = 90000) {
@@ -45,7 +49,7 @@ async function waitFor(name: string, timeout = 90000) {
 
 const dart = spawn('flutter', ['test', 'test/cross_client_test.dart', '--reporter', 'expanded'], {
     cwd: appDir, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, CROSS_BASE: origin, CROSS_TOKEN: bearer, CROSS_ME_ID: appUser.id, CROSS_ME_NAME: 'appuser', CROSS_PEER_ID: webUser.id, CROSS_PEER_NAME: 'webuser', CROSS_DIR: sync, CROSS_DYLIB: dylib },
+    env: { ...process.env, CROSS_BASE: origin, CROSS_TOKEN: bearer, CROSS_ME_ID: appUser.id, CROSS_ME_NAME: 'appuser', CROSS_PEER_ID: webUser.id, CROSS_PEER_NAME: 'webuser', CROSS_THIRD_ID: thirdUser.id, CROSS_THIRD_NAME: 'thirduser', CROSS_DIR: sync, CROSS_DYLIB: dylib },
 });
 let dartOutput = '';
 dart.stdout.on('data', chunk => { dartOutput += chunk; });
@@ -54,8 +58,8 @@ const dartDone = new Promise<number>(resolve => dart.on('exit', code => { if (co
 
 const playwright = await import(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 const browser = await playwright.chromium.launch();
-const [name, value] = cookie.split('=');
-async function webPage() {
+async function webPage(as = cookie) {
+    const [name, value] = as.split('=');
     const context = await browser.newContext();
     await context.addCookies([{ name, value, url: origin }]);
     const page = await context.newPage();
@@ -195,8 +199,87 @@ try {
     await page.click('#conv-menu summary'); await page.click('#conv-burn');
     await page.waitForSelector('#burn-confirm', { state: 'visible' }); await page.click('#burn-confirm-yes');
     signal('burned');
-    await waitFor('done');
     step('burn from the web deletes the conversation in the app');
+
+    // Groups over MLS (docs/m4-groups.md): the web and the app in one group, both ways, plus add/remove.
+    const groupsReady = (p: any) => p.waitForFunction(() => (window as any).Groups?.enabled(), null, { timeout: 90000 });
+    await waitFor('groups-ready', 120000);
+    if (!testing.db.query("SELECT 1 FROM devices WHERE user_id = ? AND state = 'listed'").get(appUser.id)) throw new Error('the app\'s device is not listed');
+    await groupsReady(page);
+    step('the app signed its device list (a listed device) and uploaded KeyPackages; groups are on in both clients');
+    if (await page.locator('#conv-head').isVisible()) await page.click('#conv-back');
+    // A private channel: a group needs two other people, and the web and the app are each other's only contact.
+    await page.click('#channels-new');
+    await page.waitForSelector('#group-new', { state: 'visible' });
+    await page.fill('#group-new-name', 'Cross team');
+    await page.locator('#group-new-people label', { hasText: 'appuser' }).locator('input').check();
+    await page.click('#group-new-create');
+    await page.waitForFunction(() => document.getElementById('group-new')!.hidden && document.getElementById('conv-name')!.textContent!.includes('Cross team'), null, { timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb: ${await page.textContent('#group-new-status')}`); });
+    const groupId: string = await page.evaluate(() => (window as any).Groups.active());
+    signal('group-created', groupId);
+    const groupRecords = (p: any = page): Promise<any[]> => p.evaluate(async (id: string) => (await (window as any).ChatStore.list()).filter((r: any) => r.conversationId === id), groupId);
+    async function groupUntil(what: string, check: (list: any[]) => boolean, p: any = page, timeout = 90000) {
+        const end = Date.now() + timeout;
+        while (!check(await groupRecords(p))) {
+            if (Date.now() > end || failed) throw new Error(`web: ${what}\n${JSON.stringify((await groupRecords(p)).map(r => ({ d: r.direction, s: r.status, f: r.fromName, t: r.editedText ?? r.text, k: r.attachment?.kind, r: r.reactions })))}`);
+            await Bun.sleep(200);
+        }
+        return groupRecords(p);
+    }
+    step('the web creates the private channel "Cross team" with the app (the name travels only in the encrypted meta)');
+
+    // Web → app: an @mention and an image.
+    await page.fill('#chat-input', 'hello group from web @appuser and all');
+    await page.click('#chat-send');
+    await groupUntil('mention sent', list => list.some(r => r.direction === 'outgoing' && r.text.startsWith('hello group from web') && r.status !== 'queued'));
+    const groupPng = readFileSync(join(root, 'packages/signaling/public/icon-512.png'));
+    await page.setInputFiles('#attach-input', [{ name: 'group.png', mimeType: 'image/png', buffer: groupPng }]);
+    await groupUntil('image sent', list => list.some(r => r.direction === 'outgoing' && r.attachment?.kind === 'image' && r.status !== 'queued'));
+    signal('group-web-sent', JSON.stringify({ image: sha(groupPng) }));
+
+    // App → web: its reaction on our message, its text, its file.
+    const fromAppGroup = JSON.parse(await waitFor('group-app-sent', 120000));
+    const groupList = await groupUntil('the app\'s group messages', l =>
+        l.some(r => r.id === fromAppGroup.id && r.from === appUser.id && r.fromName === 'appuser') &&
+        l.some(r => r.direction === 'incoming' && r.attachment?.kind === 'file') &&
+        l.some(r => r.text?.startsWith('hello group from web') && (r.reactions?.[appUser.id] || []).includes('👍')));
+    if (await webSha(groupList.find(r => r.direction === 'incoming' && r.attachment?.kind === 'file').attachment) !== fromAppGroup.file) throw new Error('the app\'s group file decrypted to different bytes on the web');
+    const appRow = page.locator('#chat-log li[data-message-id]', { hasText: 'hello group from app' }).first();
+    await appRow.hover(); await page.click('#msg-actions [data-react="😂"]');
+    await groupUntil('our reaction', l => l.some(r => r.id === fromAppGroup.id && (r.reactions?.me || []).includes('😂')));
+    signal('group-web-reacted');
+    step('in the group both ways: text with @mention, an image and a file (byte-identical), and reactions by person');
+
+    // The app's own private channel: the web joins from the app's Welcome and learns the name from its meta.
+    const appGroupId = await waitFor('app-group', 120000);
+    await page.waitForFunction((id: string) => (window as any).Groups.debug(id)?.members.includes('appuser'), appGroupId, { timeout: 90000 });
+    await page.waitForFunction(() => [...document.querySelectorAll('#channel-list li strong, #pinned-list li strong')].some(node => node.textContent!.includes('App team')), null, { timeout: 90000 });
+    signal('app-group-joined');
+    step('the app creates the private channel "App team" with the web, which joins from the app\'s Welcome');
+
+    // The app adds a third person and removes them again.
+    const { page: thirdPage } = await webPage(thirdCookie);
+    await groupsReady(thirdPage);
+    // Its KeyPackages are on the server before the app claims one.
+    for (const end = Date.now() + 90000; !(testing.db.query('SELECT COUNT(*) AS n FROM mls_key_packages WHERE user_id = ?').get(thirdUser.id) as any)?.n;) {
+        if (Date.now() > end) throw new Error('the third account never uploaded KeyPackages');
+        await Bun.sleep(200);
+    }
+    signal('third-ready');
+    await waitFor('group-added', 120000);
+    const thirdRecords = (): Promise<any[]> => thirdPage.evaluate(async (id: string) => (await (window as any).ChatStore.list()).filter((r: any) => r.conversationId === id), appGroupId);
+    for (const end = Date.now() + 90000; !(await thirdRecords()).some(r => r.text === 'welcome third');) {
+        if (Date.now() > end || failed) throw new Error(`third: never read "welcome third": ${JSON.stringify((await thirdRecords()).map(r => r.text))}`);
+        await Bun.sleep(200);
+    }
+    await page.waitForFunction((id: string) => (window as any).Groups.debug(id)?.members.includes('thirduser'), appGroupId, { timeout: 90000 });
+    signal('group-third-ok');
+    await waitFor('group-removed', 120000);
+    await page.waitForFunction((id: string) => !(window as any).Groups.debug(id)?.members.includes('thirduser'), appGroupId, { timeout: 90000 });
+    signal('group-removal-seen');
+    await waitFor('done');
+    step('the app adds thirduser (who reads from then on) and removes them; the web sees both');
     code = await dartDone;
     if (code !== 0) throw new Error('the app side failed');
     console.log('Cross-client check passed.');

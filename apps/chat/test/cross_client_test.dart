@@ -16,7 +16,10 @@ import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
+import 'package:private_chat/crypto/rust_group_crypto.dart';
 import 'package:private_chat/messaging/attachments.dart';
+import 'package:private_chat/messaging/group_messenger.dart';
+import 'package:private_chat/messaging/group_sync.dart';
 import 'package:private_chat/messaging/messenger.dart';
 import 'package:private_chat/store/message.dart';
 import 'package:private_chat/store/message_store.dart';
@@ -51,6 +54,7 @@ void main() {
     sqfliteFfiInit();
     final me = User(id: env['CROSS_ME_ID']!, username: env['CROSS_ME_NAME']!);
     final web = Contact(id: env['CROSS_PEER_ID']!, username: env['CROSS_PEER_NAME']!, state: ContactState.mutual, online: true);
+    final third = Contact(id: env['CROSS_THIRD_ID']!, username: env['CROSS_THIRD_NAME']!, state: ContactState.mutual, online: true);
     final api = Api(baseUrl: base!, clientName: 'ios')..token = env['CROSS_TOKEN']!;
     final crypto = RustChatCrypto(
       directory: () async => dir,
@@ -72,8 +76,13 @@ void main() {
       ack: events.ack,
     );
     messenger.notices.listen(notices.add);
+    GroupMessenger? groups;
     events.events.listen((event) {
-      if (event is EnvelopeEvent) messenger.receive(event);
+      if (event is EnvelopeEvent) {
+        messenger.receive(event);
+      } else {
+        groups?.onEvent(event);
+      }
     });
     await events.connect();
     final conversation = messenger.conversationWith(web.id!);
@@ -200,6 +209,78 @@ void main() {
     // 8. Burn from the web deletes this conversation here.
     await waitFor('burned');
     await until(() async => (await messages()).isEmpty, 'conversation burned');
+
+    // 9. Groups over MLS (docs/m4-groups.md): the app publishes its signed device list (a listed device),
+    // creates its group identity with the same Rust core and uploads KeyPackages.
+    expect(await messenger.syncDevices(), isTrue, reason: messenger.deviceWarning ?? 'device list published');
+    final device = await messenger.device();
+    final sync = GroupSync(
+      api: api,
+      crypto: const RustGroupCrypto(),
+      store: store,
+      me: me,
+      device: () async => device,
+      platform: 'ios',
+      ensurePinned: (ids) async => groups?.ensurePinned(ids),
+      pinProblem: (ids) async => groups?.pinProblem(ids),
+      sendCursor: events.cursor,
+      ackWelcome: events.ack,
+    );
+    groups = GroupMessenger(api: api, sync: sync, chatCrypto: crypto, store: store, me: me, contacts: () => [web, third]);
+    final g = groups;
+    g.notices.listen(notices.add);
+    sync.notices.listen(notices.add);
+    await g.start();
+    expect(g.ready, isTrue, reason: g.unavailable);
+    await signal('groups-ready');
+
+    // 9a. The web created a group with the app: the Welcome arrives, the name comes from the encrypted meta.
+    final groupId = await waitFor('group-created', timeout: const Duration(seconds: 120));
+    Future<List<ChatMessage>> inGroup() => store.list(groupId);
+    describe = () async => 'group: ${[for (final m in await inGroup()) '${m.direction.name} ${m.senderName} "${m.body}" ${m.reactions.byWho}']}\nnotices: $notices';
+    await until(() async => (await store.group(groupId))?.name == 'Cross team', 'group joined and named', timeout: const Duration(seconds: 90));
+    Future<ChatMessage> inGroupFind(String what, bool Function(ChatMessage) test) async {
+      await until(() async => (await inGroup()).any(test), what, timeout: const Duration(seconds: 90));
+      return (await inGroup()).firstWhere(test);
+    }
+
+    // 9b. Web → app in the group: a message mentioning the app, and an image.
+    final webGroup = jsonDecode(await waitFor('group-web-sent', timeout: const Duration(seconds: 120))) as Map<String, dynamic>;
+    final hello = await inGroupFind('web group message', (m) => m.text.startsWith('hello group from web'));
+    expect((hello.sender, hello.senderName), (web.id, web.username));
+    expect(hello.mentions, [me.id]);
+    expect((await store.group(groupId))!.mentioned, isTrue);
+    final webImage = await inGroupFind('web group image', (m) => !m.outgoing && m.attachment?.kind == 'image');
+    expect(sha(await attachments.open(webImage.attachment!)), webGroup['image'], reason: 'image bytes identical');
+
+    // 9c. App → web: a reaction, a message, a file.
+    await g.react(groupId, hello, '👍', on: true);
+    final appMessage = await g.send(groupId, 'hello group from app');
+    final groupFile = Uint8List.fromList(List.generate(40000, (i) => (i * 13 + 5) % 256));
+    await g.send(groupId, '', attachment: await attachments.upload(bytes: groupFile, name: 'group-notes.bin', mime: 'application/octet-stream', kind: 'file'));
+    await until(() async => (await inGroup()).where((m) => m.outgoing && m.status != MessageStatus.queued).length >= 2, 'group messages sequenced');
+    await signal('group-app-sent', jsonEncode({'id': appMessage.id, 'file': sha(groupFile)}));
+
+    // 9d. The web's reaction on our message, by person.
+    await waitFor('group-web-reacted', timeout: const Duration(seconds: 120));
+    await inGroupFind('web reaction on the app message', (m) => m.id == appMessage.id && m.reactions.of(web.id!).contains('😂'));
+
+    // 9e. The app creates its own private channel with the web (the web joins from the app's Welcome), adds a
+    // third person who reads from then on, and removes them again.
+    final own = await g.create(GroupKindName.private, name: 'App team', topic: 'from the app', memberIds: [web.id!]);
+    await signal('app-group', own.id);
+    await waitFor('app-group-joined', timeout: const Duration(seconds: 120));
+    await waitFor('third-ready', timeout: const Duration(seconds: 120));
+    await g.addMembers(own.id, [third.id!]);
+    expect((await g.members(own.id, refresh: true)).map((m) => m.username).toSet(), {me.username, web.username, third.username});
+    await g.send(own.id, 'welcome third');
+    await signal('group-added');
+    await waitFor('group-third-ok', timeout: const Duration(seconds: 120));
+    await g.removeMember(own.id, third.id!);
+    expect((await g.members(own.id, refresh: true)).map((m) => m.username).toSet(), {me.username, web.username});
+    await signal('group-removed');
+    await waitFor('group-removal-seen', timeout: const Duration(seconds: 120));
+    await g.dispose();
     await signal('done');
     await events.close();
   }, skip: base == null ? 'run through tests/cross-client/run.ts' : false, timeout: const Timeout(Duration(minutes: 5)));

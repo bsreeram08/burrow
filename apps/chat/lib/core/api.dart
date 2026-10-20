@@ -231,20 +231,27 @@ class Api {
 
   /// `{epoch, seq, groupInfo, tree}` for an external join (409 between epochs).
   Future<Map<String, dynamic>> joinInfo(String id) => call('/api/channels/$id/join-info');
-  Future<void> putGroupInfo(String id, int epoch, String groupInfo) =>
-      call('/api/channels/$id/group-info', method: 'PUT', body: {'epoch': epoch, 'groupInfo': groupInfo});
+  Future<void> putGroupInfo(String id, int epoch, String groupInfo) async {
+    await call('/api/channels/$id/group-info', method: 'PUT', body: {'epoch': epoch, 'groupInfo': groupInfo});
+  }
 
   /// Log entries after [after] (default: this device's cursor): `{epoch, seq, cursor, entries, more, gap, frozen?}`.
   Future<Map<String, dynamic>> groupLog(String id, {int? after}) => call('/api/channels/$id/log${after == null ? '' : '?after=$after'}');
-  Future<void> setCursor(String id, int seq) => call('/api/channels/$id/cursor', method: 'POST', body: {'seq': seq});
+  Future<void> setCursor(String id, int seq) async {
+    await call('/api/channels/$id/cursor', method: 'POST', body: {'seq': seq});
+  }
 
   /// This device's Welcome inbox (metadata), one Welcome with its tree, and removal after storing it.
   Future<List<Map<String, dynamic>>> welcomes() async => ((await call('/api/mls/welcomes'))['welcomes'] as List).cast<Map<String, dynamic>>();
   Future<Map<String, dynamic>> welcome(String id) => call('/api/mls/welcomes/$id');
-  Future<void> deleteWelcome(String id) => call('/api/mls/welcomes/$id', method: 'DELETE');
+  Future<void> deleteWelcome(String id) async {
+    await call('/api/mls/welcomes/$id', method: 'DELETE');
+  }
 
   /// Reports that this device rejected the latest sequenced commit: the channel freezes.
-  Future<void> reportPoison(String id, int seq, String digest) => call('/api/channels/$id/poison', method: 'POST', body: {'seq': seq, 'digest': digest});
+  Future<void> reportPoison(String id, int seq, String digest) async {
+    await call('/api/channels/$id/poison', method: 'POST', body: {'seq': seq, 'digest': digest});
+  }
 
   /// An admin device resolves a frozen channel; [signature] is its device key over [resolveBytes].
   Future<Map<String, dynamic>> resolveChannel(String id, {required String action, required int seq, required String digest, required String signature}) =>

@@ -315,11 +315,19 @@
    * A local, never-sent system line (e.g. "secure session reset"), stored once per id. Peer-triggered lines
    * count toward the same caps as incoming messages, and one written within a minute of the previous
    * system line in that conversation replaces it instead of adding a row, so a contact cannot flood them.
+   * Groups keep each line (who joined, left, was added) under their newest-500 rule instead.
    */
   async function note(conversationId, id, text) {
     const message = validate({ id, conversationId, direction: 'system', text, createdAt: Date.now(), status: 'delivered', expiresAt: null }, true);
     return transaction((active, now) => {
       if (active.has(key(message))) return { result: false };
+      // A group keeps every membership line (the server rate-limits commits, and the newest-500 rule bounds them).
+      if (isGroup(conversationId)) {
+        const mine = sorted([...active.values()].filter(value => value.conversationId === conversationId));
+        const over = Math.max(0, mine.length + 1 - GROUP_KEEP, active.size + 1 - MAX_MESSAGES);
+        if (over > mine.length) throw coded('full', 'This device holds 2,000 messages. Clear chat history to receive more.');
+        return { writes: [message], deletes: mine.slice(0, over), result: true };
+      }
       const recent = [...active.values()].filter(value => value.conversationId === conversationId && value.direction === 'system' && now - value.createdAt < 60000).at(-1);
       if (recent) return { writes: [{ ...recent, text: message.text, createdAt: Math.max(recent.createdAt, message.createdAt) }], result: false };
       if (fromPeer(active, conversationId) >= MAX_PER_CONVERSATION) throw coded('conversation-full', 'This conversation holds 500 incoming messages.');

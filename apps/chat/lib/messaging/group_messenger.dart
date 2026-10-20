@@ -204,9 +204,10 @@ class GroupMessenger {
       unavailable = null;
     } on ApiException catch (error) {
       ready = false;
-      unavailable = error.status == 403 || error.status == 409
-          ? 'Groups need this device in your signed device list. Open the app on your primary device.'
-          : error.message;
+      // Not a listed device: say what to do. Anything else (offline, a server without groups) stays quiet and
+      // is retried on the next reconnect.
+      if (error.status != 403 && error.status != 409) rethrow;
+      unavailable = 'Groups need this device in your signed device list. Open the app on your primary device.';
       return;
     }
     await sync.fetchWelcomes();

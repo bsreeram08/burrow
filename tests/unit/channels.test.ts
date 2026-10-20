@@ -687,14 +687,15 @@ suite('poison commits', () => {
         // The server mechanics of a rollback with a removal (the client asks for one only for class 'signed-content').
         // Only an admin device, with its own signature over exactly this resolution, naming the commit's author.
         const a = w.a1.deviceId;
-        const resolve = (device: Device, action: string, signature?: string, named = a) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq: w.seq, digest: w.digest, author: named, signature: signature ?? device.resolution(w.channel, action as any, w.seq, w.digest, named) });
+        const leafSignature = 'L'.repeat(86); // passed on to members, who check it (not the server)
+        const resolve = (device: Device, action: string, signature?: string, named = a) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq: w.seq, digest: w.digest, author: named, leafSignature, signature: signature ?? device.resolution(w.channel, action as any, w.seq, w.digest, named) });
         expect((await resolve(w.b1, 'rollback')).status).toBe(403); // not an admin
         expect((await resolve(w.a2, 'rollback', w.a2.resolution(w.channel, 'dismiss', w.seq, w.digest, a))).status).toBe(403); // signed for another action
         expect((await resolve(w.a2, 'rollback', w.a1.resolution(w.channel, 'rollback', w.seq, w.digest, a))).status).toBe(403); // someone else's signature
         expect((await resolve(w.a2, 'rollback', 'A'.repeat(86))).status).toBe(403);
         expect((await resolve(w.a2, 'rollback', w.a2.resolution(w.channel, 'rollback', w.seq, w.digest, w.c1.deviceId), a)).status).toBe(403); // signed for another author
         expect((await resolve(w.a2, 'rollback', undefined, w.c1.deviceId)).status).toBe(409); // signed, but not the commit's author
-        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'rollback', seq: w.seq + 1, digest: w.digest, author: a, signature: w.a2.resolution(w.channel, 'rollback', w.seq + 1, w.digest, a) })).status).toBe(409);
+        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'rollback', seq: w.seq + 1, digest: w.digest, author: a, leafSignature, signature: w.a2.resolution(w.channel, 'rollback', w.seq + 1, w.digest, a) })).status).toBe(409);
         const done = await resolve(w.a2, 'rollback');
         expect(done.status).toBe(200);
         expect(done.body).toMatchObject({ resolved: 'rollback', epoch: 1, seq: w.seq - 1, removeDevice: w.a1.deviceId });
@@ -940,16 +941,20 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         const { seq, digest } = result.body;
         expect((await w.b1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
         const watch = w.c1.events(); await watch.opened;
-        const sign = (author: string, action = 'rollback') => ({ action, seq, digest, author, signature: w.a2.resolution(w.channel, action as any, seq, digest, author) });
+        const sign = (author: string, action = 'rollback') => ({ action, seq, digest, author, leafSignature: 'L'.repeat(86), signature: w.a2.resolution(w.channel, action as any, seq, digest, author) });
         expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, sign(w.a1.deviceId, 'dismiss'))).status).toBe(400); // a dismissal removes nobody
+        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { ...sign(''), leafSignature: undefined })).status).toBe(400); // members need the leaf signature
         const done = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, sign(''));
         expect(done.status).toBe(200);
         expect(done.body).toEqual({ resolved: 'rollback', epoch: 1, seq: seq - 1 });
         expect(rows('SELECT device_id FROM channel_bans WHERE channel_id = ?', w.channel)).toEqual([]);
         let change: any; const seen: string[] = [];
-        do { change = await watch.next('channel'); seen.push(change.change); } while (change.change !== 'thawed');
+        let rolled: any;
+        do { change = await watch.next('channel'); seen.push(change.change); if (change.change === 'rolled-back') rolled = change; } while (change.change !== 'thawed');
         expect(seen).toContain('rolled-back');
         expect(seen).not.toContain('remove-needed');
+        expect(rolled).toMatchObject({ action: 'rollback', seq, digest, author: '', by: w.a2.deviceId, signature: 'L'.repeat(86) });
+
         // The resolving admin publishes the restored epoch's GroupInfo; the author's device is still a member and
         // rejoins with it (its own copy had merged the rolled-back commit), then goes on.
         const view = w.a2.client.call({ cmd: 'mlsView', group: w.channel });

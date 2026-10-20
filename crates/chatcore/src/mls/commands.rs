@@ -105,6 +105,17 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 let roles = match command.get("roles") { None | Some(Value::Null) => None, Some(value) => Some(roles_of(value)?) };
                 ok(groups.commit(store, &group()?, &list(command, "adds")?, &removes, roles.as_ref(), flag(command, "update"))?)
             }
+            // Test builds only (`test-hooks`, never in build:wasm): a commit that skips this device's own policy check,
+            // to play a malicious member against the delivery service and the other members.
+            #[cfg(feature = "test-hooks")]
+            "mlsTestUnchecked" => {
+                let removes: Vec<(String, Option<String>)> = match command.get("removes") {
+                    Some(Value::Array(items)) => items.iter().map(|item| Ok((text(item, "userId")?, item.get("deviceId").and_then(Value::as_str).map(str::to_string)))).collect::<Result<_>>()?,
+                    _ => Vec::new(),
+                };
+                let roles = match command.get("roles") { None | Some(Value::Null) => None, Some(value) => Some(roles_of(value)?) };
+                ok(groups.commit_unchecked(store, &group()?, &list(command, "adds")?, &removes, roles.as_ref(), flag(command, "update"))?)
+            }
             "mlsMergeOwn" => ok(groups.merge_own(store, &group()?)?),
             "mlsClearOwn" => { groups.clear_own(store, &group()?)?; Ok(Value::Null) }
             "mlsPending" => ok(groups.pending_commit(store, &group()?)?),

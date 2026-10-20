@@ -173,10 +173,13 @@ impl CommitCheck {
 fn check_commit(provider: &Provider, group: &MlsGroup, protocol: ProtocolMessage, store: &mut dyn Store, cert: &DeviceCert) -> Result<CommitCheck> {
     let ProtocolMessage::PublicMessage(ref message) = protocol else { return Ok(CommitCheck::new(false, false, None)) };
     let claimed = message.sender().clone();
+    // An external commit is signed with a key and credential the joiner puts in the commit itself: there is no leaf
+    // in this tree to authenticate it against, so nobody can be named as its author (a forged certificate could name
+    // any device). It is rejected like any other bad commit, but never attributed.
+    if !matches!(claimed, Sender::Member(_)) { return Ok(CommitCheck::new(false, false, None)); }
     let roles = validate_context(group.extensions())?;
-    let view = |sender: &Sender, processed_leaf: Option<&LeafNode>| match sender {
+    let view = |sender: &Sender, _leaf: Option<&LeafNode>| match sender {
         Sender::Member(index) => Groups::member_view(group, &roles, *index),
-        Sender::NewMemberCommit => processed_leaf.and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
         _ => None,
     };
     match group.public_group().process_message(provider.crypto(), protocol) {
@@ -506,8 +509,8 @@ impl Groups {
     }
 
     /// A commit that skips this device's own policy check: tests use it to play a malicious member.
-    #[cfg(test)]
-    pub(crate) fn commit_unchecked(&mut self, store: &mut dyn Store, group: &GroupId, adds: &[String], removes: &[(String, Option<String>)], roles: Option<&Roles>, update: bool) -> Result<Outgoing> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn commit_unchecked(&mut self, store: &mut dyn Store, group: &GroupId, adds: &[String], removes: &[(String, Option<String>)], roles: Option<&Roles>, update: bool) -> Result<Outgoing> {
         self.build_commit(store, group, adds, removes, roles, update, false)
     }
 

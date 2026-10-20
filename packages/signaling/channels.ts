@@ -505,6 +505,9 @@ export function createChannels(deps: Deps) {
         if (!allowPoison(user.id)) return json({ error: 'Rate limited' }, 429);
         const body = await readJson(request, 2048);
         if (!body || !['rollback', 'dismiss'].includes(body.action) || !Number.isSafeInteger(body.seq) || typeof body.digest !== 'string' || !DIGEST.test(body.digest) || typeof body.author !== 'string' || !(body.author === '' || (body.action === 'rollback' && ID.test(body.author)))) return json({ error: 'Invalid resolution' }, 400);
+        // A rollback also carries the admin's signature with its MLS leaf key (members check it against their own copy
+        // of the group, docs/m4-groups.md §7); the server only passes it on, in the `rolled-back` notice.
+        if (body.action === 'rollback' && (typeof body.leafSignature !== 'string' || !SIG.test(body.leafSignature))) return json({ error: 'Invalid resolution' }, 400);
         if (channel.frozen_seq === null || channel.frozen_seq !== body.seq || channel.frozen_digest !== body.digest) return json({ error: 'That commit is not the one this channel is frozen on.' }, 409);
         // The admin device signs exactly what it resolves: the server cannot do this on its own.
         const key = deps.sigKey(deviceId!);
@@ -544,7 +547,8 @@ export function createChannels(deps: Deps) {
         announce(channelId, { added, removed });
         // Everyone learns which commit is gone (its author, if it stays, rejoins and makes the change again); then
         // sequencing resumes (members who reported it are waiting for this, as after a dismissal).
-        for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'rolled-back', seq: body.seq, digest: body.digest });
+        const notice = { type: 'channel', id: channelId, change: 'rolled-back', action: 'rollback', seq: body.seq, digest: body.digest, author: body.author, by: deviceId, signature: body.leafSignature };
+        for (const member of usersOf(members(channelId))) deps.notify(member, notice);
         for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'thawed' });
         const restored = { resolved: 'rollback', epoch: channelRow(channelId)!.epoch, seq: body.seq - 1 };
         if (!removing) return json(restored);

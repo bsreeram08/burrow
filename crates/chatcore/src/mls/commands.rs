@@ -43,7 +43,7 @@ fn ok<T: serde::Serialize>(value: T) -> Result<Value> { Ok(serde_json::to_value(
 /// `None`: not an MLS command.
 pub fn run(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> {
     #[cfg(feature = "mls")]
-    if cmd.starts_with("mls") || matches!(cmd, "companionSetup" | "signDeviceCert") { return run_mls(core, cmd, command); }
+    if cmd.starts_with("mls") || matches!(cmd, "companionSetup" | "signDeviceCert" | "adoptSuccession") { return run_mls(core, cmd, command); }
     #[cfg(feature = "ds")]
     if cmd.starts_with("ds") { return run_ds(core, cmd, command); }
     let _ = (core, cmd, command);
@@ -87,6 +87,10 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
             "companionSetup" => {
                 let identity: crate::protocol::IdentityPub = serde_json::from_value(command.get("identity").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid identity"))?;
                 return ok(core.companion_setup(&text(command, "userId")?, &identity, &text(command, "cert")?)?);
+            }
+            "adoptSuccession" => {
+                let record = command.get("record").ok_or_else(|| ChatError::coded("invalid", "record is required"))?;
+                return ok(core.adopt_succession(&text(command, "userId")?, record, &text(command, "signature")?, command.get("cert").and_then(Value::as_str))?);
             }
             "signDeviceCert" => {
                 let issued_at = command.get("issuedAt").and_then(Value::as_u64).ok_or_else(|| ChatError::coded("invalid", "issuedAt must be a number"))?;

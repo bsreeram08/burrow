@@ -264,6 +264,7 @@ Every command takes optional `now` (ms) where it says so; results are the `ok` v
 | `signSuccession { userId, published, newSign, newDh, at }` | P0: the signed record (JSON with `signature`); signs only the record bytes. |
 | `retireIdentity { userId, identity, at }` | P0 steps down to a companion of `identity`. |
 | `acceptSuccession { contact, records }` | The moved `PeerRecord` (call it **before** noting the served identity; refused for a pin awaiting review). |
+| `adoptSuccession { userId, record, signature, cert? }` | A companion core whose account key lives outside it (the web, WebCrypto) adopts the old primary's signed record: it must continue from the pinned account identity and verify; the pin moves to `newSign`/`newDh`; the old key goes to `own-previous` until `record.at`; `cert` (signed outside under the new key, naming this device's leaf) is installed first when given. Returns the new `{ dh, sign }`. Errors: `auth` (bad signature), `invalid` (not a companion, record does not continue from the pin, cert refused). Replaying it fails (the pin has moved). |
 | `mlsRecertify { platform, issuedAt }` | A new primary re-signs its own device certificate under its identity. |
 | `mlsMembers` | members now include `stale`. |
 | `mlsCheckDm { group, peer }` | §8.3 step 3. |

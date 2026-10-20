@@ -168,6 +168,35 @@ impl Core {
         Ok(next.public)
     }
 
+    /// A companion core whose account key lives outside it (the web's WebCrypto AIK, so no `successionStart`) adopts
+    /// the succession the old primary signed: the record must continue from the account identity pinned now, and the
+    /// pin moves to the new key. The old key is remembered as `own-previous` until `record.at`, so this device's own
+    /// leaf (still certified by the old key) is Previous, not stale, and can still send the commit that carries the
+    /// new certificate. `cert` (signed outside the core under the new key, naming this device's leaf) is installed
+    /// first when given; without it the old certificate stays until `companion_setup` installs one.
+    #[cfg(feature = "mls")]
+    pub fn adopt_succession(&mut self, user_id: &str, record: &Value, signature: &str, cert: Option<&str>) -> Result<IdentityPub> {
+        let account = self.account()?.ok_or_else(|| invalid("Only a companion core adopts a succession"))?;
+        let record = Record::parse(record)?;
+        if record.user_id != user_id || user_id != account.user_id || record.old_sign != account.identity.sign { return Err(invalid("The record does not continue from this account's identity")); }
+        record.verify(signature)?;
+        let next = IdentityPub { dh: record.new_dh.clone(), sign: record.new_sign.clone() };
+        if !is_key_b64(&next.sign) || !is_key_b64(&next.dh) { return Err(invalid("Invalid account identity")); }
+        if let Some(cert_json) = cert {
+            let aik = unb64_32(&next.sign)?;
+            let (groups, store) = self.groups()?;
+            let installed = groups.set_device_cert(store, cert_json, &aik)?;
+            if installed.user_id != user_id { return Err(invalid("The certificate is for another account")); }
+        }
+        let mut previous = self.own_previous()?;
+        previous.push(PreviousKey { sign: record.old_sign.clone(), until: record.at });
+        self.store.batch(vec![
+            Write::Put("account".into(), to_value(&Account { user_id: user_id.to_string(), identity: next.clone() })),
+            Write::Put("own-previous".into(), to_value(&previous)), Write::Delete("devlist:last".into()),
+        ])?;
+        Ok(next)
+    }
+
     fn own_previous(&mut self) -> Result<Vec<PreviousKey>> { Ok(self.get::<Vec<PreviousKey>>("own-previous")?.unwrap_or_default()) }
 
     /// The primary signs the record handing the account to `new_sign`/`new_dh` (docs §5.1). Changes nothing here;

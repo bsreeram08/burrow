@@ -25,6 +25,8 @@ import '../messaging/group_messenger.dart';
 import '../messaging/group_sync.dart';
 import '../messaging/linking.dart';
 import '../messaging/messenger.dart';
+import '../messaging/succession.dart';
+import '../store/message.dart' show StoreException;
 import '../store/message_store.dart';
 import '../theme/theme_prefs.dart';
 import 'chat_settings.dart';
@@ -491,6 +493,61 @@ class AppController extends Notifier<AppState> {
     await _loadGroups();
   }
 
+  // ---------- Primary transfer (m5 §5) ----------
+  /// Reopens the account on this device after a transfer changed what its core holds (primary ↔ linked).
+  Future<void> _reopen() async {
+    final user = state.user, token = _api.token;
+    if (user == null || token == null) return;
+    await _teardown();
+    await _signedIn(user, token);
+  }
+
+  /// This primary takes the QR text of the device taking over.
+  Future<HandOver> handOver(String qr) async {
+    final ctx = linkContext() ?? (throw StateError('Not signed in'));
+    return HandOver.fromQr(ctx, ref.read(groupCryptoProvider), qr);
+  }
+
+  /// The user confirmed on this primary: sign the account over, then continue here as a linked device.
+  Future<void> finishHandOver(HandOver h) async {
+    await h.approve();
+    await _reopen();
+  }
+
+  /// This linked device asks to become the primary: it shows a code for the primary to scan.
+  Future<TakeOver> startTakeOver() async {
+    final m = messenger ?? (throw StateError('Not signed in'));
+    return TakeOver.start(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), device: await m.device(), platform: _api.client);
+  }
+
+  /// The primary confirmed: take the account over, then continue here as its primary.
+  Future<void> finishTakeOver(TakeOver t) async {
+    final m = messenger ?? (throw StateError('Not signed in'));
+    await t.run(m, platform: _api.client);
+    await _reopen();
+    unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+  }
+
+  /// Linked devices following the account to a new key, and the primary certifying their leaves (§5.2.2).
+  OwnSuccession? _ownSuccession() {
+    final m = messenger, s = store, g = groups, user = state.user;
+    if (m == null || s == null || g == null || user == null) return null;
+    return OwnSuccession(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), store: s, updateLeaf: g.sync.updateLeaf, me: user, platform: _api.client);
+  }
+
+  Future<void> _followSuccession() async {
+    final own = _ownSuccession();
+    if (own == null) return;
+    try {
+      if (await own.follow()) state = state.copyWith(notice: 'Your account moved to a new primary device.');
+      await own.takeRecert();
+    } on StoreException catch (error) {
+      state = state.copyWith(notice: error.message);
+    } catch (_) {
+      // Offline: tried again on the next devices event or start.
+    }
+  }
+
   /// What linking a device needs (this device as the primary).
   LinkContext? linkContext() {
     final m = messenger, s = store;
@@ -543,7 +600,11 @@ class AppController extends Notifier<AppState> {
       case DevicesChanged(:final id):
         // A contact's list: verify it against their pinned security code. Ours: check it still names this device.
         final contact = contactById(id);
-        if (id == state.user?.id) {
+        if (id == state.user?.id && (messenger?.companion ?? false)) {
+          // A linked device: our account may have moved to a new primary (m5 §5.2 step 6).
+          unawaited(_followSuccession());
+          unawaited(groups?.sync.removeDroppedOwnLeaves().catchError((_) => 0));
+        } else if (id == state.user?.id) {
           // After a revocation the primary publishes the list without the revoked device (m5 §4).
           unawaited(messenger?.syncDevices().catchError((_) => false));
           if (event.needsList) unawaited(messenger?.publishNextList().then((_) => null, onError: (_) => null));
@@ -553,6 +614,13 @@ class AppController extends Notifier<AppState> {
         }
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
+      case RecertEvent():
+        // A linked device's certificate under the new key was answered, or (on the primary) one is waiting.
+        if (messenger?.companion ?? false) {
+          unawaited(_followSuccession());
+        } else {
+          unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+        }
       case LinkEvent():
         // Screens running a link (the primary's side) wait on these instead of polling.
         if (!_linkEvents.isClosed) _linkEvents.add(event);
@@ -574,6 +642,7 @@ class AppController extends Notifier<AppState> {
     if (messenger?.companion ?? false) {
       // A linked device: groups (and moved chats) only; the account's keys are on the primary.
       if (!(groups?.ready ?? true)) await _startGroups();
+      await _followSuccession();
       return;
     }
     try {
@@ -585,6 +654,7 @@ class AppController extends Notifier<AppState> {
           await messenger?.syncDevices();
         } catch (_) {}
         if (!(groups?.ready ?? true)) await _startGroups();
+        unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
       }
     } catch (e) {
       state = state.copyWith(notice: 'Could not check encryption keys: $e');
@@ -616,10 +686,16 @@ class AppController extends Notifier<AppState> {
     await messenger?.takeOver();
   }
 
-  /// "Use this device instead": only ever from the user's tap.
+  /// "Use this device instead" (recovery without a primary, m5 §6): only ever from the user's confirmed tap. This
+  /// device's key becomes the account's (contacts see the code change) and the first list under it names only
+  /// this device: no device of the old key is trusted again.
   Future<void> useThisDevice() async {
-    await messenger?.takeOver();
+    final m = messenger;
+    if (m == null) return;
+    await m.takeOver();
+    await m.publishNewChain(const []);
     state = state.copyWith(inactiveDevice: false);
+    await _checkActive();
   }
 
   Future<void> _checkIdentity(String contactId) async {

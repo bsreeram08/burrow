@@ -7,6 +7,7 @@ import '../app/app_controller.dart';
 import '../core/api.dart';
 import '../messaging/messenger.dart' show OwnDevice;
 import 'link/link_device_screen.dart';
+import 'link/transfer_screen.dart';
 import 'widgets/common.dart';
 
 /// Settings → Devices: this account's devices, labelled from the sealed list where this device can open it.
@@ -111,6 +112,33 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
                       },
                       icon: const Icon(Icons.add_link),
                       label: const Text('Link a device'),
+                    ),
+                  ),
+                // Primary transfer (m5 §5): the primary hands over; a linked device takes over.
+                if (amPrimary && devices.any((d) => !d.current && d.state == 'listed'))
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: OutlinedButton.icon(
+                      key: const Key('device-hand-over'),
+                      onPressed: () async {
+                        await showHandOver(context);
+                        await _load();
+                      },
+                      icon: const Icon(Icons.swap_horiz),
+                      label: const Text('Hand over to another device'),
+                    ),
+                  ),
+                if (ref.watch(appProvider.select((s) => s.companion)))
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: OutlinedButton.icon(
+                      key: const Key('device-take-over'),
+                      onPressed: () async {
+                        await showTakeOver(context);
+                        await _load();
+                      },
+                      icon: const Icon(Icons.key),
+                      label: const Text('Make this device primary'),
                     ),
                   ),
               ],

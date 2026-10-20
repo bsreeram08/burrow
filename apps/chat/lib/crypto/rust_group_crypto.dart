@@ -150,5 +150,12 @@ class RustGroupCrypto implements GroupCrypto {
   Future<String> deviceLeaf() => _call(core.mlsDeviceLeaf);
 
   @override
+  Future<void> recertify({required String platform, required int issuedAt}) => _call(() => core.mlsRecertify(platform: platform, issuedAtMs: BigInt.from(issuedAt)));
+
+  @override
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups) =>
+      _call(() => core.mlsLeafKnown(deviceId: deviceId, leafSigKey: leafSigKey, groups: groups));
+
+  @override
   Future<void> checkDm(String groupId, String peer) => _call(() => core.mlsCheckDm(groupId: groupId, peerUserId: peer));
 }

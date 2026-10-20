@@ -370,6 +370,10 @@ class GroupSync {
     await _commit(groupId, () => crypto.commit(groupId, removes: [GroupRemoval(userId, deviceId)]), redo: () => remove(groupId, userId, deviceId: deviceId));
   });
 
+  /// Commits this device's own leaf again (its new certificate, m5 §5.2.2), so the group stops seeing it as
+  /// Previous.
+  Future<void> updateLeaf(String groupId) => _serial(groupId, () => _commit(groupId, () => crypto.commit(groupId, update: true), redo: () => updateLeaf(groupId)));
+
   /// Changes the group's admins (admins only).
   Future<void> setAdmins(String groupId, List<String> admins) => _serial(groupId, () async {
     final roles = await crypto.roles(groupId);
@@ -1035,39 +1039,51 @@ class GroupSync {
   /// Joins, by external commit, channels the server lists for this account that this device isn't in yet, but
   /// only where the served tree (checked by the core, [GroupCrypto.inspectGroup]) holds a current leaf of ours
   /// for another device our verified list names. Never one this device left; at most about 3 per second.
-  Future<int> joinOwnChannels() async {
+  Future<int> joinOwnChannels({int attempts = 5}) async {
     final own = verifiedOwnDevices == null ? null : await verifiedOwnDevices!();
     if (own == null) return 0;
     final local = await device();
     var joined = 0;
-    for (final c in await api.channels()) {
-      if (c['member'] == true) continue;
-      final id = c['id'] as String;
-      final known = await store.group(id);
-      if (known?.membership == Membership.left) continue;
-      try {
-        final info = await api.joinInfo(id);
-        final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
-        // The served GroupInfo must be for this very channel.
-        if (inspected.groupId != id) continue;
-        final ours = inspected.members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
-        if (!ours) continue;
-        await _serial(id, () async {
-          await ensureReady();
-          await _externalJoin(id);
-          await _catchUpNow(id);
-        });
-        // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
-        // Our account moved it; this device never sees the pointer.
-        if (c['kind'] == GroupKindName.dm.wire && await checkDm(id)) await store.updateGroup(id, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
-        joined++;
-        await Future<void>.delayed(const Duration(milliseconds: 350));
-      } catch (_) {
-        // Fail closed: an unchecked or failed join is tried again on the next start.
+    var pending = [for (final c in await api.channels()) if (c['member'] != true) c];
+    for (var attempt = 0; attempt < attempts && pending.isNotEmpty; attempt++) {
+      if (attempt > 0) await Future<void>.delayed(_backoff(attempt - 1) * 4);
+      final failed = <Map<String, dynamic>>[];
+      for (final c in pending) {
+        final id = c['id'] as String;
+        final known = await store.group(id);
+        if (known?.membership == Membership.left) continue;
+        try {
+          final info = await api.joinInfo(id);
+          final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
+          // The served GroupInfo must be for this very channel.
+          if (inspected.groupId != id) continue;
+          final ours = inspected.members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
+          if (!ours) continue;
+          await _serial(id, () async {
+            await ensureReady();
+            await _externalJoin(id);
+            await _catchUpNow(id);
+          });
+          // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
+          // Our account moved it; this device never sees the pointer.
+          if (c['kind'] == GroupKindName.dm.wire && await checkDm(id)) await store.updateGroup(id, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
+          joinErrors.remove(id);
+          joined++;
+          await Future<void>.delayed(const Duration(milliseconds: 350));
+        } catch (error) {
+          // Fail closed: an unchecked or failed join is retried with backoff, then on the next start.
+          joinErrors[id] = '$error';
+          failed.add(c);
+        }
       }
+      pending = failed;
     }
     return joined;
   }
+
+  /// Why joining one of our own channels last failed (channel id → error), for diagnostics.
+  final Map<String, String> joinErrors = {};
+
 
   /// Whether this device's MLS state still has a leaf in the group.
   Future<bool> _holds(String groupId) async {

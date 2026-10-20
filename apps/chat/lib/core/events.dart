@@ -25,6 +25,7 @@ sealed class AccountEvent {
         'keys' => KeysChanged(m['id'] as String),
         'devices' => DevicesChanged(m['id'] as String, needsList: m['needsList'] == true),
         'link' => LinkEvent(m['id'] as String, m['event'] as String),
+        'recert' => RecertEvent(m['id'] as String, deviceId: m['deviceId'] as String?, answered: m['answered'] == true),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
           fromId: (m['from'] as Map)['id'] as String,
@@ -104,6 +105,14 @@ class DevicesChanged extends AccountEvent {
 
   /// To the primary after a revocation: publish the next list without the revoked device.
   final bool needsList;
+}
+
+/// A companion certificate request (to the primary) or its answer (to the companion, [answered]), m5 §5.2.2.
+class RecertEvent extends AccountEvent {
+  const RecertEvent(this.id, {this.deviceId, this.answered = false});
+  final String id;
+  final String? deviceId;
+  final bool answered;
 }
 
 /// A link session of this account moved on: hello, offer, grant or a new sealed message.

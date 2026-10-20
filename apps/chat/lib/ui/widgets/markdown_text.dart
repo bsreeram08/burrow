@@ -14,13 +14,16 @@ Future<void> openLink(String url) async {
 /// Renders the protocol's Markdown subset as text spans and boxes; never HTML. Matches of
 /// [highlight] (find in conversation) get a marker background.
 class MarkdownText extends StatefulWidget {
-  const MarkdownText(this.text, {super.key, required this.tokens, required this.color, this.fontSize = 16, this.highlight, this.linkColor});
+  const MarkdownText(this.text, {super.key, required this.tokens, required this.color, this.fontSize = 16, this.highlight, this.linkColor, this.mentions = const {}});
   final String text;
   final ChatTokens tokens;
   final Color color;
   final Color? linkColor;
   final double fontSize;
   final String? highlight;
+
+  /// Lower-case usernames whose `@username` is a mention (m4-groups §5.2).
+  final Set<String> mentions;
 
   @override
   State<MarkdownText> createState() => _MarkdownTextState();
@@ -76,7 +79,22 @@ class _MarkdownTextState extends State<MarkdownText> {
   Iterable<InlineSpan> _highlighted(String text, TextStyle style, TapGestureRecognizer? tap, ChatTokens t) sync* {
     final q = widget.highlight?.trim().toLowerCase() ?? '';
     if (q.isEmpty) {
-      yield TextSpan(text: text, style: style, recognizer: tap);
+      if (widget.mentions.isEmpty || tap != null) {
+        yield TextSpan(text: text, style: style, recognizer: tap);
+        return;
+      }
+      var from = 0;
+      for (final match in _mention.allMatches(text)) {
+        if (!widget.mentions.contains(match.group(2)!.toLowerCase())) continue;
+        final at = match.start + match.group(1)!.length;
+        if (at > from) yield TextSpan(text: text.substring(from, at), style: style);
+        yield TextSpan(
+          text: text.substring(at, match.end),
+          style: style.copyWith(fontWeight: FontWeight.w700, color: widget.linkColor ?? widget.color, backgroundColor: (widget.linkColor ?? widget.color).withValues(alpha: .14)),
+        );
+        from = match.end;
+      }
+      if (from < text.length) yield TextSpan(text: text.substring(from), style: style);
       return;
     }
     final lower = text.toLowerCase();
@@ -121,6 +139,8 @@ class _MarkdownTextState extends State<MarkdownText> {
     return Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, spacing: 4, children: children);
   }
 }
+
+final _mention = RegExp(r'(^|[^A-Za-z0-9_])@([A-Za-z0-9_]{3,20})(?![A-Za-z0-9_])');
 
 class _CodeBox extends StatelessWidget {
   const _CodeBox({required this.code, required this.language, required this.color, required this.fontSize, required this.tokens});

@@ -114,6 +114,32 @@ pub struct Outgoing {
     pub epoch: u64,
 }
 
+/// What a log entry is supposed to be. Handshake messages (commits) are public messages and application messages
+/// are private ones; a caller that knows which it expects (the entry's `kind`) says so, and anything else is refused
+/// before it is decrypted or staged. A private message that decrypts to a commit or proposal is refused regardless.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Expect {
+    Application,
+    Commit,
+}
+
+impl Expect {
+    pub fn parse(text: &str) -> Result<Self> {
+        match text { "application" => Ok(Self::Application), "commit" => Ok(Self::Commit), _ => Err(invalid("expect must be \"application\" or \"commit\"")) }
+    }
+    fn name(self) -> &'static str { match self { Self::Application => "application", Self::Commit => "commit" } }
+    /// The kind a message's framing allows: public messages are handshakes, private ones application messages.
+    fn of(protocol: &ProtocolMessage) -> Self { match protocol { ProtocolMessage::PublicMessage(_) => Self::Commit, ProtocolMessage::PrivateMessage(_) => Self::Application } }
+    fn check(expect: Option<Self>, protocol: &ProtocolMessage) -> Result<Self> {
+        let actual = Self::of(protocol);
+        match expect {
+            Some(wanted) if wanted != actual => Err(invalid(format!("expected a {} message, but this is a {} one", wanted.name(), actual.name()))),
+            _ => Ok(actual),
+        }
+    }
+}
+
 /// A commit built here and not yet resolved: the DS has neither accepted nor refused it as far as this device knows.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingCommit {
@@ -656,10 +682,16 @@ impl Groups {
     /// Phase one of receiving a message from the group's log: authenticate, decrypt, validate (commits through
     /// the shared validator), without persisting. Store the result, then [`Groups::commit_pending`].
     /// A rejected commit at the current epoch is `poison` (message `poison <digest>: <reason>`); report it (M3).
-    pub fn process(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Processed> {
+    pub fn process(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Processed> { self.process_as(store, group, message, None) }
+
+    /// [`Groups::process`] for a caller that knows what the entry should be (`expect`): a mismatch is refused before
+    /// anything is decrypted, merged or staged.
+    pub fn process_as(&mut self, store: &mut dyn Store, group: &GroupId, message: &str, expect: Option<Expect>) -> Result<Processed> {
         if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
         let bytes = unb64(message, "message")?;
         bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
+        let protocol: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?;
+        let framing = Expect::check(expect, &protocol)?;
         let cert = Self::device(store)?;
         self.gate(store, group)?;
         let message_digest = digest(&bytes);
@@ -675,7 +707,6 @@ impl Groups {
         }
         let result = (|| -> Result<(Processed, Vec<Write>)> {
             let provider = &self.provider;
-            let protocol: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?;
             let is_commit = matches!(&protocol, ProtocolMessage::PublicMessage(public) if public.content_type() == ContentType::Commit);
             if matches!(protocol, ProtocolMessage::PrivateMessage(_)) { bounded("application message", &bytes, limits::MAX_APPLICATION_BYTES)?; }
             let mut mls_group = Self::load_group(provider, group)?;
@@ -697,6 +728,9 @@ impl Groups {
                     let text = String::from_utf8(app.into_bytes()).map_err(|_| ChatError::coded("invalid", "payload is not UTF-8"))?;
                     Ok((Processed { pending_id: String::new(), kind: "application".into(), plaintext: Some(text), sender, epoch: current, digest: None }, Vec::new()))
                 }
+                // Handshakes travel as public messages (the DS can only validate those): a commit hidden inside a
+                // private message would skip the DS's checks, so it is never applied.
+                ProcessedMessageContent::StagedCommitMessage(_) if framing == Expect::Application => Err(invalid("a commit must be a public message")),
                 ProcessedMessageContent::StagedCommitMessage(staged) => {
                     let sender_kind = match sender_index { Some(i) => Sender::Member(i), None => Sender::NewMemberCommit };
                     let sender = match sender_index {
@@ -847,7 +881,11 @@ impl Ds {
 
     /// Sequences one message: commits must target the current epoch and pass the shared validator (then the
     /// public state advances); application messages must target the current epoch. Standalone proposals refused.
-    pub fn submit(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Submit> {
+    pub fn submit(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<Submit> { self.submit_as(store, group, message, None) }
+
+    /// [`Ds::submit`] for a caller that knows what the message should be: an `application` submission must be a
+    /// private message and a `commit` one a public message, else it is refused (not a conflict, not sequenced).
+    pub fn submit_as(&mut self, store: &mut dyn Store, group: &GroupId, message: &str, expect: Option<Expect>) -> Result<Submit> {
         let bytes = unb64(message, "message")?;
         bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
         self.gate(store, group)?;
@@ -855,7 +893,7 @@ impl Ds {
         let verdict = self.groups.run(store, |provider, store, _extra| {
             let public = Self::public(provider, group)?;
             let mut directory = Groups::ds_directory(store);
-            ds_submit(provider, public, &bytes, &mut directory)
+            ds_submit(provider, public, &bytes, expect, &mut directory)
         })?;
         // A sequenced commit may have added users whose pins the entry doesn't cover.
         if matches!(verdict, Submit::Accepted { epoch, .. } if epoch != before) { self.groups.verified.remove(&group_text(group)); }
@@ -951,9 +989,11 @@ fn ds_check(provider: &Provider, public: &PublicGroup, commit: &[u8], directory:
     validate_staged(public.group_context().extensions(), public.members(), &sender, &staged, directory)
 }
 
-fn ds_submit(provider: &Provider, mut public: PublicGroup, bytes: &[u8], directory: &mut dyn Directory) -> Result<Submit> {
+fn ds_submit(provider: &Provider, mut public: PublicGroup, bytes: &[u8], expect: Option<Expect>, directory: &mut dyn Directory) -> Result<Submit> {
     bounded("message", bytes, limits::MAX_HANDSHAKE_BYTES)?;
     let protocol = MlsMessageIn::tls_deserialize_exact(bytes).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?;
+    // The DS can't look inside a private message, but it can insist on the framing the submission is for.
+    Expect::check(expect, &protocol)?;
     let current = public.group_context().epoch().as_u64();
     if protocol.epoch().as_u64() != current { return Ok(Submit::Conflict { epoch: current }); }
     match protocol {

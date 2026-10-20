@@ -59,6 +59,16 @@ class FakeGroupCrypto implements GroupCrypto {
     return GroupDevice(userId: userId, deviceId: this.deviceId, platform: this.platform, leafSigKey: 'leaf-${this.deviceId}', aikSign: 'aik-$userId', issuedAt: issuedAt);
   }
 
+  /// Tests: certificate re-signs this device made, and the leaves a test says its groups hold.
+  int recertified = 0;
+  final Set<String> knownLeaves = {};
+
+  @override
+  Future<void> recertify({required String platform, required int issuedAt}) async => recertified++;
+
+  @override
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups) async => knownLeaves.contains('$deviceId:$leafSigKey');
+
   @override
   Future<String> deviceLeaf() async => base64Url.encode(sha256.convert(utf8.encode('leaf:$userId:$deviceId')).bytes).replaceAll('=', '');
 

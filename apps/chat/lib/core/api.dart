@@ -268,6 +268,27 @@ class Api {
     await call('/api/devices/succession', method: 'PUT', body: {'record': record, 'signature': signature});
   }
 
+  // Companion certificates under a new primary's key (m5 §5.2.2).
+  /// Companion: asks the primary to certify this leaf under the account's current key.
+  Future<void> askRecert({required String platform, required String leafSigKey}) async {
+    await call('/api/devices/recert', method: 'PUT', body: {'platform': platform, 'leafSigKey': leafSigKey});
+  }
+
+  /// Primary: listed devices waiting for a certificate, `[{deviceId, platform, leafSigKey}]`.
+  Future<List<Map<String, dynamic>>> recertRequests() async => ((await call('/api/devices/recert'))['requests'] as List? ?? const []).cast<Map<String, dynamic>>();
+
+  /// Primary: the certificate (DeviceCert JSON) answering one request.
+  Future<void> answerRecert(String deviceId, String cert) async {
+    await call('/api/devices/recert/$deviceId', method: 'PUT', body: {'cert': cert});
+  }
+
+  /// Companion: its answer, or null until there is one (404 if it never asked).
+  Future<String?> myRecert() async => (await call('/api/devices/recert/mine'))['cert'] as String?;
+
+  Future<void> dropRecert() async {
+    await call('/api/devices/recert', method: 'DELETE');
+  }
+
   /// `{userId, devices, channel}`: the contact's MLS-capable devices and our DM channel with them, if any.
   Future<Map<String, dynamic>> mlsCapability(String username) => call('/api/mls/capability/$username');
 

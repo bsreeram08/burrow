@@ -90,6 +90,10 @@ abstract class LinkCrypto {
 
   /// The old primary steps down to a companion of the account under [newIdentity].
   Future<void> retireIdentity({required String userId, required Identity newIdentity, required int at});
+
+  /// A companion follows one succession record of its own account (from its pinned account key), installing
+  /// [certJson] (its leaf under the new key) first when given. Returns the account's new identity.
+  Future<Identity> adoptSuccession({required String userId, required Map<String, Object?> record, required String signature, String? certJson});
 }
 
 class RustLinkCrypto implements LinkCrypto {
@@ -185,6 +189,12 @@ class RustLinkCrypto implements LinkCrypto {
   Future<({String userId, Identity identity})?> account() => _call(() async {
     final a = await core.account();
     return a == null ? null : (userId: a.userId, identity: Identity(dh: a.identity.dh, sign: a.identity.sign));
+  });
+
+  @override
+  Future<Identity> adoptSuccession({required String userId, required Map<String, Object?> record, required String signature, String? certJson}) => _call(() async {
+    final i = await core.adoptSuccession(userId: userId, recordJson: jsonEncode(record), signature: signature, certJson: certJson);
+    return Identity(dh: i.dh, sign: i.sign);
   });
 
   @override
@@ -328,6 +338,20 @@ class FakeLinkCrypto implements LinkCrypto {
   }
 
   Identity? _minted;
+
+  /// Tests: records this companion followed.
+  final List<Map<String, Object?>> adopted = [];
+
+  @override
+  Future<Identity> adoptSuccession({required String userId, required Map<String, Object?> record, required String signature, String? certJson}) async {
+    final c = companion;
+    if (c == null || identity != null) throw const CryptoException('not a companion', code: 'invalid');
+    if (record['userId'] != userId || record['oldSign'] != c.identity.sign) throw const CryptoException('the record does not continue from the pin', code: 'invalid');
+    final next = Identity(dh: record['newDh']! as String, sign: record['newSign']! as String);
+    adopted.add(record);
+    companion = (userId: userId, identity: next, certJson: certJson ?? c.certJson);
+    return next;
+  }
 
   @override
   Future<Identity> successionStart() async => _minted = Identity(dh: 'new-dh-${DateTime.now().microsecondsSinceEpoch}', sign: 'new-sign');

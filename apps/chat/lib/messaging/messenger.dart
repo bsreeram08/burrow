@@ -267,6 +267,15 @@ class Messenger {
     return run;
   }
 
+  /// The first list under a new account key (a primary transfer, m5 §5.2 step 4): version 1 naming this device
+  /// and [keep], every other live device (labels sealed under the new key).
+  Future<({int version, String hash})> publishNewChain(List<Map<String, Object?>> keep) {
+    Future<({int version, String hash})> now() async => _publishNext(const {}, null, null, await crypto.identity(), add: keep);
+    final run = _syncing.then((_) => now(), onError: (_) => now());
+    _syncing = run;
+    return run;
+  }
+
   Future<({int version, String hash})> _publishNextNow(Map<String, Object?>? add) async {
     final own = await crypto.identity();
     final view = await api.devices(me.username);
@@ -279,15 +288,15 @@ class Messenger {
       base = (view['list'] as Map).cast<String, dynamic>();
       baseHash = check.hash;
     }
-    return _publishNext(view, base, baseHash, own, add: add);
+    return _publishNext(view, base, baseHash, own, add: [?add]);
   }
 
-  Future<({int version, String hash})> _publishNext(Map<String, dynamic> view, Map<String, dynamic>? base, String? baseHash, Identity own, {Map<String, Object?>? add}) async {
+  Future<({int version, String hash})> _publishNext(Map<String, dynamic> view, Map<String, dynamic>? base, String? baseHash, Identity own, {List<Map<String, Object?>> add = const []}) async {
     final id = (await device()).deviceId;
     final rows = (view['devices'] as List? ?? const []).cast<Map>();
     final keep = [
       for (final d in (base?['devices'] as List? ?? const []).cast<Map>())
-        if (d['deviceId'] != id && d['deviceId'] != add?['deviceId'] && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
+        if (d['deviceId'] != id && !add.any((a) => a['deviceId'] == d['deviceId']) && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
     ];
     final self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
         {
@@ -296,7 +305,7 @@ class Messenger {
           // Label and platform, sealed under the account's device-meta key like the web does.
           'meta': sealMeta(deviceMetaKey(await crypto.deviceMetaSignature(me.id)), me.id, id, label: _deviceLabel(api.client), platform: api.client),
         };
-    final entries = [...keep, self, ?add]..sort((a, b) => (a['deviceId']! as String).compareTo(b['deviceId']! as String));
+    final entries = [...keep, self, ...add]..sort((a, b) => (a['deviceId']! as String).compareTo(b['deviceId']! as String));
     final version = ((base?['version'] as int?) ?? 0) + 1;
     final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': version, 'prevHash': baseHash ?? '', 'devices': entries};
     final head = view['list'] is Map && view['signature'] is String

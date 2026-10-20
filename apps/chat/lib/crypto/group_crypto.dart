@@ -144,6 +144,13 @@ abstract class GroupCrypto {
   /// Calling it again returns the same device.
   Future<GroupDevice> initDevice({required String userId, required String deviceId, required String platform, required int issuedAt});
 
+  /// A primary re-signs its own leaf certificate under the account key it now holds (after a succession).
+  Future<void> recertify({required String platform, required int issuedAt});
+
+  /// New primary (m5 §5.2.2): whether a group it holds (of [groups]) already has exactly this leaf key for
+  /// that device of its own account.
+  Future<bool> leafKnown(String deviceId, String leafSigKey, List<String> groups);
+
   /// This device's MLS leaf signature key (base64url), made on first use: a new device sends it in its link
   /// hello before it has a certificate (m5 §1.4).
   Future<String> deviceLeaf();

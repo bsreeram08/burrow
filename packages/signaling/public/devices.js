@@ -252,6 +252,20 @@
     opened.catch(() => deviceKeys.delete(userId));
     return opened;
   }
+  /**
+   * A browser linking before it knows its account (docs/m5-linking.md §1) keeps its device key under a placeholder
+   * owner; once linked, the same id and key move under the account (the CryptoKey itself is copied, never exported).
+   */
+  async function adoptDeviceKey(from, userId) {
+    const db = await new Promise((resolve, reject) => { const request = indexedDB.open('webrtc-bun-device-key-v1', 1); request.onupgradeneeded = () => request.result.createObjectStore('kv'); request.onerror = () => reject(request.error); request.onsuccess = () => resolve(request.result); });
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('kv', 'readwrite'), store = tx.objectStore('kv');
+      const read = store.get(from);
+      read.onsuccess = () => { if (read.result) { store.put(read.result, userId); store.delete(from); } };
+      tx.oncomplete = resolve; tx.onerror = tx.onabort = () => reject(tx.error);
+    });
+    db.close(); deviceKeys.delete(from); deviceKeys.delete(userId);
+  }
   function describeThisDevice() {
     const agent = typeof navigator !== 'undefined' ? navigator.userAgent : '';
     const browserName = /Edg\//.test(agent) ? 'Edge' : /Firefox\//.test(agent) ? 'Firefox' : /Chrome\//.test(agent) ? 'Chrome' : /Safari\//.test(agent) ? 'Safari' : 'Browser';
@@ -259,5 +273,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

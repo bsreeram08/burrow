@@ -1274,7 +1274,11 @@
   ]);
 
   window.Groups = Object.freeze({
-    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember, sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
+    start, stop, frame, devicesChanged, pinsChanged, contactAccepted, removeMember,
+    /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
+    linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
+    /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
+    bundleChannels: () => [...channels].filter(([, ch]) => ['active', 'frozen', 'paused'].includes(ch.status) && ch.kind !== 'dm').map(([id, ch]) => ({ id, kind: ch.kind, name: ch.meta?.name || ch.serverName || null, topic: ch.meta?.topic || null })), sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,
     active: () => currentId, enabled: () => enabled, flush: () => currentId && flush(currentId),
     onReact: (target, emoji, on) => send(currentId, { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }),
     async onEdit(record, text) {

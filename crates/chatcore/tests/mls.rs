@@ -61,6 +61,10 @@ fn two_devices_and_a_delivery_service_over_json_commands() {
     call(&mut bob, json!({ "cmd": "mlsJoin", "welcome": out["welcome"], "tree": tree }));
     assert_eq!(call(&mut ds, json!({ "cmd": "dsEpoch", "group": group })), 1);
 
+    // An external join must name the group it means: a missing one is an error, never an unchecked join.
+    let missing = fails(&mut bob, json!({ "cmd": "mlsJoinExternal", "groupInfo": view["groupInfo"], "tree": tree }));
+    assert!(missing.get("error").is_some(), "{missing}");
+
     let payload = json!({ "v": 2, "type": "message", "id": "123e4567-e89b-42d3-a456-426614174000", "text": "hello over MLS", "createdAt": 5, "expiresAt": null }).to_string();
     assert_eq!(call(&mut alice, json!({ "cmd": "mlsValidate", "payload": payload, "sender": alice_id })), "message");
     let sealed = call(&mut alice, json!({ "cmd": "mlsEncrypt", "group": group, "plaintext": payload }));

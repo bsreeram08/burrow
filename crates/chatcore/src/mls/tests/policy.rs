@@ -350,7 +350,7 @@ fn oversize_inputs_are_refused_before_parsing() {
     assert!(err.message.contains("exceeds"), "{err}");
     let dave = Account::new();
     let mut d1 = f.admit(&dave, "web");
-    let err = d1.groups.join_external(&mut d1.store, &junk(64 * 1024 + 1), &junk(1), None).unwrap_err();
+    let err = d1.groups.join_external(&mut d1.store, &junk(64 * 1024 + 1), &junk(1), &b64(&[1u8; 16])).unwrap_err();
     assert!(err.message.contains("exceeds"), "{err}");
     let err = f.server.ds.create(&mut f.server.store, &junk(64 * 1024 + 1), &junk(1)).unwrap_err();
     assert!(err.message.contains("exceeds"), "{err}");

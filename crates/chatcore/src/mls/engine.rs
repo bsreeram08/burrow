@@ -753,8 +753,8 @@ impl Groups {
 
     /// External commit: public-channel self-join, this user's new device, or resync. Returns the commit for the
     /// DS; the group is kept (in memory) until [`Groups::merge_own`] after the DS accepts it.
-    /// `expected` is the group id the caller means to join: a GroupInfo for any other group is refused.
-    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, expected: Option<&str>) -> Result<Outgoing> { self.external_commit(store, group_info, tree, expected, true) }
+    /// `expected` is the group id the caller means to join (required): a GroupInfo for any other group is refused.
+    pub fn join_external(&mut self, store: &mut dyn Store, group_info: &str, tree: &str, expected: &str) -> Result<Outgoing> { self.external_commit(store, group_info, tree, Some(expected), true) }
 
     /// An external join that skips this device's own policy check: tests use it to play a malicious joiner.
     #[cfg(test)]

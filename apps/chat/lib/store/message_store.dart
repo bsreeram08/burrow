@@ -3,7 +3,10 @@ import 'dart:convert';
 
 import 'package:sqflite/sqflite.dart';
 
+import 'conversation.dart';
 import 'message.dart';
+
+export 'conversation.dart';
 
 enum ReceiveResult { stored, duplicate, expired }
 
@@ -34,10 +37,12 @@ class MessageStore {
               PRIMARY KEY (conversation_id, id))''');
           await db.execute('CREATE INDEX messages_by_time ON messages (conversation_id, created_at)');
           await _addPhase1Columns(db);
+          await _addGroupParts(db);
         },
         // Additive only: every existing row keeps its content and reads back with the new parts absent.
         onUpgrade: (db, from, _) async {
           if (from < 2) await _addPhase1Columns(db);
+          if (from < 3) await _addGroupParts(db);
         },
       ),
     );
@@ -45,7 +50,20 @@ class MessageStore {
   }
 
   /// v2 (phase 1): reply, attachment, link preview, the latest edit and reactions, each as nullable columns.
-  static const schemaVersion = 2;
+  /// v3 (M4 groups): the author and mentions of group messages, and a `conversations` table for groups.
+  static const schemaVersion = 3;
+
+  static Future<void> _addGroupParts(DatabaseExecutor db) async {
+    for (final column in ['sender TEXT', 'mentions TEXT']) {
+      await db.execute('ALTER TABLE messages ADD COLUMN $column');
+    }
+    await db.execute('''
+      CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '',
+        cursor INTEGER NOT NULL DEFAULT 0, membership TEXT NOT NULL DEFAULT 'active', frozen TEXT,
+        pinned INTEGER NOT NULL DEFAULT 0, unread INTEGER NOT NULL DEFAULT 0, mentioned INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL)''');
+  }
 
   static Future<void> _addPhase1Columns(DatabaseExecutor db) async {
     for (final column in ['reply_to TEXT', 'attachment TEXT', 'link TEXT', 'edited_text TEXT', 'edited_at INTEGER', 'reactions TEXT']) {
@@ -55,6 +73,7 @@ class MessageStore {
 
   Future<void> close() async {
     await _changes.close();
+    await _groupChanges.close();
     await _db.close();
   }
 
@@ -182,7 +201,7 @@ class MessageStore {
 
   /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.
   Future<bool> react(String conversationId, String target, {required String who, required String emoji, required bool on}) async {
-    if (!Reactions.people.contains(who) || !isReactionEmoji(emoji)) throw const StoreException('Invalid reaction.', code: 'invalid');
+    if (!Reactions.validWho(who) || !isReactionEmoji(emoji)) throw const StoreException('Invalid reaction.', code: 'invalid');
     final changed = await _db.transaction((tx) async {
       final previous = await _get(tx, conversationId, target.toLowerCase());
       if (previous == null) return false;
@@ -242,6 +261,50 @@ class MessageStore {
     return {for (final row in rows) row['conversation_id']! as String: ChatMessage.fromRow(row)};
   }
 
+  // ---------- Group conversations (v3) ----------
+  final _groupChanges = StreamController<String>.broadcast();
+
+  /// Emits a group id whose conversation record changed (name, cursor, unread, frozen, membership, pin).
+  Stream<String> get groupChanges => _groupChanges.stream;
+
+  Future<GroupConversation?> group(String id) async {
+    final rows = await _db.query('conversations', where: 'id = ?', whereArgs: [id], limit: 1);
+    return rows.isEmpty ? null : GroupConversation.fromRow(rows.single);
+  }
+
+  Future<List<GroupConversation>> groups() async => [for (final row in await _db.query('conversations', orderBy: 'created_at, id')) GroupConversation.fromRow(row)];
+
+  /// Inserts or replaces a group record.
+  Future<GroupConversation> putGroup(GroupConversation value) async {
+    if (!groupIdPattern.hasMatch(value.id)) throw const StoreException('Invalid group.', code: 'invalid');
+    await _db.insert('conversations', value.toRow(), conflictAlgorithm: ConflictAlgorithm.replace);
+    _groupChanges.add(value.id);
+    return value;
+  }
+
+  /// Applies [change] to the stored record atomically; null when the group is unknown here.
+  Future<GroupConversation?> updateGroup(String id, GroupConversation Function(GroupConversation current) change) async {
+    final next = await _db.transaction((tx) async {
+      final rows = await tx.query('conversations', where: 'id = ?', whereArgs: [id], limit: 1);
+      if (rows.isEmpty) return null;
+      final updated = change(GroupConversation.fromRow(rows.single));
+      await tx.update('conversations', updated.toRow(), where: 'id = ?', whereArgs: [id]);
+      return updated;
+    });
+    if (next != null) _groupChanges.add(id);
+    return next;
+  }
+
+  /// Forgets a group on this device: its record and its history.
+  Future<void> removeGroup(String id) async {
+    await _db.transaction((tx) async {
+      await tx.delete('conversations', where: 'id = ?', whereArgs: [id]);
+      await tx.delete('messages', where: 'conversation_id = ?', whereArgs: [id]);
+    });
+    _groupChanges.add(id);
+    _changes.add(id);
+  }
+
   Future<void> removeConversation(String conversationId) async {
     if (!conversationPattern.hasMatch(conversationId)) throw const StoreException('Invalid conversation.');
     await _db.delete('messages', where: 'conversation_id = ?', whereArgs: [conversationId]);
@@ -250,6 +313,7 @@ class MessageStore {
 
   Future<void> clear() async {
     await _db.delete('messages');
+    await _db.delete('conversations');
     _changes.add(null);
   }
 }

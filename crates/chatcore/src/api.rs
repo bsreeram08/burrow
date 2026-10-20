@@ -118,7 +118,7 @@ pub fn sas_code(local_sdp: String, remote_sdp: String, my_nonce: String, peer_no
 #[cfg(feature = "mls")]
 pub use crate::mls::cert::DeviceCert;
 #[cfg(feature = "mls")]
-pub use crate::mls::engine::{CommitCheck, Expect, GroupView, MemberView, Outgoing, PendingCommit, Processed};
+pub use crate::mls::engine::{CommitCheck, Expect, ResolutionSigner, GroupView, MemberView, Outgoing, PendingCommit, Processed};
 #[cfg(feature = "mls")]
 pub use crate::mls::payload::Context as PayloadContext;
 #[cfg(feature = "mls")]
@@ -211,6 +211,17 @@ pub fn mls_receive(group_id: String, message: String, expect: Option<Expect>) ->
 /// Who signed a commit at the current epoch, checked against this device's tree (signature only; changes nothing).
 #[cfg(feature = "mls")]
 pub fn mls_commit_author(group_id: String, message: String) -> Result<CommitCheck> { with_groups(|groups, store| groups.commit_author(store, &crate::mls::engine::group_id(&group_id)?, &message)) }
+/// Signs a resolution of a frozen channel (`action`: `rollback` or `dismiss`) with this device's leaf key; see
+/// `Groups::sign_resolution`.
+#[cfg(feature = "mls")]
+pub fn mls_sign_resolution(group_id: String, action: String, seq: u64, digest: String, author: String) -> Result<String> {
+    with_groups(|groups, store| groups.sign_resolution(store, &crate::mls::engine::group_id(&group_id)?, &action, seq, &digest, &author))
+}
+/// Verifies a resolution signed by the admin device `by`; see `Groups::verify_resolution`.
+#[cfg(feature = "mls")]
+pub fn mls_verify_resolution(group_id: String, action: String, seq: u64, digest: String, author: String, by: String, signature: String) -> Result<ResolutionSigner> {
+    with_groups(|groups, store| groups.verify_resolution(store, &crate::mls::engine::group_id(&group_id)?, &action, seq, &digest, &author, &by, &signature))
+}
 #[cfg(feature = "mls")]
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { with_groups(|groups, store| groups.commit_pending(store, &pending_id)) }
 #[cfg(feature = "mls")]

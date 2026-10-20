@@ -144,6 +144,12 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 else { ok(groups.verify_resolution(store, &group()?, &action, seq, &digest, &author, &text(command, "by")?, &text(command, "byUser")?, &text(command, "signature")?)?) }
             }
             "mlsInspectGroup" => ok(groups.inspect_group(store, &text(command, "groupInfo")?, &text(command, "tree")?)?),
+            "mlsLeafKnown" => {
+                let listed = command.get("groups").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "groups must be a list"))?;
+                if listed.len() > 1000 { return Err(ChatError::coded("invalid", "too many groups")); }
+                let ids = listed.iter().map(|g| g.as_str().ok_or_else(|| ChatError::coded("invalid", "group ids are strings")).and_then(group_id)).collect::<Result<Vec<_>>>()?;
+                ok(groups.leaf_known(store, &ids, &text(command, "deviceId")?, &text(command, "leafSigKey")?)?)
+            }
             "mlsCheckDm" => { groups.check_dm(store, &group()?, &text(command, "peer")?)?; Ok(Value::Null) }
             "mlsMergeOwn" => ok(groups.merge_own(store, &group()?)?),
             "mlsClearOwn" => { groups.clear_own(store, &group()?)?; Ok(Value::Null) }

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import { createHash, createPublicKey, generateKeyPairSync, randomBytes, sign, verify, type KeyObject } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign, type KeyObject } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -578,30 +578,24 @@ suite('companion certificates after a transfer (m5 §5.2.2)', () => {
         run('UPDATE sessions SET device_id = ? WHERE token_hash = ?', c.deviceId, createHash('sha256').update(cookie.split('=')[1]!).digest('hex'));
         return { c, cookie, leaf: c.client.call({ cmd: 'mlsDeviceLeaf' }) as string };
     }
-    const request = (c: Newcomer, userId: string, leaf: string, platform = 'linux') => ({ platform, leafSigKey: leaf, signature: b64(sign(null, F.recertBytes(userId, c.deviceId, platform, leaf), c.key)) });
 
     test('a companion asks for a certificate for its own leaf, the primary answers it, and nobody else can ask, read or answer', async () => {
         await start();
         const alice = account('alice'), bob = account('bob');
         const { c, cookie, leaf } = await listedCompanion(alice);
 
-        // Only a listed device asks, only for itself, signed by its registered key.
-        expect((await call('PUT', '/api/devices/recert', { body: request(c, alice.id, leaf) })).status).toBe(401);
-        const stranger = newcomer('linux');
-        expect((await call('PUT', '/api/devices/recert', { body: request(stranger, alice.id, leaf), cookie })).status).toBe(403); // another device's signature
-        expect((await call('PUT', '/api/devices/recert', { body: { ...request(c, alice.id, leaf), leafSigKey: b64(randomBytes(32)) }, cookie })).status).toBe(403); // names a leaf it did not sign
-        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: 'short', signature: 'A'.repeat(86) }, cookie })).status).toBe(400);
-        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'toaster', leafSigKey: leaf, signature: 'A'.repeat(86) }, cookie })).status).toBe(400);
-        expect((await call('PUT', '/api/devices/recert', { body: request(c, bob.id, leaf), cookie })).status).toBe(403); // signed for another account
-        expect((await call('PUT', '/api/devices/recert', { body: request(c, alice.id, leaf), cookie })).status).toBe(201);
+        // Only a listed device asks, for a canonical key and a known platform.
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: leaf } })).status).toBe(401);
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: 'short' }, cookie })).status).toBe(400);
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'toaster', leafSigKey: leaf }, cookie })).status).toBe(400);
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: leaf }, cookie: app.accounts!.testing.cookie(alice.id) })).status).toBe(403); // a session not bound to a listed device
+        expect((await call('PUT', '/api/devices/recert', { body: { platform: 'linux', leafSigKey: leaf }, cookie })).status).toBe(201);
 
         // Only the primary lists and answers; the list carries what it needs to check the signature itself.
         expect((await call('GET', '/api/devices/recert', { cookie })).status).toBe(403);
         expect((await call('GET', '/api/devices/recert', { cookie: bob.cookie })).body.requests).toEqual([]);
         const pending = await call('GET', '/api/devices/recert', { cookie: alice.cookie });
-        expect(pending.body.requests).toEqual([{ deviceId: c.deviceId, platform: 'linux', leafSigKey: leaf, signature: expect.any(String), deviceKey: c.deviceKey }]);
-        const asked = pending.body.requests[0];
-        expect(verify(null, F.recertBytes(alice.id, c.deviceId, asked.platform, asked.leafSigKey), createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: asked.deviceKey }, format: 'jwk' }), Buffer.from(asked.signature, 'base64url'))).toBe(true);
+        expect(pending.body.requests).toEqual([{ deviceId: c.deviceId, platform: 'linux', leafSigKey: leaf }]);
 
         // The certificate must be for exactly that request and signed by the account's current identity key.
         const good = alice.client.call({ cmd: 'signDeviceCert', userId: alice.id, deviceId: c.deviceId, platform: 'linux', leafSigKey: leaf, issuedAt: clock, now: clock });

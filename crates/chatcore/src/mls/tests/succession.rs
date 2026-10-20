@@ -257,3 +257,20 @@ fn an_external_join_names_the_group_it_means_and_refuses_a_groupinfo_for_another
     assert!(err.message.contains("another group"), "{err}");
     b3.groups.join_external(&mut b3.store, &info, &tree, &g).unwrap();
 }
+
+#[test]
+fn a_leaf_is_known_only_when_a_group_this_device_holds_has_exactly_that_device_with_exactly_that_key() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    let b2_leaf = f.b2.groups.device_leaf(&mut f.b2.store).unwrap();
+    // Bob's other device sees Bob's b2 in the group with its real leaf key; a swapped key, another device id, or a
+    // device of another account (c1 is Carol's) is not known.
+    assert!(f.b1.groups.leaf_known(&mut f.b1.store, &[gid.clone()], &f.b2.device, &b2_leaf).unwrap());
+    assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[gid.clone()], &f.b2.device, &b64(&[5u8; 32])).unwrap(), "the key was swapped");
+    assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[gid.clone()], &b64(&[6u8; 16]), &b2_leaf).unwrap(), "another device id");
+    let c1_leaf = f.c1.groups.device_leaf(&mut f.c1.store).unwrap();
+    assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[gid.clone()], &f.c1.device, &c1_leaf).unwrap(), "another account's device");
+    assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[], &f.b2.device, &b2_leaf).unwrap(), "no groups prove nothing");
+    assert!(!f.b1.groups.leaf_known(&mut f.b1.store, &[group_id(&b64(&[3u8; 16])).unwrap()], &f.b2.device, &b2_leaf).unwrap(), "a group it is not in");
+}

@@ -17,11 +17,13 @@ import '../core/devices.dart';
 import '../core/events.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart';
+import '../crypto/link_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
 import '../crypto/rust_group_crypto.dart';
 import '../messaging/attachments.dart';
 import '../messaging/group_messenger.dart';
 import '../messaging/group_sync.dart';
+import '../messaging/linking.dart';
 import '../messaging/messenger.dart';
 import '../store/message_store.dart';
 import '../theme/theme_prefs.dart';
@@ -75,6 +77,9 @@ final tokenStoreProvider = Provider<TokenStore>((ref) => SecureTokenStore());
 /// The Rust core (crates/chatcore) through flutter_rust_bridge. Tests and the demo override this
 /// with FakeChatCrypto.
 final cryptoProvider = Provider<ChatCrypto>((ref) => RustChatCrypto());
+
+/// Linking, pin transfer and succession in the same Rust core. Tests override this with FakeLinkCrypto.
+final linkCryptoProvider = Provider<LinkCrypto>((ref) => const RustLinkCrypto());
 
 /// Groups over MLS: the same Rust core (its group engine). Tests and the demo override this with FakeGroupCrypto.
 final groupCryptoProvider = Provider<GroupCrypto>((ref) => const RustGroupCrypto());
@@ -430,6 +435,13 @@ class AppController extends Notifier<AppState> {
     await _loadGroups();
   }
 
+  /// What linking a device needs (this device as the primary).
+  LinkContext? linkContext() {
+    final m = messenger, s = store;
+    if (m == null || s == null) return null;
+    return LinkContext(api: _api, crypto: _crypto, link: ref.read(linkCryptoProvider), messenger: m, store: s, contacts: () => state.contacts);
+  }
+
   void openGroup(String id) {
     viewingGroup = id;
     unawaited(groups?.markRead(id));
@@ -476,7 +488,10 @@ class AppController extends Notifier<AppState> {
         // A contact's list: verify it against their pinned security code. Ours: check it still names this device.
         final contact = contactById(id);
         if (id == state.user?.id) {
+          // After a revocation the primary publishes the list without the revoked device (m5 §4).
           unawaited(messenger?.syncDevices().catchError((_) => false));
+          if (event.needsList) unawaited(messenger?.publishNextList().then((_) => null, onError: (_) => null));
+          unawaited(groups?.sync.removeDroppedOwnLeaves().catchError((_) => 0));
         } else if (contact != null) {
           unawaited(messenger?.verifyContactDevices(contact).catchError((_) => null));
         }

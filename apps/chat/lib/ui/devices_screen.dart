@@ -5,8 +5,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../app/app_controller.dart';
 import '../core/api.dart';
-import '../crypto/chat_crypto.dart' show CryptoException;
 import '../messaging/messenger.dart' show OwnDevice;
+import 'link/link_device_screen.dart';
 import 'widgets/common.dart';
 
 /// Settings → Devices: this account's devices, labelled from the sealed list where this device can open it.
@@ -44,34 +44,16 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
     }
   }
 
-  Future<void> _remove(OwnDevice device) async {
-    final name = device.label ?? platformName(device.platform);
-    final yes = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: Text('Remove $name?'),
-        content: const Text("It's signed out and can no longer read new messages. To use it again, link it from this device."),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-          FilledButton(
-            key: const Key('device-remove-confirm'),
-            style: FilledButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
-            onPressed: () => Navigator.pop(context, true),
-            child: const Text('Remove'),
-          ),
-        ],
-      ),
-    );
-    if (yes != true) return;
+  Future<void> _revoke(OwnDevice d) async {
     setState(() => _busy = true);
     try {
-      await ref.read(appProvider.notifier).messenger!.removeOwnDevice(device);
-      if (mounted) showSnack(context, '$name was removed.');
+      if (await confirmRevoke(context, ref, d.id, d.label ?? platformName(d.platform))) {
+        // On the primary, publish the list without it right away (other devices wait for the primary).
+        final messenger = ref.read(appProvider.notifier).messenger;
+        if (_devices?.any((x) => x.current && x.primary) ?? false) await messenger?.publishNextList().then((_) => null, onError: (_) => null);
+        if (mounted) showSnack(context, '${d.label ?? platformName(d.platform)} was revoked.');
+      }
       await _load();
-    } on ApiException catch (e) {
-      if (mounted) showSnack(context, e.message);
-    } on CryptoException catch (e) {
-      if (mounted) showSnack(context, e.message);
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -109,9 +91,27 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
                       ].join(' · '),
                       style: TextStyle(color: muted),
                     ),
-                    trailing: amPrimary && !d.current && !d.primary
-                        ? TextButton(onPressed: _busy ? null : () => _remove(d), child: Text('Remove', style: TextStyle(color: Theme.of(context).colorScheme.error)))
+                    // Any device of the account can revoke another (never the primary: that is a transfer).
+                    trailing: !d.current && !d.primary && d.state != 'revoked'
+                        ? TextButton(
+                            key: ValueKey('revoke-${d.id}'),
+                            onPressed: _busy ? null : () => _revoke(d),
+                            child: Text('Revoke', style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                          )
                         : null,
+                  ),
+                if (amPrimary)
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: FilledButton.icon(
+                      key: const Key('device-link-new'),
+                      onPressed: () async {
+                        await showLinkDevice(context);
+                        await _load();
+                      },
+                      icon: const Icon(Icons.add_link),
+                      label: const Text('Link a device'),
+                    ),
                   ),
               ],
             ),

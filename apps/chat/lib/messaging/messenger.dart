@@ -201,8 +201,12 @@ class Messenger {
   /// pin, and publish the next version if this device is missing from it or isn't its primary. The list
   /// names this device and every listed device the server still has; meta is empty (the app doesn't seal
   /// labels). Returns whether this device is now listed. One at a time.
-  Future<bool> syncDevices() => _syncing = _syncing.then((_) => _syncDevicesNow(), onError: (_) => _syncDevicesNow());
-  Future<bool> _syncing = Future.value(false);
+  Future<bool> syncDevices() {
+    final run = _syncing.then((_) => _syncDevicesNow(), onError: (_) => _syncDevicesNow());
+    _syncing = run;
+    return run;
+  }
+  Future<Object?> _syncing = Future.value(false);
 
   /// Why the served list was not accepted, if it wasn't.
   String? deviceWarning;
@@ -234,10 +238,40 @@ class Messenger {
         return true;
       }
     }
+    await _publishNext(view, base, baseHash, own);
+    deviceWarning = null;
+    return true;
+  }
+
+  /// The identity-key holder publishes the next list: this device, every device the current list names that
+  /// the server still calls listed, and [add] (a device being linked). Returns the version and hash.
+  Future<({int version, String hash})> publishNextList({Map<String, Object?>? add}) {
+    final run = _syncing.then((_) => _publishNextNow(add), onError: (_) => _publishNextNow(add));
+    _syncing = run;
+    return run;
+  }
+
+  Future<({int version, String hash})> _publishNextNow(Map<String, Object?>? add) async {
+    final own = await crypto.identity();
+    final view = await api.devices(me.username);
+    Map<String, dynamic>? base;
+    String? baseHash;
+    if (view['list'] != null) {
+      final check = verifyView(userId: me.id, aikSign: own.sign, list: view['list'], signature: view['signature'], certs: view['certs'], pin: devices.pin(me.id, me.id));
+      if (!check.ok) throw CryptoException('The device list on the server is not one this device signed (${check.reason}).');
+      devices.setPin(me.id, me.id, check.pin!);
+      base = (view['list'] as Map).cast<String, dynamic>();
+      baseHash = check.hash;
+    }
+    return _publishNext(view, base, baseHash, own, add: add);
+  }
+
+  Future<({int version, String hash})> _publishNext(Map<String, dynamic> view, Map<String, dynamic>? base, String? baseHash, Identity own, {Map<String, Object?>? add}) async {
+    final id = (await device()).deviceId;
     final rows = (view['devices'] as List? ?? const []).cast<Map>();
     final keep = [
       for (final d in (base?['devices'] as List? ?? const []).cast<Map>())
-        if (d['deviceId'] != id && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
+        if (d['deviceId'] != id && d['deviceId'] != add?['deviceId'] && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
     ];
     final self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
         {
@@ -246,19 +280,18 @@ class Messenger {
           // Label and platform, sealed under the account's device-meta key like the web does.
           'meta': sealMeta(deviceMetaKey(await crypto.deviceMetaSignature(me.id)), me.id, id, label: _deviceLabel(api.client), platform: api.client),
         };
-    final entries = [...keep, self]..sort((a, b) => (a['deviceId'] as String).compareTo(b['deviceId'] as String));
-    final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': ((base?['version'] as int?) ?? 0) + 1, 'prevHash': baseHash ?? '', 'devices': entries};
+    final entries = [...keep, self, ?add]..sort((a, b) => (a['deviceId']! as String).compareTo(b['deviceId']! as String));
+    final version = ((base?['version'] as int?) ?? 0) + 1;
+    final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': version, 'prevHash': baseHash ?? '', 'devices': entries};
     final head = view['list'] is Map && view['signature'] is String
         ? (list: (view['list'] as Map).cast<String, Object?>(), signature: view['signature'] as String)
         : null;
     final sig = await crypto.signDeviceList(me.id, own.sign, list, head: head);
-    final certs = sig.certs;
-    final signed = {'list': list, 'signature': sig.signature, 'certs': certs};
+    final signed = {'list': list, 'signature': sig.signature, 'certs': sig.certs};
     await api.publishDeviceList(signed, id);
-    final after = verifyView(userId: me.id, aikSign: own.sign, list: list, signature: signed['signature'], certs: certs, pin: devices.pin(me.id, me.id));
+    final after = verifyView(userId: me.id, aikSign: own.sign, list: list, signature: signed['signature'], certs: sig.certs, pin: devices.pin(me.id, me.id));
     if (after.ok) devices.setPin(me.id, me.id, after.pin!);
-    deviceWarning = null;
-    return true;
+    return (version: version, hash: listHash(listBytes(list)));
   }
 
   /// This account's served device list, verified under our account key (this core's identity, or the

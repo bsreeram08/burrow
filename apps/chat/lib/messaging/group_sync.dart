@@ -60,6 +60,14 @@ class LogEntry {
   );
 }
 
+/// This account's verified device list: the devices it names, and the ones an earlier pinned list named and
+/// a later one dropped (the pin's tombstones: proven absent).
+class OwnDeviceList {
+  const OwnDeviceList({required this.listed, required this.dropped});
+  final Set<String> listed;
+  final Set<String> dropped;
+}
+
 /// Where an admin device keeps its tag-only rollbacks per author device (timestamps, ms).
 abstract class TagRollbackLog {
   Map<String, List<int>> read();
@@ -134,6 +142,7 @@ class GroupSync {
     required this.device,
     required this.platform,
     required this.ensurePinned,
+    this.verifiedOwnDevices,
     TagRollbackLog? tagLog,
     this.sendCursor,
     this.onDelivery,
@@ -164,6 +173,14 @@ class GroupSync {
 
   /// This admin device's record of tag-only rollbacks per author device (kept on the device).
   final TagRollbackLog tagLog;
+
+  /// This account's own signed device list, verified under our account key against our pin (and moving it
+  /// forward): the devices it names, and the ones a pinned list dropped. Null when it can't be verified; then
+  /// no own leaf is removed and no channel is auto-joined (m5 §3, §4).
+  final Future<OwnDeviceList?> Function()? verifiedOwnDevices;
+
+  /// The random 0–3 s wait before acting on our own revoked leaves, so devices don't all commit at once.
+  Duration Function() removalJitter = () => Duration(milliseconds: math.Random().nextInt(3000));
   DeliveryHandler? onDelivery;
   Future<void> Function(MembershipChange change)? onMembership;
   final int Function() _now;
@@ -521,7 +538,7 @@ class GroupSync {
   Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false}) async {
     if (entry.seq <= group.cursor) return true;
     final local = await device();
-    if (entry.fromDevice == local.deviceId) {
+    if (entry.fromUser == me.id && entry.fromDevice == local.deviceId) {
       // Never our own application messages; our own commit only while one is pending (the answer was lost).
       if (entry.kind == 'commit' && await crypto.pendingCommit(group.id) != null) {
         try {
@@ -825,10 +842,20 @@ class GroupSync {
         if (own == null || own.seq != event.seq || own.digest != event.digest) return;
         if (!await _verifiedRollback(event, own.seq, own.digest, own.epoch)) return;
         _lastOwn.remove(event.id);
-        await _serial(event.id, () async {
-          await crypto.forget(event.id);
-          await _externalJoin(event.id);
-        });
+        // A rollback that names this device removes it: nothing to redo.
+        if (event.author == (await device()).deviceId) {
+          _notice('An admin undid a change you made and removed this device from the group.');
+          return;
+        }
+        try {
+          await _serial(event.id, () async {
+            await crypto.forget(event.id);
+            await _externalJoin(event.id);
+          });
+        } catch (_) {
+          _notice("A change you made was undone, and this device couldn't rejoin the group to make it again.");
+          return;
+        }
         final redo = own.redo;
         if (redo != null) {
           await redo();
@@ -843,6 +870,9 @@ class GroupSync {
       case 'left':
         // Confirmed by the log: a removed device can no longer read it.
         unawaited(catchUp(event.id).catchError((_) {}));
+      case 'remove-device':
+        // A hint only: we remove our own leaf only if our verified list dropped that device.
+        unawaited(removeDroppedOwnLeaves(groupId: event.id).catchError((_) => 0));
       case 'gap':
         unawaited(_serial(event.id, () => _resync(event.id)).catchError((_) {}));
       case 'joined' || 'invited' || 'updated':
@@ -861,10 +891,12 @@ class GroupSync {
   /// m4-groups §7: an admin of our own copy signed it with its leaf key, the channel is back at the commit's
   /// pre-commit epoch, and the log holds no commit with that digest.
   Future<bool> _verifiedRollback(ChannelEvent event, int seq, String digest, int epoch) async {
-    final by = event.by, signature = event.signature, author = event.author;
-    if (event.action != 'rollback' || by == null || signature == null || author == null) return false;
+    final by = event.by, byUser = event.byUser, signature = event.signature, author = event.author;
+    if (event.action != 'rollback' || by == null || byUser == null || signature == null || author == null) return false;
     try {
-      await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, signature: signature);
+      // The signer is matched as (user, device), never by device id alone.
+      final signer = await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, signature: signature);
+      if (signer != byUser) throw const CryptoException('the resolution was signed by another user', code: 'invalid');
     } catch (_) {
       _notice('A rollback notice for a group could not be verified and was ignored.');
       return false;
@@ -889,6 +921,75 @@ class GroupSync {
     final next = [...tagRollbacks(deviceId), _now()];
     all[deviceId] = next.length > 20 ? next.sublist(next.length - 20) : next;
     tagLog.write(all);
+  }
+
+  // ---------- Our own devices' leaves (m5 §3, §4) ----------
+  /// Removes our own leaves for devices a verified signed list dropped (the pin's tombstones), and leaves the
+  /// core marks stale. A device that is merely missing, or an unverifiable list, removes nothing. Matches
+  /// (userId, deviceId). Treats "no such member" and conflicts as done.
+  Future<int> removeDroppedOwnLeaves({String? groupId}) async {
+    final own = verifiedOwnDevices == null ? null : await verifiedOwnDevices!();
+    final local = await device();
+    var removed = 0;
+    final groups = groupId == null ? await store.groups() : [?await store.group(groupId)];
+    for (final group in groups) {
+      if (!group.active) continue;
+      List<GroupMember> members;
+      try {
+        members = await crypto.members(group.id);
+      } catch (_) {
+        continue;
+      }
+      final targets = [
+        for (final m in members)
+          if (m.userId == me.id && m.deviceId != local.deviceId && (m.stale || (own?.dropped.contains(m.deviceId) ?? false))) m,
+      ];
+      for (final m in targets) {
+        await Future<void>.delayed(removalJitter());
+        try {
+          await remove(group.id, me.id, deviceId: m.deviceId);
+          removed++;
+        } on CryptoException catch (e) {
+          if (e.code != 'invalid') rethrow; // "no such member": another device of ours already did it.
+        } on ApiException catch (e) {
+          if (e.status != 409) rethrow;
+        }
+      }
+    }
+    if (removed > 0) _notice('Removed a revoked device of yours from $removed ${removed == 1 ? 'group' : 'groups'}.');
+    return removed;
+  }
+
+  /// Joins, by external commit, channels the server lists for this account that this device isn't in yet, but
+  /// only where the served tree (checked by the core, [GroupCrypto.inspectGroup]) holds a current leaf of ours
+  /// for another device our verified list names. Never one this device left; at most about 3 per second.
+  Future<int> joinOwnChannels() async {
+    final own = verifiedOwnDevices == null ? null : await verifiedOwnDevices!();
+    if (own == null) return 0;
+    final local = await device();
+    var joined = 0;
+    for (final c in await api.channels()) {
+      if (c['member'] == true) continue;
+      final id = c['id'] as String;
+      final known = await store.group(id);
+      if (known?.membership == Membership.left) continue;
+      try {
+        final info = await api.joinInfo(id);
+        final members = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);
+        final ours = members.any((m) => m.userId == me.id && !m.stale && m.deviceId != local.deviceId && own.listed.contains(m.deviceId));
+        if (!ours) continue;
+        await _serial(id, () async {
+          await ensureReady();
+          await _externalJoin(id);
+          await _catchUpNow(id);
+        });
+        joined++;
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+      } catch (_) {
+        // Fail closed: an unchecked or failed join is tried again on the next start.
+      }
+    }
+    return joined;
   }
 
   /// Whether this device's MLS state still has a leaf in the group.
@@ -954,7 +1055,7 @@ class GroupSync {
       if (raw != null) entry = LogEntry.fromJson(raw);
     } catch (_) {}
     if (entry == null || entry.kind != 'commit' || messageDigest(entry.message) != frozen.digest) return const FrozenCheck(FrozenVerdict.unknown);
-    if (entry.fromDevice == (await device()).deviceId || group.cursor >= frozen.seq) return const FrozenCheck(FrozenVerdict.ok);
+    if ((entry.fromUser == me.id && entry.fromDevice == (await device()).deviceId) || group.cursor >= frozen.seq) return const FrozenCheck(FrozenVerdict.ok);
     CommitCheck? check;
     try {
       check = await crypto.commitAuthor(groupId, entry.message);

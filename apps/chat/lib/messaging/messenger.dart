@@ -12,6 +12,7 @@ import '../crypto/chat_crypto.dart';
 import '../store/disposition.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
+import 'group_sync.dart' show OwnDeviceList;
 import 'payload.dart';
 
 /// Read receipts: at most one `read` per contact per 2 s.
@@ -258,6 +259,30 @@ class Messenger {
     if (after.ok) devices.setPin(me.id, me.id, after.pin!);
     deviceWarning = null;
     return true;
+  }
+
+  /// This account's served device list, verified under our account key (this core's identity, or the
+  /// account key pinned for us on a linked device) and against our own pin, which it moves forward. Null when
+  /// it can't be verified. Tombstones (`dropped`) are only devices an earlier pinned list named and a later one
+  /// dropped: proven absent, never just missing.
+  Future<OwnDeviceList?> verifiedOwnDevices() async {
+    try {
+      final view = await api.devices(me.username);
+      final pin = devices.pin(me.id, me.id);
+      String? aik;
+      try {
+        aik = (await crypto.identity()).sign;
+      } catch (_) {
+        aik = pin?.aik;
+      }
+      if (aik == null || view['list'] == null) return null;
+      final check = verifyView(userId: me.id, aikSign: aik, list: view['list'], signature: view['signature'], certs: view['certs'], pin: pin);
+      if (!check.ok) return null;
+      devices.setPin(me.id, me.id, check.pin!);
+      return OwnDeviceList(listed: {...check.pin!.devices}, dropped: {...check.pin!.revoked});
+    } catch (_) {
+      return null;
+    }
   }
 
   /// This account's devices as the server lists them, labelled from the sealed list where this device can open

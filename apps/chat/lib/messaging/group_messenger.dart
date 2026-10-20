@@ -248,6 +248,9 @@ class GroupMessenger {
     }
     await sync.fetchWelcomes();
     await sync.refresh();
+    // Our own channels this device isn't in yet (checked before joining), and leaves of devices our verified
+    // list dropped.
+    unawaited(sync.joinOwnChannels().then((_) => sync.removeDroppedOwnLeaves()).catchError((_) => 0));
     for (final g in await store.groups()) {
       if (g.active) unawaited(members(g.id, refresh: true));
     }

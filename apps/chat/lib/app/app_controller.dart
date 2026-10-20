@@ -359,6 +359,7 @@ class AppController extends Notifier<AppState> {
       device: m.device,
       platform: _api.client,
       ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: m.verifiedOwnDevices,
       tagLog: SharedTagRollbackLog(await SharedPreferences.getInstance(), user.id),
       sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
       ackWelcome: events.ack,

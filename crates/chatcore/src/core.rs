@@ -191,13 +191,44 @@ impl Core {
     /// list is parsed and validated here (devices.js `validateList`), must name `user_id`, and the account's
     /// published identity (`published_sign`, as the server serves it) must be this core's own identity key: the
     /// AIK signs only the canonical list and certificate bytes built here, never caller-chosen bytes.
-    pub fn sign_device_list(&mut self, user_id: &str, published_sign: &str, list_json: &str) -> Result<crate::devicelist::SignedList> {
-        use crate::devicelist::{cert_bytes, list_bytes, parse_list, SignedList};
+    ///
+    /// The core also remembers the last list it signed or saw (`devlist:last`: version and hash) and signs only
+    /// the next one: `version == last + 1` naming the last hash (version 1 only when nothing is known), or the very
+    /// same list again (a publish that failed). Another device of the account may have signed newer lists since;
+    /// `head` is the list the server serves now with its signature, and moves the memory forward only if that
+    /// signature verifies under this core's own key. A head older than the memory is ignored; a different list at
+    /// the same version is a fork and is refused.
+    pub fn sign_device_list(&mut self, user_id: &str, published_sign: &str, list_json: &str, head: Option<&crate::devicelist::ListHead>) -> Result<crate::devicelist::SignedList> {
+        use crate::devicelist::{cert_bytes, list_bytes, list_hash, parse_list, SignedList};
+        #[derive(Serialize, Deserialize, Clone, PartialEq)]
+        struct Last { version: u64, hash: String }
         let list = parse_list(list_json)?;
         if list.user_id != user_id { return Err(ChatError::coded("invalid", "The device list names another account")); }
         let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
         if identity.public.sign != published_sign { return Err(ChatError::coded("mismatch", "This device does not hold the account's published identity key")); }
         let key = SigningKey::from_bytes(&identity.sign.0);
+        let mut last = self.get::<Last>("devlist:last")?;
+        if let Some(head) = head {
+            let served = parse_list(&head.list_json)?;
+            if served.user_id != user_id { return Err(ChatError::coded("invalid", "The served device list names another account")); }
+            let signature = crate::primitives::unb64(&head.signature, Some(64)).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
+            let signature = ed25519_dalek::Signature::from_slice(&signature).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
+            key.verifying_key().verify_strict(&list_bytes(&served), &signature).map_err(|_| ChatError::coded("invalid", "The served device list is not signed by this account's identity key"))?;
+            let seen = Last { version: served.version, hash: list_hash(&served) };
+            match &last {
+                Some(known) if seen.version < known.version => {}
+                Some(known) if seen.version == known.version && seen.hash != known.hash => return Err(ChatError::coded("invalid", "The served device list forks the last one this identity signed")),
+                _ => last = Some(seen),
+            }
+        }
+        let hash = list_hash(&list);
+        let follows = match &last {
+            None => list.version == 1,
+            Some(known) => (list.version == known.version + 1 && list.prev_hash == known.hash) || (list.version == known.version && hash == known.hash),
+        };
+        if !follows { return Err(ChatError::coded("invalid", "The device list does not follow the last one this identity signed")); }
+        // Remembered before anything is signed: a signature that cannot be recorded is never handed out.
+        self.store.put("devlist:last", to_value(&Last { version: list.version, hash }))?;
         let certs = list.devices.iter().map(|device| (device.device_id.clone(), b64(&key.sign(&cert_bytes(user_id, device)).to_bytes()))).collect();
         Ok(SignedList { signature: b64(&key.sign(&list_bytes(&list)).to_bytes()), certs })
     }
@@ -408,7 +439,11 @@ impl Core {
         Ok(Some(Safety { number, verified: peer.verified, changed: peer.changed, blocked: peer.blocked }))
     }
 
-    pub fn set_verified(&mut self, contact: &str, verified: bool) -> Result<()> {
+    pub fn set_verified(&mut self, contact: &str, verified: bool) -> Result<()> { self.set_verified_for(contact, verified, None) }
+    /// With `identity`: only if that is exactly the code the user was shown (the pinned identity now). Otherwise
+    /// `mismatch`, and the caller shows the new code for review instead.
+    pub fn set_verified_for(&mut self, contact: &str, verified: bool, identity: Option<&IdentityPub>) -> Result<()> {
+        self.expect_identity(contact, identity)?;
         if let Some(mut peer) = self.peer(contact)? {
             peer.verified = verified;
             if verified { peer.changed = false; }
@@ -419,13 +454,24 @@ impl Core {
     }
 
     /// The user reviewed a changed security code and keeps messaging (without marking it verified).
-    pub fn accept_change(&mut self, contact: &str) -> Result<()> {
+    pub fn accept_change(&mut self, contact: &str) -> Result<()> { self.accept_change_for(contact, None) }
+    /// [`Core::accept_change`] for exactly the identity the user reviewed (see [`Core::set_verified_for`]).
+    pub fn accept_change_for(&mut self, contact: &str, identity: Option<&IdentityPub>) -> Result<()> {
+        self.expect_identity(contact, identity)?;
         if let Some(mut peer) = self.peer(contact)? {
             peer.changed = false;
             peer.blocked = false;
             self.store.put(&format!("peer:{contact}"), to_value(&peer))?;
         }
         Ok(())
+    }
+
+    fn expect_identity(&mut self, contact: &str, identity: Option<&IdentityPub>) -> Result<()> {
+        let Some(shown) = identity else { return Ok(()) };
+        match self.peer(contact)? {
+            Some(peer) if same_identity(&peer.identity, shown) => Ok(()),
+            _ => Err(ChatError::coded("mismatch", "The security code changed again. Review the new one.")),
+        }
     }
 
     pub fn forget(&mut self, contact: &str) -> Result<()> { self.store.delete(&format!("sessions:{contact}")) }
@@ -458,7 +504,7 @@ impl Core {
         self.pending.clear();
         self.pending_order.clear();
         for prefix in ["sessions:", "opk:", "claim:", "claims:"] { self.store.delete_prefix(prefix)?; }
-        self.store.batch(vec![Write::Delete("identity".into()), Write::Delete("spk".into()), Write::Delete("opk-next".into())])?;
+        self.store.batch(vec![Write::Delete("identity".into()), Write::Delete("spk".into()), Write::Delete("opk-next".into()), Write::Delete("devlist:last".into())])?;
         self.may_create_identity = true; // The explicit user action is the only other way to a new identity.
         Ok(())
     }
@@ -483,5 +529,5 @@ impl Core {
 
     /// The account identity key (AIK) that certifies this user's devices.
     #[cfg(feature = "mls")]
-    pub fn account_signing_key(&mut self) -> Result<ed25519_dalek::SigningKey> { Ok(ed25519_dalek::SigningKey::from_bytes(&self.identity()?.sign.0)) }
+    pub(crate) fn account_signing_key(&mut self) -> Result<ed25519_dalek::SigningKey> { Ok(ed25519_dalek::SigningKey::from_bytes(&self.identity()?.sign.0)) }
 }

@@ -168,8 +168,8 @@ export class Device {
         }
     }
     /** What an admin device signs to resolve a frozen channel. */
-    resolution(channel: string, action: 'rollback' | 'dismiss', seq: number, digest: string) {
-        return b64(sign(null, resolveBytes(channel, action, seq, digest), this.key));
+    resolution(channel: string, action: 'rollback' | 'dismiss', seq: number, digest: string, author: string) {
+        return b64(sign(null, resolveBytes(channel, action, seq, digest, author), this.key));
     }
     events() {
         const url = new URL('/api/events', this.app.server.url); url.protocol = 'ws:';

@@ -686,6 +686,31 @@ impl Groups {
 
     /// [`Groups::process`] for a caller that knows what the entry should be (`expect`): a mismatch is refused before
     /// anything is decrypted, merged or staged.
+    /// Who signed a commit at the group's current epoch, checked against this device's own copy of the tree (the
+    /// signature only: like the delivery service, without the tags only members can check). Changes nothing. For
+    /// resolving a reported commit: the author whose device a rollback removes is decided here, not by the server.
+    pub fn commit_author(&mut self, store: &mut dyn Store, group: &GroupId, message: &str) -> Result<MemberView> {
+        if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
+        let bytes = unb64(message, "message")?;
+        bounded("message", &bytes, limits::MAX_HANDSHAKE_BYTES)?;
+        let protocol: ProtocolMessage = MlsMessageIn::tls_deserialize_exact(bytes.as_slice()).map_err(|_| ChatError::malformed())?.try_into_protocol_message().map_err(|_| ChatError::malformed())?;
+        Expect::check(Some(Expect::Commit), &protocol)?;
+        self.gate(store, group)?;
+        let mls_group = Self::load_group(&self.provider, group)?;
+        if protocol.epoch() != mls_group.epoch() { return Err(invalid("that commit is not for this group's current epoch")); }
+        let roles = validate_context(mls_group.extensions())?;
+        let processed = mls_group.public_group().process_message(self.provider.crypto(), protocol).map_err(|e| ChatError::coded("auth", &format!("commit signature rejected: {e:?}")))?;
+        let author = match processed.sender() {
+            Sender::Member(index) => Self::member_view(&mls_group, &roles, *index),
+            Sender::NewMemberCommit => match processed.content() {
+                ProcessedMessageContent::StagedCommitMessage(staged) => staged.update_path_leaf_node().and_then(|leaf| cert_of(leaf.credential())).map(|c| MemberView { leaf: u32::MAX, admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform }),
+                _ => None,
+            },
+            _ => None,
+        };
+        author.ok_or_else(|| invalid("that commit has no member author"))
+    }
+
     pub fn process_as(&mut self, store: &mut dyn Store, group: &GroupId, message: &str, expect: Option<Expect>) -> Result<Processed> {
         if self.stale { return Err(ChatError::storage("group state must be reloaded")); }
         let bytes = unb64(message, "message")?;

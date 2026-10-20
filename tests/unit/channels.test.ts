@@ -655,13 +655,20 @@ suite('poison commits', () => {
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: w.seq, digest: w.digest })).body).toEqual({ frozen: true });
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq: w.seq, digest: '1'.repeat(64) })).status).toBe(409);
 
-        // Only an admin device, with its own signature over exactly this resolution.
-        const resolve = (device: Device, action: string, signature?: string) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq: w.seq, digest: w.digest, signature: signature ?? device.resolution(w.channel, action as any, w.seq, w.digest) });
+        // The admin's own copy of the group authenticates who signed the commit (signature only; nothing changes).
+        const author = w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: entry.message });
+        expect(author).toMatchObject({ userId: w.alice.id, deviceId: w.a1.deviceId });
+        expect(() => w.a2.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: flip(entry.message, 40) })).toThrow();
+        // Only an admin device, with its own signature over exactly this resolution, naming the commit's author.
+        const a = w.a1.deviceId;
+        const resolve = (device: Device, action: string, signature?: string, named = a) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq: w.seq, digest: w.digest, author: named, signature: signature ?? device.resolution(w.channel, action as any, w.seq, w.digest, named) });
         expect((await resolve(w.b1, 'rollback')).status).toBe(403); // not an admin
-        expect((await resolve(w.a2, 'rollback', w.a2.resolution(w.channel, 'dismiss', w.seq, w.digest))).status).toBe(403); // signed for another action
-        expect((await resolve(w.a2, 'rollback', w.a1.resolution(w.channel, 'rollback', w.seq, w.digest))).status).toBe(403); // someone else's signature
+        expect((await resolve(w.a2, 'rollback', w.a2.resolution(w.channel, 'dismiss', w.seq, w.digest, a))).status).toBe(403); // signed for another action
+        expect((await resolve(w.a2, 'rollback', w.a1.resolution(w.channel, 'rollback', w.seq, w.digest, a))).status).toBe(403); // someone else's signature
         expect((await resolve(w.a2, 'rollback', 'A'.repeat(86))).status).toBe(403);
-        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'rollback', seq: w.seq + 1, digest: w.digest, signature: w.a2.resolution(w.channel, 'rollback', w.seq + 1, w.digest) })).status).toBe(409);
+        expect((await resolve(w.a2, 'rollback', w.a2.resolution(w.channel, 'rollback', w.seq, w.digest, w.c1.deviceId), a)).status).toBe(403); // signed for another author
+        expect((await resolve(w.a2, 'rollback', undefined, w.c1.deviceId)).status).toBe(409); // signed, but not the commit's author
+        expect((await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'rollback', seq: w.seq + 1, digest: w.digest, author: a, signature: w.a2.resolution(w.channel, 'rollback', w.seq + 1, w.digest, a) })).status).toBe(409);
         const done = await resolve(w.a2, 'rollback');
         expect(done.status).toBe(200);
         expect(done.body).toMatchObject({ resolved: 'rollback', epoch: 1, seq: w.seq - 1, removeDevice: w.a1.deviceId });
@@ -693,7 +700,7 @@ suite('poison commits', () => {
         const seq = honest.body.seq, digest = honest.body.digest;
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202); // a faulty or hostile report
         expect((await w.a1.send(w.channel, 'x')).status).toBe(423);
-        const resolve = (device: Device, action: string) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq, digest, signature: device.resolution(w.channel, action as any, seq, digest) });
+        const resolve = (device: Device, action: string) => device.api('POST', `/api/channels/${w.channel}/resolve`, { action, seq, digest, author: w.a1.deviceId, signature: device.resolution(w.channel, action as any, seq, digest, w.a1.deviceId) });
         expect((await resolve(w.c1, 'dismiss')).status).toBe(403);
         expect((await resolve(w.a2, 'dismiss')).body).toEqual({ resolved: 'dismiss' });
         expect(one('SELECT frozen_seq FROM channels WHERE id = ?', w.channel).frozen_seq).toBeNull();
@@ -731,7 +738,7 @@ suite('review fixes', () => {
         const honest = await w.a1.commit(w.channel, { update: true });
         const { seq, digest } = honest.body;
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
-        const dismiss = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'dismiss', seq, digest, signature: w.a2.resolution(w.channel, 'dismiss', seq, digest) });
+        const dismiss = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'dismiss', seq, digest, author: w.a1.deviceId, signature: w.a2.resolution(w.channel, 'dismiss', seq, digest, w.a1.deviceId) });
         expect(dismiss.status).toBe(200);
         // The same commit is not reportable any more...
         expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(409);
@@ -881,5 +888,21 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         const leaf2 = holder.call({ cmd: 'mlsDeviceLeaf' });
         const forged = F.mlsCertJson(userId, deviceId, 'web', leaf2, aik, issuedAt, sign(null, F.mlsCertBytes(userId, deviceId, 'web', leaf2, aik, issuedAt), privateKey).toString('base64url'));
         expect(() => holder.call({ cmd: 'mlsSetDeviceCert', cert: forged, aik })).toThrow();
+    });
+
+    test('acceptChange and setVerified take the exact identity reviewed, and refuse a newer one', async () => {
+        await start();
+        const core = new Client(Core), contact = id();
+        const [first, second] = [new Client(Core).call({ cmd: 'identity' }), new Client(Core).call({ cmd: 'identity' })];
+        core.call({ cmd: 'notePeer', contact, identity: first });
+        expect(core.call({ cmd: 'notePeer', contact, identity: second }).blocked).toBe(true);
+        let error: any;
+        try { core.call({ cmd: 'acceptChange', contact, identity: first }); } catch (caught) { error = caught; }
+        expect(error?.code).toBe('mismatch');
+        expect(core.call({ cmd: 'peer', contact }).blocked).toBe(true);
+        expect(() => core.call({ cmd: 'setVerified', contact, verified: true, identity: first })).toThrow(/changed again/);
+        core.call({ cmd: 'acceptChange', contact, identity: second });
+        core.call({ cmd: 'setVerified', contact, verified: true, identity: second });
+        expect(core.call({ cmd: 'peer', contact })).toMatchObject({ blocked: false, verified: true, identity: second });
     });
 });

@@ -27,8 +27,12 @@ type MemberView = { userId: string; deviceId: string; admin: boolean };
 export type GroupConnection = { kind: 'events'; userId: string; session: string; sent: Set<string>; groups: Map<string, number> };
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' } });
 
-/** What an admin device signs to resolve a frozen channel: its device key over these exact UTF-8 bytes. */
-export const resolveBytes = (channelId: string, action: string, seq: number, digest: string) => Buffer.from(`webrtc-bun-mlsresolve-v1\n${channelId}\n${action}\n${seq}\n${digest}`);
+/**
+ * What an admin device signs to resolve a frozen channel: its device key over these exact UTF-8 bytes. `author` is
+ * the commit's author device as the admin's own copy of the group authenticated it (its signature), so the server
+ * can neither swap whose device a rollback cuts off nor apply the signature to another commit.
+ */
+export const resolveBytes = (channelId: string, action: string, seq: number, digest: string, author: string) => Buffer.from(`webrtc-bun-mlsresolve-v2\n${channelId}\n${action}\n${seq}\n${digest}\n${author}`);
 
 type Deps = {
     db: Database; now: () => number; origin: string; ds: DsCore; keyPackages: KeyPackages;
@@ -498,11 +502,14 @@ export function createChannels(deps: Deps) {
         if (!member.admin) return json({ error: 'Only an admin device resolves a frozen channel.' }, 403);
         if (!allowPoison(user.id)) return json({ error: 'Rate limited' }, 429);
         const body = await readJson(request, 2048);
-        if (!body || !['rollback', 'dismiss'].includes(body.action) || !Number.isSafeInteger(body.seq) || typeof body.digest !== 'string' || !DIGEST.test(body.digest)) return json({ error: 'Invalid resolution' }, 400);
+        if (!body || !['rollback', 'dismiss'].includes(body.action) || !Number.isSafeInteger(body.seq) || typeof body.digest !== 'string' || !DIGEST.test(body.digest) || typeof body.author !== 'string' || !ID.test(body.author)) return json({ error: 'Invalid resolution' }, 400);
         if (channel.frozen_seq === null || channel.frozen_seq !== body.seq || channel.frozen_digest !== body.digest) return json({ error: 'That commit is not the one this channel is frozen on.' }, 409);
         // The admin device signs exactly what it resolves: the server cannot do this on its own.
         const key = deps.sigKey(deviceId!);
-        if (!key || !ed25519Verify(key, resolveBytes(channelId, body.action, body.seq, body.digest), body.signature)) return json({ error: 'The resolution is not signed by this device.' }, 403);
+        if (!key || !ed25519Verify(key, resolveBytes(channelId, body.action, body.seq, body.digest, body.author), body.signature)) return json({ error: 'The resolution is not signed by this device.' }, 403);
+        // The admin's device names the author it authenticated; it must be the device that sent that commit.
+        const reported = db.query<{ sender_device: string }, [string, number]>('SELECT sender_device FROM group_log WHERE channel_id = ? AND seq = ?').get(channelId, body.seq);
+        if (!reported || reported.sender_device !== body.author) return json({ error: 'That is not the author of the frozen commit.' }, 409);
         if (body.action === 'dismiss') {
             // The dismissed commit can't be reported again: the rollback state it needed is dropped with the report.
             db.query('UPDATE channels SET frozen_seq = NULL, frozen_digest = NULL, frozen_by = NULL, frozen_at = NULL, prev_state = NULL, prev_epoch = NULL WHERE id = ?').run(channelId);

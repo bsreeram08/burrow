@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
+import 'package:private_chat/crypto/chat_crypto.dart' show Identity;
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/crypto/fake_chat_crypto.dart';
 import 'package:private_chat/crypto/fake_group_crypto.dart';
@@ -39,8 +40,7 @@ class Member {
       me: user,
       device: () async => device,
       platform: 'ios',
-      ensurePinned: (ids) => member.messenger.ensurePinned(ids),
-      pinProblem: (ids) => member.messenger.pinProblem(ids),
+      ensurePinned: (ids, {force = false}) => member.messenger.ensurePinned(ids, force: force),
       backoff: (_) => Duration.zero,
     );
     final messenger = GroupMessenger(api: api, sync: sync, chatCrypto: chat, store: store, me: user, contacts: () => contacts, viewing: () => member.viewing);
@@ -185,5 +185,29 @@ void main() {
     await eventually(() => alice.list(channel.id), (l) => l.any((m) => m.system && m.text == 'bob joined'));
     await bob.messenger.send(channel.id, 'hi all');
     await eventually(() => alice.list(channel.id), (l) => l.any((m) => m.text == 'hi all' && m.senderName == 'bob'));
+  });
+
+  test('a live frame that is not typing is never stored', () async {
+    final id = await team();
+    await alice.messenger.sync.sendEphemeral(id, '{"v":1,"type":"message","id":"00000000-0000-4000-8000-000000000009","text":"live","createdAt":${DateTime.now().millisecondsSinceEpoch},"expiresAt":null}');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect((await bob.list(id)).any((m) => m.text == 'live'), isFalse);
+  });
+
+  test("a non-contact's changed code is recorded for review, pauses, and is never accepted silently", () async {
+    final id = await team();
+    // carol isn't bob's contact: pinned on first use. Now the server publishes a different key for her.
+    final before = (await bob.chat.peer(carol.user.id))!.identity;
+    ds.identityOverride[carol.user.id] = {'dh': 'new-dh', 'sign': 'new-sign'};
+    final problems = await bob.messenger.ensurePinned([carol.user.id], force: true);
+    expect(problems, [carol.user.id]);
+    expect(bob.messenger.pinChanges[carol.user.id]?.before, before);
+    expect((await bob.chat.peer(carol.user.id))!.blocked, isTrue);
+    expect(identityFingerprint(const Identity(dh: 'dh-x', sign: 'sign-y')), '28513 19099 06416 32833 52028 08291 38447 55948 14084 34865 00787 50264');
+    await bob.messenger.acceptChangedCode(carol.user.id, verified: true);
+    final after = (await bob.chat.peer(carol.user.id))!;
+    expect((after.blocked, after.verified), (false, true));
+    expect(bob.messenger.pinChanges, isEmpty);
+    expect(id, isNotEmpty);
   });
 }

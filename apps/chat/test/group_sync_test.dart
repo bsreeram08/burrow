@@ -8,6 +8,7 @@ import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
 import 'package:private_chat/crypto/fake_group_crypto.dart';
 import 'package:private_chat/messaging/group_sync.dart';
+import 'package:private_chat/store/message.dart' show StoreException;
 import 'package:private_chat/store/message_store.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 
@@ -39,7 +40,7 @@ class Party {
       me: user,
       device: () async => device,
       platform: 'ios',
-      ensurePinned: (_) async {},
+      ensurePinned: (_, {force = false}) async => const <String>[],
       backoff: (_) => Duration.zero,
     )..onDelivery = (d) async => delivered.add(d);
     ds.listen(device.deviceId, (event) {
@@ -173,5 +174,41 @@ void main() {
     await alice.sync.send(group.id, '{"thawed":true}');
     await until(() => carol.delivered.any((d) => d.plaintext == '{"thawed":true}'));
   });
-}
 
+  test('security rules: a log entry of the wrong kind is skipped; remove-needed frames are ignored', () async {
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id));
+    final notices = <String>[];
+    bob.sync.notices.listen(notices.add);
+    // An application message the server logs as a commit: refused before it is used, skipped with a notice.
+    final message = await alice.crypto.encrypt(group.id, '{"sneaky":true}');
+    final channel = ds.channels[group.id]!;
+    final seq = channel.append('commit', alice.user.id, alice.crypto.deviceId, message);
+    await bob.sync.onGroupFrame(GroupEvent(channel: group.id, seq: seq, epoch: channel.epoch, kind: 'commit', fromUserId: alice.user.id, fromDeviceId: alice.crypto.deviceId, message: message, createdAt: 1));
+    expect(bob.delivered, isEmpty);
+    expect(notices, isNotEmpty);
+    expect((await bob.store.group(group.id))!.cursor, seq, reason: 'skipped, not retried');
+    // The server can't make an admin remove someone.
+    await alice.sync.onChannel(ChannelEvent(id: group.id, change: 'remove-needed', deviceId: bob.crypto.deviceId));
+    await settle();
+    expect((await alice.crypto.members(group.id)).any((m) => m.userId == bob.user.id), isTrue);
+  });
+
+  test('rollback is signed only when the admin device itself finds the frozen commit bad', () async {
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id));
+    // Someone reports alice's own valid commit: it checks out on alice's device, so only Dismiss is possible.
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id]);
+    final channel = ds.channels[group.id]!;
+    final last = channel.log.last;
+    channel.frozen = {'seq': last['seq'], 'digest': FakeDs.digest(last['message']! as String)};
+    await alice.store.updateGroup(group.id, (g) => g.copyWith(frozen: Frozen(seq: last['seq']! as int, digest: FakeDs.digest(last['message']! as String))));
+    expect(await alice.sync.checkFrozen(group.id), FrozenVerdict.ok);
+    await expectLater(alice.sync.resolve(group.id, rollback: true), throwsA(isA<StoreException>()));
+    expect(channel.resolved, isEmpty, reason: 'nothing signed');
+    await alice.sync.resolve(group.id, rollback: false);
+    expect(channel.resolved, ['dismiss']);
+  });
+}

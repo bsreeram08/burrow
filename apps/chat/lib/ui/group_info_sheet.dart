@@ -20,9 +20,57 @@ Future<void> showGroupInfo(BuildContext context, WidgetRef ref, String groupId) 
   builder: (_) => GroupInfoSheet(groupId: groupId),
 );
 
+/// A changed code of someone known only from groups (m4-groups §3): the code before and after side by side,
+/// and an explicit choice. Nothing is accepted silently.
+Future<void> showCodeChangeReview(BuildContext context, WidgetRef ref, String userId, String username) async {
+  final groups = ref.read(appProvider.notifier).groups;
+  if (groups == null) return;
+  final change = groups.pinChanges[userId];
+  final current = await ref.read(cryptoProvider).peer(userId);
+  if (!context.mounted) return;
+  final mono = TextStyle(fontFamily: 'Menlo', fontFamilyFallback: const ['monospace'], fontSize: 13, color: Theme.of(context).colorScheme.onSurface);
+  final choice = await showModalBottomSheet<String>(
+    context: context,
+    builder: (context) => SafeArea(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(24, 4, 24, 16),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text("$username's security code changed", style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 8),
+            const Text('This happens when they reinstall or reset their keys, and also when someone tries to read their messages. Check the new code with them before you accept it.'),
+            const SizedBox(height: 12),
+            const Text('Before', style: TextStyle(fontWeight: FontWeight.w700)),
+            Text(change == null ? 'not recorded' : identityFingerprint(change.before), key: const Key('code-before'), style: mono),
+            const SizedBox(height: 8),
+            const Text('Now', style: TextStyle(fontWeight: FontWeight.w700)),
+            Text(change != null ? identityFingerprint(change.after) : (current == null ? 'not recorded' : identityFingerprint(current.identity)), key: const Key('code-after'), style: mono),
+            const SizedBox(height: 16),
+            Wrap(
+              spacing: 8,
+              children: [
+                TextButton(key: const Key('code-not-now'), onPressed: () => Navigator.pop(context), child: const Text('Not now')),
+                OutlinedButton(key: const Key('code-accept'), onPressed: () => Navigator.pop(context, 'accept'), child: const Text('Accept new code')),
+                FilledButton(key: const Key('code-verify'), onPressed: () => Navigator.pop(context, 'verify'), child: const Text('Mark as verified')),
+              ],
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+  if (choice != null) await groups.acceptChangedCode(userId, verified: choice == 'verify');
+}
+
 /// A member's security code (any member, contact or not), with the same review actions as a contact's.
+/// A changed code of someone who isn't a contact opens [showCodeChangeReview] instead.
 Future<void> showMemberSafety(BuildContext context, WidgetRef ref, String userId, String username) async {
   final app = ref.read(appProvider.notifier);
+  final pinned = await ref.read(cryptoProvider).peer(userId);
+  if (!context.mounted) return;
+  if (app.contactById(userId) == null && (pinned?.blocked ?? false)) return showCodeChangeReview(context, ref, userId, username);
   final me = ref.read(appProvider).user;
   final crypto = ref.read(cryptoProvider);
   if (me == null) return;

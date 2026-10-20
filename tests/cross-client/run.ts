@@ -205,8 +205,12 @@ try {
     const groupsReady = (p: any) => p.waitForFunction(() => (window as any).Groups?.enabled(), null, { timeout: 90000 });
     await waitFor('groups-ready', 120000);
     if (!testing.db.query("SELECT 1 FROM devices WHERE user_id = ? AND state = 'listed'").get(appUser.id)) throw new Error('the app\'s device is not listed');
+    // The server accepted the app's signed list (chatcore sign_device_list), with its label sealed like the web's.
+    const appList = testing.db.query('SELECT list, aik_sign FROM device_lists WHERE user_id = ?').get(appUser.id) as any;
+    const appEntry = JSON.parse(appList?.list ?? '{"devices":[]}').devices.find((entry: any) => entry.deviceId === appDevice);
+    if (!appEntry || !/^[A-Za-z0-9_-]{38,}$/.test(appEntry.meta)) throw new Error(`the app's list doesn't name its device with a sealed label: ${appList?.list}`);
     await groupsReady(page);
-    step('the app signed its device list (a listed device) and uploaded KeyPackages; groups are on in both clients');
+    step('the server accepted the app\'s signed device list (sealed label, chatcore-signed); KeyPackages uploaded; groups are on in both clients');
     if (await page.locator('#conv-head').isVisible()) await page.click('#conv-back');
     // A private channel: a group needs two other people, and the web and the app are each other's only contact.
     await page.click('#channels-new');

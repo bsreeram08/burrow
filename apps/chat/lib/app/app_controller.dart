@@ -334,8 +334,7 @@ class AppController extends Notifier<AppState> {
       me: user,
       device: m.device,
       platform: _api.client,
-      ensurePinned: (ids) async => groups?.ensurePinned(ids),
-      pinProblem: (ids) async => groups?.pinProblem(ids),
+      ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
       sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
       ackWelcome: events.ack,
     );

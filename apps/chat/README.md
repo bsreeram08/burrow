@@ -13,7 +13,10 @@ lib/
   crypto/                   ChatCrypto contract, RustChatCrypto (the real core), FakeChatCrypto, Sas
   src/rust/                 flutter_rust_bridge bindings (generated) for rust/ → crates/chatcore
   store/                    SQLite message store (chat-store.js rules), inbound disposition
-  messaging/messenger.dart  mailbox receive/send, encrypted receipts, burn, send queue
+  messaging/messenger.dart  mailbox receive/send, encrypted receipts, burn, send queue, signed device list
+  messaging/group_sync.dart MLS transport for groups (docs/m4-groups.md): KeyPackages, commits with 409 retry,
+                            Welcomes, ordered log with cursors, external joins, poison/frozen protocol
+  messaging/group_messenger.dart  Phase 1 payloads in groups, mentions, read-by, typing, meta, leave
   calls/                    room signaling parser, CallController (flutter_webrtc, verify-v1)
   push/push_service.dart    FCM / APNs / PushKit with proof of possession
   theme/                    presets, accent contrast clamping, per-chat prefs

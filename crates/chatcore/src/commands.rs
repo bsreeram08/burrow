@@ -108,6 +108,18 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
         "sasCommitment" => Ok(json!(sas::commitment(&text(command, "nonce")?)?)),
         "sasCheck" => Ok(json!(sas::check_reveal(&text(command, "commitment")?, &text(command, "nonce")?))),
         // Linked devices (docs/m5-linking.md): the link crypto, pins, succession.
+        // The account's next DeviceList and certificates, signed in the core (docs/devices.md "App list signing").
+        "signDeviceList" => {
+            let list = match command.get("list") { Some(Value::String(text)) => text.clone(), Some(value @ Value::Object(_)) => value.to_string(), _ => return Err(ChatError::coded("invalid", "list must be the device list")) };
+            let head = match command.get("head") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(crate::devicelist::ListHead {
+                    list_json: match value.get("list") { Some(Value::String(text)) => text.clone(), Some(v @ Value::Object(_)) => v.to_string(), _ => return Err(ChatError::coded("invalid", "head.list must be the served list")) },
+                    signature: text(value, "signature")?,
+                }),
+            };
+            Ok(json!(core.sign_device_list(&text(command, "userId")?, &text(command, "published")?, &list, head.as_ref())?))
+        }
         "linkQr" => Ok(json!({ "qr": core.link_qr(&text(command, "linkId")?, now(command))? })),
         "linkAccept" => Ok(json!(core.link_accept(&text(command, "qr")?, now(command))?)),
         "linkComplete" => Ok(json!({ "code": core.link_complete(&text(command, "linkId")?, &text(command, "eph")?, now(command))? })),

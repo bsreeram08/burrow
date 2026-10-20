@@ -271,7 +271,7 @@ impl Core {
 
     /// The primary: checks the scanned QR, makes its ephemeral key and derives the keys and the code.
     pub fn link_accept(&mut self, qr: &str, now: u64) -> Result<LinkAccepted> {
-        if self.identity_row()?.is_none() { return Err(companion()); }
+        self.reject_companion()?;
         let (id, eph_n, secret) = crate::link::parse_qr(qr)?;
         let eph = DhPair::generate();
         let shared = dh(&eph, &eph_n)?;
@@ -350,7 +350,7 @@ impl Core {
     /// The primary looked a code up: remembers the new device's commitment and device id and makes its own
     /// ephemeral key. Returns the key to offer. No keys exist yet.
     pub fn link_lookup(&mut self, link_id: &str, device_n: &str, commit: &str, device_p: &str, now: u64) -> Result<String> {
-        if self.identity_row()?.is_none() { return Err(companion()); }
+        self.reject_companion()?;
         crate::link::link_id_bytes(link_id)?;
         if !crate::devicelist::device_id_ok(device_n) || !crate::devicelist::device_id_ok(device_p) { return Err(invalid("A device id is 22 base64url characters")); }
         unb64_32(commit)?;

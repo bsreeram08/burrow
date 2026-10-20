@@ -334,8 +334,12 @@ fn the_short_code_variant_commits_before_it_reveals_and_binds_both_device_ids() 
     n4.link_reveal(&link, &eph_p, now).unwrap();
     assert!(n4.link_complete_code(&link, &b64(&[1u8; 32]), &device_p, now).is_err(), "another key");
     assert!(n4.link_complete(&link, &eph_p, now).is_err(), "a code link is not a QR link");
-    let (mut c, mut q) = (core(), core());
-    c.identity().unwrap();
-    assert!(c.link_lookup(&link, &device_n, &b64(&[1u8; 32]), &device_p, now).is_ok());
-    assert_eq!(code_of(q.link_lookup(&link, &device_n, &b64(&[1u8; 32]), &device_p, now)).as_deref(), Some("companion"), "only an identity holder scans");
+    // A core that has no identity of its own (the web's MLS store) may scan; a companion may not.
+    let mut plain = core();
+    assert!(plain.link_lookup(&link, &device_n, &b64(&[1u8; 32]), &device_p, now).is_ok());
+    let mut retired = core();
+    let me = retired.identity().unwrap().public;
+    retired.retire_identity(&id(), &core().identity().unwrap().public, 1).unwrap();
+    let _ = me;
+    assert_eq!(code_of(retired.link_lookup(&link, &device_n, &b64(&[1u8; 32]), &device_p, now)).as_deref(), Some("companion"), "a companion cannot scan");
 }

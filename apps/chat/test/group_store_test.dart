@@ -9,7 +9,7 @@ import 'package:private_chat/store/message_store.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
 import 'package:uuid/uuid.dart';
 
-/// Store schema v3 (docs/m4-groups.md §10): the migration from v2, group conversations, and the group
+/// Store schema v3 (docs/m4-groups.md §10) and v4 (m5 §8): the migrations, group conversations, and the group
 /// rules for senders, mentions, read-by, system rows and the newest-500 eviction.
 void main() {
   sqfliteFfiInit();
@@ -67,6 +67,34 @@ void main() {
     final again = await MessageStore.open(databaseFactoryFfi, path, now: () => now);
     expect((await again.list(group)).single.senderName, 'alice', reason: 'reopening is a no-op');
     await again.close();
+    await dir.delete(recursive: true);
+  });
+
+  test('a version 3 database upgrades to v4: groups keep their state, a DM group remembers its peer and move', () async {
+    final dir = await Directory.systemTemp.createTemp('chat-v4');
+    final path = p.join(dir.path, 'messages.db');
+    // A v3 database: today's schema without the v4 columns.
+    await (await MessageStore.open(databaseFactoryFfi, path, now: () => now)).close();
+    final v3 = await databaseFactoryFfi.openDatabase(path);
+    for (final column in ['moved_at', 'dm_checked', 'peer']) {
+      await v3.execute('ALTER TABLE conversations DROP COLUMN $column');
+    }
+    await v3.insert('conversations', {...GroupConversation(id: group, kind: GroupKindName.private, createdAt: now, name: 'design', cursor: 4).toRow()}..removeWhere((k, _) => ['peer', 'dm_checked', 'moved_at'].contains(k)));
+    await v3.setVersion(3);
+    await v3.close();
+
+    final upgraded = await MessageStore.open(databaseFactoryFfi, path, now: () => now);
+    final kept = (await upgraded.group(group))!;
+    expect((kept.name, kept.cursor, kept.peer, kept.dmChecked, kept.movedAt), ('design', 4, null, false, null));
+    final dmGroup = 'D' * 22;
+    await upgraded.putGroup(GroupConversation(id: dmGroup, kind: GroupKindName.dm, createdAt: now, peer: alice));
+    await upgraded.updateGroup(dmGroup, (g) => g.copyWith(dmChecked: true, movedAt: now));
+    final moved = (await upgraded.group(dmGroup))!;
+    expect((moved.kind, moved.peer, moved.dmChecked, moved.movedAt), (GroupKindName.dm, alice, true, now));
+    // A 1:1 chat's move is a system line in that chat.
+    await upgraded.note(dm, 'Messages in this chat now use the new encryption.');
+    expect((await upgraded.list(dm)).single.system, isTrue);
+    await upgraded.close();
     await dir.delete(recursive: true);
   });
 

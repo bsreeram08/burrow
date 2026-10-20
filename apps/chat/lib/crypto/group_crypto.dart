@@ -187,4 +187,8 @@ abstract class GroupCrypto {
   /// The members of a served GroupInfo and tree after whole-group validation, without joining (m5 §3). Throws
   /// when the core can't check it; callers then join nothing (fail closed).
   Future<({String groupId, List<GroupMember> members})> inspectGroup(String groupInfo, String tree);
+
+  /// m5 §8.3: passes only when [groupId] is the DM of this account and [peer] (DM roles naming exactly the two)
+  /// and every leaf chains to the pinned account keys. Throws otherwise.
+  Future<void> checkDm(String groupId, String peer);
 }

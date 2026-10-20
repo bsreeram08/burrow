@@ -12,6 +12,7 @@ import '../crypto/chat_crypto.dart';
 import '../store/disposition.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
+import 'group_messenger.dart';
 import 'group_sync.dart' show OwnDeviceList;
 import 'payload.dart';
 
@@ -22,6 +23,13 @@ const readIntervalMs = 2000;
 const typingThrottleMs = 4000;
 const typingFreshMs = 15000;
 const typingHideMs = 6000;
+
+/// A 1:1 chat's move to MLS (m5 §8): the first sender tries at most once per contact in this time, and a
+/// receiver waits this long for the pointer's group.
+const dmMoveRetryMs = 600000;
+
+/// The system line both sides show where a 1:1 chat moved.
+const dmMovedNote = 'Messages in this chat now use the new encryption.';
 
 /// End-to-end encrypted contact messaging over the server mailbox. Port of the
 /// web client's account.js receive/send path: decrypt, validate, store, then
@@ -400,6 +408,7 @@ class Messenger {
     var failed = false;
     String? receipt;
     var burned = false, rotated = false;
+    String? pointer;
     try {
       Identity? published;
       final decrypted = await crypto.decryptFrom(event.fromId, event.envelope);
@@ -449,6 +458,10 @@ class Messenger {
             break; // Typing travels only as an ephemeral envelope; a stored one is stale.
           case 'meta' || 'leave':
             break; // Group payloads mean nothing in a 1:1 chat.
+          case 'mls-dm':
+            // Over the pinned session only (an untrusted sender never gets here); the group is checked next.
+            await store.note(conversationId, dmMovedNote);
+            pointer = payload['channel']! as String;
           default:
             if (await store.receive(conversationId, payload) == ReceiveResult.stored) {
               if (untrusted) flagged.add((payload['id'] as String).toLowerCase());
@@ -501,6 +514,7 @@ class Messenger {
     if (receipt != null && contact != null) {
       unawaited(_sendControl(contact, {'v': 1, 'type': 'receipt', 'id': receipt}).catchError((_) {}));
     }
+    if (pointer != null && !failed && contact != null) unawaited(_acceptPointer(contact, pointer).catchError((_) {}));
   }
 
   /// 1:1 typing no longer travels over the Double Ratchet (docs/m5-linking.md §9): live-only envelopes that
@@ -554,7 +568,7 @@ class Messenger {
     final conversationId = conversationWith(contact.id!);
     if (!await store.react(conversationId, target.id, who: 'me', emoji: emoji, on: on)) return;
     try {
-      await _sendControl(contact, {'v': 1, 'type': 'react', 'id': const Uuid().v4(), 'target': target.id, 'emoji': emoji, 'on': on});
+      await _sendToContact(contact, {'v': 1, 'type': 'react', 'id': const Uuid().v4(), 'target': target.id, 'emoji': emoji, 'on': on});
     } catch (_) {
       await store.react(conversationId, target.id, who: 'me', emoji: emoji, on: !on);
       rethrow;
@@ -571,7 +585,7 @@ class Messenger {
     final editedAt = math.max(_now(), (target.editedAt ?? 0) + 1);
     final payload = {'v': 1, 'type': 'edit', 'id': const Uuid().v4(), 'target': target.id, 'text': text, 'editedAt': editedAt};
     encodePayload(payload);
-    await _sendControl(contact, payload);
+    await _sendToContact(contact, payload);
     await store.edit(conversationWith(contact.id!), target.id, text: text, editedAt: editedAt, author: Direction.outgoing);
   }
 
@@ -608,7 +622,7 @@ class Messenger {
     try {
       final changed = await store.markRead(conversationId, batch, direction: Direction.incoming);
       if (changed.isNotEmpty && readReceipts() && active && !keysLocked) {
-        await _sendControl(contact, {'v': 1, 'type': 'read', 'id': const Uuid().v4(), 'ids': changed});
+        await _sendToContact(contact, {'v': 1, 'type': 'read', 'id': const Uuid().v4(), 'ids': changed});
       }
     } catch (_) {
       // A receipt is a courtesy: never retry into a loop. The messages stay marked here.
@@ -658,6 +672,98 @@ class Messenger {
     }
   }
 
+  // ---------- 1:1 chats on MLS (docs/m5-linking.md §8) ----------
+  GroupMessenger? _groups;
+
+  /// Groups on this device, the transport of 1:1 chats that moved to MLS. Set by the app once groups start.
+  GroupMessenger? get groups => _groups;
+  set groups(GroupMessenger? value) {
+    _groups = value;
+    if (value == null) return;
+    value.dmIncoming = (peer) {
+      if (viewing?.call() == peer) return;
+      unread[peer] = (unread[peer] ?? 0) + 1;
+      if (!_unread.isClosed) _unread.add(Map.of(unread));
+    };
+    value.dmTyping = _setTyping;
+    value.sync.onDmJoined = (channel) {
+      final wake = _pointerWake.remove(channel);
+      if (wake != null && !wake.isCompleted) wake.complete();
+    };
+    dmTyping = (contact, on) async {
+      final channel = await value.dmChannelWith(contact.id!);
+      if (channel != null) await value.typingChanged(channel, on: on);
+    };
+  }
+
+  /// Off: 1:1 chats stay on the Double Ratchet (tests of the 1:1 protocol itself).
+  bool moveChats = true;
+
+  Future<String?> _dmChannel(String contactId) async => await _groups?.dmChannelWith(contactId);
+
+  /// Every payload to a contact: through the DM group once the chat moved, otherwise the 1:1 session.
+  Future<void> _sendToContact(Contact contact, Map<String, Object?> payload) async {
+    final groups = _groups, channel = await _dmChannel(contact.id!);
+    if (groups != null && channel != null) return groups.sendDm(channel, payload);
+    await _sendControl(contact, payload);
+  }
+
+  final Map<String, int> _moveTried = {};
+
+  /// §8.2: the first sender moves the chat when both of us have a device that can. The pointer is the last
+  /// Double Ratchet message of this chat.
+  Future<void> _maybeMove(Contact contact) async {
+    final groups = _groups, id = contact.id!;
+    if (!moveChats || groups == null || !groups.ready || !active || keysLocked) return;
+    final tried = _moveTried[id];
+    if (tried != null && _now() - tried < dmMoveRetryMs) return;
+    if (await groups.dmChannelWith(id) != null) return;
+    _moveTried[id] = _now();
+    final capability = await api.mlsCapability(contact.username);
+    if ((capability['devices'] as int? ?? 0) < 1) return; // They can't yet.
+    final existing = capability['channel'];
+    String? channel;
+    if (existing is String) {
+      // A DM group this device already holds and checked, whose pointer never went out (ours, or theirs still in
+      // flight): point at it. One we don't hold yet: wait for their pointer.
+      if (!await groups.acceptDm(existing, id)) return;
+      channel = existing;
+    } else {
+      channel = await groups.createDm(contact);
+    }
+    if (channel == null) return;
+    await _sendControl(contact, {'v': 1, 'type': 'mls-dm', 'id': const Uuid().v4(), 'channel': channel, 'at': _now()});
+    await groups.markMoved(channel);
+    await store.note(conversationWith(id), dmMovedNote);
+  }
+
+  final Map<String, Completer<void>> _pointerWake = {};
+
+  /// §8.3: their pointer moves the chat only when the server calls the channel our DM, this device is in it,
+  /// and the core checks the group is exactly the DM of us two, chained to the pinned keys. The Welcome may
+  /// come later: tried again when it arrives, otherwise with backoff, for 10 minutes. Anything else: ignored.
+  Future<void> _acceptPointer(Contact contact, String channel) async {
+    final deadline = _now() + dmMoveRetryMs;
+    for (var wait = 1000; !_disposed && _now() < deadline; wait = math.min(wait * 2, 15000)) {
+      final groups = _groups;
+      if (groups != null) {
+        Map<String, dynamic>? info;
+        try {
+          info = await api.channel(channel);
+        } catch (_) {}
+        final peer = info?['peer'];
+        if (info != null && (info['kind'] != 'dm' || peer is! Map || peer['id'] != contact.id)) return; // Not our DM.
+        if (info?['member'] == true && await groups.acceptDm(channel, contact.id!)) {
+          await groups.markMoved(channel);
+          return;
+        }
+      }
+      final wake = _pointerWake[channel] = Completer<void>();
+      await wake.future.timeout(Duration(milliseconds: wait), onTimeout: () {});
+      _pointerWake.remove(channel);
+    }
+  }
+
   /// Sends every queued message, oldest first, keeping each contact's order.
   Future<void> flush() async {
     if (!active || keysLocked || _disposed) return; // Messages stay queued here until this device is usable.
@@ -673,15 +779,24 @@ class Messenger {
       final queued = await store.queued();
       for (final contact in mutualContacts()) {
         final conversationId = conversationWith(contact.id!);
-        var prepared = false;
-        for (final record in queued.where((m) => m.conversationId == conversationId)) {
+        final mine = queued.where((m) => m.conversationId == conversationId).toList();
+        if (mine.isEmpty) continue;
+        await _maybeMove(contact).catchError((_) {});
+        final channel = await _dmChannel(contact.id!);
+        var prepared = channel != null;
+        for (final record in mine) {
           try {
             if (!prepared) {
               await _rotateIfDue(contact);
               await _tellPolicy(contact);
               prepared = true;
             }
-            await _sendControl(contact, record.toPayload());
+            final groups = _groups;
+            if (channel != null && groups != null) {
+              await groups.sendDm(channel, record.toPayload());
+            } else {
+              await _sendControl(contact, record.toPayload());
+            }
             await store.setStatus(conversationId, record.id, MessageStatus.sent);
           } catch (error) {
             if (error is CryptoException && error.code == 'identity-blocked') {

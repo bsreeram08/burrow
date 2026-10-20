@@ -6,9 +6,9 @@
 /// AIK-signed certificate. A contact's device is trusted only if a list signed by the pinned AIK names it,
 /// never because the server says so.
 ///
-/// The app verifies and pins lists. It does not publish one yet: the AIK lives inside crates/chatcore,
-/// which gains list signing with M2. Until then the app's device takes the account's inbox by holding the
-/// published identity (see `Api.announceDevice`).
+/// The app verifies and pins lists, and the device holding the AIK publishes the account's list: chatcore
+/// validates and signs it (`ChatCrypto.signDeviceList`), and labels are sealed with [sealMeta] under the key
+/// derived from chatcore's `deviceMetaSignature`, exactly as devices.js does.
 library;
 
 import 'dart:convert';
@@ -17,9 +17,13 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart' as hash;
 import 'package:ed25519_edwards/ed25519_edwards.dart' as ed;
+import 'package:pointycastle/export.dart' show AEADParameters, AESEngine, GCMBlockCipher, KeyParameter;
 
 const maxDevices = 16;
 const _maxVersion = 2147483647;
+const _metaLabel = 'webrtc-bun-devicemeta-v1';
+const devicePlatforms = {'web', 'ios', 'android', 'macos', 'windows', 'linux'};
+const _metaMaxLabel = 64;
 const _listLabel = 'webrtc-bun-devicelist-v1', _certLabel = 'webrtc-bun-devicecert-v1', _bindLabel = 'webrtc-bun-devicebind-v1', _claimLabel = 'webrtc-bun-deviceclaim-v1';
 final _userId = RegExp(r'^[A-Za-z0-9_-]{1,64}$');
 final _deviceId = RegExp(r'^[A-Za-z0-9_-]{22}$');
@@ -316,4 +320,53 @@ Future<LocalDevice> localDevice(DevicePrefs prefs, String userId, [Random? rando
   final id = newDeviceId(source);
   await prefs.writeDevice(userId, jsonEncode({'deviceId': id, 'seed': b64(seed)}));
   return LocalDevice._(id, ed.newKeyFromSeed(seed));
+}
+
+// ---------- Sealed device metadata (devices.js deviceMetaKey / sealMeta / openMeta) ----------
+/// The AES-256-GCM key that seals list labels: HKDF-SHA-256 over the AIK's signature of the devicemeta label
+/// and the user id ([seed], from chatcore `deviceMetaSignature`), zero salt, info = the label.
+Uint8List deviceMetaKey(String seed) {
+  final ikm = unb64(seed);
+  final prk = hash.Hmac(hash.sha256, List.filled(32, 0)).convert(ikm).bytes;
+  return Uint8List.fromList(hash.Hmac(hash.sha256, prk).convert([...utf8.encode(_metaLabel), 1]).bytes);
+}
+
+/// What the identity key signs to seed [deviceMetaKey] (devices.js deviceMetaKey; chatcore meta_bytes).
+Uint8List metaSeedBytes(String userId) {
+  if (!_userId.hasMatch(userId)) _fail('Invalid user id');
+  return (_Writer()
+        ..text16(_metaLabel)
+        ..text16(userId))
+      .done();
+}
+
+Uint8List _metaAad(String userId, String deviceId) => (_Writer()
+      ..text16(_metaLabel)
+      ..text16(userId)
+      ..text16(deviceId))
+    .done();
+
+/// Seals `{label, platform}` for one list entry (12-byte IV ‖ ciphertext ‖ tag, base64url); the AAD binds it
+/// to that account and device.
+String sealMeta(Uint8List key, String userId, String deviceId, {required String label, required String platform, Uint8List? iv}) {
+  if (!devicePlatforms.contains(platform)) _fail('Invalid device platform');
+  final short = label.length > _metaMaxLabel ? label.substring(0, _metaMaxLabel) : label;
+  final plain = Uint8List.fromList(utf8.encode(jsonEncode({'label': short, 'platform': platform})));
+  final nonce = iv ?? Uint8List.fromList(List<int>.generate(12, (_) => Random.secure().nextInt(256)));
+  final gcm = GCMBlockCipher(AESEngine())..init(true, AEADParameters(KeyParameter(key), 128, nonce, _metaAad(userId, deviceId)));
+  return b64([...nonce, ...gcm.process(plain)]);
+}
+
+/// The entry's `{label, platform}`, or null when it is empty, not ours, or tampered with.
+Map<String, String>? openMeta(Uint8List key, String userId, String deviceId, String meta) {
+  if (meta.isEmpty) return null;
+  try {
+    final bytes = unb64(meta);
+    final gcm = GCMBlockCipher(AESEngine())..init(false, AEADParameters(KeyParameter(key), 128, Uint8List.sublistView(bytes, 0, 12), _metaAad(userId, deviceId)));
+    final value = jsonDecode(utf8.decode(gcm.process(Uint8List.sublistView(bytes, 12))));
+    if (value is Map && value.length == 2 && value['label'] is String && devicePlatforms.contains(value['platform'])) {
+      return {'label': value['label'] as String, 'platform': value['platform'] as String};
+    }
+  } catch (_) {}
+  return null;
 }

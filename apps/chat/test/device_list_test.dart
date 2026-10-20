@@ -48,8 +48,10 @@ void main() {
     expect(sent['deviceId'], device);
     final list = sent['list'] as Map;
     expect((list['version'], list['prevHash'], (list['devices'] as List).single['deviceId']), (1, '', device));
-    // Exactly the canonical list bytes and this device's certificate bytes went to the core to sign.
-    expect(crypto.signedRecords.map(base64Encode).toSet(), {base64Encode(listBytes(list)), base64Encode(certBytes(me.id, (list['devices'] as List).single as Map))});
+    // The structured list went to the core to validate and sign; this device's label is sealed in it.
+    expect(crypto.signedLists.single, list);
+    final meta = (list['devices'] as List).single['meta'] as String;
+    expect(openMeta(deviceMetaKey(await crypto.deviceMetaSignature(me.id)), me.id, device, meta), {'label': 'iPhone app', 'platform': 'ios'});
 
     // Someone else's key published: not the key holder, nothing signed.
     view = {...view, 'identity': {'dh': 'x', 'sign': 'y'}};

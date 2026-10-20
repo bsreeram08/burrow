@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
@@ -26,14 +25,22 @@ class FakeChatCrypto implements ChatCrypto {
   /// Tests: make the next [init] fail as a locked key database.
   bool locked = false;
 
-  /// Device records signed so far (tests); the fake key can't make a verifiable signature.
-  final List<Uint8List> signedRecords = [];
+  /// Device lists signed so far (tests); the fake key can't make a verifiable signature.
+  final List<Map<String, Object?>> signedLists = [];
+
+  String _fakeSig(List<int> bytes) => base64Url.encode(sha256.convert([...utf8.encode(me.sign), ...bytes]).bytes + List.filled(32, 0)).replaceAll('=', '');
 
   @override
-  Future<String> signDeviceRecord(Uint8List bytes) async {
-    signedRecords.add(bytes);
-    return base64Url.encode(sha256.convert([...utf8.encode(me.sign), ...bytes]).bytes + List.filled(32, 0)).replaceAll('=', '');
+  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list) async {
+    if (publishedSign != me.sign) throw const CryptoException('not the published identity', code: 'mismatch');
+    if (list['userId'] != userId) throw const CryptoException('another account', code: 'invalid');
+    signedLists.add(list);
+    final devices = (list['devices']! as List).cast<Map>();
+    return (signature: _fakeSig(utf8.encode(jsonEncode(list))), certs: {for (final d in devices) d['deviceId'] as String: _fakeSig(utf8.encode(d['deviceId'] as String))});
   }
+
+  @override
+  Future<String> deviceMetaSignature(String userId) async => _fakeSig(utf8.encode('meta:$userId'));
 
   @override
   Future<void> init(String dbPath) async {
@@ -151,6 +158,12 @@ class FakeChatCrypto implements ChatCrypto {
         ..blocked = true
         ..verified = false;
     }
+  }
+
+  @override
+  Future<PinnedPeer?> peer(String contactId) async {
+    final p = _peers[contactId];
+    return p == null ? null : PinnedPeer(identity: p.identity, verified: p.verified, changed: p.changed, blocked: p.blocked);
   }
 
   @override

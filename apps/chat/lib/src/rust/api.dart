@@ -77,6 +77,9 @@ Future<Safety?> safety({
   theirUsername: theirUsername,
 );
 
+Future<Peer?> peer({required String contactId}) =>
+    RustLib.instance.api.crateApiPeer(contactId: contactId);
+
 Future<void> setVerified({required String contactId, required bool verified}) =>
     RustLib.instance.api.crateApiSetVerified(
       contactId: contactId,
@@ -97,21 +100,24 @@ Future<SessionInfo?> sessionInfo({required String contactId}) =>
 
 Future<void> resetIdentity() => RustLib.instance.api.crateApiResetIdentity();
 
-/// Signs one device-list record with the account identity key (docs/devices.md): `bytes` must be a
-/// DeviceList or a DeviceCert in devices.js's canonical encoding, which starts with the u16-length-prefixed
-/// label `webrtc-bun-devicelist-v1` or `webrtc-bun-devicecert-v1` (the app builds them with devices.dart,
-/// the same bytes the server and contacts verify). Anything else is refused, so this signs device records
-/// and nothing else. The key never leaves Rust: the account's sealed key database is opened read-only for
-/// this call with the store key the app already holds. Returns the base64url Ed25519 signature.
-Future<String> signDeviceRecord({
-  required String dbPath,
-  required List<int> storeKey,
-  required List<int> bytes,
-}) => RustLib.instance.api.crateApiSignDeviceRecord(
-  dbPath: dbPath,
-  storeKey: storeKey,
-  bytes: bytes,
+/// Signs the account's next DeviceList (JSON in devices.js's shape) and one certificate per device: chatcore
+/// validates the list (devices.js validateList), checks it names `user_id` and that `published_sign` (the
+/// identity the server publishes for the account) is this core's own key, and signs only the canonical bytes it
+/// builds. JSON of `{signature, certs: {deviceId: signature}}`.
+Future<String> signDeviceList({
+  required String userId,
+  required String publishedSign,
+  required String listJson,
+}) => RustLib.instance.api.crateApiSignDeviceList(
+  userId: userId,
+  publishedSign: publishedSign,
+  listJson: listJson,
 );
+
+/// The seed of the device-meta sealing key: the identity key's signature over the fixed devicemeta label and
+/// `user_id` only (devices.js deviceMetaKey). A secret: keep it on the device.
+Future<String> deviceMetaSignature({required String userId}) =>
+    RustLib.instance.api.crateApiDeviceMetaSignature(userId: userId);
 
 /// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
 /// domain-separated bytes itself, so this is never a general signing oracle.
@@ -589,6 +595,38 @@ class MlsRoles {
           admins == other.admins &&
           joinPolicy == other.joinPolicy &&
           dm == other.dm;
+}
+
+/// The pinned identity of a contact (or a group member pinned on first use), with its review state.
+class Peer {
+  final Identity identity;
+  final bool verified;
+  final bool changed;
+  final bool blocked;
+
+  const Peer({
+    required this.identity,
+    required this.verified,
+    required this.changed,
+    required this.blocked,
+  });
+
+  @override
+  int get hashCode =>
+      identity.hashCode ^
+      verified.hashCode ^
+      changed.hashCode ^
+      blocked.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Peer &&
+          runtimeType == other.runtimeType &&
+          identity == other.identity &&
+          verified == other.verified &&
+          changed == other.changed &&
+          blocked == other.blocked;
 }
 
 class Safety {

@@ -52,6 +52,18 @@ void main() {
       expect(hash.sha256.convert(certBytes('user_1', (list['devices'] as List).first as Map)).toString(), '5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea');
       expect(hash.sha256.convert(bindBytes('user_1', 'a' * 22, 'A' * 43)).toString(), 'e11ceff09f689bbea340eef1c1fcc013f3fff12ff1167b7d44d664fbf5101b18');
       expect(hash.sha256.convert(claimBytes('user_1', 'a' * 22, 'A' * 43)).toString(), '2238b7912ca08441271c164e5591d1f62afd2ae2afec60aa8b5a49054366ef40');
+      expect(hash.sha256.convert(metaSeedBytes('user_1')).toString(), '64af139533103232deb371d33f3f5879ff5c4d2259c243745d86b10f4b7b1c44');
+    });
+
+    test('device labels seal exactly as devices.js does (key and ciphertext pinned in tests/unit/devices.test.ts)', () {
+      final key = deviceMetaKey(b64(List.filled(64, 7)));
+      expect(key.map((b) => b.toRadixString(16).padLeft(2, '0')).join(), 'f1b317907f2ebd6fc36b538d054a8817fe4ba642b533685b332bf2b0e736b492');
+      const sealed = 'AwMDAwMDAwMDAwMDGHB1mKscvERwIyTohJwm7EUEWZwtQS_mptDtAQajSQK2noBM4pRz0d5LshDjOeUsDYriASS_';
+      expect(sealMeta(key, 'user_1', 'a' * 22, label: 'Mac app', platform: 'macos', iv: Uint8List.fromList(List.filled(12, 3))), sealed);
+      expect(openMeta(key, 'user_1', 'a' * 22, sealed), {'label': 'Mac app', 'platform': 'macos'});
+      expect(openMeta(key, 'user_1', 'b' * 22, sealed), isNull, reason: 'bound to its entry');
+      expect(openMeta(key, 'user_2', 'a' * 22, sealed), isNull, reason: 'bound to its account');
+      expect(() => sealMeta(key, 'user_1', 'a' * 22, label: 'x', platform: 'toaster'), throwsA(anything));
     });
 
     test('non-canonical or malformed lists are refused', () {

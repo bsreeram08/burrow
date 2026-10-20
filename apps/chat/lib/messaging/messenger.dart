@@ -223,17 +223,26 @@ class Messenger {
         if (d['deviceId'] != id && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
     ];
     final self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
-        {'deviceId': id, 'addedAt': _now(), 'meta': ''};
+        {
+          'deviceId': id,
+          'addedAt': _now(),
+          // Label and platform, sealed under the account's device-meta key like the web does.
+          'meta': sealMeta(deviceMetaKey(await crypto.deviceMetaSignature(me.id)), me.id, id, label: _deviceLabel(api.client), platform: api.client),
+        };
     final entries = [...keep, self]..sort((a, b) => (a['deviceId'] as String).compareTo(b['deviceId'] as String));
-    final list = {'v': 1, 'userId': me.id, 'version': ((base?['version'] as int?) ?? 0) + 1, 'prevHash': baseHash ?? '', 'devices': entries};
-    final certs = {for (final d in entries) d['deviceId'] as String: await crypto.signDeviceRecord(certBytes(me.id, d))};
-    final signed = {'list': list, 'signature': await crypto.signDeviceRecord(listBytes(list)), 'certs': certs};
+    final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': ((base?['version'] as int?) ?? 0) + 1, 'prevHash': baseHash ?? '', 'devices': entries};
+    final sig = await crypto.signDeviceList(me.id, own.sign, list);
+    final certs = sig.certs;
+    final signed = {'list': list, 'signature': sig.signature, 'certs': certs};
     await api.publishDeviceList(signed, id);
     final after = verifyView(userId: me.id, aikSign: own.sign, list: list, signature: signed['signature'], certs: certs, pin: devices.pin(me.id, me.id));
     if (after.ok) devices.setPin(me.id, me.id, after.pin!);
     deviceWarning = null;
     return true;
   }
+
+  static String _deviceLabel(String platform) =>
+      const {'ios': 'iPhone app', 'android': 'Android app', 'macos': 'Mac app', 'windows': 'Windows app', 'linux': 'Linux app'}[platform] ?? 'App';
 
   /// Only on the user's tap: publish this device's identity, signed prekey and 100 fresh
   /// one-time prekeys. This device becomes active; contacts see a security-code change.

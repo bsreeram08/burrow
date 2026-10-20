@@ -22,7 +22,7 @@ describe('link and succession bytes (shared vectors)', () => {
   });
   test('the label key sent to a linked device opens what the primary sealed', async () => {
     const { privateKey } = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) as unknown as CryptoKeyPair;
-    const sign = async (bytes: Uint8Array) => new Uint8Array(await crypto.subtle.sign('Ed25519', privateKey, bytes as BufferSource));
+    const sign = async (bytes: Uint8Array) => new Uint8Array(await crypto.subtle.sign('Ed25519', privateKey, new Uint8Array(bytes)));
     const primary = await F.deviceMetaKey('user_1', sign), raw = await F.deviceMetaKeyBytes('user_1', sign);
     expect(raw).toHaveLength(32);
     const sealed = await F.sealMeta(primary, 'user_1', 'd'.repeat(22), { label: 'Chrome on Mac', platform: 'web' });

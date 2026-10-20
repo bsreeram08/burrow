@@ -423,6 +423,13 @@ pub fn succession_complete(record_json: String, signature: String) -> Result<Ide
 pub fn sign_succession(user_id: String, published_sign: String, new_sign: String, new_dh: String, at: u64) -> Result<String> {
     Ok(core::sign_succession(user_id, published_sign, new_sign, new_dh, at)?)
 }
+/// A companion follows its account's succession (`record_json` without `signature`), installing `cert_json` (signed
+/// under the new key for this leaf) first when given. Returns the account's new identity.
+pub fn adopt_succession(user_id: String, record_json: String, signature: String, cert_json: Option<String>) -> Result<Identity> {
+    Ok(core::adopt_succession(user_id, record_json, signature, cert_json)?.into())
+}
+/// New primary: whether a group it holds already has exactly this leaf key for that device of its account (m5 §5.2.2).
+pub fn mls_leaf_known(device_id: String, leaf_sig_key: String, groups: Vec<String>) -> Result<bool> { Ok(core::mls_leaf_known(device_id, leaf_sig_key, groups)?) }
 /// Old primary steps down to a companion of the account under `new_identity`.
 pub fn retire_identity(user_id: String, new_identity: Identity, at: u64) -> Result<()> { Ok(core::retire_identity(user_id, new_identity.into(), at)?) }
 /// Contact: follows the served `succession` records (JSON list) from the pinned identity; verification kept.

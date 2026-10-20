@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -866956798;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 259585120;
 
 // Section: executor
 
@@ -208,6 +208,47 @@ fn wire__crate__api__account_impl(
             move |context| {
                 transform_result_sse::<_, crate::api::CoreError>((move || {
                     let output_ok = crate::api::account()?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__adopt_succession_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "adopt_succession",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_user_id = <String>::sse_decode(&mut deserializer);
+            let api_record_json = <String>::sse_decode(&mut deserializer);
+            let api_signature = <String>::sse_decode(&mut deserializer);
+            let api_cert_json = <Option<String>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::api::CoreError>((move || {
+                    let output_ok = crate::api::adopt_succession(
+                        api_user_id,
+                        api_record_json,
+                        api_signature,
+                        api_cert_json,
+                    )?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -1447,6 +1488,42 @@ fn wire__crate__api__mls_key_packages_impl(
             move |context| {
                 transform_result_sse::<_, crate::api::CoreError>((move || {
                     let output_ok = crate::api::mls_key_packages(api_count, api_last_resort)?;
+                    std::result::Result::Ok(output_ok)
+                })())
+            }
+        },
+    )
+}
+fn wire__crate__api__mls_leaf_known_impl(
+    port_: flutter_rust_bridge::for_generated::MessagePort,
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_normal::<flutter_rust_bridge::for_generated::SseCodec, _, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "mls_leaf_known",
+            port: Some(port_),
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Normal,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_device_id = <String>::sse_decode(&mut deserializer);
+            let api_leaf_sig_key = <String>::sse_decode(&mut deserializer);
+            let api_groups = <Vec<String>>::sse_decode(&mut deserializer);
+            deserializer.end();
+            move |context| {
+                transform_result_sse::<_, crate::api::CoreError>((move || {
+                    let output_ok =
+                        crate::api::mls_leaf_known(api_device_id, api_leaf_sig_key, api_groups)?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -3230,69 +3307,71 @@ fn pde_ffi_dispatcher_primary_impl(
         3 => wire__crate__api__accept_change_for_impl(port, ptr, rust_vec_len, data_len),
         4 => wire__crate__api__accept_succession_impl(port, ptr, rust_vec_len, data_len),
         5 => wire__crate__api__account_impl(port, ptr, rust_vec_len, data_len),
-        6 => wire__crate__api__commit_impl(port, ptr, rust_vec_len, data_len),
-        7 => wire__crate__api__companion_setup_impl(port, ptr, rust_vec_len, data_len),
-        8 => wire__crate__api__decrypt_from_impl(port, ptr, rust_vec_len, data_len),
-        9 => wire__crate__api__device_meta_signature_impl(port, ptr, rust_vec_len, data_len),
-        10 => wire__crate__api__encrypt_to_impl(port, ptr, rust_vec_len, data_len),
-        11 => wire__crate__api__export_pins_impl(port, ptr, rust_vec_len, data_len),
-        12 => wire__crate__api__forget_impl(port, ptr, rust_vec_len, data_len),
-        13 => wire__crate__api__identity_impl(port, ptr, rust_vec_len, data_len),
-        14 => wire__crate__api__import_pins_impl(port, ptr, rust_vec_len, data_len),
-        15 => wire__crate__api__init_impl(port, ptr, rust_vec_len, data_len),
-        16 => wire__crate__api__link_accept_impl(port, ptr, rust_vec_len, data_len),
-        17 => wire__crate__api__link_commit_impl(port, ptr, rust_vec_len, data_len),
-        18 => wire__crate__api__link_complete_impl(port, ptr, rust_vec_len, data_len),
-        19 => wire__crate__api__link_complete_code_impl(port, ptr, rust_vec_len, data_len),
-        20 => wire__crate__api__link_end_impl(port, ptr, rust_vec_len, data_len),
-        21 => wire__crate__api__link_lookup_impl(port, ptr, rust_vec_len, data_len),
-        22 => wire__crate__api__link_open_impl(port, ptr, rust_vec_len, data_len),
-        23 => wire__crate__api__link_open_commitment_impl(port, ptr, rust_vec_len, data_len),
-        24 => wire__crate__api__link_qr_impl(port, ptr, rust_vec_len, data_len),
-        25 => wire__crate__api__link_reveal_impl(port, ptr, rust_vec_len, data_len),
-        26 => wire__crate__api__link_seal_impl(port, ptr, rust_vec_len, data_len),
-        27 => wire__crate__api__mls_check_dm_impl(port, ptr, rust_vec_len, data_len),
-        28 => wire__crate__api__mls_clear_own_impl(port, ptr, rust_vec_len, data_len),
-        29 => wire__crate__api__mls_commit_impl(port, ptr, rust_vec_len, data_len),
-        30 => wire__crate__api__mls_commit_author_impl(port, ptr, rust_vec_len, data_len),
-        31 => wire__crate__api__mls_create_group_impl(port, ptr, rust_vec_len, data_len),
-        32 => wire__crate__api__mls_device_leaf_impl(port, ptr, rust_vec_len, data_len),
-        33 => wire__crate__api__mls_encrypt_impl(port, ptr, rust_vec_len, data_len),
-        34 => wire__crate__api__mls_forget_group_impl(port, ptr, rust_vec_len, data_len),
-        35 => wire__crate__api__mls_group_view_impl(port, ptr, rust_vec_len, data_len),
-        36 => wire__crate__api__mls_init_device_impl(port, ptr, rust_vec_len, data_len),
-        37 => wire__crate__api__mls_inspect_group_impl(port, ptr, rust_vec_len, data_len),
-        38 => wire__crate__api__mls_join_impl(port, ptr, rust_vec_len, data_len),
-        39 => wire__crate__api__mls_join_external_impl(port, ptr, rust_vec_len, data_len),
-        40 => wire__crate__api__mls_key_packages_impl(port, ptr, rust_vec_len, data_len),
-        41 => wire__crate__api__mls_members_impl(port, ptr, rust_vec_len, data_len),
-        42 => wire__crate__api__mls_merge_own_impl(port, ptr, rust_vec_len, data_len),
-        43 => wire__crate__api__mls_pending_commit_impl(port, ptr, rust_vec_len, data_len),
-        44 => wire__crate__api__mls_receive_impl(port, ptr, rust_vec_len, data_len),
-        45 => wire__crate__api__mls_receive_abort_impl(port, ptr, rust_vec_len, data_len),
-        46 => wire__crate__api__mls_receive_commit_impl(port, ptr, rust_vec_len, data_len),
-        47 => wire__crate__api__mls_recertify_impl(port, ptr, rust_vec_len, data_len),
-        48 => wire__crate__api__mls_roles_impl(port, ptr, rust_vec_len, data_len),
-        49 => wire__crate__api__mls_sign_resolution_impl(port, ptr, rust_vec_len, data_len),
-        50 => wire__crate__api__mls_validate_payload_impl(port, ptr, rust_vec_len, data_len),
-        51 => wire__crate__api__mls_verify_resolution_impl(port, ptr, rust_vec_len, data_len),
-        52 => wire__crate__api__note_peer_impl(port, ptr, rust_vec_len, data_len),
-        53 => wire__crate__api__one_time_prekeys_impl(port, ptr, rust_vec_len, data_len),
-        54 => wire__crate__api__peer_impl(port, ptr, rust_vec_len, data_len),
-        55 => wire__crate__api__prepare_prekeys_impl(port, ptr, rust_vec_len, data_len),
-        56 => wire__crate__api__prove_identity_impl(port, ptr, rust_vec_len, data_len),
-        57 => wire__crate__api__reset_identity_impl(port, ptr, rust_vec_len, data_len),
-        58 => wire__crate__api__retire_identity_impl(port, ptr, rust_vec_len, data_len),
-        59 => wire__crate__api__rotate_impl(port, ptr, rust_vec_len, data_len),
-        61 => wire__crate__api__safety_impl(port, ptr, rust_vec_len, data_len),
-        66 => wire__crate__api__session_info_impl(port, ptr, rust_vec_len, data_len),
-        67 => wire__crate__api__set_verified_impl(port, ptr, rust_vec_len, data_len),
-        68 => wire__crate__api__set_verified_for_impl(port, ptr, rust_vec_len, data_len),
-        69 => wire__crate__api__sign_device_cert_impl(port, ptr, rust_vec_len, data_len),
-        70 => wire__crate__api__sign_device_list_impl(port, ptr, rust_vec_len, data_len),
-        71 => wire__crate__api__sign_succession_impl(port, ptr, rust_vec_len, data_len),
-        72 => wire__crate__api__succession_complete_impl(port, ptr, rust_vec_len, data_len),
-        73 => wire__crate__api__succession_start_impl(port, ptr, rust_vec_len, data_len),
+        6 => wire__crate__api__adopt_succession_impl(port, ptr, rust_vec_len, data_len),
+        7 => wire__crate__api__commit_impl(port, ptr, rust_vec_len, data_len),
+        8 => wire__crate__api__companion_setup_impl(port, ptr, rust_vec_len, data_len),
+        9 => wire__crate__api__decrypt_from_impl(port, ptr, rust_vec_len, data_len),
+        10 => wire__crate__api__device_meta_signature_impl(port, ptr, rust_vec_len, data_len),
+        11 => wire__crate__api__encrypt_to_impl(port, ptr, rust_vec_len, data_len),
+        12 => wire__crate__api__export_pins_impl(port, ptr, rust_vec_len, data_len),
+        13 => wire__crate__api__forget_impl(port, ptr, rust_vec_len, data_len),
+        14 => wire__crate__api__identity_impl(port, ptr, rust_vec_len, data_len),
+        15 => wire__crate__api__import_pins_impl(port, ptr, rust_vec_len, data_len),
+        16 => wire__crate__api__init_impl(port, ptr, rust_vec_len, data_len),
+        17 => wire__crate__api__link_accept_impl(port, ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__link_commit_impl(port, ptr, rust_vec_len, data_len),
+        19 => wire__crate__api__link_complete_impl(port, ptr, rust_vec_len, data_len),
+        20 => wire__crate__api__link_complete_code_impl(port, ptr, rust_vec_len, data_len),
+        21 => wire__crate__api__link_end_impl(port, ptr, rust_vec_len, data_len),
+        22 => wire__crate__api__link_lookup_impl(port, ptr, rust_vec_len, data_len),
+        23 => wire__crate__api__link_open_impl(port, ptr, rust_vec_len, data_len),
+        24 => wire__crate__api__link_open_commitment_impl(port, ptr, rust_vec_len, data_len),
+        25 => wire__crate__api__link_qr_impl(port, ptr, rust_vec_len, data_len),
+        26 => wire__crate__api__link_reveal_impl(port, ptr, rust_vec_len, data_len),
+        27 => wire__crate__api__link_seal_impl(port, ptr, rust_vec_len, data_len),
+        28 => wire__crate__api__mls_check_dm_impl(port, ptr, rust_vec_len, data_len),
+        29 => wire__crate__api__mls_clear_own_impl(port, ptr, rust_vec_len, data_len),
+        30 => wire__crate__api__mls_commit_impl(port, ptr, rust_vec_len, data_len),
+        31 => wire__crate__api__mls_commit_author_impl(port, ptr, rust_vec_len, data_len),
+        32 => wire__crate__api__mls_create_group_impl(port, ptr, rust_vec_len, data_len),
+        33 => wire__crate__api__mls_device_leaf_impl(port, ptr, rust_vec_len, data_len),
+        34 => wire__crate__api__mls_encrypt_impl(port, ptr, rust_vec_len, data_len),
+        35 => wire__crate__api__mls_forget_group_impl(port, ptr, rust_vec_len, data_len),
+        36 => wire__crate__api__mls_group_view_impl(port, ptr, rust_vec_len, data_len),
+        37 => wire__crate__api__mls_init_device_impl(port, ptr, rust_vec_len, data_len),
+        38 => wire__crate__api__mls_inspect_group_impl(port, ptr, rust_vec_len, data_len),
+        39 => wire__crate__api__mls_join_impl(port, ptr, rust_vec_len, data_len),
+        40 => wire__crate__api__mls_join_external_impl(port, ptr, rust_vec_len, data_len),
+        41 => wire__crate__api__mls_key_packages_impl(port, ptr, rust_vec_len, data_len),
+        42 => wire__crate__api__mls_leaf_known_impl(port, ptr, rust_vec_len, data_len),
+        43 => wire__crate__api__mls_members_impl(port, ptr, rust_vec_len, data_len),
+        44 => wire__crate__api__mls_merge_own_impl(port, ptr, rust_vec_len, data_len),
+        45 => wire__crate__api__mls_pending_commit_impl(port, ptr, rust_vec_len, data_len),
+        46 => wire__crate__api__mls_receive_impl(port, ptr, rust_vec_len, data_len),
+        47 => wire__crate__api__mls_receive_abort_impl(port, ptr, rust_vec_len, data_len),
+        48 => wire__crate__api__mls_receive_commit_impl(port, ptr, rust_vec_len, data_len),
+        49 => wire__crate__api__mls_recertify_impl(port, ptr, rust_vec_len, data_len),
+        50 => wire__crate__api__mls_roles_impl(port, ptr, rust_vec_len, data_len),
+        51 => wire__crate__api__mls_sign_resolution_impl(port, ptr, rust_vec_len, data_len),
+        52 => wire__crate__api__mls_validate_payload_impl(port, ptr, rust_vec_len, data_len),
+        53 => wire__crate__api__mls_verify_resolution_impl(port, ptr, rust_vec_len, data_len),
+        54 => wire__crate__api__note_peer_impl(port, ptr, rust_vec_len, data_len),
+        55 => wire__crate__api__one_time_prekeys_impl(port, ptr, rust_vec_len, data_len),
+        56 => wire__crate__api__peer_impl(port, ptr, rust_vec_len, data_len),
+        57 => wire__crate__api__prepare_prekeys_impl(port, ptr, rust_vec_len, data_len),
+        58 => wire__crate__api__prove_identity_impl(port, ptr, rust_vec_len, data_len),
+        59 => wire__crate__api__reset_identity_impl(port, ptr, rust_vec_len, data_len),
+        60 => wire__crate__api__retire_identity_impl(port, ptr, rust_vec_len, data_len),
+        61 => wire__crate__api__rotate_impl(port, ptr, rust_vec_len, data_len),
+        63 => wire__crate__api__safety_impl(port, ptr, rust_vec_len, data_len),
+        68 => wire__crate__api__session_info_impl(port, ptr, rust_vec_len, data_len),
+        69 => wire__crate__api__set_verified_impl(port, ptr, rust_vec_len, data_len),
+        70 => wire__crate__api__set_verified_for_impl(port, ptr, rust_vec_len, data_len),
+        71 => wire__crate__api__sign_device_cert_impl(port, ptr, rust_vec_len, data_len),
+        72 => wire__crate__api__sign_device_list_impl(port, ptr, rust_vec_len, data_len),
+        73 => wire__crate__api__sign_succession_impl(port, ptr, rust_vec_len, data_len),
+        74 => wire__crate__api__succession_complete_impl(port, ptr, rust_vec_len, data_len),
+        75 => wire__crate__api__succession_start_impl(port, ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }
@@ -3305,11 +3384,11 @@ fn pde_ffi_dispatcher_sync_impl(
 ) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
     // Codec=Pde (Serialization + dispatch), see doc to use other codecs
     match func_id {
-        60 => wire__crate__api__rotation_interval_impl(ptr, rust_vec_len, data_len),
-        62 => wire__crate__api__sas_check_reveal_impl(ptr, rust_vec_len, data_len),
-        63 => wire__crate__api__sas_code_impl(ptr, rust_vec_len, data_len),
-        64 => wire__crate__api__sas_commitment_impl(ptr, rust_vec_len, data_len),
-        65 => wire__crate__api__sas_new_nonce_impl(ptr, rust_vec_len, data_len),
+        62 => wire__crate__api__rotation_interval_impl(ptr, rust_vec_len, data_len),
+        64 => wire__crate__api__sas_check_reveal_impl(ptr, rust_vec_len, data_len),
+        65 => wire__crate__api__sas_code_impl(ptr, rust_vec_len, data_len),
+        66 => wire__crate__api__sas_commitment_impl(ptr, rust_vec_len, data_len),
+        67 => wire__crate__api__sas_new_nonce_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

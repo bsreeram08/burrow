@@ -40,6 +40,37 @@ sealed class AccountEvent {
           createdAt: m['createdAt'] as int,
           ephemeral: m['ephemeral'] == true,
         ),
+        'group' => GroupEvent(
+          channel: m['channel'] as String,
+          seq: m['seq'] as int,
+          epoch: m['epoch'] as int,
+          kind: m['kind'] as String,
+          fromUserId: (m['from'] as Map)['userId'] as String,
+          fromDeviceId: (m['from'] as Map)['deviceId'] as String,
+          message: m['message'] as String?,
+          createdAt: m['createdAt'] as int,
+          large: m['large'] == true,
+        ),
+        'welcome' => WelcomeEvent(
+          id: m['id'] as String,
+          channel: m['channel'] as String,
+          from: m['from'] as String,
+          epoch: m['epoch'] as int,
+          seq: m['seq'] as int,
+          welcome: m['welcome'] as String?,
+          tree: m['tree'] as String?,
+          createdAt: m['createdAt'] as int,
+          large: m['large'] == true,
+        ),
+        'channel' => ChannelEvent(
+          id: m['id'] as String,
+          change: m['change'] as String,
+          seq: m['seq'] as int?,
+          digest: m['digest'] as String?,
+          deviceId: m['deviceId'] as String?,
+          oldest: m['oldest'] as int?,
+        ),
+        'keypackages' => KeyPackagesLow(m['remaining'] as int),
         _ => null,
       };
     } catch (_) {
@@ -109,6 +140,74 @@ class EnvelopeEvent extends AccountEvent {
   final int createdAt;
 }
 
+/// The next log entry of a channel for this device (never our own). [message] is null when [large]:
+/// fetch it from the channel's log.
+class GroupEvent extends AccountEvent {
+  const GroupEvent({
+    required this.channel,
+    required this.seq,
+    required this.epoch,
+    required this.kind,
+    required this.fromUserId,
+    required this.fromDeviceId,
+    required this.message,
+    required this.createdAt,
+    this.large = false,
+  });
+  final String channel;
+  final int seq;
+  final int epoch;
+
+  /// `commit` or `app`.
+  final String kind;
+  final String fromUserId;
+  final String fromDeviceId;
+  final String? message;
+  final int createdAt;
+  final bool large;
+}
+
+/// A Welcome for this device; acknowledge it (`ack` with [id]) once the group is stored.
+class WelcomeEvent extends AccountEvent {
+  const WelcomeEvent({
+    required this.id,
+    required this.channel,
+    required this.from,
+    required this.epoch,
+    required this.seq,
+    required this.welcome,
+    required this.tree,
+    required this.createdAt,
+    this.large = false,
+  });
+  final String id;
+  final String channel;
+  final String from;
+  final int epoch;
+  final int seq;
+  final String? welcome;
+  final String? tree;
+  final int createdAt;
+  final bool large;
+}
+
+/// A channel changed: joined, invited, updated, left, frozen (+seq, digest), thawed, remove-needed (+deviceId), gap (+oldest).
+class ChannelEvent extends AccountEvent {
+  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest});
+  final String id;
+  final String change;
+  final int? seq;
+  final String? digest;
+  final String? deviceId;
+  final int? oldest;
+}
+
+/// This device's one-time KeyPackages are running low.
+class KeyPackagesLow extends AccountEvent {
+  const KeyPackagesLow(this.remaining);
+  final int remaining;
+}
+
 /// Signed out by the server (code 4401): stop reconnecting.
 class SignedOutEvent extends AccountEvent {
   const SignedOutEvent();
@@ -169,8 +268,9 @@ class EventsClient {
     _retry = Timer(delay, connect);
   }
 
-  /// The only client messages the server accepts: envelope acks and "ringing".
+  /// The client messages the server accepts: envelope and Welcome acks, channel cursors and "ringing".
   void ack(String id) => _send({'type': 'ack', 'id': id});
+  void cursor(String channel, int seq) => _send({'type': 'cursor', 'channel': channel, 'seq': seq});
   void ringing(String roomId) => _send({'type': 'ringing', 'roomId': roomId});
 
   void _send(Map<String, Object?> message) {

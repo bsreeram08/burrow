@@ -36,9 +36,12 @@ class Contact {
 }
 
 class ApiException implements Exception {
-  const ApiException(this.message, this.status);
+  const ApiException(this.message, this.status, [this.body = const {}]);
   final String message;
   final int status;
+
+  /// The error response's JSON (e.g. a 409's `{epoch, seq}`, a 423's `frozen`).
+  final Map<String, dynamic> body;
   @override
   String toString() => message;
 }
@@ -91,7 +94,7 @@ class Api {
       if (decoded is Map<String, dynamic>) data = decoded;
     } catch (_) {}
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw ApiException(data['error'] as String? ?? 'Something went wrong. Try again.', response.statusCode);
+      throw ApiException(data['error'] as String? ?? 'Something went wrong. Try again.', response.statusCode, data);
     }
     return data;
   }
@@ -172,6 +175,71 @@ class Api {
   /// [ephemeral]: delivered only to the recipient's open connections, never stored (typing).
   Future<void> postEnvelope(String username, String envelope, {bool ephemeral = false}) =>
       call('/api/messages', method: 'POST', body: {'to': username, 'envelope': envelope, if (ephemeral) 'ephemeral': true});
+
+  /// Publishes the next signed device list (docs/devices.md): `{list, signature, certs}` from this primary device.
+  Future<Map<String, dynamic>> publishDeviceList(Map<String, dynamic> signed, String deviceId) =>
+      call('/api/devices/list', method: 'PUT', body: {...signed, 'deviceId': deviceId});
+
+  // ---- Groups and channels: the MLS delivery service (docs/signaling-api.md "Groups and channels") ----
+  /// Uploads one-time KeyPackages and/or the last-resort one. `{oneTime, lastResort, low}`.
+  Future<Map<String, dynamic>> uploadKeyPackages({List<String>? oneTime, String? lastResort}) =>
+      call('/api/mls/keypackages', method: 'PUT', body: {'keyPackages': ?oneTime, 'lastResort': ?lastResort});
+
+  /// `{oneTime, lastResort, low, max}` for this device.
+  Future<Map<String, dynamic>> keyPackageCount() => call('/api/mls/keypackages');
+
+  /// One KeyPackage per listed device of each user: `{keyPackages: [{userId, deviceId, keyPackage, lastResort}], missing}`.
+  Future<Map<String, dynamic>> claimKeyPackages(List<String> userIds) =>
+      call('/api/mls/keypackages/claim', method: 'POST', body: {'users': userIds});
+
+  /// Registers a group this device just created. [kind]: public, private, group_dm, dm or self.
+  Future<Map<String, dynamic>> createChannel({
+    required String id,
+    required String kind,
+    required String groupInfo,
+    required String tree,
+    String? name,
+    String? peer,
+  }) => call('/api/channels', method: 'POST', body: {'id': id, 'kind': kind, 'groupInfo': groupInfo, 'tree': tree, 'name': ?name, 'peer': ?peer});
+
+  /// The caller's channels: `[{id, kind, name, epoch, seq, frozen, member, cursor, admin}]`.
+  Future<List<Map<String, dynamic>>> channels() async => ((await call('/api/channels'))['channels'] as List).cast<Map<String, dynamic>>();
+  Future<Map<String, dynamic>> channel(String id) => call('/api/channels/$id');
+
+  /// Member devices: `[{userId, username, deviceId, admin}]`.
+  Future<List<Map<String, dynamic>>> channelMembers(String id) async =>
+      ((await call('/api/channels/$id/members'))['members'] as List).cast<Map<String, dynamic>>();
+
+  /// An application message. `{epoch, seq, digest}`; 409 `{epoch, seq}` when built for another epoch.
+  Future<Map<String, dynamic>> postGroupMessage(String id, String message) => call('/api/channels/$id/messages', method: 'POST', body: {'message': message});
+
+  /// A commit, with the Welcome and the added devices' ids when it adds any. 409 on another epoch, 423 frozen.
+  Future<Map<String, dynamic>> postCommit(String id, String message, {String? welcome, List<String>? joiners}) =>
+      call('/api/channels/$id/commits', method: 'POST', body: {'message': message, 'welcome': ?welcome, 'joiners': ?joiners});
+
+  /// An external commit: a public channel, a new device of a member, or a resync.
+  Future<Map<String, dynamic>> joinChannel(String id, String message) => call('/api/channels/$id/join', method: 'POST', body: {'message': message});
+
+  /// `{epoch, seq, groupInfo, tree}` for an external join (409 between epochs).
+  Future<Map<String, dynamic>> joinInfo(String id) => call('/api/channels/$id/join-info');
+  Future<void> putGroupInfo(String id, int epoch, String groupInfo) =>
+      call('/api/channels/$id/group-info', method: 'PUT', body: {'epoch': epoch, 'groupInfo': groupInfo});
+
+  /// Log entries after [after] (default: this device's cursor): `{epoch, seq, cursor, entries, more, gap, frozen?}`.
+  Future<Map<String, dynamic>> groupLog(String id, {int? after}) => call('/api/channels/$id/log${after == null ? '' : '?after=$after'}');
+  Future<void> setCursor(String id, int seq) => call('/api/channels/$id/cursor', method: 'POST', body: {'seq': seq});
+
+  /// This device's Welcome inbox (metadata), one Welcome with its tree, and removal after storing it.
+  Future<List<Map<String, dynamic>>> welcomes() async => ((await call('/api/mls/welcomes'))['welcomes'] as List).cast<Map<String, dynamic>>();
+  Future<Map<String, dynamic>> welcome(String id) => call('/api/mls/welcomes/$id');
+  Future<void> deleteWelcome(String id) => call('/api/mls/welcomes/$id', method: 'DELETE');
+
+  /// Reports that this device rejected the latest sequenced commit: the channel freezes.
+  Future<void> reportPoison(String id, int seq, String digest) => call('/api/channels/$id/poison', method: 'POST', body: {'seq': seq, 'digest': digest});
+
+  /// An admin device resolves a frozen channel; [signature] is its device key over [resolveBytes].
+  Future<Map<String, dynamic>> resolveChannel(String id, {required String action, required int seq, required String digest, required String signature}) =>
+      call('/api/channels/$id/resolve', method: 'POST', body: {'action': action, 'seq': seq, 'digest': digest, 'signature': signature});
 
   // ---- Encrypted blobs and link previews ----
   Map<String, String> get _auth => {if (token != null) 'Authorization': 'Bearer $token'};

@@ -238,19 +238,24 @@
     let base = null;
     if (view.list) {
       const check = await Devices.verifyView({ userId: me.id, aikSign: own.sign, list: view.list, signature: view.signature, certs: view.certs, pin });
-      if (!check.ok) { deviceWarning = `The device list on the server is not one this device signed (${check.reason}). It was not changed.`; deviceView = view; renderDevices(); return; }
-      pins[me.id] = check.pin; writePins(pins);
-      base = { list: view.list, hash: check.hash };
+      // A new account key here (recovery or a primary transfer, m5 §5-§6): the old key's list ends; version 1 starts.
+      if (!check.ok && newChain && check.reason === 'signature') base = null;
+      else if (!check.ok) { deviceWarning = `The device list on the server is not one this device signed (${check.reason}). It was not changed.`; deviceView = view; renderDevices(); return; }
+      else { pins[me.id] = check.pin; writePins(pins); base = { list: view.list, hash: check.hash }; }
       const mine = view.devices.find(row => row.id === id);
-      if (view.currentDevice === id && mine?.primary && view.list.devices.some(device => device.deviceId === id)) { deviceWarning = ''; deviceView = view; renderDevices(); return; }
+      if (base && view.currentDevice === id && mine?.primary && view.list.devices.some(device => device.deviceId === id)) { deviceWarning = ''; deviceView = view; renderDevices(); return; }
     }
-    // Next version: this device plus every listed device the server still has, chained to the current list.
-    const keep = base ? base.list.devices.filter(device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && row.state === 'listed')) : [];
+    // Next version: this device plus every listed device the server still has, chained to the current list. A new
+    // chain keeps only the devices the transfer brought along (none after a recovery).
+    const stillListed = device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && ['listed', 'pending'].includes(row.state));
+    const keep = base ? base.list.devices.filter(device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && row.state === 'listed')) : (newChain?.keep || []).filter(stillListed);
     const self = base?.list.devices.find(device => device.deviceId === id) || { deviceId: id, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, id, { label: Devices.describeThisDevice(), platform: 'web' }) };
     const list = { v: 1, userId: me.id, version: (base?.list.version || 0) + 1, prevHash: base?.hash || '', devices: [...keep, self].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
     const signed = await signList(list);
     await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
+    if (!base) { const pins = readPins(); delete pins[me.id]; writePins(pins); } // The new key's chain starts here.
     await pinOwn(signed);
+    newChain = null;
     deviceWarning = '';
     deviceView = await api(`/api/devices/${me.username}`);
     renderDevices();
@@ -277,7 +282,7 @@
   }
   function linkContext() {
     return {
-      me: () => me, notice: text => say('chats-status', text), platformName, addToList, signWithIdentity, contacts: () => contacts,
+      me: () => me, notice: text => say('chats-status', text), platformName, addToList, signWithIdentity, contacts: () => contacts, recover,
       async isPrimary() {
         if (!box || linked || inactive) return false;
         const view = await api(`/api/devices/${me.username}`).catch(() => null);
@@ -290,22 +295,43 @@
       devicesChanged: () => api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}),
     };
   }
+  /** Set by a recovery or a primary transfer: the next list starts a new chain under this device's new key. */
+  let newChain = null;
+  /**
+   * Recovery without a primary (m5 §6): only after the explicit warning. This browser makes a new account key, takes
+   * messaging over, and publishes a list naming only itself. Contacts see the code change; groups it was in see its
+   * old devices as stale.
+   */
+  async function recover() {
+    if (!box || linked) return;
+    if (!await window.Linking.confirmRecovery()) return;
+    try {
+      newChain = { keep: [] };
+      await box.resetIdentity();
+      writeJson(`rotation-told-v1:${me.id}`, {});
+      await publishKeys(true);
+      say('chats-status', 'This browser now holds your account. Everyone you talk to will see that your security code changed.');
+      setTimeout(() => location.reload(), 1500);
+    } catch (error) { newChain = null; say('chats-status', `Couldn’t start over: ${error.message}`); }
+  }
   const platformName = platform => ({ web: 'Web browser', ios: 'iPhone app', android: 'Android app', macos: 'Mac app', windows: 'Windows app', linux: 'Linux app' })[platform] || 'Device';
   async function renderDevices() {
     const list = $('device-list');
     if (!list || !me) return;
     say('devices-status', deviceWarning || deviceNotice);
-    if (!deviceView?.devices) { list.replaceChildren(); return; }
-    const amPrimary = deviceView.devices.some(row => row.current && row.primary);
+    // A snapshot: sign-out (or a refresh) may replace deviceView while this awaits keys.
+    const view = deviceView, account = me;
+    if (!view?.devices) { list.replaceChildren(); return; }
+    const amPrimary = view.devices.some(row => row.current && row.primary);
     // Only the identity-key holder can open the sealed labels; other browsers show the kind of client.
     const linkedKey = linked ? localStorage.getItem(`device-meta-key-v1:${me.id}`) : null;
     const key = amPrimary && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : linkedKey ? await Devices.metaKeyFromBytes(Devices.unb64(linkedKey)).catch(() => null) : null;
     const rows = [];
-    for (const row of deviceView.devices) {
+    for (const row of view.devices) {
       const item = document.createElement('li'); item.className = 'device-row'; item.dataset.deviceId = row.id; item.dataset.state = row.state;
       const name = document.createElement('strong');
-      const entry = deviceView.list?.devices.find(device => device.deviceId === row.id);
-      const described = key && entry ? await Devices.openMeta(key, me.id, row.id, entry.meta) : null;
+      const entry = view.list?.devices.find(device => device.deviceId === row.id);
+      const described = key && entry ? await Devices.openMeta(key, account.id, row.id, entry.meta) : null;
       name.textContent = described?.label || platformName(described?.platform || row.platform);
       const meta = document.createElement('small');
       meta.textContent = [row.current ? 'This browser' : null, row.primary ? 'Primary · holds your keys' : null, row.state === 'pending' ? 'Signed in · not linked' : null, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
@@ -338,6 +364,7 @@
       }
       rows.push(item);
     }
+    if (deviceView !== view) return; // Superseded while drawing.
     list.replaceChildren(...rows);
   }
   window.addEventListener('linking-flows', () => renderDevices());
@@ -559,6 +586,7 @@
    */
   async function maybeMove(contact) {
     if (!box || linked || !window.Groups?.enabled() || readMoved()[await pairId(contact.id)] || Date.now() - (tried.get(contact.id) || 0) < 600000) return;
+    if (await window.Core?.testFlag?.('dm-move-test') === 'off') return; // Test runs of the 1:1 protocol itself (loopback only).
     tried.set(contact.id, Date.now());
     const capability = await api(`/api/mls/capability/${encodeURIComponent(contact.username)}`).catch(() => null);
     if (!capability || capability.devices < 1 || capability.channel) return; // They can't yet, or they are already moving it.
@@ -569,15 +597,30 @@
     await markMoved(contact, channel);
     await window.ChatStore.note(await pairId(contact.id), pointer.id, 'Messages in this chat now use the new encryption.').catch(() => {});
   }
-  /** §8.3: their pointer moves the chat only when the group is really our DM, chained to the pinned keys. */
+  /**
+   * §8.3: their pointer moves the chat only when the group is really our DM, chained to the pinned keys. The Welcome
+   * may arrive after the pointer: joining a DM group retries at once (dmJoined), otherwise with backoff for 10 minutes.
+   */
+  const pointers = new Map();
   async function acceptPointer(contact, payload) {
     const deadline = Date.now() + 600000;
-    while (me && Date.now() < deadline) {
-      const info = await api(`/api/channels/${payload.channel}`).catch(() => null);
-      if (info && (info.kind !== 'dm' || info.peer?.id !== contact.id)) return; // Not our DM: ignore the pointer.
-      if (info?.member && await window.Groups?.acceptDm(payload.channel, contact.id)) { await markMoved(contact, payload.channel); render(); return; }
-      await new Promise(resolve => setTimeout(resolve, 15000)); // The Welcome may still be on its way.
+    pointers.set(payload.channel, { contact, payload });
+    for (let wait = 1000; me && pointers.has(payload.channel) && Date.now() < deadline; wait = Math.min(wait * 2, 15000)) {
+      if (await tryPointer(payload.channel)) return;
+      await new Promise(resolve => { const timer = setTimeout(resolve, wait); pointers.get(payload.channel) && (pointers.get(payload.channel).wake = () => { clearTimeout(timer); resolve(); }); });
     }
+    pointers.delete(payload.channel);
+  }
+  async function tryPointer(channel) {
+    const pending = pointers.get(channel);
+    if (!pending) return true;
+    const info = await api(`/api/channels/${channel}`).catch(() => null);
+    if (info && (info.kind !== 'dm' || info.peer?.id !== pending.contact.id)) { pointers.delete(channel); return true; } // Not our DM: ignore the pointer.
+    if (!info?.member || !await window.Groups?.acceptDm(channel, pending.contact.id)) return false;
+    pointers.delete(channel);
+    await markMoved(pending.contact, channel); render();
+    if (current?.id === pending.contact.id) App.refreshHistory();
+    return true;
   }
   /** Encrypts and posts every queued outgoing message, oldest first, one contact at a time. */
   async function flushOutgoing() {
@@ -1086,6 +1129,7 @@
       pairIdOf: id => pairId(id),
       dmIncoming: peerId => { if (!(body.dataset.screen === 'conversation' && current?.id === peerId)) { unread[peerId] = (unread[peerId] || 0) + 1; writeJson(`unread-v1:${me.id}`, unread); } },
       dmTyping: (peerId, payload) => typing(peerId, payload),
+      dmJoined: channel => pointers.get(channel)?.wake?.(),
       dmChanged: peerId => { if (current?.id === peerId && body.dataset.screen === 'conversation') App.refreshHistory(); render(); },
     };
   }

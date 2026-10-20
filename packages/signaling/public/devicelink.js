@@ -215,7 +215,7 @@
   /** account.js hands over what linking needs from the signed-in account, and the flows appear. */
   function attach(context) {
     ctx = context;
-    window.Linking.register(context ? { linkNew: linkNewDevice, linkThis: linkThisBrowser } : null);
+    window.Linking.register(context ? { linkNew: linkNewDevice, linkThis: linkThisBrowser, recover: context.recover } : null);
   }
   const wire = () => { const button = document.getElementById('signin-link'); if (button) button.onclick = () => linkThisBrowser(); };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', wire); else wire();

@@ -61,11 +61,14 @@
     say('me-name', `@${user.username}`); say('account-status', '');
     try { unread = JSON.parse(localStorage.getItem(`unread-v1:${me.id}`) || '{}') || {}; } catch { unread = {}; }
     ready = setupKeys(user);
+    // Groups and channels (groups.js) start once this device's keys and device list are in place.
+    ready.then(ok => { if (ok && me?.id === user.id && !inactive) window.Groups?.start(groupContext()); });
     window.Theme?.setAccount(user.id); App.accountId = user.id; App.myName = user.username; App.rescheduleReminders?.(); loadEmoji();
     $('rotation-every').value = String(myRotation());
     loadContacts(); connectEvents(); window.Alerts?.signedIn();
   }
   function signedOut(message = '') {
+    window.Groups?.stop(); delete body.dataset.kind;
     me = null; contacts = []; current = null; pairs.clear(); box = null; deviceView = null; announced = ''; metaKey = null; deviceWarning = ''; deviceNotice = ''; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
     clearTimeout(retryTimer); clearTimeout(flushTimer); const previous = events; events = null; previous?.close();
     if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true;
@@ -316,7 +319,8 @@
       else if (message.type === 'contacts') loadContacts();
       else if (message.type === 'incoming') incoming(message);
       else if (message.type === 'envelope') inbound = inbound.then(() => receiveEnvelope(socket, message)).catch(() => {});
-      else if (message.type === 'devices' && message.id === me?.id) { if (!inactive) syncDevices().catch(() => {}); else api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); }
+      else if (['group', 'welcome', 'channel', 'keypackages', 'ephemeral'].includes(message.type)) window.Groups?.frame(message);
+      else if (message.type === 'devices' && message.id === me?.id) { if (!inactive) syncDevices().then(() => window.Groups?.devicesChanged()).catch(() => {}); else api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); }
       else if (message.type === 'devices') { const contact = contactById(message.id); if (contact) verifyContactDevices(contact).catch(() => {}); }
       else if (message.type === 'keys' && message.id === me?.id) publishKeys().catch(() => {}); // Another device took over messaging.
       else if (message.type === 'keys') checkIdentity(message.id).then(flushOutgoing).catch(() => {});
@@ -468,7 +472,7 @@
       else if (retryLater) flushTimer = setTimeout(flushOutgoing, 15000);
     }
   }
-  App.onQueued = () => { if (current) App.chatStatus(''); flushOutgoing(); };
+  App.onQueued = () => { if (window.Groups?.active()) { App.chatStatus(''); window.Groups.flush(); return; } if (current) App.chatStatus(''); flushOutgoing(); };
   App.onBurn = async () => {
     const contact = current && contactById(current.id);
     if (!contact) throw new Error('Open the conversation to burn it.');
@@ -546,8 +550,9 @@
     if (inactive) throw new Error('Messaging is active on another device. Move it here first.');
     return contact;
   };
-  App.onReact = async (target, emoji, on) => { await sendControl(openContact(), { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }); };
+  App.onReact = async (target, emoji, on) => { if (window.Groups?.active()) return window.Groups.onReact(target, emoji, on); await sendControl(openContact(), { v: 1, type: 'react', id: crypto.randomUUID(), target, emoji, on }); };
   App.onEdit = async (record, text) => {
+    if (window.Groups?.active()) return window.Groups.onEdit(record, text);
     const contact = openContact(), conversationId = await pairId(contact.id);
     const editedAt = Math.max(Date.now(), (record.editedAt || 0) + 1);
     if (!await window.ChatStore.edit(conversationId, record.id, 'me', text, editedAt)) throw new Error('This message can no longer be edited.');
@@ -561,6 +566,7 @@
   let readTimer = null, readAt = 0;
   const looking = () => Boolean(current) && body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus();
   App.onDisplayed = () => {
+    if (window.Groups?.active()) { window.Groups.onDisplayed(); return; }
     if (readTimer || !looking() || !box || inactive) return;
     readTimer = setTimeout(sendReads, Math.max(0, 2000 - (Date.now() - readAt)));
   };
@@ -582,6 +588,7 @@
   // so a hint never spends one of their one-time keys. `on` at most every 4 s while there is text; `off` on send/clear/blur.
   let typingSent = 0, typingOn = false, typingHide = null, typingFrom = null;
   App.onTyping = active => {
+    if (window.Groups?.active()) { window.Groups.onTyping(active); return; }
     const contact = current && contactById(current.id);
     if (!contact || contact.state !== 'mutual' || !box || inactive) { typingOn = false; return; }
     if (active) {
@@ -762,9 +769,10 @@
   $('safety-verify').onclick = async () => {
     const safety = await box.safety(me.username, current.id, current.username);
     await box.setVerified(current.id, !safety.verified);
+    window.Groups?.pinsChanged(current.id); // Verifying also accepts a changed code: groups waiting on it resume.
     $('safety').hidden = true; updateBanner(); flushOutgoing();
   };
-  $('safety-accept').onclick = async () => { await box.acceptChange(current.id); $('safety').hidden = true; updateBanner(); flushOutgoing(); };
+  $('safety-accept').onclick = async () => { await box.acceptChange(current.id); window.Groups?.pinsChanged(current.id); $('safety').hidden = true; updateBanner(); flushOutgoing(); };
 
   // ---------- Contacts and chat list ----------
   async function loadContacts() {
@@ -775,42 +783,89 @@
       render(); flushOutgoing(); openPending();
     } catch (error) { if (error.status === 401) signedOut('Your session ended. Sign in again.'); }
   }
+  // ---------- Chat list: pinned, channels, groups, direct messages ----------
+  const pinsKey = () => `pins-v1:${me.id}`;
+  const readPinned = () => { try { const list = JSON.parse(localStorage.getItem(pinsKey()) || '[]'); return Array.isArray(list) ? list : []; } catch { return []; } };
+  function togglePin(key) {
+    const list = readPinned(), next = list.includes(key) ? list.filter(value => value !== key) : [...list, key].slice(-20);
+    try { localStorage.setItem(pinsKey(), JSON.stringify(next)); } catch {}
+    render();
+    return next.includes(key);
+  }
+  /** One row of the chat list: avatar, name, last message or state, time, unread badge, mention mark. */
+  function convoRow({ className, avatar, online, title, sub, time, count, mentioned, label, onOpen }) {
+    const row = document.createElement('li'); row.className = className;
+    const face = document.createElement('span'); face.className = 'avatar'; face.textContent = avatar; face.setAttribute('aria-hidden', 'true');
+    if (online !== undefined) face.dataset.online = String(online);
+    const text = document.createElement('span'); text.className = 'contact-text';
+    const name = document.createElement('strong'); name.textContent = title;
+    const small = document.createElement('small'); small.textContent = sub;
+    text.append(name, small); row.append(face, text);
+    const side = document.createElement('span'); side.className = 'contact-side';
+    const stamp = document.createElement('time'); stamp.textContent = time ? clock(time) : '';
+    side.append(stamp);
+    if (count || mentioned) {
+      const badge = document.createElement('span'); badge.className = mentioned ? 'badge mention-badge' : 'badge';
+      badge.textContent = mentioned ? '@' : count > 99 ? '99+' : String(count); side.append(badge); row.classList.add('unread');
+    }
+    const open = document.createElement('button'); open.type = 'button'; open.className = 'row-button';
+    open.setAttribute('aria-label', label); open.onclick = onOpen;
+    row.append(side, open);
+    return row;
+  }
   async function render() {
     if (!me) return;
     const records = window.ChatStore ? await window.ChatStore.list().catch(() => []) : [];
     const last = new Map(); for (const record of records) last.set(record.conversationId, record);
+    const pinnedKeys = readPinned(), pinnedRows = [];
+    const preview = recent => recent ? `${recent.direction === 'outgoing' ? 'You: ' : recent.fromName ? `${recent.fromName}: ` : ''}${App.preview ? App.preview(recent) : recent.text}` : null;
     const list = $('contact-list'), rows = [];
     for (const contact of contacts) {
-      const row = document.createElement('li'); row.className = `contact ${contact.state}`;
-      const avatar = document.createElement('span'); avatar.className = 'avatar'; avatar.textContent = initial(contact.username); avatar.setAttribute('aria-hidden', 'true');
-      if (contact.state === 'mutual') avatar.dataset.online = String(contact.online);
-      const text = document.createElement('span'); text.className = 'contact-text';
-      const name = document.createElement('strong'); name.textContent = contact.username;
-      const sub = document.createElement('small');
-      text.append(name, sub); row.append(avatar, text);
+      let row;
       if (contact.state === 'mutual') {
         const recent = last.get(await pairId(contact.id)), count = unread[contact.id] || 0;
-        sub.textContent = recent ? `${recent.direction === 'outgoing' ? 'You: ' : ''}${App.preview ? App.preview(recent) : recent.text}` : contact.online ? 'Online' : 'Say hello. Messages are end-to-end encrypted.';
-        const side = document.createElement('span'); side.className = 'contact-side';
-        const time = document.createElement('time'); time.textContent = recent ? clock(recent.createdAt) : '';
-        side.append(time);
-        if (count) { const badge = document.createElement('span'); badge.className = 'badge'; badge.textContent = count > 99 ? '99+' : String(count); side.append(badge); row.classList.add('unread'); }
-        const open = document.createElement('button'); open.type = 'button'; open.className = 'row-button';
-        open.setAttribute('aria-label', `Open conversation with ${contact.username}${count ? `, ${count} unread` : ''}${contact.online ? ', online' : ''}`);
-        open.onclick = () => openConversation(contact);
-        row.append(side, open);
-      } else if (contact.state === 'incoming') {
-        sub.textContent = 'Wants to add you';
-        row.append(action('Accept', 'primary', async () => { await api(`/api/contacts/${contact.username}/accept`, 'POST', {}); loadContacts(); }),
-          action('Decline', '', async () => { await api(`/api/contacts/${contact.username}`, 'DELETE'); loadContacts(); }));
+        row = convoRow({ className: `contact ${contact.state}`, avatar: initial(contact.username), online: contact.online, title: contact.username,
+          sub: preview(recent) || (contact.online ? 'Online' : 'Say hello. Messages are end-to-end encrypted.'), time: recent?.createdAt, count,
+          label: `Open conversation with ${contact.username}${count ? `, ${count} unread` : ''}${contact.online ? ', online' : ''}`, onOpen: () => openConversation(contact) });
+        if (pinnedKeys.includes(`dm:${contact.id}`)) { pinnedRows.push([pinnedKeys.indexOf(`dm:${contact.id}`), row]); continue; }
       } else {
-        sub.textContent = 'Request sent';
-        row.append(action('Cancel', '', async () => { await api(`/api/contacts/${contact.username}`, 'DELETE'); loadContacts(); }));
+        row = document.createElement('li'); row.className = `contact ${contact.state}`;
+        const avatar = document.createElement('span'); avatar.className = 'avatar'; avatar.textContent = initial(contact.username); avatar.setAttribute('aria-hidden', 'true');
+        const text = document.createElement('span'); text.className = 'contact-text';
+        const name = document.createElement('strong'); name.textContent = contact.username;
+        const sub = document.createElement('small');
+        text.append(name, sub); row.append(avatar, text);
+        if (contact.state === 'incoming') {
+          sub.textContent = 'Wants to add you';
+          row.append(action('Accept', 'primary', async () => { await api(`/api/contacts/${contact.username}/accept`, 'POST', {}); loadContacts(); }),
+            action('Decline', '', async () => { await api(`/api/contacts/${contact.username}`, 'DELETE'); loadContacts(); }));
+        } else {
+          sub.textContent = 'Request sent';
+          row.append(action('Cancel', '', async () => { await api(`/api/contacts/${contact.username}`, 'DELETE'); loadContacts(); }));
+        }
       }
       rows.push(row);
     }
     list.replaceChildren(...rows);
-    $('contacts-empty').hidden = rows.length > 0;
+    $('contacts-empty').hidden = rows.length > 0 || pinnedRows.length > 0;
+    // Groups and channels, newest activity first.
+    const groups = window.Groups?.sections() || { rows: [], enabled: false, reason: '' }, channelRows = [], groupRows = [];
+    for (const item of groups.rows.sort((a, b) => Math.max(b.lastAt, last.get(b.id)?.createdAt || 0) - Math.max(a.lastAt, last.get(a.id)?.createdAt || 0))) {
+      const recent = last.get(item.id);
+      const state = item.status === 'left' ? 'You left' : item.status === 'removed' ? 'You were removed' : item.status === 'frozen' ? 'Paused while an admin checks a change' : item.status === 'paused' ? 'Paused: a security code changed' : null;
+      const row = convoRow({ className: `contact group ${item.channel ? 'is-channel' : 'is-group'} status-${item.status}`, avatar: item.channel ? '#' : initial(item.title), title: item.title,
+        sub: state || preview(recent) || item.topic || (item.channel ? 'Say what this channel is for.' : 'Say hello to everyone.'), time: recent?.createdAt || item.lastAt, count: item.unread, mentioned: item.mentioned,
+        label: `Open ${item.channel ? 'channel' : 'group'} ${item.title}${item.mentioned ? ', you were mentioned' : ''}${item.unread ? `, ${item.unread} unread` : ''}`, onOpen: () => openGroup(item.id) });
+      row.dataset.channel = item.id;
+      if (pinnedKeys.includes(`g:${item.id}`)) pinnedRows.push([pinnedKeys.indexOf(`g:${item.id}`), row]);
+      else (item.channel ? channelRows : groupRows).push(row);
+    }
+    $('channel-list').replaceChildren(...channelRows); $('group-list').replaceChildren(...groupRows);
+    $('channels-empty').textContent = groups.enabled || !groups.reason ? 'Channels keep a topic in one place. Start one, or browse the public ones to join.' : groups.reason;
+    $('channels-empty').hidden = channelRows.length > 0;
+    $('groups-empty').hidden = groupRows.length > 0;
+    $('pinned-list').replaceChildren(...pinnedRows.sort((a, b) => a[0] - b[0]).map(([, row]) => row));
+    $('pinned-section').hidden = pinnedRows.length === 0;
     if (current) updateHeader();
   }
   function action(label, kind, task) {
@@ -853,12 +908,39 @@
   async function openConversation(contact) {
     const conversationId = await pairId(contact.id);
     if (App.active && App.conversationId !== conversationId) await App.end();
+    window.Groups?.close(); body.dataset.kind = 'dm';
     current = contact; body.dataset.screen = 'conversation'; updateHeader();
     delete unread[contact.id]; try { localStorage.setItem(`unread-v1:${me.id}`, JSON.stringify(unread)); } catch {}
     if (!App.active) App.openConversation({ conversationId, peerName: contact.username, peerId: contact.id, online: contact.online });
     if (!await ready) App.chatStatus('This browser is too old for encrypted messaging. Update it to send and receive messages.');
     updateBanner(); flushOutgoing();
   }
+  /** A group or channel: the same conversation screen, driven by groups.js. Calls stay 1:1. */
+  async function openGroup(id) {
+    if (App.active) { say('chats-status', 'Finish the call first. Group calls come later.'); return; }
+    App.onTyping(false); App.showTyping?.(false);
+    current = null; $('key-banner').hidden = true;
+    body.dataset.screen = 'conversation'; body.dataset.kind = 'group';
+    window.Groups.open(id);
+    render();
+  }
+  function groupContext() {
+    return {
+      me, backend: backendName, box, signWithIdentity, contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
+      viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
+      looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
+      socket: () => events, openGroup,
+      review: async userId => { const contact = contactById(userId); if (contact) { await openConversation(contact); openSafety(); } },
+    };
+  }
+  $('channels-new').onclick = () => window.Groups?.openNew('channel');
+  $('channels-browse').onclick = () => window.Groups?.openBrowser();
+  $('groups-new').onclick = () => window.Groups?.openNew('group_dm');
+  $('conv-pin').onclick = () => {
+    $('conv-menu').open = false;
+    const key = window.Groups?.active() ? `g:${window.Groups.active()}` : current ? `dm:${current.id}` : null;
+    if (key) App.chatStatus(togglePin(key) ? 'Pinned to the top of your chats.' : 'Unpinned.');
+  };
   /** Notification taps only choose which conversation to show. They never start or answer a call:
    *  an incoming call keeps ringing on its sheet until the user taps Accept in the app. */
   async function openPending() {
@@ -898,6 +980,7 @@
   $('conv-video').onclick = () => call('video');
   $('conv-back').onclick = () => {
     App.onTyping(false); App.showTyping?.(false);
+    if (window.Groups?.active()) { window.Groups.close(); App.closeConversation(); body.dataset.screen = 'list'; delete body.dataset.kind; render(); return; }
     body.dataset.screen = 'list'; $('key-banner').hidden = true;
     if (!App.active) { App.closeConversation(); current = null; }
     render();

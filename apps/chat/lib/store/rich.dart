@@ -218,13 +218,21 @@ class Attachment {
   int get hashCode => jsonEncode(toJson()).hashCode;
 }
 
-/// Reactions on one message in a 1:1 chat: who (`me` / `peer`) → their set of emoji.
+/// Reactions on one message: who → their set of emoji. In a 1:1 chat who is `me` or `peer`; in a group
+/// it is `me` or the reacting member's user id, so "who reacted" can be shown.
 class Reactions {
   const Reactions([this.byWho = const {}]);
   final Map<String, List<String>> byWho;
 
   static const maxDistinct = 20;
   static const people = {'me', 'peer'};
+  static final _member = RegExp(r'^[A-Za-z0-9_-]{22}$');
+
+  /// `me`, `peer`, or a group member's user id.
+  static bool validWho(Object? who) => who is String && (people.contains(who) || _member.hasMatch(who));
+
+  /// Everyone but me who reacted with [emoji], in first-seen order.
+  List<String> others(String emoji) => [for (final e in byWho.entries) if (e.key != 'me' && e.value.contains(emoji)) e.key];
 
   bool get isEmpty => byWho.values.every((v) => v.isEmpty);
   List<String> of(String who) => byWho[who] ?? const [];
@@ -232,7 +240,7 @@ class Reactions {
 
   /// Emoji in first-seen order with their count and whether `me` is among them.
   List<({String emoji, int count, bool mine})> get summary {
-    final order = <String>{...of('me'), ...of('peer')}.toList();
+    final order = <String>{...of('me'), for (final e in byWho.entries) if (e.key != 'me') ...e.value}.toList();
     return [for (final e in order) (emoji: e, count: byWho.values.where((v) => v.contains(e)).length, mine: of('me').contains(e))];
   }
 
@@ -253,7 +261,7 @@ class Reactions {
     final out = <String, List<String>>{};
     for (final entry in json.entries) {
       final list = entry.value;
-      if (!people.contains(entry.key) || list is! List || !list.every((e) => e is String && isReactionEmoji(e))) _bad('reactions');
+      if (!validWho(entry.key) || list is! List || !list.every((e) => e is String && isReactionEmoji(e))) _bad('reactions');
       if (list.isNotEmpty) out[entry.key as String] = List<String>.of(list.cast<String>().toSet());
     }
     final r = Reactions(out);

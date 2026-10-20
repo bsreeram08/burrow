@@ -39,6 +39,8 @@ class ChatMessage {
     this.editedText,
     this.editedAt,
     this.reactions = const Reactions(),
+    this.sender,
+    this.mentions = const [],
   });
 
   final String id;
@@ -54,6 +56,12 @@ class ChatMessage {
   final String? editedText;
   final int? editedAt;
   final Reactions reactions;
+
+  /// Group messages: the author's user id (incoming only; null in 1:1 chats, where it is the peer).
+  final String? sender;
+
+  /// Group messages: the user ids the text mentions (`@name`), for highlighting and notifications.
+  final List<String> mentions;
 
   bool get outgoing => direction == Direction.outgoing;
   bool expired(int now) => expiresAt != null && expiresAt! <= now;
@@ -76,6 +84,8 @@ class ChatMessage {
     editedText: editedText ?? this.editedText,
     editedAt: editedAt ?? this.editedAt,
     reactions: reactions ?? this.reactions,
+    sender: sender,
+    mentions: mentions,
   );
 
   ChatMessage withStatus(MessageStatus next) => copyWith(status: next);
@@ -90,7 +100,9 @@ class ChatMessage {
       expiresAt == other.expiresAt &&
       replyTo == other.replyTo &&
       attachment == other.attachment &&
-      link == other.link;
+      link == other.link &&
+      sender == other.sender &&
+      _sameList(mentions, other.mentions);
 
   /// The encrypted wire payload (`{v:1, type:'message', ...}`); optional parts are omitted when absent.
   Map<String, Object?> toPayload() => {
@@ -119,6 +131,8 @@ class ChatMessage {
     'edited_text': editedText,
     'edited_at': editedAt,
     'reactions': reactions.isEmpty ? null : jsonEncode(reactions.toJson()),
+    'sender': sender,
+    'mentions': mentions.isEmpty ? null : jsonEncode(mentions),
   };
 
   static ChatMessage fromRow(Map<String, Object?> row) {
@@ -144,6 +158,8 @@ class ChatMessage {
         editedText: row['edited_text'] as String?,
         editedAt: row['edited_at'] as int?,
         reactions: row['reactions'] == null ? const Reactions() : Reactions.fromJson(json('reactions')),
+        sender: row['sender'] as String?,
+        mentions: row['mentions'] == null ? const [] : _mentions(json('mentions')),
       );
     } on FormatException {
       throw const StoreException('Invalid chat message.', code: 'invalid');
@@ -175,7 +191,24 @@ const _maxDate = 8640000000000000;
 const _maxSafeInt = 9007199254740991;
 
 final uuidPattern = RegExp(r'^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', caseSensitive: false);
-final conversationPattern = RegExp(r'^[A-Za-z0-9_-]{43}$');
+/// A 1:1 pair id (43 characters) or an MLS group id (22).
+final conversationPattern = RegExp(r'^([A-Za-z0-9_-]{43}|[A-Za-z0-9_-]{22})$');
+final _userId = RegExp(r'^[A-Za-z0-9_-]{1,64}$');
+const maxMentions = 64;
+
+bool _sameList(List<String> a, List<String> b) => a.length == b.length && [for (var i = 0; i < a.length; i++) a[i] == b[i]].every((x) => x);
+
+List<String> _mentions(Object? json) {
+  if (json is! List || json.length > maxMentions || !json.every((v) => v is String && _userId.hasMatch(v))) throw const FormatException('Invalid mentions');
+  return List<String>.unmodifiable(json.cast<String>());
+}
+
+/// Strict `mentions` from a payload: at most 64 distinct user ids.
+List<String> mentionsFromJson(Object? json) {
+  final list = _mentions(json);
+  if (list.toSet().length != list.length) throw const FormatException('Invalid mentions');
+  return list;
+}
 
 /// Message text bounds: at most 4096 UTF-8 bytes, empty only beside an attachment.
 bool validText(String text, {required bool hasAttachment}) => (text.isNotEmpty || hasAttachment) && utf8.encode(text).length <= maxTextBytes;
@@ -197,7 +230,10 @@ ChatMessage validate(ChatMessage message) {
       (message.link == null || message.text.contains(message.link!.url)) &&
       ((editedText == null) == (editedAt == null)) &&
       (editedText == null || validText(editedText, hasAttachment: message.attachment != null)) &&
-      (editedAt == null || validTime(editedAt));
+      (editedAt == null || validTime(editedAt)) &&
+      (message.sender == null || (_userId.hasMatch(message.sender!) && !message.outgoing)) &&
+      message.mentions.length <= maxMentions &&
+      message.mentions.every(_userId.hasMatch);
   if (!ok) throw const StoreException('Invalid chat message.', code: 'invalid');
   return ChatMessage(
     id: message.id.toLowerCase(),
@@ -213,5 +249,7 @@ ChatMessage validate(ChatMessage message) {
     editedText: editedText,
     editedAt: editedAt,
     reactions: message.reactions,
+    sender: message.sender,
+    mentions: message.mentions,
   );
 }

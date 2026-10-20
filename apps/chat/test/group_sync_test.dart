@@ -1,0 +1,173 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter_test/flutter_test.dart';
+import 'package:private_chat/core/api.dart';
+import 'package:private_chat/core/devices.dart';
+import 'package:private_chat/core/events.dart';
+import 'package:private_chat/crypto/fake_group_crypto.dart';
+import 'package:private_chat/messaging/group_sync.dart';
+import 'package:private_chat/store/message_store.dart';
+import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+
+import 'support/fake_ds.dart';
+
+/// The MLS transport (GroupSync) against the fake delivery service: create, add, Welcome, the log in
+/// order with cursors, 409 rebuild-and-retry, removal, and the poison-commit protocol.
+class Party {
+  Party._(this.user, this.sync, this.crypto, this.store, this.delivered);
+  final User user;
+  final GroupSync sync;
+  final FakeGroupCrypto crypto;
+  final MessageStore store;
+  final List<GroupDelivery> delivered;
+
+  static Future<Party> join(FakeDs ds, String name) async {
+    final user = User(id: '${name}_${'x' * (21 - name.length)}', username: name);
+    final prefs = MemoryDevicePrefs();
+    final device = await localDevice(prefs, user.id);
+    final api = ds.client(userId: user.id, username: name, deviceId: device.deviceId);
+    // One database per party (in-memory paths are shared single instances).
+    final store = await MessageStore.open(databaseFactoryFfi, '${Directory.systemTemp.createTempSync('group-sync').path}/m.db');
+    final crypto = FakeGroupCrypto(userId: user.id);
+    final delivered = <GroupDelivery>[];
+    final sync = GroupSync(
+      api: api,
+      crypto: crypto,
+      store: store,
+      me: user,
+      device: () async => device,
+      platform: 'ios',
+      ensurePinned: (_) async {},
+      backoff: (_) => Duration.zero,
+    )..onDelivery = (d) async => delivered.add(d);
+    ds.listen(device.deviceId, (event) {
+      switch (event) {
+        case GroupEvent():
+          unawaited(sync.onGroupFrame(event));
+        case WelcomeEvent():
+          unawaited(sync.onWelcome(event));
+        case ChannelEvent():
+          unawaited(sync.onChannel(event));
+        default:
+      }
+    });
+    await sync.ensureReady();
+    return Party._(user, sync, crypto, store, delivered);
+  }
+}
+
+Future<void> settle() async {
+  for (var i = 0; i < 20; i++) {
+    await Future<void>.delayed(Duration.zero);
+  }
+}
+
+Future<void> until(bool Function() test, [String what = 'condition']) async {
+  for (var i = 0; i < 200 && !test(); i++) {
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+  }
+  expect(test(), isTrue, reason: what);
+}
+
+void main() {
+  sqfliteFfiInit();
+  late FakeDs ds;
+  late Party alice, bob;
+  setUp(() async {
+    ds = FakeDs();
+    alice = await Party.join(ds, 'alice');
+    bob = await Party.join(ds, 'bob');
+  });
+
+  test('KeyPackages are stocked: 100 one-time and a last-resort one', () async {
+    final count = await ds.client(userId: bob.user.id, username: 'bob', deviceId: bob.crypto.deviceId).keyPackageCount();
+    expect(count['oneTime'], 100);
+    expect(count['lastResort'], isTrue);
+  });
+
+  test('create, add, Welcome, messages both ways, cursors advance', () async {
+    final group = await alice.sync.create(GroupKindName.private, name: 'Team', members: [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id), 'bob joined from the Welcome');
+    await until(() => ds.welcomes[bob.crypto.deviceId]?.isEmpty ?? true, 'the Welcome was removed');
+    expect((await bob.store.group(group.id))?.kind, GroupKindName.private);
+    await alice.sync.send(group.id, '{"n":1}');
+    await until(() => bob.delivered.isNotEmpty, 'bob received');
+    expect(bob.delivered.single.plaintext, '{"n":1}');
+    expect(bob.delivered.single.sender.userId, alice.user.id);
+    await bob.sync.send(group.id, '{"n":2}');
+    await until(() => alice.delivered.isNotEmpty, 'alice received');
+    expect(alice.delivered.single.plaintext, '{"n":2}');
+    await settle();
+    expect((await alice.store.group(group.id))!.cursor, 3);
+    expect((await bob.store.group(group.id))!.cursor, 3);
+    expect(ds.channels[group.id]!.members[bob.crypto.deviceId]!.cursor, 3);
+  });
+
+  test('a 409 drops the commit, catches up and rebuilds', () async {
+    final group = await alice.sync.create(GroupKindName.groupDm);
+    ds.conflicts = 2;
+    await alice.sync.add(group.id, [bob.user.id]);
+    expect(ds.conflicts, 0);
+    expect(await alice.crypto.pendingCommit(group.id), isNull);
+    await until(() => bob.crypto.groups.contains(group.id));
+    expect((await alice.crypto.members(group.id)).map((m) => m.userId).toSet(), {alice.user.id, bob.user.id});
+  });
+
+  test('a message sent while the group moved on is rebuilt for the new epoch', () async {
+    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id));
+    // Alice's next epoch lands on the server before bob processed it: bob's message is refused, then rebuilt.
+    final carol = await Party.join(ds, 'carol');
+    ds.listeners.remove(bob.crypto.deviceId);
+    await alice.sync.add(group.id, [carol.user.id]);
+    await bob.sync.send(group.id, '{"late":true}');
+    await until(() => alice.delivered.any((d) => d.plaintext == '{"late":true}'));
+    await until(() => carol.delivered.any((d) => d.plaintext == '{"late":true}'));
+  });
+
+  test('removal: the removed member stops, the others carry on', () async {
+    final carol = await Party.join(ds, 'carol');
+    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id, carol.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
+    await alice.sync.remove(group.id, bob.user.id);
+    await until(() => true);
+    await settle();
+    await until(() => (bob.store.group(group.id) as dynamic) != null);
+    var removed = false;
+    for (var i = 0; i < 100 && !removed; i++) {
+      removed = (await bob.store.group(group.id))!.membership == Membership.removed;
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect(removed, isTrue);
+    await alice.sync.send(group.id, '{"after":true}');
+    await until(() => carol.delivered.any((d) => d.plaintext == '{"after":true}'));
+    expect(bob.delivered.where((d) => d.plaintext == '{"after":true}'), isEmpty);
+  });
+
+  test('a commit every member rejects is reported, freezes the channel, and an admin rolls it back', () async {
+    final carol = await Party.join(ds, 'carol');
+    final group = await alice.sync.create(GroupKindName.private, members: [bob.user.id, carol.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id) && carol.crypto.groups.contains(group.id));
+    // Bob (not an admin) sends a commit removing carol: the delivery service can't tell, every member refuses it.
+    final api = ds.client(userId: bob.user.id, username: 'bob', deviceId: bob.crypto.deviceId);
+    String encode(Object v) => base64Url.encode(utf8.encode(jsonEncode(v))).replaceAll('=', '');
+    final me = {'userId': bob.user.id, 'deviceId': bob.crypto.deviceId, 'platform': 'ios'};
+    final victim = {'userId': carol.user.id, 'deviceId': carol.crypto.deviceId, 'platform': 'ios'};
+    await api.postCommit(group.id, encode({'t': 'commit', 'g': group.id, 'epoch': ds.channels[group.id]!.epoch, 'from': me, 'adds': [], 'removes': [victim], 'n': 999}));
+    await until(() => ds.channels[group.id]!.frozen != null, 'reported');
+    var frozen = await alice.store.group(group.id);
+    for (var i = 0; i < 100 && frozen?.frozen == null; i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+      frozen = await alice.store.group(group.id);
+    }
+    expect(frozen!.frozen, isNotNull);
+    await alice.sync.resolve(group.id, rollback: true);
+    expect(ds.channels[group.id]!.resolved, ['rollback']);
+    expect((await alice.store.group(group.id))!.frozen, isNull);
+    await alice.sync.send(group.id, '{"thawed":true}');
+    await until(() => carol.delivered.any((d) => d.plaintext == '{"thawed":true}'));
+  });
+}
+

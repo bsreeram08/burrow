@@ -33,7 +33,8 @@ class FakeGroupCrypto implements GroupCrypto {
     }
   }
 
-  static String _digest(String text) => sha256.convert(utf8.encode(text)).toString();
+  /// SHA-256 (hex) of the message bytes, like the engine's commit digest.
+  static String _digest(String text) => sha256.convert(base64Url.decode(base64Url.normalize(text))).toString();
 
   _Group _group(String groupId) => _groups[groupId] ?? (throw const CryptoException('unknown group', code: 'unknown-group'));
 

@@ -18,6 +18,9 @@ const keyPackageLow = 20;
 
 /// Conflicts (409) rebuild and retry: at most 5 tries, backing off 0.5, 1, 2, 4 s (§4).
 const commitAttempts = 5;
+/// Tries to commit this device's re-signed leaf in one group after a succession (m5 §7).
+const recommitAttempts = 5;
+
 Duration commitBackoff(int attempt) => Duration(milliseconds: 500 * (1 << attempt));
 
 /// At most this many users per KeyPackage claim (§4).
@@ -386,7 +389,7 @@ class GroupSync {
 
   /// [updateLeaf] until the group holds no stale leaf of this device, at most [attempts] times with backoff.
   /// Returns whether it got there.
-  Future<bool> recommitLeaf(String groupId, {int attempts = 5}) async {
+  Future<bool> recommitLeaf(String groupId, {int attempts = recommitAttempts}) async {
     final self = (await device()).deviceId;
     for (var attempt = 0; attempt < attempts; attempt++) {
       if (attempt > 0) await Future<void>.delayed(_backoff(attempt - 1) * 2);

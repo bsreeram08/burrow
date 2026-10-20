@@ -460,8 +460,9 @@ void main() {
       alice.crypto.staleDevices.add(alice.crypto.deviceId);
       ds.identityConflict = true;
       ds.commitsSeen = 0;
-      expect(await alice.sync.recommitLeaf(group.id, attempts: 3), isFalse);
-      expect(ds.commitsSeen, 3);
+      expect(await alice.sync.recommitLeaf(group.id), isFalse);
+      expect(ds.commitsSeen, recommitAttempts, reason: 'the app makes exactly this many tries');
+      expect(recommitAttempts, 5);
     });
   });
 }

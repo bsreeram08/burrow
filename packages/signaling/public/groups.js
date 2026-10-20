@@ -349,14 +349,15 @@
     const ch = channels.get(id);
     if (entry.from.deviceId === deviceId) {
       // Our own: application messages are already stored; a commit is merged here only if it was left pending.
-      if (entry.kind === 'commit' && await run({ cmd: 'mlsPending', group: id }).catch(() => null)) await run({ cmd: 'mlsReceive', group: id, message: entry.message }).catch(() => {});
+      if (entry.kind === 'commit' && await run({ cmd: 'mlsPending', group: id }).catch(() => null)) await run({ cmd: 'mlsReceive', group: id, message: entry.message, expect: 'commit' }).catch(() => {});
       return 'ok';
     }
     const before = entry.kind === 'commit' ? await treeUsers(id) : null, rolesBefore = entry.kind === 'commit' ? ch.admins.slice() : null;
     await ensurePins([entry.from.userId]);
     let processed;
     for (let attempt = 0; ; attempt++) {
-      try { processed = await withPins(id, () => run({ cmd: 'mlsReceive', group: id, message: entry.message, commit: false })); break; }
+      // The log says what the entry is; the core refuses a message that is something else.
+      try { processed = await withPins(id, () => run({ cmd: 'mlsReceive', group: id, message: entry.message, commit: false, expect: entry.kind === 'app' ? 'application' : 'commit' })); break; }
       catch (error) {
         if (error.code === 'stale') return 'stop';
         if (error.code === 'replay') return 'ok'; // Already processed (we stopped between storing it and moving the cursor).
@@ -485,7 +486,7 @@
     if (!usable(ch) || !idle(id) || message.from?.deviceId === deviceId) return;
     enqueue(id, async () => {
       try {
-        const processed = await run({ cmd: 'mlsReceive', group: id, message: message.message });
+        const processed = await run({ cmd: 'mlsReceive', group: id, message: message.message, expect: 'application' });
         const payload = JSON.parse(processed.plaintext);
         if (processed.kind === 'application' && window.ChatStore.checkPayload(payload) === 'typing') typing(id, processed.sender.userId, payload);
       } catch {}

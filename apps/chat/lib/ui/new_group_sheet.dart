@@ -104,7 +104,7 @@ class _NewGroupSheetState extends ConsumerState<NewGroupSheet> {
                 switch (widget.kind) {
                   GroupKindName.public => 'Anyone here can find and join it. The server sees its name, never its messages.',
                   GroupKindName.private => 'Only people you add can read it. Its name is end-to-end encrypted.',
-                  _ => 'Pick two or more people to start a group. Everything in it is end-to-end encrypted.',
+                  _ => 'Choose at least two people for a group. Everything in it is end-to-end encrypted.',
                 },
                 style: TextStyle(color: muted),
               ),

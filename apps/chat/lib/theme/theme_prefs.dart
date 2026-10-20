@@ -54,7 +54,7 @@ class Display {
   final Density density;
   final ListStyle listStyle;
 
-  /// The room between messages and between chats in the list; it grows with the text size.
+  /// Space between messages and between chats; scales with the text size.
   double get gap => (density == Density.compact ? 1.0 : 3.0) * textSize.scale;
   double get rowPadding => (density == Density.compact ? 2.0 : 8.0) * textSize.scale;
 

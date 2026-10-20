@@ -139,7 +139,7 @@ class ThemePicker extends ConsumerWidget {
                   onSelectionChanged: (v) => notifier.setDisplay(display.copyWith(textSize: v.first)),
                 ),
                 label('Spacing'),
-                Text('The room between messages and between chats in the list. It grows with the text size.', style: TextStyle(color: scheme.onSurface.withValues(alpha: .7))),
+                Text('Space between messages and between chats. Scales with the text size.', style: TextStyle(color: scheme.onSurface.withValues(alpha: .7))),
                 const SizedBox(height: 8),
                 SegmentedButton<Density>(
                   segments: const [ButtonSegment(value: Density.comfortable, label: Text('Comfortable')), ButtonSegment(value: Density.compact, label: Text('Compact'))],
@@ -155,7 +155,7 @@ class ThemePicker extends ConsumerWidget {
                 Padding(
                   padding: const EdgeInsets.only(top: 6),
                   child: Text(
-                    display.listStyle == ListStyle.detailed ? 'Each chat with its picture, the time and the last message.' : 'One line per chat.',
+                    display.listStyle == ListStyle.detailed ? 'Picture, time and last message for each chat.' : 'One line per chat.',
                     style: TextStyle(color: scheme.onSurface.withValues(alpha: .7)),
                   ),
                 ),

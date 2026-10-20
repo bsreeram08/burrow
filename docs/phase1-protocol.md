@@ -86,14 +86,14 @@ Theme families (each with light and dark; "System" follows the OS). Existing the
 
 | Family | Mood | Light bg / surface / text / accent | Dark bg / surface / text / accent | Font |
 | --- | --- | --- | --- | --- |
-| Classic | Warm paper by day, ink by night | `#FBF8F3` `#F2EDE4` `#1F1B16` `#5B6CF0` | `#121214` `#1C1C20` `#ECEAE6` `#7C8BFF` | System sans |
-| Forest | Soft green-grey and deep forest | `#F3F6F2` `#E5ECE3` `#18231B` `#2F7A4F` | `#0F1712` `#17221B` `#E3EDE5` `#5FBF86` | System sans |
-| Ocean | Sea glass and deep teal | `#F1F8F8` `#E0EFF0` `#0F2328` `#0F8A9D` | `#0B1A1E` `#12262B` `#E0F1F3` `#3CC6D8` | System sans |
-| Dusk | Lilac evenings and violet ink, a little sunset | `#F7F3FB` `#ECE4F5` `#221A2B` `#7B4FD6` | `#17121F` `#221A2D` `#EEE6F7` `#B08CFF` (secondary `#FF9A76`) | System sans |
-| Rose | Blush and raspberry | `#FDF4F5` `#F8E5E8` `#2A1418` `#C8305A` | `#1C1013` `#2A181D` `#F7E6EA` `#FF6F93` | System sans |
-| Paper | Old paper and rust, serif throughout | `#F6F0E4` `#EDE4D2` `#2B2118` `#A44A26` | `#1A1611` `#26201A` `#EFE6D6` `#E07A4F` | Serif (Georgia / New York) |
-| Mono | Greyscale, monospaced, square avatars | `#FFFFFF` `#F2F2F2` `#111111` `#111111` | `#0A0A0A` `#161616` `#EDEDED` `#EDEDED` | Monospace; square avatars; no name colours |
-| Midnight | True black for OLED, electric accent, vivid names | — (dark only) | `#000000` `#0E0E10` `#F5F5F7` `#3D7BFF` | System sans |
+| Classic | Off-white by day, charcoal by night, indigo accent | `#FBF8F3` `#F2EDE4` `#1F1B16` `#5B6CF0` | `#121214` `#1C1C20` `#ECEAE6` `#7C8BFF` | System sans |
+| Forest | Muted greens, deep green accent | `#F3F6F2` `#E5ECE3` `#18231B` `#2F7A4F` | `#0F1712` `#17221B` `#E3EDE5` `#5FBF86` | System sans |
+| Ocean | Pale aqua, teal accent | `#F1F8F8` `#E0EFF0` `#0F2328` `#0F8A9D` | `#0B1A1E` `#12262B` `#E0F1F3` `#3CC6D8` | System sans |
+| Dusk | Soft violet, purple accent, a touch of coral | `#F7F3FB` `#ECE4F5` `#221A2B` `#7B4FD6` | `#17121F` `#221A2D` `#EEE6F7` `#B08CFF` (secondary `#FF9A76`) | System sans |
+| Rose | Pale pink, crimson accent | `#FDF4F5` `#F8E5E8` `#2A1418` `#C8305A` | `#1C1013` `#2A181D` `#F7E6EA` `#FF6F93` | System sans |
+| Paper | Cream and brown, serif text | `#F6F0E4` `#EDE4D2` `#2B2118` `#A44A26` | `#1A1611` `#26201A` `#EFE6D6` `#E07A4F` | Serif (Georgia / New York) |
+| Mono | Black, white and grey, monospaced, square avatars | `#FFFFFF` `#F2F2F2` `#111111` `#111111` | `#0A0A0A` `#161616` `#EDEDED` `#EDEDED` | Monospace; square avatars; no name colours |
+| Midnight | Pure black for OLED, bright blue accent | — (dark only) | `#000000` `#0E0E10` `#F5F5F7` `#3D7BFF` | System sans |
 
 Own bubbles use the accent at 100% with contrasting text (≥ 4.5:1); others use `surface`. Names are coloured from a per-theme palette of 8 (hash of user id) except Mono.
 

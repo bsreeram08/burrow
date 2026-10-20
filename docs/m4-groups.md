@@ -27,6 +27,7 @@ chatcore accepts a member's certificate only if it verifies under the account ke
 - **Everyone else** (people you meet in a group or channel): trust on first use from the server: `GET /api/users/:userId/identity` → `{ userId, username, identity: { dh, sign } }`, then `notePeer(userId, identity)`. This is the same key the delivery service validated the commit with, so client and server agree. A later different key is a security-code change: the group pauses for that person until it is reviewed (never silently re-pinned).
 - **When to pin.** Before `mlsJoin` (Welcome) and `mlsJoinExternal`: every user in `GET /api/channels/:id/members`. Before processing a log entry: its `from.userId`, and every member the last `members` fetch listed. If a call still fails with `no pinned account key for user <userId>` (chatcore names the user), pin that user and retry once.
 - **Pin problems are local, never poison.** If a commit fails while a pin is missing, blocked or just changed, do not report poison; pause that channel ("Review <name>'s security code to keep reading this channel") and resume after review. Only a failure with every involved pin current is reported (§7).
+- **Reviewing a changed code is always explicit.** For a contact, the 1:1 safety sheet. For someone met only in groups, a review sheet showing the code before and after, with **Not now**, **Accept new code** (`acceptChange`) and **Mark as verified** (`acceptChange` + `setVerified`). Nothing calls `acceptChange` without that tap. Keep the previous identity when `notePeer` records a change so the sheet can show it. The code shown is a fingerprint: SHA-256 over the UTF-8 string `dh + "|" + sign`, then 12 groups of 5 digits, group *i* = `byte[2i] * 256 + byte[2i+1]` zero-padded.
 
 ## 4. Creating, adding, removing, leaving, joining
 
@@ -71,6 +72,7 @@ Per channel, one queue processes everything in `seq` order: `group` frames when 
 
 1. `from.deviceId` is this device: skip it, except a commit while `mlsPending` is set, which goes to `mlsReceive` (it merges our own commit).
 2. Otherwise `mlsReceive { group, message, commit: false, expect }` with `expect` `'application'` for a log entry of kind `app` and `'commit'` for `commit` (the core refuses a message that is the other kind), then:
+   - **The kind must match the log**: an `app` entry must come back `application`, a `commit` entry must come back `commit`, `own` or `removed`. On any mismatch, `mlsAbortReceived`, skip the entry with a notice, and never commit it (the core also refuses a mismatch when `expect` is set).
    - `application`: parse the payload, store it (§10), then `mlsCommitReceived`. A payload that fails validation is acknowledged and dropped (`mlsCommitReceived` all the same, so the key is spent).
    - `commit`: `mlsCommitReceived`; refresh members; write a system line for joins and removals ("alice added bob", "carol left", "dave joined").
    - `removed`: `mlsCommitReceived`; the channel becomes read-only ("You were removed from #design"); stop processing it.
@@ -80,7 +82,12 @@ Errors: `replay` (already processed, e.g. after a crash between commit and curso
 
 ## 7. Frozen channels and poison commits
 
-A commit that `mlsReceive` rejects with `poison <digest>: …` (and whose pins are all current, §3) is reported with `POST /api/channels/:id/poison { seq, digest }`; processing stops. The channel shows a banner "This channel is paused while an admin checks a change." Admins (the `channel` frame `frozen`, or a 423 on send) see "A change to #name was rejected by a member" with **Roll back** (removes the change and its author's device) and **Dismiss** (keeps it). Each signs `"webrtc-bun-mlsresolve-v1\n" + channelId + "\n" + action + "\n" + seq + "\n" + digest` with the **device key** (the key the device registered with `announce`) and posts `POST .../resolve`. After a rollback an admin device gets `remove-needed { deviceId }` and removes that device's leaf with an ordinary commit (`removes: [{ userId, deviceId }]`). A device that already merged the rolled-back commit can't continue: it resyncs (§4). `thawed` resumes processing.
+A commit that `mlsReceive` rejects with `poison <digest>: …` (and whose pins are all current, §3) is reported with `POST /api/channels/:id/poison { seq, digest }`; processing stops. The channel shows a banner "This channel is paused while an admin checks a change." An admin device (the `channel` frame `frozen` with `seq` and `digest`, a 423 on send, or `frozen` in a log page) **checks the commit itself before offering anything**: fetch `GET .../log?after=<seq-1>`, take the entry at `seq`, require `kind: 'commit'` and SHA-256 (hex) of its bytes equal to the reported digest, then:
+- `fails`: this device rejected it itself (it reported it), or `mlsReceive { commit: false, expect: 'commit' }` fails with `poison`. Offer **Roll back** and **Dismiss**: "…was rejected by a member's device, and this device rejects it too."
+- `ok`: this device built it, already merged it (cursor ≥ seq), or the trial receive succeeds (then `mlsAbortReceived`: nothing is kept). Offer **Dismiss** only: "…but it checks out on this device."
+- `unknown`: no matching entry, a digest mismatch, or any other error. Offer **Dismiss** only: "This device couldn't check it, so rolling back isn't offered."
+
+The client refuses to sign a rollback unless the check said `fails`. Signing: `"webrtc-bun-mlsresolve-v1\n" + channelId + "\n" + action + "\n" + seq + "\n" + digest` with the **device key** (the key registered with `announce`), posted to `POST .../resolve`. **`remove-needed` frames are ignored**: a frame alone never makes a device remove anyone. The admin that rolled back removes exactly the device its own resolve answer names (`removeDevice`) with an ordinary commit (`removes: [{ userId, deviceId }]`). A device that already merged the rolled-back commit can't continue: it resyncs (§4). `thawed` resumes processing and sends what waited.
 
 ## 8. Server additions in M4
 
@@ -90,7 +97,7 @@ A commit that `mlsReceive` rejects with `poison <digest>: …` (and whose pins a
 | `GET /api/users/:userId/identity` | `{ userId, username, identity: { dh, sign } }` for any account (ids are 128-bit random, so this enumerates nothing). 404 if unknown or without keys. Rate limited. |
 | `POST /api/channels/:id/ephemeral { message }` | An application message (private MLS message, at most 2 KiB) for the current epoch (409 `{ epoch }` otherwise). Not logged, not stored, not pushed: sent once to the open streams of the channel's other member devices as `{ type: 'ephemeral', channel, from: { userId, deviceId }, message, createdAt }`. `202 { delivered }`. 10/s per account. |
 
-Receivers process an `ephemeral` frame with `mlsReceive { commit: true }` only when the channel's queue is idle and the payload is `typing`; anything else, or any error, is dropped silently.
+Receivers process an `ephemeral` frame only when the channel's queue is idle, with `mlsReceive { commit: false, expect: 'application' }`. They call `mlsCommitReceived` only when the result is `kind: 'application'` and the payload checks as `typing`; for anything else (a commit, a message, an invalid payload, an error) they call `mlsAbortReceived` and drop it silently. A live frame never changes group state beyond spending one typing message's key.
 
 ## 9. Web specifics
 

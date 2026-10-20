@@ -278,7 +278,9 @@ try {
     return { status: response.status, seq: entry.seq };
   }, general);
   if (report.status !== 202) throw new Error(`report: ${JSON.stringify(report)}`);
-  await until(bob, () => !document.getElementById('group-dismiss').hidden && /rejected/.test(document.getElementById('group-banner-text').textContent));
+  // Bob's device re-checks the reported commit (it made it): it checks out, so only Dismiss is offered.
+  await until(bob, () => !document.getElementById('group-dismiss').hidden && /checks out/.test(document.getElementById('group-banner-text').textContent));
+  if (!await bob.locator('#group-rollback').isHidden()) throw new Error('Rollback offered for a commit that checks out');
   await shot(bob, 'frozen');
   await bob.fill('#chat-input', 'while frozen'); await bob.press('#chat-input', 'Enter');
   await bob.waitForTimeout(1500);
@@ -292,7 +294,7 @@ try {
   await openGroup(dave, 'general');
   await sees(dave, 'Back to normal');
   if (await message(alice, 'Back to normal').count()) throw new Error('a member who left still receives');
-  step('carol reports the commit: #general freezes, bob sees "rejected" with Roll back / Dismiss, dismisses it, and the queued message goes out');
+  step('carol reports the commit: #general freezes, bob\'s device re-checks it ("checks out", no Roll back), he dismisses it, and the queued message goes out');
 
   console.log('GROUPS E2E PASSED');
 } catch (error) {

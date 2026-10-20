@@ -268,6 +268,15 @@
     <div class="dialog-actions"><button id="group-leave-cancel" type="button">Stay</button><button id="group-leave-yes" class="danger" type="button">Leave</button></div>
   </div></div>
 
+  <div id="pin-review" class="dialog" role="dialog" aria-modal="true" aria-labelledby="pin-review-title" hidden><div class="dialog-card">
+    <h2 id="pin-review-title">Security code changed</h2>
+    <p>Their account key is not the one this device knew. That happens when they reinstall or reset their keys, and also when someone tries to pose as them. Compare the new code with them in person or on a call before you trust it.</p>
+    <h3>Before</h3><p id="pin-review-before" class="safety-number"></p>
+    <h3>Now</h3><p id="pin-review-after" class="safety-number"></p>
+    <p id="pin-review-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="pin-review-cancel" type="button">Not now</button><button id="pin-review-accept" type="button">Accept new code</button><button id="pin-review-verify" class="primary" type="button">Mark as verified</button></div>
+  </div></div>
+
   <div id="receipt-info" class="dialog" role="dialog" aria-modal="true" aria-labelledby="receipt-title" hidden><div class="dialog-card">
     <h2 id="receipt-title">Message info</h2>
     <h3>Read by</h3><ul id="receipt-read" class="pick-list"></ul>

@@ -368,6 +368,7 @@ class AppController extends Notifier<AppState> {
     await prefs.writeDevice(_linkOwner, 'null'); // The next link starts with a new device.
     prefs.setPin(setup.user.id, setup.user.id, setup.pin);
     await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:${setup.user.id}', setup.metaKey);
+    await (await _certKey(setup.user.id)).write(setup.identity.sign); // The grant's certificate is under this key.
     await (await SharedPreferences.getInstance()).setString('linked-core-v1:${setup.user.id}', 'keys-link-${link.deviceId}');
     await _signedIn(setup.user, setup.token, linked: setup.bundle);
   }
@@ -434,6 +435,8 @@ class AppController extends Notifier<AppState> {
     groups = g;
     // Moved 1:1 chats travel through their DM groups (m5 §8).
     m.groups = g;
+    sync.followIdentity = _followAuthor;
+    _certKeyCached = await _certKey(user.id);
     _subscriptions
       ..add(sync.notices.listen((text) => state = state.copyWith(notice: text)))
       ..add(g.notices.listen((text) => state = state.copyWith(notice: text)))
@@ -506,14 +509,22 @@ class AppController extends Notifier<AppState> {
   /// This primary takes the QR text of the device taking over.
   Future<HandOver> handOver(String qr) async {
     final ctx = linkContext() ?? (throw StateError('Not signed in'));
-    return HandOver.fromQr(ctx, ref.read(groupCryptoProvider), qr);
+    return HandOver.fromQr(ctx, ref.read(groupCryptoProvider), qr, hold: (held) async {
+      final sync = groups?.sync;
+      if (sync == null) return;
+      held ? sync.held = true : await sync.release();
+    });
   }
 
   /// The user confirmed on this primary: sign the account over, then continue here as a linked device.
   Future<void> finishHandOver(HandOver h) async {
     final userId = state.user?.id;
     final metaKey = await h.approve();
-    if (userId != null) await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:$userId', metaKey);
+    if (userId != null) {
+      await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:$userId', metaKey);
+      final under = h.request?.identity.sign; // The demote's certificate is under the new key.
+      if (under != null) await (await _certKey(userId)).write(under);
+    }
     await _reopen();
     await _recommitLeaves();
   }
@@ -573,7 +584,35 @@ class AppController extends Notifier<AppState> {
   OwnSuccession? _ownSuccession() {
     final m = messenger, s = store, g = groups, user = state.user;
     if (m == null || s == null || g == null || user == null) return null;
-    return OwnSuccession(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), store: s, updateLeaf: g.sync.updateLeaf, me: user, platform: _api.client, chat: _crypto, devices: m.devices, device: m.device);
+    return OwnSuccession(
+      api: _api,
+      link: ref.read(linkCryptoProvider),
+      groups: ref.read(groupCryptoProvider),
+      store: s,
+      updateLeaf: g.sync.updateLeaf,
+      me: user,
+      platform: _api.client,
+      chat: _crypto,
+      devices: m.devices,
+      device: m.device,
+      certKey: _certKeyCached,
+    );
+  }
+
+  /// The account key this device's MLS certificate is under, persisted per account (§5.2.2).
+  ({Future<String?> Function() read, Future<void> Function(String sign) write})? _certKeyCached;
+  Future<({Future<String?> Function() read, Future<void> Function(String sign) write})> _certKey(String userId) async {
+    final prefs = await SharedPreferences.getInstance(), key = 'cert-key-v1:$userId';
+    return (read: () async => prefs.getString(key), write: (String sign) async => prefs.setString(key, sign).then((_) {}));
+  }
+
+  /// The author of a commit about to be reported as poison may have moved to a new account key (m5 §5.2): ours
+  /// follows our own chain, a contact's is checked again. True when a pin moved.
+  Future<bool> _followAuthor(String userId) async {
+    if (userId == state.user?.id) return messenger?.companion ?? false ? await _ownSuccession()?.follow() ?? false : false;
+    final before = (await _crypto.peer(userId))?.identity;
+    await _checkIdentity(userId);
+    return (await _crypto.peer(userId))?.identity != before;
   }
 
   Future<void> _followSuccession() async {

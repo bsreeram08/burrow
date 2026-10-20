@@ -144,7 +144,7 @@ void main() {
     final p0Ctx = LinkContext(api: p0Api, crypto: p0Chat, link: r.p0Link, messenger: p0Messenger, store: r.p0Store, contacts: () => [], wait: (_) async => Future<void>.delayed(const Duration(milliseconds: 5)));
     r.take = await TakeOver.start(api: r.nApi, link: r.nLink, groups: r.nGroups, device: await r.nMessenger.device(), platform: 'macos', wait: (_) => Future<void>.delayed(const Duration(milliseconds: 5)));
     final offered = r.take.waitOffer();
-    r.hand = await HandOver.fromQr(p0Ctx, r.p0Groups, r.take.qr);
+    r.hand = await HandOver.fromQr(p0Ctx, r.p0Groups, r.take.qr, hold: (held) async => r.holds.add(held));
     expect(await offered, r.hand.code, reason: 'both screens show the same digits');
     r.request = await r.hand.waitRequest();
     expect(r.request.leafSigKey, await r.nGroups.deviceLeaf());
@@ -162,6 +162,7 @@ void main() {
     expect(r.nGroups.recertified, 1);
     expect(r.nMessenger.companion, isFalse);
     expect(r.marker, isNull, reason: 'the marker is cleared when done');
+    expect(r.holds, [true], reason: 'the old primary stopped group traffic before succession and stepped down held');
     // P0: a linked device of the new key now, with its leaf certified under it.
     expect(r.p0Link.identity, isNull);
     expect(r.p0Link.companion?.identity, r.request.identity);
@@ -183,6 +184,8 @@ void main() {
     await expectLater(r.take.run(r.nMessenger, platform: 'macos', markers: r.markers), throwsA(isA<StoreException>()));
     expect((r.succession, r.published, r.served['sign']), (null, null, r.p0Link.identity!.sign), reason: 'no record, keys or list');
     expect((r.nMessenger.companion, r.marker), (true, null));
+    await Future<void>.delayed(const Duration(milliseconds: 400));
+    expect(r.holds, [true, false], reason: 'still the primary after a failed hand-over: group traffic resumes');
     await r.nStore.close();
     await r.p0Store.close();
   });
@@ -232,7 +235,11 @@ void main() {
     final link = FakeLinkCrypto()..companion = (userId: me.id, identity: old, certJson: '{}');
     final store = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
     final groups = FakeGroupCrypto(userId: me.id);
-    OwnSuccession own() => OwnSuccession(api: api, link: link, groups: groups, store: store, updateLeaf: (_) async {}, me: me, platform: 'macos');
+    String? under = old.sign; // The account key our certificate is under.
+    OwnSuccession own() => OwnSuccession(
+      api: api, link: link, groups: groups, store: store, updateLeaf: (_) async {}, me: me, platform: 'macos',
+      certKey: (read: () async => under, write: (String sign) async => under = sign),
+    );
 
     // A served key with a forged chain moves nothing.
     chain = [{...chain.single, 'signature': b64(List.filled(64, 1))}];
@@ -244,6 +251,10 @@ void main() {
     expect(link.companion?.identity, next);
     expect(asked.single['leafSigKey'], await groups.deviceLeaf());
     expect(await own().follow(), isFalse, reason: 'already there');
+    expect(asked, hasLength(2), reason: 'the certificate is still under the old key: asked again (a first ask can be refused)');
+    under = next.sign;
+    expect(await own().follow(), isFalse);
+    expect(asked, hasLength(2), reason: 'certified under the current key: no more asking');
     await store.close();
   });
 
@@ -333,6 +344,9 @@ class _Rig {
   Map<String, dynamic>? succession, published;
   late Map<String, dynamic> served;
   int records = 0, lists = 0;
+
+  /// The old primary's group processing: stopped (true) from sending `succession`, resumed (false) on failure.
+  final List<bool> holds = [];
   bool Function(String method, String path)? fail;
   String? marker;
   late final TakeOverMarkers markers = (read: () async => marker, write: (String? v) async => marker = v);

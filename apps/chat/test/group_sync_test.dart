@@ -212,6 +212,39 @@ void main() {
     expect((await alice.crypto.members(group.id)).any((m) => m.userId == bob.user.id), isTrue);
   });
 
+  test('while a hand-over holds group traffic nothing is processed; released, the log is read from where it stopped', () async {
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id), 'bob joined');
+    bob.sync.held = true;
+    await alice.sync.send(group.id, 'during the hand-over');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect(bob.delivered, isEmpty);
+    await bob.sync.release();
+    await until(() => bob.delivered.any((d) => d.plaintext == 'during the hand-over'), 'read after the release');
+  });
+
+  test("a commit that would be poison under an author's old key is retried once their identity is followed", () async {
+    final group = await alice.sync.create(GroupKindName.private);
+    await alice.sync.add(group.id, [bob.user.id]);
+    await until(() => bob.crypto.groups.contains(group.id), 'bob joined');
+    // alice's next commit fails here (as a recertify under a key bob doesn't pin yet would) until bob follows her.
+    bob.crypto.tagFailFrom = alice.crypto.deviceId;
+    final followed = <String>[];
+    bob.sync.followIdentity = (userId) async {
+      followed.add(userId);
+      bob.crypto.tagFailFrom = null; // Her new key is pinned now.
+      return true;
+    };
+    await alice.sync.setAdmins(group.id, [alice.user.id, bob.user.id]);
+    for (var i = 0; i < 200 && !(await bob.crypto.roles(group.id)).isAdmin(bob.user.id); i++) {
+      await Future<void>.delayed(const Duration(milliseconds: 5));
+    }
+    expect((await bob.crypto.roles(group.id)).isAdmin(bob.user.id), isTrue);
+    expect(followed, [alice.user.id]);
+    expect(ds.channels[group.id]!.frozen, isNull, reason: 'not reported as poison');
+  });
+
   test('rollback is signed only when the admin device itself finds the frozen commit bad', () async {
     final group = await alice.sync.create(GroupKindName.private);
     await alice.sync.add(group.id, [bob.user.id]);

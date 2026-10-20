@@ -189,6 +189,20 @@ class GroupSync {
   DeliveryHandler? onDelivery;
   Future<void> Function(MembershipChange change)? onMembership;
 
+  /// The author of a commit this device would report as poison: follow their identity (ours: our account's
+  /// succession chain; a contact's: their served identity and chain). True when a pin moved, so it is retried.
+  Future<bool> Function(String userId)? followIdentity;
+
+  /// While this primary hands the account over (m5 §5.2): no group traffic is processed (the new primary's
+  /// commits are under a key this device doesn't pin yet). Released with [release].
+  bool held = false;
+
+  /// Ends [held] and reads every channel's log from where it stopped.
+  Future<void> release() async {
+    held = false;
+    await refresh().catchError((_) {});
+  }
+
   /// This device joined a 1:1 chat's DM group (m5 §8.3): a pointer waiting for it can be tried now.
   void Function(String groupId)? onDmJoined;
   final int Function() _now;
@@ -523,7 +537,7 @@ class GroupSync {
 
   /// An `ephemeral` frame: processed only while the channel's queue is idle; anything wrong is dropped.
   Future<void> onEphemeral(GroupEphemeral event) async {
-    if ((_busy[event.channel] ?? 0) > 0 || keysLocked) return;
+    if ((_busy[event.channel] ?? 0) > 0 || keysLocked || held) return;
     final group = await store.group(event.channel);
     final local = await device();
     if (group == null || !group.active || event.fromDeviceId == local.deviceId) return;
@@ -615,8 +629,9 @@ class GroupSync {
   }
 
   /// Processes one entry (§6). Returns false when processing must stop here (retry later, paused, ended).
-  Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false}) async {
+  Future<bool> _process(GroupConversation group, LogEntry entry, {bool repinned = false, bool refollowed = false}) async {
     if (entry.seq <= group.cursor) return true;
+    if (held) return false; // A hand-over in progress: the cursor stays until it is done.
     final local = await device();
     if (entry.fromUser == me.id && entry.fromDevice == local.deviceId) {
       // Never our own application messages; our own commit only while one is pending (the answer was lost).
@@ -673,6 +688,12 @@ class GroupSync {
         }
       }
       if (error.code == 'poison') {
+        // A recertify commit under a new account key can arrive before the devices or keys frame: follow the
+        // author's identity (our own succession chain, or a contact's) and try once more before blaming it.
+        final follow = followIdentity;
+        if (!refollowed && follow != null && await follow(entry.fromUser).catchError((_) => false)) {
+          return _process(group, entry, repinned: repinned, refollowed: true);
+        }
         await _reportPoison(group, entry);
         return false;
       }

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import '../core/api.dart';
 import '../core/devices.dart';
@@ -50,6 +51,28 @@ class _Inbox {
 
 final _key = RegExp(r'^[A-Za-z0-9_-]{43}$');
 
+/// Our own account's list as served, verified under [aikSign] and moving forward from our [pin]: each device with
+/// its `addedAt` and, when [metaKey] opens it, its sealed label (`{label, platform}`). Null when it doesn't verify.
+/// Only these devices are ever carried into a new key's list or certified (never the server's raw device rows).
+List<({String deviceId, int addedAt, Map<String, String>? described})>? verifiedOwnList(
+  Map<String, dynamic> view, {
+  required String userId,
+  required String aikSign,
+  DevicePin? pin,
+  Uint8List? metaKey,
+}) {
+  final check = verifyView(userId: userId, aikSign: aikSign, list: view['list'], signature: view['signature'], certs: view['certs'], pin: pin);
+  if (!check.ok) return null;
+  return [
+    for (final d in ((view['list']! as Map)['devices']! as List).cast<Map>())
+      (
+        deviceId: d['deviceId'] as String,
+        addedAt: d['addedAt'] as int,
+        described: metaKey == null ? null : openMeta(metaKey, userId, d['deviceId'] as String, d['meta'] as String? ?? ''),
+      ),
+  ];
+}
+
 /// This device is the primary and hands the account over to another device of it (m5 §5.2, P0). Nothing is
 /// signed before the user compares the codes and confirms; this device deletes its account key only once the
 /// server serves the new one and the new primary sent `demote` (its certificate under the new key).
@@ -89,8 +112,8 @@ class HandOver {
   }
 
   /// The user confirmed: sign the account over, wait for the new primary to take over, then step down to a linked
-  /// device of the new key (keeping this device's key, leaf and groups).
-  Future<void> approve({Duration timeout = const Duration(minutes: 5)}) async {
+  /// device of the new key (keeping this device's key, leaf and groups). Returns the new device-label key.
+  Future<String> approve({Duration timeout = const Duration(minutes: 5)}) async {
     final r = request ?? (throw StateError('No request yet'));
     final me = _ctx.messenger.me, own = await _ctx.crypto.identity();
     final signed = (jsonDecode(await _ctx.link.signSuccession(userId: me.id, publishedSign: own.sign, newIdentity: r.identity, at: _ctx.now())) as Map).cast<String, Object?>();
@@ -98,12 +121,13 @@ class HandOver {
     await _ctx.api.linkSend(linkId, await _ctx.link.seal(linkId, jsonEncode({'v': 1, 'type': 'succession', 'record': signed, 'signature': signature, 'leafSigKey': await _groups.deviceLeaf()})));
     final demote = await _inbox.next('demote', const {'v', 'type', 'identity', 'cert', 'metaKey'}, timeout: timeout);
     final identity = demote['identity'];
-    if (identity is! Map || identity['sign'] != r.identity.sign || identity['dh'] != r.identity.dh || demote['cert'] is! String) throw const StoreException('The new primary sent something unexpected.');
+    if (identity is! Map || identity['sign'] != r.identity.sign || identity['dh'] != r.identity.dh || demote['cert'] is! String || demote['metaKey'] is! String || !_key.hasMatch(demote['metaKey'] as String)) throw const StoreException('The new primary sent something unexpected.');
     final served = (await _ctx.api.keyCount()).identity;
     if (served?['sign'] != r.identity.sign || served?['dh'] != r.identity.dh) throw const StoreException("The new primary hasn't taken over yet. Nothing changed here.");
     await _ctx.link.retireIdentity(userId: me.id, newIdentity: r.identity, at: signed['at']! as int);
     await _ctx.link.companionSetup(userId: me.id, identity: r.identity, certJson: demote['cert']! as String);
     await _ctx.link.end(linkId);
+    return demote['metaKey']! as String;
   }
 
   Future<void> cancel() async {
@@ -170,7 +194,8 @@ class TakeOver {
 
   /// After the primary confirmed: check the record, publish it, hold the new key, publish keys and list v1, then
   /// certify the old primary's leaf under the new key and tell it to step down.
-  Future<void> run(Messenger messenger, {required String platform, Duration timeout = const Duration(minutes: 10)}) async {
+  /// [oldMetaKey]: the account's device-label key from the link grant, to carry labels over (else platform names).
+  Future<void> run(Messenger messenger, {required String platform, Uint8List? oldMetaKey, Duration timeout = const Duration(minutes: 10)}) async {
     final minted = _minted ?? (throw StateError('waitOffer first'));
     final m = await _inbox.next('succession', const {'v', 'type', 'record', 'signature', 'leafSigKey'}, timeout: timeout);
     final record = m['record'], signature = m['signature'], primaryLeaf = m['leafSigKey'];
@@ -182,8 +207,14 @@ class TakeOver {
     }
     final view = await _api.devices(me.username);
     final rows = (view['devices'] as List? ?? const []).cast<Map>();
-    final primary = rows.where((row) => row['id'] == _primary && row['state'] == 'listed').firstOrNull;
-    if (primary == null) throw const StoreException("Your primary device isn't in your device list. Nothing changed.");
+    // Only devices our own signed list names (verified under the account key we pinned, from our pin) carry over.
+    final owned = verifiedOwnList(view, userId: me.id, aikSign: account.identity.sign, pin: messenger.devices.pin(me.id, me.id), metaKey: oldMetaKey);
+    if (owned == null) throw const StoreException("The device list on the server isn't one your primary signed. Nothing changed.");
+    bool listed(String id) => rows.any((row) => row['id'] == id && row['state'] == 'listed');
+    final p0 = owned.where((d) => d.deviceId == _primary && listed(d.deviceId)).firstOrNull;
+    if (p0 == null) throw const StoreException("Your primary device isn't in your device list. Nothing changed.");
+    String platformOf(({String deviceId, int addedAt, Map<String, String>? described}) d) =>
+        d.described?['platform'] ?? rows.firstWhere((row) => row['id'] == d.deviceId)['platform'] as String? ?? 'web';
     await _api.publishSuccession(r, signature);
     await _link.successionComplete(jsonEncode(r), signature);
     // From here this device holds the account key: 1:1 messaging, the device list, certificates.
@@ -192,17 +223,18 @@ class TakeOver {
     final self = (await messenger.device()).deviceId;
     final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
     final keep = <Map<String, Object?>>[
-      for (final d in ((view['list'] as Map?)?['devices'] as List? ?? const []).cast<Map>())
-        if (d['deviceId'] != self && rows.any((row) => row['id'] == d['deviceId'] && row['state'] == 'listed'))
-          () {
-            final platformOf = rows.firstWhere((row) => row['id'] == d['deviceId'])['platform'] as String? ?? 'web';
-            return {'deviceId': d['deviceId'], 'addedAt': d['addedAt'], 'meta': sealMeta(metaKey, me.id, d['deviceId'] as String, label: platformLabel(platformOf), platform: platformOf)};
-          }(),
+      for (final d in owned)
+        if (d.deviceId != self && listed(d.deviceId))
+          {
+            'deviceId': d.deviceId,
+            'addedAt': d.addedAt,
+            'meta': sealMeta(metaKey, me.id, d.deviceId, label: d.described?['label'] ?? platformLabel(platformOf(d)), platform: platformOf(d)),
+          },
     ];
     await messenger.publishNewChain(keep);
     final now = DateTime.now().millisecondsSinceEpoch;
     await _groups.recertify(platform: platform, issuedAt: now);
-    final cert = await _link.signDeviceCert(userId: me.id, deviceId: primary['id'] as String, platform: primary['platform'] as String, leafSigKey: primaryLeaf, issuedAt: now);
+    final cert = await _link.signDeviceCert(userId: me.id, deviceId: p0.deviceId, platform: platformOf(p0), leafSigKey: primaryLeaf, issuedAt: now);
     await _api.linkSend(linkId, await _link.seal(linkId, jsonEncode({'v': 1, 'type': 'demote', 'identity': minted.toJson(), 'cert': cert, 'metaKey': b64(metaKey)})), claim: claim);
     await _link.end(linkId);
   }
@@ -219,7 +251,19 @@ class TakeOver {
 /// signed chain and asks for its leaf to be certified under it; the new primary certifies only (device, leaf)
 /// pairs its own groups already hold.
 class OwnSuccession {
-  OwnSuccession({required this.api, required this.link, required this.groups, required this.store, required this.updateLeaf, required this.me, required this.platform, int Function()? now})
+  OwnSuccession({
+    required this.api,
+    required this.link,
+    required this.groups,
+    required this.store,
+    required this.updateLeaf,
+    required this.me,
+    required this.platform,
+    this.chat,
+    this.devices,
+    this.device,
+    int Function()? now,
+  })
     : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
 
   final Api api;
@@ -231,6 +275,11 @@ class OwnSuccession {
   final Future<void> Function(String groupId) updateLeaf;
   final User me;
   final String platform;
+
+  /// The primary's account key, pins and own device: what a recert answer is checked against.
+  final ChatCrypto? chat;
+  final DevicePrefs? devices;
+  final Future<LocalDevice> Function()? device;
   final int Function() _now;
 
   /// Linked device: the served account key moved on from our pin. Follows a valid chain (never the server's word
@@ -277,15 +326,29 @@ class OwnSuccession {
     return true;
   }
 
-  /// New primary: certifies each waiting linked device whose (device, leaf key) a group here already holds.
-  /// Returns how many.
+  /// New primary: certifies a waiting linked device only if our verified own list names it, it isn't this device,
+  /// and a group here already holds exactly that leaf as a current one; the platform comes from the device's sealed
+  /// label in our list, never from the request. Returns how many.
   Future<int> answerRecerts() async {
+    final chat = this.chat, devices = this.devices, device = this.device;
+    if (chat == null || devices == null || device == null) return 0;
     final requests = await api.recertRequests();
     if (requests.isEmpty) return 0;
+    final own = await chat.identity(), self = (await device()).deviceId;
+    final owned = verifiedOwnList(
+      await api.devices(me.username),
+      userId: me.id,
+      aikSign: own.sign,
+      pin: devices.pin(me.id, me.id),
+      metaKey: deviceMetaKey(await chat.deviceMetaSignature(me.id)),
+    );
+    if (owned == null) return 0;
     final channels = [for (final g in await store.groups()) if (g.active) g.id];
     var answered = 0;
     for (final r in requests) {
-      final deviceId = r['deviceId'] as String, leaf = r['leafSigKey'] as String, platform = r['platform'] as String;
+      final deviceId = r['deviceId'] as String, leaf = r['leafSigKey'] as String;
+      final platform = owned.where((d) => d.deviceId == deviceId && deviceId != self).firstOrNull?.described?['platform'];
+      if (platform == null) continue;
       if (!await groups.leafKnown(deviceId, leaf, channels).catchError((_) => false)) continue; // Asked again later.
       final cert = await link.signDeviceCert(userId: me.id, deviceId: deviceId, platform: platform, leafSigKey: leaf, issuedAt: _now());
       await api.answerRecert(deviceId, cert);

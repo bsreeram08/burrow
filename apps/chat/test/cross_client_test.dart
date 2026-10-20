@@ -397,7 +397,7 @@ void main() {
       if (event is! EnvelopeEvent) lg.onEvent(event);
     });
     await linkedEvents.connect();
-    await installLinkBundle(setup.bundle, linkedStore, linkedSync);
+    await installLinkBundle(setup.bundle, linkedStore);
     expect(await companion.checkActive(), isFalse);
     await lg.start();
     expect(lg.ready, isTrue, reason: lg.unavailable);

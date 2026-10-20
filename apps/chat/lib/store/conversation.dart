@@ -53,7 +53,7 @@ class GroupConversation {
     this.mentioned = false,
     this.metaAt = 0,
     this.peer,
-    this.dmChecked = false,
+    this.dmCheckedPeer,
     this.movedAt,
   });
 
@@ -76,11 +76,15 @@ class GroupConversation {
   /// `at` of the `meta` payload that set [name] and [topic] (latest wins).
   final int metaAt;
 
-  /// A 1:1 chat's DM group (kind dm, docs/m5-linking.md §8): the other person's user id.
+  /// A 1:1 chat's DM group (kind dm, docs/m5-linking.md §8): the other person's user id. Bound once, from the
+  /// first server row that names it, and never changed afterwards (see [copyWith]).
   final String? peer;
 
-  /// This device checked the DM group is exactly the DM of us two, chained to the pinned keys (mlsCheckDm).
-  final bool dmChecked;
+  /// The peer this device checked the DM group for (mlsCheckDm: exactly the DM of us two, chained to the pins).
+  final String? dmCheckedPeer;
+
+  /// Checked, and for the peer it is bound to.
+  bool get dmChecked => peer != null && dmCheckedPeer == peer;
 
   /// When the 1:1 chat with [peer] moved to this group (the pointer was sent or accepted, §8.2–§8.3).
   final int? movedAt;
@@ -101,7 +105,8 @@ class GroupConversation {
     GroupKindName? kind,
     int? metaAt,
     String? peer,
-    bool? dmChecked,
+    String? dmCheckedPeer,
+    bool clearDmCheck = false,
     int? movedAt,
   }) => GroupConversation(
     id: id,
@@ -116,8 +121,9 @@ class GroupConversation {
     unread: unread ?? this.unread,
     mentioned: mentioned ?? this.mentioned,
     metaAt: metaAt ?? this.metaAt,
-    peer: peer ?? this.peer,
-    dmChecked: dmChecked ?? this.dmChecked,
+    // A peer, once bound, is never rebound (by server rows or anything else).
+    peer: this.peer ?? peer,
+    dmCheckedPeer: clearDmCheck ? null : dmCheckedPeer ?? this.dmCheckedPeer,
     movedAt: movedAt ?? this.movedAt,
   );
 
@@ -134,7 +140,7 @@ class GroupConversation {
     'mentioned': mentioned ? 1 : 0,
     'meta_at': metaAt,
     'peer': peer,
-    'dm_checked': dmChecked ? 1 : 0,
+    'dm_checked_peer': dmCheckedPeer,
     'moved_at': movedAt,
     'created_at': createdAt,
   };
@@ -152,7 +158,7 @@ class GroupConversation {
     mentioned: row['mentioned'] == 1,
     metaAt: row['meta_at'] as int? ?? 0,
     peer: row['peer'] as String?,
-    dmChecked: row['dm_checked'] == 1,
+    dmCheckedPeer: row['dm_checked_peer'] as String?,
     movedAt: row['moved_at'] as int?,
     createdAt: row['created_at']! as int,
   );

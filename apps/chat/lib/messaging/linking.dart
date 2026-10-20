@@ -9,7 +9,6 @@ import '../crypto/group_crypto.dart' show GroupCrypto;
 import '../crypto/link_crypto.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
-import 'group_sync.dart' show GroupSync;
 import 'messenger.dart';
 
 /// Bundle limits (docs/m5-linking.md §2): history of at most 20 conversations, 200 messages each; at most 16
@@ -352,12 +351,14 @@ class NewDeviceLink {
 
 /// A checked link bundle on the new device (m5 §2, §3): history as received, and channel names for when this
 /// device joins those channels.
-Future<void> installLinkBundle(Map<String, Object?> bundle, MessageStore store, GroupSync sync) async {
+Future<void> installLinkBundle(Map<String, Object?> bundle, MessageStore store) async {
+  final names = <String, ({String name, String topic})>{};
   for (final c in (bundle['channels'] as List? ?? const []).take(500)) {
     if (c is! Map || c['id'] is! String || !groupIdPattern.hasMatch(c['id'] as String)) continue;
     final name = c['name'] is String ? c['name'] as String : '', topic = c['topic'] is String ? c['topic'] as String : '';
-    sync.bundleNames[c['id'] as String] = (name: String.fromCharCodes(name.runes.take(64)), topic: String.fromCharCodes(topic.runes.take(256)));
+    names[c['id'] as String] = (name: String.fromCharCodes(name.runes.take(64)), topic: String.fromCharCodes(topic.runes.take(256)));
   }
+  await store.putBundleNames(names);
   final records = [
     for (final c in (bundle['conversations'] as List? ?? const []).take(bundleConversations))
       if (c is Map && c['history'] is List) ...(c['history'] as List).reversed.take(bundleMessages).toList().reversed,

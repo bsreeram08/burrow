@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:ed25519_edwards/ed25519_edwards.dart' as ed;
@@ -52,8 +53,21 @@ void main() {
   const me = User(id: 'uuuuuuuuuuuuuuuuuuuuuu', username: 'me');
   final p0Device = 'p' * 22, linkId = 'L' * 22, claim = b64(List.filled(32, 3));
 
-  test('hand over: request, compare, record, keys, list v1, demote, step down', () async {
-    final aik = ed.generateKey();
+  /// The served list, signed (with per-device certificates) by [key].
+  Map<String, Object?> signed(ed.KeyPair key, List<String> ids) {
+    final list = {'v': 1, 'userId': me.id, 'version': 1, 'prevHash': '', 'devices': [for (final (i, id) in (ids.toList()..sort()).indexed) {'deviceId': id, 'addedAt': i + 1, 'meta': ''}]};
+    return {
+      'list': list,
+      'signature': b64(ed.sign(key.privateKey, listBytes(list))),
+      'certs': {for (final d in list['devices']! as List) (d as Map)['deviceId']: b64(ed.sign(key.privateKey, certBytes(me.id, d)))},
+    };
+  }
+
+  for (final forged in [false, true]) {
+  test(forged
+      ? "a served list our primary didn't sign stops the take-over before anything is published"
+      : 'hand over: request, compare, record, keys, list v1 (only our signed list), demote, step down', () async {
+    final aik = ed.generateKey(), other = ed.generateKey();
     final p0Link = _SigningLink(aik);
     final p0Chat = FakeChatCrypto(me: p0Link.identity!);
     final nChat = FakeChatCrypto(me: const Identity(dh: 'unused', sign: 'unused'));
@@ -91,8 +105,9 @@ void main() {
         return ok({
           'userId': me.id,
           'identity': served,
-          'list': {'v': 1, 'userId': me.id, 'version': 4, 'prevHash': b64(List.filled(32, 1)), 'devices': [{'deviceId': p0Device, 'addedAt': 1, 'meta': ''}, {'deviceId': nDevice, 'addedAt': 2, 'meta': ''}]},
-          'devices': [{'id': p0Device, 'state': 'listed', 'platform': 'ios', 'primary': true}, {'id': nDevice, 'state': 'listed', 'platform': 'macos'}],
+          ...signed(forged ? other : aik, [p0Device, nDevice]),
+          // The server also shows a device our list never named: it must not be signed into the new list.
+          'devices': [{'id': p0Device, 'state': 'listed', 'platform': 'ios', 'primary': true}, {'id': nDevice, 'state': 'listed', 'platform': 'macos'}, {'id': 'x' * 22, 'state': 'listed', 'platform': 'web'}],
         });
       }
       if (path == '/api/devices/succession') {
@@ -130,7 +145,16 @@ void main() {
     expect(request.leafSigKey, await nGroups.deviceLeaf());
     expect(succession, isNull, reason: 'nothing signed before the user confirms');
 
-    await Future.wait([hand.approve(), take.run(nMessenger, platform: 'macos')]);
+    if (forged) {
+      unawaited(hand.approve(timeout: const Duration(milliseconds: 300)).then((_) {}, onError: (_) {}));
+      await expectLater(take.run(nMessenger, platform: 'macos'), throwsA(isA<StoreException>()));
+      expect((succession, published, served['sign']), (null, null, p0Link.identity!.sign), reason: 'no record, keys or list');
+      expect(nMessenger.companion, isTrue);
+      await nStore.close();
+      await p0Store.close();
+      return;
+    }
+    await Future.wait([hand.approve(), take.run(nMessenger, platform: 'macos')], eagerError: true);
 
     // N: record, then keys, then list v1 under the new key naming the old primary; its own leaf re-signed.
     expect((succession!['record'] as Map)['newSign'], request.identity.sign);
@@ -148,6 +172,7 @@ void main() {
     await nStore.close();
     await p0Store.close();
   });
+  }
 
   test('a linked device follows its account to a new key only along a valid chain, then asks for a certificate', () async {
     final aik = ed.generateKey();
@@ -183,26 +208,73 @@ void main() {
     await store.close();
   });
 
-  test('the new primary certifies only a (device, leaf) its own groups already hold', () async {
+  test('the new primary certifies only a device of its verified list (not itself) whose leaf a group holds, with the platform from its sealed label', () async {
+    final aik = ed.generateKey();
+    final chat = FakeChatCrypto(me: Identity(dh: b64(List.filled(32, 2)), sign: b64(aik.publicKey.bytes)));
+    final prefs = MemoryDevicePrefs();
+    final self = await localDevice(prefs, me.id);
+    final metaKey = deviceMetaKey(await chat.deviceMetaSignature(me.id));
+    final a = 'a' * 22, b = 'b' * 22, c = 'c' * 22;
+    final ids = [a, b, self.deviceId]..sort();
+    final list = {
+      'v': 1, 'userId': me.id, 'version': 1, 'prevHash': '',
+      'devices': [for (final id in ids) {'deviceId': id, 'addedAt': 1, 'meta': sealMeta(metaKey, me.id, id, label: 'L', platform: id == a ? 'web' : 'macos')}],
+    };
+    final view = {
+      'identity': chat.me.toJson(),
+      'list': list,
+      'signature': b64(ed.sign(aik.privateKey, listBytes(list))),
+      'certs': {for (final d in list['devices']! as List) (d as Map)['deviceId']: b64(ed.sign(aik.privateKey, certBytes(me.id, d)))},
+    };
     final answered = <String, String>{};
     final api = Api(
       baseUrl: 'https://calls.example',
       clientName: 'ios',
       client: MockClient((request) async {
         final path = request.url.path;
+        if (path == '/api/devices/me') return http.Response(jsonEncode(view), 200);
         if (path == '/api/devices/recert' && request.method == 'GET') {
-          return http.Response(jsonEncode({'requests': [{'deviceId': 'a' * 22, 'platform': 'web', 'leafSigKey': 'K' * 43}, {'deviceId': 'b' * 22, 'platform': 'web', 'leafSigKey': 'S' * 43}]}), 200);
+          return http.Response(jsonEncode({'requests': [
+            for (final id in [a, b, c, self.deviceId]) {'deviceId': id, 'platform': 'ios', 'leafSigKey': 'K' * 43},
+          ]}), 200);
         }
         if (path.startsWith('/api/devices/recert/')) answered[path.split('/').last] = (jsonDecode(request.body) as Map)['cert'] as String;
         return http.Response('{}', 201);
       }),
     )..token = 't';
     final store = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
-    final groups = FakeGroupCrypto(userId: me.id)..knownLeaves.add('${'a' * 22}:${'K' * 43}');
-    final own = OwnSuccession(api: api, link: FakeLinkCrypto(identity: const Identity(dh: 'd', sign: 's')), groups: groups, store: store, updateLeaf: (_) async {}, me: me, platform: 'ios');
+    // Groups hold the leaf for a, c (not in our list) and this device; not for b.
+    final groups = FakeGroupCrypto(userId: me.id)..knownLeaves.addAll(['$a:${'K' * 43}', '$c:${'K' * 43}', '${self.deviceId}:${'K' * 43}']);
+    final own = OwnSuccession(
+      api: api, link: FakeLinkCrypto(identity: chat.me), groups: groups, store: store, updateLeaf: (_) async {}, me: me, platform: 'ios',
+      chat: chat, devices: prefs, device: () async => self,
+    );
     expect(await own.answerRecerts(), 1);
-    expect(answered.keys, ['a' * 22], reason: 'a leaf no group holds is not certified (the server could have swapped it)');
-    expect((jsonDecode(answered['a' * 22]!) as Map)['leafSigKey'], 'K' * 43);
+    expect(answered.keys, [a], reason: 'b: no group holds that leaf; c: not in our signed list; never this device');
+    final cert = jsonDecode(answered[a]!) as Map;
+    expect((cert['leafSigKey'], cert['platform']), ('K' * 43, 'web'), reason: "the platform from a's sealed label, not the request");
+    await store.close();
+  });
+
+  test('recovery: the new key\'s first list names only this device, whatever the server lists', () async {
+    Map<String, dynamic>? published;
+    final api = Api(
+      baseUrl: 'https://calls.example',
+      clientName: 'ios',
+      client: MockClient((request) async {
+        if (request.url.path == '/api/devices/list') published = jsonDecode(request.body) as Map<String, dynamic>;
+        if (request.url.path == '/api/devices/me') {
+          return http.Response(jsonEncode({'list': {'v': 1, 'userId': me.id, 'version': 9, 'prevHash': '', 'devices': [{'deviceId': 'o' * 22, 'addedAt': 1, 'meta': ''}]}, 'devices': [{'id': 'o' * 22, 'state': 'listed'}]}), 200);
+        }
+        return http.Response('{}', 200);
+      }),
+    )..token = 't';
+    final store = await MessageStore.open(databaseFactoryFfi, inMemoryDatabasePath);
+    final messenger = Messenger(api: api, crypto: FakeChatCrypto(), store: store, me: me, contactById: (_) => null, mutualContacts: () => [], ack: (_) {});
+    await messenger.publishNewChain(const []);
+    final list = published!['list'] as Map;
+    expect(list['version'], 1);
+    expect([for (final d in list['devices'] as List) d['deviceId']], [(await messenger.device()).deviceId]);
     await store.close();
   });
 }

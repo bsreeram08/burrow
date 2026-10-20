@@ -51,6 +51,7 @@ class GroupConversation {
     this.pinned = false,
     this.unread = 0,
     this.mentioned = false,
+    this.metaAt = 0,
   });
 
   /// The MLS group id (22 base64url characters); also the message store's conversation id.
@@ -68,6 +69,9 @@ class GroupConversation {
 
   /// An unread message mentions me.
   final bool mentioned;
+
+  /// `at` of the `meta` payload that set [name] and [topic] (latest wins).
+  final int metaAt;
   final int createdAt;
 
   bool get active => membership == Membership.active;
@@ -83,6 +87,7 @@ class GroupConversation {
     int? unread,
     bool? mentioned,
     GroupKindName? kind,
+    int? metaAt,
   }) => GroupConversation(
     id: id,
     kind: kind ?? this.kind,
@@ -95,6 +100,7 @@ class GroupConversation {
     pinned: pinned ?? this.pinned,
     unread: unread ?? this.unread,
     mentioned: mentioned ?? this.mentioned,
+    metaAt: metaAt ?? this.metaAt,
   );
 
   Map<String, Object?> toRow() => {
@@ -108,6 +114,7 @@ class GroupConversation {
     'pinned': pinned ? 1 : 0,
     'unread': unread,
     'mentioned': mentioned ? 1 : 0,
+    'meta_at': metaAt,
     'created_at': createdAt,
   };
 
@@ -122,6 +129,7 @@ class GroupConversation {
     pinned: row['pinned'] == 1,
     unread: row['unread'] as int? ?? 0,
     mentioned: row['mentioned'] == 1,
+    metaAt: row['meta_at'] as int? ?? 0,
     createdAt: row['created_at']! as int,
   );
 }

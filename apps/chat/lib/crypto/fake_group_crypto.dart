@@ -230,7 +230,8 @@ class FakeGroupCrypto implements GroupCrypto {
     final from = (body['from']! as Map).cast<String, Object?>();
     final external = body['external'] == true;
     final index = g.members.indexWhere((m) => m['deviceId'] == from['deviceId']);
-    if (index < 0 && !external) return const CommitCheck(authenticated: false, signedContentInvalid: false, cls: 'tag');
+    // Like the engine: an external commit is never attributed (a forged joiner certificate could frame anyone).
+    if (index < 0 || external) return const CommitCheck(authenticated: false, signedContentInvalid: false, cls: 'tag');
     final author = GroupMember(
       leaf: external ? CommitCheck.externalLeaf : index,
       userId: from['userId']! as String,

@@ -222,6 +222,7 @@ class GroupMessenger {
   Future<GroupConversation> create(GroupKindName kind, {required String name, String topic = '', List<String> memberIds = const []}) async {
     if (!ready) throw StoreException(unavailable ?? 'Groups are not available on this device yet.');
     final group = await sync.create(kind, name: name.trim());
+    await store.note(group.id, kind == GroupKindName.groupDm ? 'You started this group.' : 'You created this ${kind == GroupKindName.public ? 'public' : 'private'} channel.');
     final missing = memberIds.isEmpty ? <String>{} : await sync.add(group.id, memberIds);
     await _sendMeta(group.id, name.trim(), topic.trim());
     _reportMissing(missing);
@@ -231,6 +232,8 @@ class GroupMessenger {
 
   Future<void> addMembers(String groupId, List<String> userIds) async {
     final missing = await sync.add(groupId, userIds);
+    final added = [for (final u in userIds) if (!missing.contains(u)) nameOf(u)];
+    if (added.isNotEmpty) await store.note(groupId, 'You added ${added.join(', ')}');
     final group = await store.group(groupId);
     // New members learn the name and topic from a fresh meta.
     if (group != null && await isAdmin(groupId)) await _sendMeta(groupId, group.name, group.topic);
@@ -246,6 +249,7 @@ class GroupMessenger {
 
   Future<void> removeMember(String groupId, String userId) async {
     await sync.remove(groupId, userId);
+    await store.note(groupId, 'You removed ${nameOf(userId)}');
     await members(groupId, refresh: true);
   }
 

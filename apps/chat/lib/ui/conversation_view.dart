@@ -854,14 +854,17 @@ class ConversationViewState extends State<ConversationView> {
                   closeLabel: 'Cancel reply',
                 ),
               if (_mentionOptions.isNotEmpty)
-                Container(
-                  key: const Key('mention-list'),
-                  margin: const EdgeInsets.fromLTRB(4, 0, 4, 6),
-                  decoration: BoxDecoration(color: t.surface2, borderRadius: BorderRadius.circular(12), border: Border.all(color: t.line)),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      for (var i = 0; i < _mentionOptions.length; i++)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
+                  child: Material(
+                    key: const Key('mention-list'),
+                    color: t.surface2,
+                    clipBehavior: Clip.antiAlias,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: t.line)),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (var i = 0; i < _mentionOptions.length; i++)
                         ListTile(
                           key: ValueKey('mention-${_mentionOptions[i].username}'),
                           dense: true,
@@ -871,7 +874,8 @@ class ConversationViewState extends State<ConversationView> {
                           title: Text('@${_mentionOptions[i].username}', style: TextStyle(color: t.text)),
                           onTap: () => _insertMention(_mentionOptions[i]),
                         ),
-                    ],
+                      ],
+                    ),
                   ),
                 ),
               if (_link != null && _editing == null)

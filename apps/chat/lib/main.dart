@@ -12,6 +12,7 @@ import 'ui/call_screen.dart';
 import 'ui/chat_list_screen.dart';
 import 'ui/command_palette.dart';
 import 'ui/conversation_screen.dart';
+import 'ui/group_screen.dart';
 import 'ui/incoming_call.dart';
 import 'ui/welcome_screen.dart';
 
@@ -42,6 +43,7 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(path: '/welcome', builder: (_, state) => WelcomeScreen(invite: _invite(state.uri))),
       GoRoute(path: '/', builder: (_, _) => const ChatListScreen()),
       GoRoute(path: '/chat/:id', builder: (_, state) => ConversationScreen(contactId: state.pathParameters['id']!)),
+      GoRoute(path: '/group/:id', builder: (_, state) => GroupScreen(groupId: state.pathParameters['id']!)),
       GoRoute(path: '/call', pageBuilder: (_, _) => const MaterialPage(fullscreenDialog: true, child: CallScreen())),
     ],
   );

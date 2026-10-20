@@ -1091,18 +1091,22 @@ suite('recertifying a companion after a transfer (docs/m5-linking.md §5.2.2)', 
 });
 
 suite('an identity change keeps the account\'s places (docs/m5-linking.md §5.3)', () => {
-    test('while the list is void (devices pending) the sweep and the stream withhold, but do not forget, the account\'s devices; a revoked one still loses its place', async () => {
+    test('while the list is void (devices pending) the sweep withholds but does not forget; a revoked device loses its place; once a list under the current key omits a pending device it goes too', async () => {
         const w = await populated();
-        const before = rows('SELECT device_id FROM channel_members WHERE channel_id = ? ORDER BY device_id', w.channel);
+        const places = (...ids: string[]) => rows(`SELECT device_id FROM channel_members WHERE channel_id = ? AND device_id IN (${ids.map(() => '?').join(', ')}) ORDER BY device_id`, w.channel, ...ids).map(row => row.device_id);
+        const both = [w.b1.deviceId, w.b2.deviceId].sort();
         // What identityChanged does for the account: lists void, devices pending until list v1 under the new key.
         run("UPDATE devices SET state = 'pending' WHERE user_id = ?", w.bob.id);
         run('DELETE FROM device_lists WHERE user_id = ?', w.bob.id);
         app.channels!.sweep(true);
-        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? ORDER BY device_id', w.channel)).toEqual(before);
+        expect(places(...both)).toEqual(both);
         // A device that is actually revoked still loses its place.
         run("UPDATE devices SET state = 'revoked' WHERE id = ?", w.b2.deviceId);
         app.channels!.sweep(true);
-        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? AND device_id = ?', w.channel, w.b2.deviceId)).toEqual([]);
-        expect(rows('SELECT device_id FROM channel_members WHERE channel_id = ? AND device_id = ?', w.channel, w.b1.deviceId).length).toBe(1);
+        expect(places(...both)).toEqual([w.b1.deviceId]);
+        // Once a list under the account's current key exists and does not name b1, it loses its place too.
+        run('INSERT INTO device_lists (user_id, aik_sign, version, hash, list, signature, certs, updated_at) VALUES (?, (SELECT sign FROM identity_keys WHERE user_id = ?), 1, ?, ?, ?, ?, ?)', w.bob.id, w.bob.id, 'h', '{}', 's', '{}', clock);
+        app.channels!.sweep(true);
+        expect(places(...both)).toEqual([]);
     });
 });

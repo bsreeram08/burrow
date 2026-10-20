@@ -184,7 +184,7 @@ export function startSignaling(options: SignalingOptions) {
     let channels: Channels | undefined;
     if (db && accounts && options.dataDir) {
         const ds = createDsCore({ db, dir: dsDir });
-        const directory = { db, now, ds, eligible: accounts.devices.eligible, sessionDevice: accounts.devices.sessionDevice, aikOf: accounts.devices.aikOf, successions: accounts.devices.successions, identityChange: accounts.devices.identityChange, mutual: accounts.mutual, notify: accounts.notify };
+        const directory = { db, now, ds, eligible: accounts.devices.eligible, sessionDevice: accounts.devices.sessionDevice, aikOf: accounts.devices.aikOf, listUnderCurrentKey: accounts.devices.listUnderCurrentKey, successions: accounts.devices.successions, identityChange: accounts.devices.identityChange, mutual: accounts.mutual, notify: accounts.notify };
         channels = createChannels({ ...directory, origin: options.origin, keyPackages: createKeyPackages(directory), sigKey: accounts.devices.sigKey, userByName: accounts.userByName, streams: accounts.streams as any, pumpUser: accounts.pumpUser });
         accounts.attach(channels);
     }

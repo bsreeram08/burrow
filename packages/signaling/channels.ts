@@ -42,6 +42,8 @@ type Deps = {
     sessionDevice(session: string): string | null;
     sigKey(deviceId: string): string | null;
     aikOf(userId: string): string | null;
+    /** Whether the account has a device list signed by its current identity key (false while an identity change has voided it). */
+    listUnderCurrentKey(userId: string): boolean;
     identityChange?(userId: string): { aik: string; event: string } | null;
     mutual(a: string, b: string): boolean;
     userByName(username: string): { id: string; username: string } | null;
@@ -593,9 +595,11 @@ export function createChannels(deps: Deps) {
 
     /** A device that is no longer eligible holds no place in any channel and has no Welcomes waiting. */
     function dropDevice(deviceId: string) {
-        // Only a revoked or deleted device loses its place. One that is merely unlisted for now (an account identity change
-        // voids the list until the new key's list v1; docs/m5-linking.md §5.3) is withheld by the eligibility gate, not forgotten.
-        if (db.query("SELECT 1 FROM devices WHERE id = ? AND state != 'revoked'").get(deviceId)) return;
+        // A revoked or deleted device loses its place. A pending one keeps it only while the account's list is void (an identity
+        // change voids it until the new key's list v1; docs/m5-linking.md §5.3): withheld by the eligibility gate, not forgotten.
+        // Once a list under the current key exists and does not name the device, it is gone.
+        const row = db.query<{ user_id: string; state: string }, [string]>('SELECT user_id, state FROM devices WHERE id = ?').get(deviceId);
+        if (row && row.state !== 'revoked' && !deps.listUnderCurrentKey(row.user_id)) return;
         db.query('DELETE FROM channel_members WHERE device_id = ?').run(deviceId);
         db.query('DELETE FROM mls_welcomes WHERE device_id = ?').run(deviceId);
     }

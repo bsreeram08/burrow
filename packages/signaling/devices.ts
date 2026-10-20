@@ -150,7 +150,10 @@ export function createDevices(deps: Deps) {
             if (owner && (owner.user_id !== user.id || owner.state === 'revoked')) return [409, { error: `Device ${device.deviceId} cannot be listed.` }];
         }
         const listed = new Set(list.devices.map(device => device.deviceId));
-        const dropped = live(user.id).filter(row => row.state === 'listed' && !listed.has(row.id)).map(row => row.id);
+        // A list under a new key (recovery, takeover, a transfer) is the account's whole truth again: every device it omits goes,
+        // pending ones too. Under the same key a pending device is a newcomer waiting for the primary to list it.
+        const firstUnderKey = !stored || stored.aik_sign !== aik;
+        const dropped = live(user.id).filter(row => row.state !== 'placeholder' && !listed.has(row.id) && (row.state === 'listed' || firstUnderKey)).map(row => row.id);
         db.transaction(() => {
             // The device that held this account's envelopes (a placeholder, or an unlisted device that claimed
             // messaging) hands them to the device the signed list now makes primary.
@@ -413,6 +416,12 @@ export function createDevices(deps: Deps) {
      * identity key (so its certificate chains to the AIK the list is signed with). Pending, revoked and placeholder
      * devices, and any device after an identity change (which voids the lists), are not.
      */
+    /** Whether the account has a device list signed by its current identity key. */
+    function listUnderCurrentKey(userId: string) {
+        const list = db.query<{ aik_sign: string }, [string]>('SELECT aik_sign FROM device_lists WHERE user_id = ?').get(userId);
+        const aik = aikOf(userId);
+        return Boolean(list && aik && list.aik_sign === aik);
+    }
     function eligible(userId: string, deviceId: string | null) {
         if (!deviceId) return false;
         const row = db.query<{ state: string }, [string, string]>('SELECT state FROM devices WHERE id = ? AND user_id = ?').get(deviceId, userId);
@@ -425,6 +434,6 @@ export function createDevices(deps: Deps) {
 
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, recertRequest, recertPending, recertAnswer, recertMine, recertDone, identityChanged, identityChange, touch, sessionDevice, eligible, sigKey, aikOf };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, recertRequest, recertPending, recertAnswer, recertMine, recertDone, identityChanged, identityChange, touch, sessionDevice, eligible, listUnderCurrentKey, sigKey, aikOf };
 }
 export type Devices = ReturnType<typeof createDevices>;

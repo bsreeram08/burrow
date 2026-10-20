@@ -620,3 +620,33 @@ suite('companion certificates after a transfer (m5 §5.2.2)', () => {
         expect((await call('GET', '/api/devices/recert/mine', { cookie })).status).toBe(404);
     });
 });
+
+suite('a list under a new key is the whole truth (publish)', () => {
+    test('list v1 under a new identity revokes every non-revoked device it omits, pending ones too; under the same key a pending newcomer is left for the primary to list', async () => {
+        await start();
+        const alice = account('alice');
+        const pending = id(), listed = id();
+        for (const [device, state] of [[pending, 'pending'], [listed, 'listed']] as const) run("INSERT INTO devices (id, user_id, platform, state, is_primary, sig_key, created_at) VALUES (?, ?, 'linux', ?, 0, ?, ?)", device, alice.id, state, b64(randomBytes(32)), clock);
+
+        // Same key, next version: a pending newcomer (waiting to be listed) is not touched; an unlisted 'listed' device is dropped.
+        const v2 = { v: 1, userId: alice.id, version: 2, prevHash: sha(F.listBytes(alice.list)), devices: alice.list.devices };
+        const signed = alice.client.call({ cmd: 'signDeviceList', userId: alice.id, published: alice.identity.sign, list: v2 });
+        const same = await call('PUT', '/api/devices/list', { body: { list: v2, signature: signed.signature, certs: signed.certs, deviceId: alice.deviceId }, cookie: alice.cookie });
+        expect(same.status).toBe(200);
+        expect(rows('SELECT id, state FROM devices WHERE id IN (?, ?) ORDER BY id', pending, listed).sort((a, b) => a.id < b.id ? -1 : 1)).toEqual([{ id: pending, state: 'pending' }, { id: listed, state: 'revoked' }].sort((a, b) => a.id < b.id ? -1 : 1));
+
+        // A new identity key (what PUT /api/keys with a new identity does): the list is void and everything is pending.
+        const fresh = new Client(Core);
+        const identity = fresh.call({ cmd: 'identity' });
+        run('UPDATE identity_keys SET sign = ?, dh = ? WHERE user_id = ?', identity.sign, identity.dh, alice.id);
+        run('DELETE FROM device_lists WHERE user_id = ?', alice.id);
+        run("UPDATE devices SET state = 'pending', is_primary = 0 WHERE user_id = ? AND state != 'revoked'", alice.id);
+        const v1 = { v: 1, userId: alice.id, version: 1, prevHash: '', devices: [{ deviceId: alice.deviceId, addedAt: clock, meta: '' }] };
+        const first = fresh.call({ cmd: 'signDeviceList', userId: alice.id, published: identity.sign, list: v1 });
+        const published = await call('PUT', '/api/devices/list', { body: { list: v1, signature: first.signature, certs: first.certs, deviceId: alice.deviceId }, cookie: alice.cookie });
+        expect(published.status).toBe(200);
+        expect(published.body.revoked).toEqual([pending]);
+        expect(rows('SELECT state FROM devices WHERE id = ?', pending)[0].state).toBe('revoked');
+        expect(rows('SELECT state FROM devices WHERE id = ?', alice.deviceId)[0].state).toBe('listed');
+    });
+});

@@ -84,11 +84,11 @@ class _EmojiPickerState extends State<_EmojiPicker> {
   }
 }
 
-enum MessageAction { reply, edit, copy }
+enum MessageAction { reply, edit, copy, info }
 
 /// Long-press / right-click on a message: a row of quick reactions ("more" opens the picker) and actions.
 /// Returns an emoji (reacted) or a [MessageAction].
-Future<Object?> showMessageMenu(BuildContext context, {required ChatMessage message, required ChatTokens tokens, required bool canEdit, required bool canReact}) {
+Future<Object?> showMessageMenu(BuildContext context, {required ChatMessage message, required ChatTokens tokens, required bool canEdit, required bool canReact, bool canInfo = false}) {
   HapticFeedback.selectionClick();
   final mine = message.reactions.of('me');
   return showModalBottomSheet<Object>(
@@ -135,6 +135,8 @@ Future<Object?> showMessageMenu(BuildContext context, {required ChatMessage mess
             if (canEdit) ListTile(leading: const Icon(Icons.edit_outlined), title: const Text('Edit'), onTap: () => Navigator.pop(context, MessageAction.edit)),
             if (message.body.isNotEmpty)
               ListTile(leading: const Icon(Icons.copy_rounded), title: const Text('Copy text'), onTap: () => Navigator.pop(context, MessageAction.copy)),
+            if (canInfo)
+              ListTile(leading: const Icon(Icons.done_all_rounded), title: const Text('Read by'), onTap: () => Navigator.pop(context, MessageAction.info)),
           ],
         ),
       ),
@@ -144,10 +146,13 @@ Future<Object?> showMessageMenu(BuildContext context, {required ChatMessage mess
 
 /// Reaction pills under a bubble: emoji and count, ours highlighted. Tap toggles; long-press lists who.
 class ReactionPills extends StatelessWidget {
-  const ReactionPills({super.key, required this.reactions, required this.tokens, required this.peerName, this.onToggle});
+  const ReactionPills({super.key, required this.reactions, required this.tokens, required this.peerName, this.onToggle, this.nameOf});
   final Reactions reactions;
   final ChatTokens tokens;
   final String peerName;
+
+  /// Groups: who reacted, by user id.
+  final String Function(String userId)? nameOf;
   final void Function(String emoji, bool on)? onToggle;
 
   @override
@@ -159,7 +164,7 @@ class ReactionPills extends StatelessWidget {
       children: [
         for (final r in reactions.summary)
           Tooltip(
-            message: [if (r.mine) 'You', if (reactions.of('peer').contains(r.emoji)) peerName].join(', '),
+            message: [if (r.mine) 'You', for (final who in reactions.others(r.emoji)) who == 'peer' ? peerName : (nameOf?.call(who) ?? who)].join(', '),
             triggerMode: TooltipTriggerMode.longPress,
             child: Semantics(
               button: true,

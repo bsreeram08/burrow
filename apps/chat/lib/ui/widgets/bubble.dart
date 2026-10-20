@@ -44,6 +44,8 @@ class Bubble extends StatefulWidget {
     this.showRead = true,
     this.attachments,
     this.callbacks = const BubbleCallbacks(),
+    this.nameOf,
+    this.mentionNames = const {},
   });
 
   final ChatMessage message;
@@ -57,6 +59,12 @@ class Bubble extends StatefulWidget {
   final String? findQuery;
   final AttachmentService? attachments;
   final BubbleCallbacks callbacks;
+
+  /// Groups: names the people who reacted.
+  final String Function(String userId)? nameOf;
+
+  /// Groups: `@username`s in the text that name a mentioned member, drawn as mentions.
+  final Set<String> mentionNames;
 
   @override
   State<Bubble> createState() => _BubbleState();
@@ -132,7 +140,7 @@ class _BubbleState extends State<Bubble> with SingleTickerProviderStateMixin {
         Align(
           alignment: Alignment.centerLeft,
           widthFactor: 1,
-          child: MarkdownText(m.body, tokens: t, color: ink, fontSize: 16, highlight: widget.findQuery, linkColor: mine ? ink : t.accent),
+          child: MarkdownText(m.body, tokens: t, color: ink, fontSize: 16, highlight: widget.findQuery, linkColor: mine ? ink : t.accent, mentions: widget.mentionNames),
         ),
       if (m.link != null)
         Padding(
@@ -233,6 +241,7 @@ class _BubbleState extends State<Bubble> with SingleTickerProviderStateMixin {
               reactions: m.reactions,
               tokens: t,
               peerName: widget.peerName,
+              nameOf: widget.nameOf,
               onToggle: cb.onReact == null ? null : (emoji, on) => cb.onReact!(m, emoji, on),
             ),
           ),
@@ -335,8 +344,11 @@ class _Quote extends StatelessWidget {
 
 /// "`name` is typing…" with three dots that pulse; still dots under reduced motion.
 class TypingIndicator extends StatefulWidget {
-  const TypingIndicator({super.key, required this.name, required this.tokens});
+  const TypingIndicator({super.key, required this.name, required this.tokens, this.line});
   final String name;
+
+  /// The whole line instead of "`name` is typing" (groups: "alice and bob are typing").
+  final String? line;
   final ChatTokens tokens;
   @override
   State<TypingIndicator> createState() => _TypingIndicatorState();
@@ -362,7 +374,7 @@ class _TypingIndicatorState extends State<TypingIndicator> with SingleTickerProv
     final t = widget.tokens;
     return Semantics(
       liveRegion: true,
-      label: '${widget.name} is typing',
+      label: widget.line ?? '${widget.name} is typing',
       child: Padding(
         padding: const EdgeInsets.fromLTRB(6, 6, 6, 2),
         child: Row(
@@ -389,7 +401,7 @@ class _TypingIndicatorState extends State<TypingIndicator> with SingleTickerProv
             const SizedBox(width: 8),
             Flexible(
               child: Text(
-                '${widget.name} is typing…',
+                '${widget.line ?? '${widget.name} is typing'}…',
                 overflow: TextOverflow.ellipsis,
                 style: TextStyle(color: t.muted, fontSize: 12.5),
               ),

@@ -140,11 +140,10 @@ try {
     signal('web-rich', JSON.stringify({ image: sha(png), file: sha(file) }));
     await waitFor('web-rich-ok');
     await page.fill('#chat-input', '');
-    step('web → app: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive in the app');
+    step('web → app: reply, reactions on/off, edit, image + file (byte-identical) and a link preview arrive in the app (1:1 typing is gone: m5 §9)');
 
     // App → web: the same set.
     const fromApp = JSON.parse(await waitFor('app-rich'));
-    await page.waitForFunction(() => !document.getElementById('typing')!.hidden && document.getElementById('typing-text')!.textContent!.includes('appuser'), null, { timeout: 15000 });
     const list = await webUntil('rich messages from the app', l =>
         l.some(r => r.text === 'app reply' && r.replyTo?.id === fromApp.target) &&
         l.some(r => r.id === fromApp.target && (r.reactions?.peer || []).join() === '❤️') &&
@@ -158,7 +157,7 @@ try {
     // The app's photo decrypts and draws on the web.
     await page.waitForFunction(() => [...document.querySelectorAll('#chat-log img.media-full')].some(i => (i as HTMLImageElement).alt === 'app.png' && (i as HTMLImageElement).naturalWidth === 64), null, { timeout: 20000 });
     signal('app-rich-ok');
-    step('app → web: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive on the web');
+    step('app → web: reply, reactions on/off, edit, image + file (byte-identical) and a link preview arrive on the web');
 
     const appNumber = await waitFor('safety');
     await page.click('#conv-menu summary'); await page.click('#conv-safety');

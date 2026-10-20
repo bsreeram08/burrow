@@ -250,11 +250,11 @@ class FakeGroupCrypto implements GroupCrypto {
   }
 
   @override
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) async {
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature}) async {
     final g = _group(groupId);
     if (signature != 'res:$by:$groupId:$action:$seq:$digest:$author') throw const CryptoException('bad resolution signature', code: 'auth');
     final member = g.members.where((m) => m['deviceId'] == by).firstOrNull;
-    if (member == null || !g.roles.isAdmin(member['userId']! as String)) throw const CryptoException('not an admin device', code: 'invalid');
+    if (member == null || member['userId'] != byUser || !g.roles.isAdmin(member['userId']! as String)) throw const CryptoException('not an admin device', code: 'invalid');
     return member['userId']! as String;
   }
 

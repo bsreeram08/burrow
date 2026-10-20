@@ -470,41 +470,9 @@ class Messenger {
     }
   }
 
-  /// Live-only envelopes carry typing and nothing else. They are never acknowledged (the server keeps
-  /// nothing to delete) and any failure is dropped silently: a lost typing hint is harmless.
-  Future<void> _receiveEphemeral(EnvelopeEvent event) async {
-    // Live-only envelopes may only continue an existing session: an X3DH initial message would claim a prekey
-    // slot outside the stored path, so it is dropped before decrypting.
-    if (startsSession(event.envelope)) return;
-    try {
-      final decrypted = await crypto.decryptFrom(event.fromId, event.envelope);
-      // A new identity never arrives on a live-only envelope; a session must already exist.
-      if (decrypted.identity != null || decrypted.identityChanged) {
-        await crypto.abort(decrypted.commitId);
-        return;
-      }
-      Map<String, Object?>? payload;
-      try {
-        payload = checkPayload(decrypted.plaintextJson);
-      } on PayloadException {
-        payload = null;
-      }
-      final safety = await crypto.safety(me.username, event.fromId, event.fromUsername);
-      if (payload == null || payload['type'] != 'typing' || (safety?.blocked ?? false)) {
-        await crypto.abort(decrypted.commitId); // Discarded unsaved, like the web client.
-        return;
-      }
-      await crypto.commit(decrypted.commitId, rotate: false);
-      final on = payload['on'] as bool, at = payload['at'] as int;
-      if (on && (_now() - at).abs() > typingFreshMs) return;
-      _setTyping(event.fromId, on);
-    } on CryptoException catch (error) {
-      if (error.keysLocked) {
-        keysLocked = true;
-        _lockedChanges.add(true);
-      }
-    } catch (_) {}
-  }
+  /// 1:1 typing no longer travels over the Double Ratchet (docs/m5-linking.md §9): live-only envelopes that
+  /// still arrive are ignored, untouched (never decrypted, never acknowledged).
+  Future<void> _receiveEphemeral(EnvelopeEvent event) async {}
 
   void markRead(String contactId) {
     if (unread.remove(contactId) != null) _unread.add(Map.of(unread));
@@ -617,11 +585,8 @@ class Messenger {
 
   // ---------- Typing ----------
   final Map<String, Timer> _typingTimers = {};
-  final Map<String, int> _typingSentAt = {};
-  final Set<String> _typingOn = {};
 
-  /// Contacts we have received from on the current session: their side holds it, so a live-only
-  /// envelope can never be a session's first message (X3DH initial messages are claimed once).
+  /// Contacts we have received from on the current session.
   final Set<String> _confirmed = {};
 
   void _setTyping(String contactId, bool on) {
@@ -633,28 +598,18 @@ class Messenger {
     }
   }
 
-  /// The composer has text ([on]) or was sent, cleared or left. `on:true` is throttled to one per 4 s;
-  /// `on:false` goes only after an `on:true`. Live-only, so sent only while the contact is online and an
-  /// established session exists (each dropped envelope still advances the sending chain).
+  /// The composer has text ([on]) or was sent, cleared or left. Typing goes only through the chat's MLS group
+  /// once the 1:1 chat has moved there ([dmTyping]); a chat still on the Double Ratchet shows no typing (m5 §9).
   Future<void> typingChanged(Contact contact, {required bool on}) async {
-    final id = contact.id!;
-    if (!active || keysLocked || _disposed) return;
-    final now = _now();
-    if (on) {
-      if (now - (_typingSentAt[id] ?? 0) < typingThrottleMs) return;
-    } else if (!_typingOn.contains(id)) {
-      return;
-    }
-    if (!contact.online || !_confirmed.contains(id) || await crypto.sessionInfo(id) == null) return;
-    final safety = await crypto.safety(me.username, id, contact.username);
-    if (safety?.blocked ?? false) return;
-    on ? _typingSentAt[id] = now : _typingSentAt.remove(id);
-    on ? _typingOn.add(id) : _typingOn.remove(id);
-    try {
-      final result = await crypto.encryptTo(id, encodePayload({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now, 'on': on}));
-      if (result is Encrypted) await api.postEnvelope(contact.username, result.envelope, ephemeral: true);
-    } catch (_) {}
+    if (_disposed) return;
+    await dmTyping?.call(contact, on);
   }
+
+  /// Sends typing through a moved chat's DM group, when there is one (set by the app).
+  Future<void> Function(Contact contact, bool on)? dmTyping;
+
+  /// A typing hint for a 1:1 chat that arrived through its DM group.
+  void showTyping(String contactId, bool on) => _setTyping(contactId, on);
 
   Future<void> _sendControl(Contact contact, Map<String, Object?> payload) async {
     final json = encodePayload(payload);
@@ -797,9 +752,7 @@ class Messenger {
     final view = await api.devices(contact.username);
     final served = view['identity'];
     if (served is! Map<String, dynamic>) return null;
-    // Recording the served identity flags it if it is not the pinned one, so a list is only ever checked
-    // against the security code the user knows.
-    await crypto.notePeer(id, Identity.fromJson(served));
+    await followIdentity(contact, Identity.fromJson(served), view['succession']);
     final safety = await crypto.safety(me.username, id, contact.username);
     if (safety == null || safety.blocked) return deviceChecks[id] = const DeviceCheck.failed('identity');
     final check = verifyView(
@@ -818,6 +771,28 @@ class Messenger {
       _notices.add("${contact.username}'s device list failed verification (${check.reason}).");
     }
     return check;
+  }
+
+  /// A contact's served identity (m5 §5.3): when it differs from the pin and a signed succession chain from
+  /// the pinned key reaches it, the pin moves with verification kept and a soft notice; otherwise recording it
+  /// flags a security-code change for review, so nothing is ever trusted silently. Returns true on a succession.
+  Future<bool> followIdentity(Contact contact, Identity served, Object? succession) async {
+    final id = contact.id!;
+    final pinned = await crypto.peer(id);
+    if (pinned != null && pinned.identity != served && !pinned.blocked && succession is List && succession.isNotEmpty) {
+      try {
+        final moved = await crypto.acceptSuccession(id, [for (final r in succession) (r as Map).cast<String, dynamic>()]);
+        if (moved.identity == served) {
+          _notices.add('${contact.username} moved to a new device. Verification kept.');
+          _confirmed.remove(id);
+          return true;
+        }
+      } on CryptoException {
+        // Not a valid chain from our pin: the usual security-code review below.
+      }
+    }
+    await crypto.notePeer(id, served);
+    return false;
   }
 
   Future<void> regenerateIdentity() async {

@@ -7,8 +7,6 @@
 /// protocol. [FakeChatCrypto] implements the same contract for tests and UI work.
 library;
 
-import 'dart:typed_data';
-
 /// A contact's long-term identity: X25519 (`dh`) and Ed25519 (`sign`) public
 /// keys, base64url, exactly as the server publishes them.
 class Identity {
@@ -104,6 +102,16 @@ class CryptoException implements Exception {
   final bool keysLocked;
   @override
   String toString() => message;
+}
+
+class PinnedPeer {
+  const PinnedPeer({required this.identity, required this.verified, required this.changed, required this.blocked});
+  final Identity identity;
+  final bool verified;
+
+  /// A different identity than the first one was recorded; [blocked] until the user reviews it.
+  final bool changed;
+  final bool blocked;
 }
 
 class SafetyNumber {
@@ -205,10 +213,15 @@ abstract class ChatCrypto {
   /// itself, so it signs nothing else. Base64url.
   Future<String> proveIdentity(String userId, String deviceId, String challenge);
 
-  /// Signs one device-list record (a DeviceList or DeviceCert in devices.js's canonical bytes, built with
-  /// devices.dart) with the account identity key, so this device can publish the account's signed list
-  /// (docs/devices.md). The core refuses any other bytes. Base64url.
-  Future<String> signDeviceRecord(Uint8List bytes);
+  /// Signs the account's next DeviceList and its device certificates with the account identity key
+  /// (docs/devices.md). The core validates [list] (devices.js validateList), requires it to name [userId] and
+  /// [publishedSign] (the identity the server publishes) to be its own key, and signs only the canonical bytes
+  /// it builds itself.
+  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list);
+
+  /// The seed of the key that seals device labels in the list ([deviceMetaKey]): the identity key's signature
+  /// of the fixed devicemeta label and [userId] only. Secret; never sent anywhere.
+  Future<String> deviceMetaSignature(String userId);
 
   /// Records an identity seen from the server (key-change events). A
   /// different identity than the pinned one is flagged and blocks sending.
@@ -220,6 +233,9 @@ abstract class ChatCrypto {
     String theirUsername,
   );
   Future<void> setVerified(String contactId, bool verified);
+
+  /// The identity pinned for [contactId] (a contact, or a group member pinned on first use), or null.
+  Future<PinnedPeer?> peer(String contactId);
   Future<void> acceptChange(String contactId);
 
   // ---- Call verification (verify-v1) ----

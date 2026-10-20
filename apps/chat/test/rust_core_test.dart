@@ -1,8 +1,6 @@
 // RustChatCrypto against the real Rust core on the host (the dylib `cargo build` produces in rust/).
 // Skipped when it has not been built: `cargo build --manifest-path rust/Cargo.toml`.
-import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
@@ -50,21 +48,24 @@ void main() {
     }
   }, skip: skip);
 
-  test('the core signs device lists and certificates with the identity key, and nothing else', () async {
+  test('the core validates and signs device lists, and seeds the label key, for its own identity only', () async {
     final core = crypto(MemoryStoreKeys());
     await core.init('lists');
     final identity = await core.identity();
     const user = 'uuuuuuuuuuuuuuuuuuuuuu', device = 'dddddddddddddddddddddd';
-    final entry = {'deviceId': device, 'addedAt': 1700000000000, 'meta': ''};
-    final list = {'v': 1, 'userId': user, 'version': 1, 'prevHash': '', 'devices': [entry]};
-    final signature = await core.signDeviceRecord(listBytes(list));
-    final cert = await core.signDeviceRecord(certBytes(user, entry));
-    final check = verifyView(userId: user, aikSign: identity.sign, list: list, signature: signature, certs: {device: cert});
+    final seed = await core.deviceMetaSignature(user);
+    expect(verifyBytes(identity.sign, metaSeedBytes(user), seed), isTrue);
+    final key = deviceMetaKey(seed);
+    final entry = <String, Object?>{'deviceId': device, 'addedAt': 1700000000000, 'meta': sealMeta(key, user, device, label: 'Mac app', platform: 'macos')};
+    final list = <String, Object?>{'v': 1, 'userId': user, 'version': 1, 'prevHash': '', 'devices': [entry]};
+    final signed = await core.signDeviceList(user, identity.sign, list);
+    final check = verifyView(userId: user, aikSign: identity.sign, list: list, signature: signed.signature, certs: signed.certs);
     expect(check.ok, isTrue, reason: check.reason);
-    // Never a general signing oracle: claim bytes, bind bytes and arbitrary bytes are refused.
-    for (final bytes in [claimBytes(user, device, 'B' * 42 + 'A'), bindBytes(user, device, 'B' * 42 + 'A'), Uint8List.fromList(utf8.encode('hello'))]) {
-      await expectLater(core.signDeviceRecord(bytes), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'invalid')));
-    }
+    expect(openMeta(key, user, device, entry['meta']! as String), {'label': 'Mac app', 'platform': 'macos'});
+    // Refused: another account's list, an identity that isn't this core's, a malformed list.
+    await expectLater(core.signDeviceList('vvvvvvvvvvvvvvvvvvvvvv', identity.sign, list), throwsA(isA<CryptoException>()));
+    await expectLater(core.signDeviceList(user, 'B' * 43, list), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'mismatch')));
+    await expectLater(core.signDeviceList(user, identity.sign, {...list, 'extra': 1}), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'invalid')));
   }, skip: skip);
 
   Matcher locked() => throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'storage').having((e) => e.keysLocked, 'keysLocked', isTrue));

@@ -40,6 +40,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MlsRoles dco_decode_box_autoadd_mls_roles(dynamic raw);
 
   @protected
+  Peer dco_decode_box_autoadd_peer(dynamic raw);
+
+  @protected
   Safety dco_decode_box_autoadd_safety(dynamic raw);
 
   @protected
@@ -121,6 +124,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MlsRoles? dco_decode_opt_box_autoadd_mls_roles(dynamic raw);
 
   @protected
+  Peer? dco_decode_opt_box_autoadd_peer(dynamic raw);
+
+  @protected
   Safety? dco_decode_opt_box_autoadd_safety(dynamic raw);
 
   @protected
@@ -128,6 +134,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<String>? dco_decode_opt_list_String(dynamic raw);
+
+  @protected
+  Peer dco_decode_peer(dynamic raw);
 
   @protected
   Safety dco_decode_safety(dynamic raw);
@@ -166,6 +175,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   MlsRoles sse_decode_box_autoadd_mls_roles(SseDeserializer deserializer);
+
+  @protected
+  Peer sse_decode_box_autoadd_peer(SseDeserializer deserializer);
 
   @protected
   Safety sse_decode_box_autoadd_safety(SseDeserializer deserializer);
@@ -253,6 +265,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   MlsRoles? sse_decode_opt_box_autoadd_mls_roles(SseDeserializer deserializer);
 
   @protected
+  Peer? sse_decode_opt_box_autoadd_peer(SseDeserializer deserializer);
+
+  @protected
   Safety? sse_decode_opt_box_autoadd_safety(SseDeserializer deserializer);
 
   @protected
@@ -262,6 +277,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   List<String>? sse_decode_opt_list_String(SseDeserializer deserializer);
+
+  @protected
+  Peer sse_decode_peer(SseDeserializer deserializer);
 
   @protected
   Safety sse_decode_safety(SseDeserializer deserializer);
@@ -307,6 +325,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
     MlsRoles self,
     SseSerializer serializer,
   );
+
+  @protected
+  void sse_encode_box_autoadd_peer(Peer self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_safety(Safety self, SseSerializer serializer);
@@ -417,6 +438,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_peer(Peer? self, SseSerializer serializer);
+
+  @protected
   void sse_encode_opt_box_autoadd_safety(
     Safety? self,
     SseSerializer serializer,
@@ -430,6 +454,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_opt_list_String(List<String>? self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_peer(Peer self, SseSerializer serializer);
 
   @protected
   void sse_encode_safety(Safety self, SseSerializer serializer);

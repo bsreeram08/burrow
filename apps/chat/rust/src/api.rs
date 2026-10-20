@@ -91,6 +91,16 @@ pub fn note_peer(contact_id: String, identity: Identity) -> Result<()> { Ok(core
 pub fn safety(my_username: String, contact_id: String, their_username: String) -> Result<Option<Safety>> {
     Ok(core::safety(my_username, contact_id, their_username)?.map(|value| Safety { number: value.number, verified: value.verified, changed: value.changed, blocked: value.blocked }))
 }
+/// The pinned identity of a contact (or a group member pinned on first use), with its review state.
+pub struct Peer {
+    pub identity: Identity,
+    pub verified: bool,
+    pub changed: bool,
+    pub blocked: bool,
+}
+pub fn peer(contact_id: String) -> Result<Option<Peer>> {
+    Ok(core::peer(contact_id)?.map(|p| Peer { identity: p.identity.into(), verified: p.verified, changed: p.changed, blocked: p.blocked }))
+}
 pub fn set_verified(contact_id: String, verified: bool) -> Result<()> { Ok(core::set_verified(contact_id, verified)?) }
 pub fn accept_change(contact_id: String) -> Result<()> { Ok(core::accept_change(contact_id)?) }
 pub fn forget(contact_id: String) -> Result<()> { Ok(core::forget(contact_id)?) }
@@ -102,30 +112,18 @@ pub fn session_info(contact_id: String) -> Result<Option<SessionInfo>> {
 }
 pub fn reset_identity() -> Result<()> { Ok(core::reset_identity()?) }
 
-/// Signs one device-list record with the account identity key (docs/devices.md): `bytes` must be a
-/// DeviceList or a DeviceCert in devices.js's canonical encoding, which starts with the u16-length-prefixed
-/// label `webrtc-bun-devicelist-v1` or `webrtc-bun-devicecert-v1` (the app builds them with devices.dart,
-/// the same bytes the server and contacts verify). Anything else is refused, so this signs device records
-/// and nothing else. The key never leaves Rust: the account's sealed key database is opened read-only for
-/// this call with the store key the app already holds. Returns the base64url Ed25519 signature.
-pub fn sign_device_record(db_path: String, store_key: Vec<u8>, bytes: Vec<u8>) -> Result<String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    use ed25519_dalek::Signer;
-    const LABELS: [&str; 2] = ["webrtc-bun-devicelist-v1", "webrtc-bun-devicecert-v1"];
-    let labelled = LABELS.iter().any(|label| {
-        let len = label.len();
-        bytes.len() > 2 + len && bytes[..2] == (len as u16).to_be_bytes() && &bytes[2..2 + len] == label.as_bytes()
-    });
-    if !labelled || bytes.len() > 16 * 1024 {
-        return Err(CoreError { code: Some("invalid".into()), message: "not a device list or certificate".into() });
-    }
-    let key = <[u8; 32]>::try_from(store_key.as_slice()).map_err(|_| CoreError { code: Some("storage".into()), message: "store key must be 32 bytes".into() })?;
-    let store = chatcore::store::SqliteStore::open_sealed(&db_path, key, chatcore::store::Open::Existing)?;
-    let mut core = chatcore::Core::new(Box::new(store));
-    let aik = core.account_signing_key()?;
-    Ok(URL_SAFE_NO_PAD.encode(aik.sign(&bytes).to_bytes()))
+/// Signs the account's next DeviceList (JSON in devices.js's shape) and one certificate per device: chatcore
+/// validates the list (devices.js validateList), checks it names `user_id` and that `published_sign` (the
+/// identity the server publishes for the account) is this core's own key, and signs only the canonical bytes it
+/// builds. JSON of `{signature, certs: {deviceId: signature}}`.
+pub fn sign_device_list(user_id: String, published_sign: String, list_json: String) -> Result<String> {
+    let signed = core::sign_device_list(user_id, published_sign, list_json)?;
+    serde_json::to_string(&signed).map_err(|error| CoreError { code: None, message: error.to_string() })
 }
+
+/// The seed of the device-meta sealing key: the identity key's signature over the fixed devicemeta label and
+/// `user_id` only (devices.js deviceMetaKey). A secret: keep it on the device.
+pub fn device_meta_signature(user_id: String) -> Result<String> { Ok(core::device_meta_signature(user_id)?) }
 
 /// Signs a device-claim challenge with the account identity key (docs/devices.md). The core builds the
 /// domain-separated bytes itself, so this is never a general signing oracle.

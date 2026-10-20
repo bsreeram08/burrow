@@ -1,7 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
-import 'dart:typed_data';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
@@ -51,11 +50,9 @@ class RustChatCrypto implements ChatCrypto {
   }
 
   Future<String> _path(String name) async => p.join(await _directory(), '$name.sqlite');
-  String? _open;
 
   @override
   Future<void> init(String name) async {
-    _open = null;
     await (_loaded ??= RustLib.init(externalLibrary: externalLibrary));
     final path = await _path(name);
     final saved = await _storeKeys.read(name);
@@ -67,22 +64,20 @@ class RustChatCrypto implements ChatCrypto {
       }
       final created = await _storeKeys.create(name);
       await _call(() => core.init(dbPath: path, storeKey: created, expectExisting: false));
-      _open = name;
       return;
     }
     // The keystore holds a key, so the database must exist and authenticate (a deleted one fails closed).
     await _call(() => core.init(dbPath: path, storeKey: saved, expectExisting: true));
-    _open = name;
   }
 
   @override
-  Future<String> signDeviceRecord(Uint8List bytes) async {
-    final name = _open;
-    final key = name == null ? null : await _storeKeys.read(name);
-    if (name == null || key == null) throw const CryptoException('The key database is not open.', code: 'storage', keysLocked: true);
-    final path = await _path(name);
-    return _call(() => core.signDeviceRecord(dbPath: path, storeKey: key, bytes: bytes));
-  }
+  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list) => _call(() async {
+    final signed = jsonDecode(await core.signDeviceList(userId: userId, publishedSign: publishedSign, listJson: jsonEncode(list))) as Map<String, dynamic>;
+    return (signature: signed['signature'] as String, certs: (signed['certs'] as Map).cast<String, String>());
+  });
+
+  @override
+  Future<String> deviceMetaSignature(String userId) => _call(() => core.deviceMetaSignature(userId: userId));
 
   @override
   Future<void> resetLocal(String name) async {
@@ -162,6 +157,12 @@ class RustChatCrypto implements ChatCrypto {
 
   @override
   Future<void> setVerified(String contactId, bool verified) => _call(() => core.setVerified(contactId: contactId, verified: verified));
+
+  @override
+  Future<PinnedPeer?> peer(String contactId) => _call(() async {
+    final p = await core.peer(contactId: contactId);
+    return p == null ? null : PinnedPeer(identity: Identity(dh: p.identity.dh, sign: p.identity.sign), verified: p.verified, changed: p.changed, blocked: p.blocked);
+  });
 
   @override
   Future<void> acceptChange(String contactId) => _call(() => core.acceptChange(contactId: contactId));

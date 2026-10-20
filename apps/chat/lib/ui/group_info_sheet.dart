@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../app/app_controller.dart';
 import '../core/api.dart';
+import '../crypto/chat_crypto.dart' show CryptoException;
 import '../messaging/group_messenger.dart';
 import '../store/message.dart' show StoreException;
 import '../store/message_store.dart' show GroupConversation, GroupKindName;
@@ -28,6 +29,9 @@ Future<void> showCodeChangeReview(BuildContext context, WidgetRef ref, String us
   final change = groups.pinChanges[userId];
   final current = await ref.read(cryptoProvider).peer(userId);
   if (!context.mounted) return;
+  // The decision binds to exactly the identity shown as "Now".
+  final shown = change?.after ?? current?.identity;
+  if (shown == null) return;
   final mono = TextStyle(fontFamily: 'Menlo', fontFamilyFallback: const ['monospace'], fontSize: 13, color: Theme.of(context).colorScheme.onSurface);
   final choice = await showModalBottomSheet<String>(
     context: context,
@@ -46,7 +50,7 @@ Future<void> showCodeChangeReview(BuildContext context, WidgetRef ref, String us
             Text(change == null ? 'not recorded' : identityFingerprint(change.before), key: const Key('code-before'), style: mono),
             const SizedBox(height: 8),
             const Text('Now', style: TextStyle(fontWeight: FontWeight.w700)),
-            Text(change != null ? identityFingerprint(change.after) : (current == null ? 'not recorded' : identityFingerprint(current.identity)), key: const Key('code-after'), style: mono),
+            Text(identityFingerprint(shown), key: const Key('code-after'), style: mono),
             const SizedBox(height: 16),
             Wrap(
               spacing: 8,
@@ -61,7 +65,13 @@ Future<void> showCodeChangeReview(BuildContext context, WidgetRef ref, String us
       ),
     ),
   );
-  if (choice != null) await groups.acceptChangedCode(userId, verified: choice == 'verify');
+  if (choice == null) return;
+  try {
+    await groups.acceptChangedCode(userId, shown, verified: choice == 'verify');
+  } on CryptoException catch (e) {
+    if (e.code != 'mismatch') rethrow;
+    if (context.mounted) showSnack(context, "$username's security code changed again while you were reviewing it. Review the new one.");
+  }
 }
 
 /// A member's security code (any member, contact or not), with the same review actions as a contact's.
@@ -84,9 +94,17 @@ Future<void> showMemberSafety(BuildContext context, WidgetRef ref, String userId
     showSnack(context, "Couldn't get $username's security code. Try again when you're online.");
     return;
   }
+  final shown = (await crypto.peer(userId))?.identity;
+  if (!context.mounted) return;
   final result = await showSafetySheet(context, username, safety);
   if (result == null) return;
-  await app.reviewedKey(userId, verified: result == SafetyAction.verify);
+  try {
+    await app.reviewedKey(userId, verified: result == SafetyAction.verify, shown: shown);
+  } on CryptoException catch (e) {
+    if (e.code != 'mismatch') rethrow;
+    if (context.mounted) showSnack(context, "$username's security code changed again. Review the new one.");
+    return;
+  }
   if (result == SafetyAction.unverify) await crypto.setVerified(userId, false);
 }
 

@@ -80,6 +80,25 @@ Future<Safety?> safety({
 Future<Peer?> peer({required String contactId}) =>
     RustLib.instance.api.crateApiPeer(contactId: contactId);
 
+/// Accept / verify only the identity the user was shown: `mismatch` if the pinned one changed since.
+Future<void> acceptChangeFor({
+  required String contactId,
+  required Identity identity,
+}) => RustLib.instance.api.crateApiAcceptChangeFor(
+  contactId: contactId,
+  identity: identity,
+);
+
+Future<void> setVerifiedFor({
+  required String contactId,
+  required bool verified,
+  required Identity identity,
+}) => RustLib.instance.api.crateApiSetVerifiedFor(
+  contactId: contactId,
+  verified: verified,
+  identity: identity,
+);
+
 Future<void> setVerified({required String contactId, required bool verified}) =>
     RustLib.instance.api.crateApiSetVerified(
       contactId: contactId,
@@ -104,14 +123,20 @@ Future<void> resetIdentity() => RustLib.instance.api.crateApiResetIdentity();
 /// validates the list (devices.js validateList), checks it names `user_id` and that `published_sign` (the
 /// identity the server publishes for the account) is this core's own key, and signs only the canonical bytes it
 /// builds. JSON of `{signature, certs: {deviceId: signature}}`.
+/// `head_list_json` / `head_signature`: the list the server serves now and its signature, so the core can follow
+/// lists another device of the account signed (it trusts them only if they verify under its own key).
 Future<String> signDeviceList({
   required String userId,
   required String publishedSign,
   required String listJson,
+  String? headListJson,
+  String? headSignature,
 }) => RustLib.instance.api.crateApiSignDeviceList(
   userId: userId,
   publishedSign: publishedSign,
   listJson: listJson,
+  headListJson: headListJson,
+  headSignature: headSignature,
 );
 
 /// The seed of the device-meta sealing key: the identity key's signature over the fixed devicemeta label and
@@ -241,6 +266,15 @@ Future<MlsProcessed> mlsReceive({
   groupId: groupId,
   message: message,
   expect: expect,
+);
+
+/// Who signed a commit at the current epoch, verified against this device's own tree (changes nothing).
+Future<MlsMember> mlsCommitAuthor({
+  required String groupId,
+  required String message,
+}) => RustLib.instance.api.crateApiMlsCommitAuthor(
+  groupId: groupId,
+  message: message,
 );
 
 Future<void> mlsReceiveCommit({required String pendingId}) =>

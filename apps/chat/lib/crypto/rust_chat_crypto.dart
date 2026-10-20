@@ -71,8 +71,21 @@ class RustChatCrypto implements ChatCrypto {
   }
 
   @override
-  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list) => _call(() async {
-    final signed = jsonDecode(await core.signDeviceList(userId: userId, publishedSign: publishedSign, listJson: jsonEncode(list))) as Map<String, dynamic>;
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  }) => _call(() async {
+    final signed = jsonDecode(
+      await core.signDeviceList(
+        userId: userId,
+        publishedSign: publishedSign,
+        listJson: jsonEncode(list),
+        headListJson: head == null ? null : jsonEncode(head.list),
+        headSignature: head?.signature,
+      ),
+    ) as Map<String, dynamic>;
     return (signature: signed['signature'] as String, certs: (signed['certs'] as Map).cast<String, String>());
   });
 
@@ -157,6 +170,14 @@ class RustChatCrypto implements ChatCrypto {
 
   @override
   Future<void> setVerified(String contactId, bool verified) => _call(() => core.setVerified(contactId: contactId, verified: verified));
+
+  @override
+  Future<void> acceptChangeFor(String contactId, Identity shown) =>
+      _call(() => core.acceptChangeFor(contactId: contactId, identity: core.Identity(dh: shown.dh, sign: shown.sign)));
+
+  @override
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown) =>
+      _call(() => core.setVerifiedFor(contactId: contactId, verified: verified, identity: core.Identity(dh: shown.dh, sign: shown.sign)));
 
   @override
   Future<PinnedPeer?> peer(String contactId) => _call(() async {

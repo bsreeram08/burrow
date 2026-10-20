@@ -3,7 +3,7 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
-import 'package:private_chat/crypto/chat_crypto.dart' show Identity;
+import 'package:private_chat/crypto/chat_crypto.dart' show CryptoException, Identity;
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/crypto/fake_chat_crypto.dart';
 import 'package:private_chat/crypto/fake_group_crypto.dart';
@@ -204,7 +204,13 @@ void main() {
     expect(bob.messenger.pinChanges[carol.user.id]?.before, before);
     expect((await bob.chat.peer(carol.user.id))!.blocked, isTrue);
     expect(identityFingerprint(const Identity(dh: 'dh-x', sign: 'sign-y')), '28513 19099 06416 32833 52028 08291 38447 55948 14084 34865 00787 50264');
-    await bob.messenger.acceptChangedCode(carol.user.id, verified: true);
+    // Accepting binds to the code shown: a newer change in between is refused, nothing accepted.
+    ds.identityOverride[carol.user.id] = {'dh': 'newer-dh', 'sign': 'newer-sign'};
+    await bob.messenger.ensurePinned([carol.user.id], force: true);
+    await expectLater(bob.messenger.acceptChangedCode(carol.user.id, const Identity(dh: 'new-dh', sign: 'new-sign'), verified: true), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'mismatch')));
+    expect((await bob.chat.peer(carol.user.id))!.blocked, isTrue);
+    expect(bob.messenger.pinChanges[carol.user.id]?.after, const Identity(dh: 'newer-dh', sign: 'newer-sign'));
+    await bob.messenger.acceptChangedCode(carol.user.id, const Identity(dh: 'newer-dh', sign: 'newer-sign'), verified: true);
     final after = (await bob.chat.peer(carol.user.id))!;
     expect((after.blocked, after.verified), (false, true));
     expect(bob.messenger.pinChanges, isEmpty);

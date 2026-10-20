@@ -177,10 +177,19 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
         return;
       }
     }
+    // The decision binds to the identity whose code is shown now.
+    final shown = (await crypto.peer(widget.contactId))?.identity;
     if (!mounted || safety == null) return;
     final result = await showSafetySheet(context, contact.username, safety);
     if (result != null) {
-      await _app.reviewedKey(widget.contactId, verified: result == SafetyAction.verify);
+      try {
+        await _app.reviewedKey(widget.contactId, verified: result == SafetyAction.verify, shown: shown);
+      } on CryptoException catch (e) {
+        if (e.code != 'mismatch') rethrow;
+        if (mounted) showSnack(context, "${contact.username}'s security code changed again. Review the new one.");
+        await _loadSafety();
+        return;
+      }
       if (result == SafetyAction.unverify) await crypto.setVerified(widget.contactId, false);
       await _loadSafety();
     }

@@ -142,6 +142,10 @@ abstract class GroupCrypto {
   /// a mismatch is refused before anything is staged.
   Future<GroupProcessed> receive(String groupId, String message, {ProcessedKind? expect});
   Future<void> receiveCommit(String pendingId);
+
+  /// The authenticated author of a commit for the group's current epoch, checked against this device's own
+  /// tree (signature only; nothing changes).
+  Future<GroupMember> commitAuthor(String groupId, String message);
   Future<void> receiveAbort(String pendingId);
 
   Future<List<GroupMember>> members(String groupId);

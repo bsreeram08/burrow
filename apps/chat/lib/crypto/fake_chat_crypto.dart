@@ -31,7 +31,12 @@ class FakeChatCrypto implements ChatCrypto {
   String _fakeSig(List<int> bytes) => base64Url.encode(sha256.convert([...utf8.encode(me.sign), ...bytes]).bytes + List.filled(32, 0)).replaceAll('=', '');
 
   @override
-  Future<({String signature, Map<String, String> certs})> signDeviceList(String userId, String publishedSign, Map<String, Object?> list) async {
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  }) async {
     if (publishedSign != me.sign) throw const CryptoException('not the published identity', code: 'mismatch');
     if (list['userId'] != userId) throw const CryptoException('another account', code: 'invalid');
     signedLists.add(list);
@@ -158,6 +163,20 @@ class FakeChatCrypto implements ChatCrypto {
         ..blocked = true
         ..verified = false;
     }
+  }
+
+  @override
+  Future<void> acceptChangeFor(String contactId, Identity shown) async {
+    final p = _peers[contactId];
+    if (p != null && p.identity != shown) throw const CryptoException('the code changed again', code: 'mismatch');
+    await acceptChange(contactId);
+  }
+
+  @override
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown) async {
+    final p = _peers[contactId];
+    if (p != null && p.identity != shown) throw const CryptoException('the code changed again', code: 'mismatch');
+    await setVerified(contactId, verified);
   }
 
   @override

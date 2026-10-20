@@ -152,7 +152,7 @@ class GroupMessenger {
         }
         if (published != null) {
           final identity = Identity.fromJson(published);
-          if (pinned != null && pinned.identity != identity && !pinned.blocked && contact == null) {
+          if (pinned != null && pinned.identity != identity && contact == null) {
             pinChanges[id] = (before: pinChanges[id]?.before ?? pinned.identity, after: identity);
           }
           // First sight: trust on first use. A different key: recorded as a change, which blocks until reviewed.
@@ -167,10 +167,20 @@ class GroupMessenger {
     return problems;
   }
 
-  /// The user reviewed a group member's changed code: accept it (and optionally mark it verified), then resume.
-  Future<void> acceptChangedCode(String userId, {bool verified = false}) async {
-    await chatCrypto.acceptChange(userId);
-    if (verified) await chatCrypto.setVerified(userId, true);
+  /// The user reviewed a group member's changed code: accept exactly [shown] (and optionally mark it
+  /// verified), then resume. If the pin changed again meanwhile, the core refuses with `mismatch`; the newer
+  /// key is recorded for the next review and nothing is accepted.
+  Future<void> acceptChangedCode(String userId, Identity shown, {bool verified = false}) async {
+    try {
+      verified ? await chatCrypto.setVerifiedFor(userId, true, shown) : await chatCrypto.acceptChangeFor(userId, shown);
+    } on CryptoException catch (error) {
+      if (error.code == 'mismatch') {
+        final now = await chatCrypto.peer(userId);
+        final before = pinChanges[userId]?.before;
+        if (now != null && before != null) pinChanges[userId] = (before: before, after: now.identity);
+      }
+      rethrow;
+    }
     pinChanges.remove(userId);
     await sync.resume(userId);
   }

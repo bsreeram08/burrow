@@ -101,6 +101,9 @@ pub struct Peer {
 pub fn peer(contact_id: String) -> Result<Option<Peer>> {
     Ok(core::peer(contact_id)?.map(|p| Peer { identity: p.identity.into(), verified: p.verified, changed: p.changed, blocked: p.blocked }))
 }
+/// Accept / verify only the identity the user was shown: `mismatch` if the pinned one changed since.
+pub fn accept_change_for(contact_id: String, identity: Identity) -> Result<()> { Ok(core::accept_change_for(contact_id, identity.into())?) }
+pub fn set_verified_for(contact_id: String, verified: bool, identity: Identity) -> Result<()> { Ok(core::set_verified_for(contact_id, verified, identity.into())?) }
 pub fn set_verified(contact_id: String, verified: bool) -> Result<()> { Ok(core::set_verified(contact_id, verified)?) }
 pub fn accept_change(contact_id: String) -> Result<()> { Ok(core::accept_change(contact_id)?) }
 pub fn forget(contact_id: String) -> Result<()> { Ok(core::forget(contact_id)?) }
@@ -116,8 +119,14 @@ pub fn reset_identity() -> Result<()> { Ok(core::reset_identity()?) }
 /// validates the list (devices.js validateList), checks it names `user_id` and that `published_sign` (the
 /// identity the server publishes for the account) is this core's own key, and signs only the canonical bytes it
 /// builds. JSON of `{signature, certs: {deviceId: signature}}`.
-pub fn sign_device_list(user_id: String, published_sign: String, list_json: String) -> Result<String> {
-    let signed = core::sign_device_list(user_id, published_sign, list_json)?;
+/// `head_list_json` / `head_signature`: the list the server serves now and its signature, so the core can follow
+/// lists another device of the account signed (it trusts them only if they verify under its own key).
+pub fn sign_device_list(user_id: String, published_sign: String, list_json: String, head_list_json: Option<String>, head_signature: Option<String>) -> Result<String> {
+    let head = match (head_list_json, head_signature) {
+        (Some(list_json), Some(signature)) => Some(chatcore::devicelist::ListHead { list_json, signature }),
+        _ => None,
+    };
+    let signed = core::sign_device_list(user_id, published_sign, list_json, head)?;
     serde_json::to_string(&signed).map_err(|error| CoreError { code: None, message: error.to_string() })
 }
 
@@ -290,6 +299,8 @@ pub fn mls_receive(group_id: String, message: String, expect: Option<MlsExpect>)
     let p = core::mls_receive(group_id, message, expect)?;
     Ok(MlsProcessed { pending_id: p.pending_id, kind: p.kind, plaintext: p.plaintext, sender: p.sender.into(), epoch: p.epoch, digest: p.digest })
 }
+/// Who signed a commit at the current epoch, verified against this device's own tree (changes nothing).
+pub fn mls_commit_author(group_id: String, message: String) -> Result<MlsMember> { Ok(core::mls_commit_author(group_id, message)?.into()) }
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { Ok(core::mls_receive_commit(pending_id)?) }
 pub fn mls_receive_abort(pending_id: String) -> Result<()> { Ok(core::mls_receive_abort(pending_id)?) }
 pub fn mls_members(group_id: String) -> Result<Vec<MlsMember>> { Ok(core::mls_members(group_id)?.into_iter().map(Into::into).collect()) }

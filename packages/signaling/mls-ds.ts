@@ -110,7 +110,7 @@ export function pinAccounts(deps: Pick<Deps, 'aikOf'> & { successions?(userId: s
             catch (inner) {
                 if (!(inner instanceof DsError)) throw inner;
                 const change = deps.identityChange?.(userId);
-                if (!change || change.aik !== aik) throw new Abort(409, 'A member\'s identity key does not match the one this channel was built on.');
+                if (!change || change.aik !== aik) throw new Abort(409, 'A member\'s identity key does not match the one this channel was built on.', { code: 'identity', userId });
                 call({ cmd: 'dsRepin', userId, aik });
             }
             void followed;

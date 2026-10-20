@@ -13,10 +13,14 @@ class PayloadException implements Exception {
 }
 
 const maxReadIds = 100;
-const _messageOptional = {'replyTo', 'attachment', 'link'};
+const _messageOptional = {'replyTo', 'attachment', 'link', 'mentions'};
+const maxMetaName = 64;
+const maxMetaTopic = 256;
+final _control = RegExp(r'[\u0000-\u001f]');
 
 /// Decodes and checks one plaintext. Returns the payload; its `type` is one of
-/// receipt, burn, message, rotate, policy, react, edit, read, typing.
+/// receipt, burn, message, rotate, policy, react, edit, read, typing, and in groups (docs/m4-groups.md §5)
+/// meta and leave, and mls-dm (m5 §8). `mentions` is checked here for shape; the store allows it only in groups.
 Map<String, Object?> checkPayload(String json) {
   if (utf8.encode(json).length > maxPayloadBytes) throw const PayloadException();
   Object? decoded;
@@ -59,9 +63,28 @@ Map<String, Object?> checkPayload(String json) {
           (p['ids'] as List).length <= maxReadIds &&
           (p['ids'] as List).every(_isId),
     'typing' => exactly(const {'v', 'type', 'id', 'at', 'on'}) && p['at'] is int && validTime(p['at'] as int) && p['on'] is bool,
+    'meta' =>
+      exactly(const {'v', 'type', 'id', 'name', 'topic', 'at'}) &&
+          p['name'] is String &&
+          (p['name'] as String).runes.length <= maxMetaName &&
+          !_control.hasMatch(p['name'] as String) &&
+          p['topic'] is String &&
+          (p['topic'] as String).runes.length <= maxMetaTopic &&
+          p['at'] is int &&
+          validTime(p['at'] as int),
+    'leave' => size == 3,
+    // A 1:1 chat's move to its DM group (docs/m5-linking.md §8.2), over the Double Ratchet only.
+    'mls-dm' => exactly(const {'v', 'type', 'id', 'channel', 'at'}) && p['channel'] is String && userIdPattern.hasMatch(p['channel'] as String) && p['at'] is int && validTime(p['at'] as int),
     _ => false,
   };
   if (!ok) throw const PayloadException();
+  if (p['type'] == 'message' && p.containsKey('mentions')) {
+    try {
+      mentionsFromJson(p['mentions']);
+    } on FormatException {
+      throw const PayloadException();
+    }
+  }
   return p;
 }
 

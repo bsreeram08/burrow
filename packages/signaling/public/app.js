@@ -10,6 +10,8 @@ let dataChannel = null, flushTimer, requestChatFlush = null, chatBusy = false, h
 let burnAck = null, peerBurned = false;
 // Account conversations keep one stable ChatStore id per contact pair across rooms; guest links use the room id.
 let conversationId = null, peerName = 'the other participant', accountChat = false, peerKey = null;
+// Groups and channels (groups.js): many senders, reactions per person, read by whom, mentions.
+let groupChat = false, composable = true;
 const encoder = new TextEncoder();
 const messageIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const chatStatus = text => { $('chat-status').textContent = text; };
@@ -40,11 +42,11 @@ function openInvitation(value) {
   refreshHistory();
 }
 function updateComposer() {
-  const canCompose = (validInvite || accountChat) && selectedHistory === conversationId && Boolean(window.ChatStore);
+  const canCompose = (validInvite || accountChat) && selectedHistory === conversationId && Boolean(window.ChatStore) && (!groupChat || composable);
   // Never disable the text box while a send is in flight: that drops keyboard focus mid-conversation.
   $('chat-input').disabled = !canCompose;
   $('chat-send').disabled = !canCompose || chatBusy;
-  $('burn').disabled = $('conv-burn').disabled = !(validInvite || accountChat) || chatBusy;
+  $('burn').disabled = $('conv-burn').disabled = !(validInvite || accountChat) || chatBusy || groupChat;
   // Attachments, voice, reactions, edits and link previews need an account (blobs and receipts go end to end through it).
   view('rich', accountChat && canCompose ? 'yes' : 'no');
   $('attach').disabled = $('voice-record').disabled = !canCompose || !accountChat;
@@ -70,7 +72,15 @@ const readReceiptsOn = () => preference('read-receipts-v1');
 const linkPreviewsOn = () => preference('link-previews-v1');
 const shownText = record => record.editedText ?? record.text;
 const peerLabel = () => peerName === 'the other participant' ? 'They' : peerName;
-const who = record => record.direction === 'outgoing' ? 'You' : peerLabel();
+const who = record => record.direction === 'outgoing' ? 'You' : groupChat ? record.fromName || 'Someone' : peerLabel();
+const nameOf = person => person === 'me' ? 'You' : person === 'peer' ? peerLabel() : window.Groups?.nameOf(person) || 'Someone';
+/** In a group, one of our messages counts as read once every other current member read it. */
+function groupStatus(record) {
+  if (!groupChat || record.direction !== 'outgoing' || record.status === 'queued' || record.status === 'uncertain') return record.status;
+  const info = window.Groups?.info(), others = (info?.members || []).filter(member => member.userId !== info.me);
+  const read = new Set(record.readBy || []);
+  return others.length && others.every(member => read.has(member.userId)) ? 'read' : 'sent';
+}
 /** Shortens to at most `max` UTF-16 units without splitting a character. */
 function clip(text, max) { let out = ''; for (const character of text) { if (out.length + character.length > max) break; out += character; } return out; }
 /** One line for a message: quotes, the chat list and the find bar. */
@@ -82,14 +92,27 @@ function preview(record) {
 }
 function describe(record, flagged) {
   if (record.direction === 'system') return `${record.text} · ${new Date(record.createdAt).toLocaleString()}`;
-  const status = record.status === 'read' && !readReceiptsOn() ? 'delivered' : record.status;
-  const delivery = { queued: 'Queued on this device', sent: 'Sent · delivery unconfirmed', delivered: 'Delivered to device', read: 'Read', uncertain: 'Restored · delivery unconfirmed' }[status];
-  const detail = `${record.direction === 'outgoing' ? 'You' : peerName === 'the other participant' ? 'Other participant' : peerName} · ${new Date(record.createdAt).toLocaleString()} · ${delivery}${record.editedAt ? ` · Edited ${new Date(record.editedAt).toLocaleString()}` : ''}${record.expiresAt ? ' · Disappears ' + new Date(record.expiresAt).toLocaleString() : ''}`;
-  return flagged ? `${detail} · Sent under a new security code` : detail;
+  const status = groupStatus(record) === 'read' && !readReceiptsOn() ? 'delivered' : groupStatus(record);
+  const readers = (record.readBy || []).length;
+  const delivery = groupChat ? { queued: 'Queued on this device', sent: readers ? `Sent · read by ${readers}` : 'Sent to everyone', delivered: 'Sent to everyone', read: 'Read by everyone', uncertain: 'Restored · delivery unconfirmed' }[status]
+    : { queued: 'Queued on this device', sent: 'Sent · delivery unconfirmed', delivered: 'Delivered to device', read: 'Read', uncertain: 'Restored · delivery unconfirmed' }[status];
+  const detail = `${record.direction === 'outgoing' ? 'You' : groupChat ? record.fromName || 'Someone' : peerName === 'the other participant' ? 'Other participant' : peerName} · ${new Date(record.createdAt).toLocaleString()} · ${delivery}${record.editedAt ? ` · Edited ${new Date(record.editedAt).toLocaleString()}` : ''}${record.expiresAt ? ' · Disappears ' + new Date(record.expiresAt).toLocaleString() : ''}`;
+  // History a linked device got from your other device (m5 §2): shown as such, never as something it received itself.
+  const origin = record.imported ? `${detail} · From your other device` : detail;
+  return flagged ? `${origin} · Sent under a new security code` : origin;
 }
 /** Markdown subset with custom emoji in its plain runs; DOM nodes only. */
-function renderText(container, text) {
-  const runs = run => { if (!window.Emoji) return [document.createTextNode(run)]; const fragment = document.createDocumentFragment(); window.Emoji.render(fragment, run); return [...fragment.childNodes]; };
+function renderText(container, text, record) {
+  const plain = run => { if (!window.Emoji) return [document.createTextNode(run)]; const fragment = document.createDocumentFragment(); window.Emoji.render(fragment, run); return [...fragment.childNodes]; };
+  // @mentions (docs/m4-groups.md §5.2): only names the message really mentions are highlighted; yours stands out.
+  const named = new Map((record?.mentions || []).map(id => [nameOf(id).toLowerCase(), id]));
+  const myId = window.Groups?.info()?.me;
+  const runs = !named.size ? plain : run => run.split(/(@[a-z0-9_]{3,20})(?![a-z0-9_])/i).flatMap((part, index) => {
+    const id = index % 2 ? named.get(part.slice(1).toLowerCase()) : undefined;
+    if (!id) return part ? plain(part) : [];
+    const mark = element('span', id === myId ? 'mention mention-me' : 'mention', part);
+    return [mark];
+  });
   if (window.Markdown) window.Markdown.render(container, text, runs); else container.replaceChildren(...runs(text));
 }
 /** A poll: the question, then one button per option with its tally; your choice is marked and can be changed. */
@@ -116,11 +139,12 @@ function paintQuote(quote, record) {
   quote.setAttribute('aria-label', `In reply to ${original ? who(original) : 'a message'}: ${text}.${original ? ' Show the original.' : ''}`);
   quote.disabled = !original;
 }
+const joinNames = list => list.length <= 2 ? list.join(' and ') : `${list.slice(0, -1).join(', ')} and ${list.at(-1)}`;
 function paintReactions(container, record) {
   const people = new Map();
-  for (const person of ['me', 'peer']) for (const emoji of record.reactions?.[person] || []) people.set(emoji, [...people.get(emoji) || [], person]);
+  for (const [person, emoji] of Object.entries(record.reactions || {}).flatMap(([person, list]) => list.map(emoji => [person, emoji]))) people.set(emoji, [...people.get(emoji) || [], person]);
   container.replaceChildren(...[...people].map(([emoji, list]) => {
-    const button = element('button', 'reaction'), mine = list.includes('me'), names = list.map(person => person === 'me' ? 'You' : peerLabel()).join(' and ');
+    const button = element('button', 'reaction'), mine = list.includes('me'), names = joinNames(list.sort((a, b) => (b === 'me') - (a === 'me')).map(nameOf));
     button.type = 'button'; button.dataset.emoji = emoji; button.setAttribute('aria-pressed', String(mine));
     button.title = `${names} reacted with ${emoji}`;
     button.setAttribute('aria-label', `${emoji} ${list.length}: ${names}. ${mine ? 'Remove your reaction' : 'React with this too'}`);
@@ -133,9 +157,9 @@ function paintReactions(container, record) {
 }
 function paintRow(row, record) {
   // Messages that arrived under a changed security code stay marked until the code is reviewed.
-  const flagged = Boolean(window.App?.flagged?.(record)), status = record.status === 'read' && !readReceiptsOn() ? 'delivered' : record.status;
+  const flagged = Boolean(window.App?.flagged?.(record)), status = groupStatus(record) === 'read' && !readReceiptsOn() ? 'delivered' : groupStatus(record);
   const quoted = record.replyTo ? shown.get(record.replyTo.id)?.direction || '-' : '';
-  const key = `${status}|${flagged}|${record.createdAt}|${shownText(record)}|${record.editedAt || ''}|${JSON.stringify(record.votes || null)}|${JSON.stringify(record.reactions || null)}|${quoted}|${peerName}|${window.Emoji?.revision || 0}`;
+  const key = `${status}|${flagged}|${record.createdAt}|${shownText(record)}|${record.editedAt || ''}|${JSON.stringify(record.votes || null)}|${JSON.stringify(record.reactions || null)}|${quoted}|${peerName}|${(record.readBy || []).length}|${record.fromName || ''}|${record.imported ? 'i' : ''}|${window.Emoji?.revision || 0}`;
   if (row.dataset.paint === key) return;
   row.dataset.paint = key; row.dataset.status = status; row.classList.toggle('flagged', flagged);
   const body = row.querySelector('.message-text'), text = shownText(record);
@@ -144,19 +168,20 @@ function paintRow(row, record) {
   // An action reads as a sentence on both sides ("alice waves"); a guest's own line, with no username, reads "You: waves".
   else if (record.kind === 'action') body.textContent = record.direction === 'outgoing' ? `${window.App?.myName || 'You:'} ${text}` : `${who(record)} ${text}`;
   else if (record.direction !== 'system') {
-    if (text) renderText(body, text); else body.replaceChildren(); // An attachment alone: no text block.
+    if (text) renderText(body, text, record); else body.replaceChildren(); // An attachment alone: no text block.
+    row.classList.toggle('mentions-me', Boolean(record.mentions?.includes(window.Groups?.info()?.me)) && record.direction === 'incoming');
     const size = window.Emoji && !record.attachment ? window.Emoji.size(text) : '';
     if (size) row.dataset.emoji = size;
     // A `:name:` this device does not know yet may be a custom emoji someone just added: refresh the pack.
     if (/:[a-z0-9_+-]{2,32}:/.test(text) && window.Emoji && !body.querySelector('.custom-emoji')) window.App?.onUnknownEmoji?.();
   }
   else body.textContent = text; // System lines can be updated in place.
-  const head = row.querySelector('.msg-head'); if (head) head.textContent = peerLabel();
+  const head = row.querySelector('.msg-head'); if (head) head.textContent = groupChat ? record.fromName || 'Someone' : peerLabel();
   const quote = row.querySelector('.reply-quote'); if (quote) paintQuote(quote, record);
   const reactions = row.querySelector('.reactions'); if (reactions) paintReactions(reactions, record);
   const label = describe(record, flagged); row.title = label;
   const meta = row.querySelector('.message-meta'); meta.setAttribute('aria-label', label);
-  meta.querySelector('.meta-text').textContent = `${flagged ? '⚠ ' : ''}${record.expiresAt ? '⏱ ' : ''}${record.editedAt ? 'edited · ' : ''}${clock(record.createdAt)}${record.direction === 'outgoing' && record.status === 'uncertain' ? ' ?' : ''}`;
+  meta.querySelector('.meta-text').textContent = `${record.imported ? 'from your other device · ' : ''}${flagged ? '⚠ ' : ''}${record.expiresAt ? '⏱ ' : ''}${record.editedAt ? 'edited · ' : ''}${clock(record.createdAt)}${record.direction === 'outgoing' && record.status === 'uncertain' ? ' ?' : ''}`;
 }
 function buildRow(record, animate) {
   const row = document.createElement('li'); row.className = record.direction;
@@ -164,7 +189,7 @@ function buildRow(record, animate) {
   if (record.attachment) row.classList.add('has-attachment', `attachment-${record.attachment.kind}`);
   if (animate) row.classList.add('enter');
   row.dataset.messageId = record.id;
-  if (record.direction === 'incoming') { const head = element('span', 'msg-head'); head.dataset.name = String(window.Theme?.nameIndex?.(peerKey || peerName) ?? 0); row.append(head); }
+  if (record.direction === 'incoming') { const head = element('span', 'msg-head'); head.dataset.name = String(window.Theme?.nameIndex?.(record.from || peerKey || peerName) ?? 0); row.append(head); }
   if (record.replyTo) { const quote = element('button', 'reply-quote'); quote.type = 'button'; quote.dataset.target = record.replyTo.id; row.append(quote); }
   if (record.attachment) row.append(attachmentNode(record));
   const text = document.createElement('div'); text.className = 'message-text';
@@ -189,7 +214,7 @@ function dayLabel(time) {
   return date.toLocaleDateString([], { weekday: 'short', month: 'long', day: 'numeric', year: date.getFullYear() === today.getFullYear() ? undefined : 'numeric' });
 }
 /** Consecutive messages from the same sender within 5 minutes share one header; only the last has the tail. */
-const sameGroup = (a, b) => Boolean(a && b) && a.direction === b.direction && a.direction !== 'system' && b.createdAt - a.createdAt < GROUP_GAP && dayKey(a.createdAt) === dayKey(b.createdAt);
+const sameGroup = (a, b) => Boolean(a && b) && a.direction === b.direction && a.from === b.from && a.direction !== 'system' && b.createdAt - a.createdAt < GROUP_GAP && dayKey(a.createdAt) === dayKey(b.createdAt);
 function renderTranscript(visible) {
   const log = $('chat-log'), wasNearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
   // A different conversation (or a forced refresh) is a fresh, motionless render.
@@ -383,6 +408,7 @@ function messagePayload(record) {
   if (record.replyTo) payload.replyTo = record.replyTo;
   if (record.attachment) payload.attachment = record.attachment;
   if (record.link && text.includes(record.link.url)) payload.link = record.link;
+  if (record.mentions) payload.mentions = record.mentions;
   return payload;
 }
 function send(message) {
@@ -745,6 +771,7 @@ window.addEventListener('hashchange', () => {
 $('history-select').onchange = () => { selectedHistory = $('history-select').value; refreshHistory(); };
 /** Saves an outgoing message (plain, /me action, poll or attachment) and hands it to the right transport. */
 async function queueMessage({ text, kind, poll, replyTo, attachment, link }) {
+  if (groupChat && kind === 'poll') throw new Error('Polls in groups and channels come later.');
   if (!kind && window.Emoji) text = window.Emoji.expand(text); // ":smile:" becomes 😄 on send; custom ones stay as :name:.
   if (!text.trim() && !attachment || encoder.encode(text).length > 4096) throw new Error('Enter a message up to 4096 UTF-8 bytes.');
   const createdAt = Date.now(), duration = Number($('disappear').value) || 0;
@@ -752,6 +779,8 @@ async function queueMessage({ text, kind, poll, replyTo, attachment, link }) {
   if (replyTo) rich.replyTo = replyTo;
   if (attachment) rich.attachment = attachment;
   if (link && text.includes(link.url)) rich.link = link;
+  const mentions = groupChat ? mentionsIn(text) : [];
+  if (mentions.length) rich.mentions = mentions;
   await window.ChatStore.put({ id: crypto.randomUUID(), conversationId, direction: 'outgoing', text, createdAt, status: 'queued', expiresAt: duration ? createdAt + duration : null, ...rich });
   if (accountChat) window.App?.onQueued?.(); // Encrypted and posted to the mailbox by account.js.
   else if (requestChatFlush?.(), dataChannel?.readyState === 'open') chatStatus('');
@@ -878,6 +907,7 @@ $('chat-log').addEventListener('click', async event => {
 function resizeComposer() { const input = $('chat-input'); if (!input.style) return; input.style.height = 'auto'; input.style.height = `${Math.min(input.scrollHeight, 160)}px`; }
 $('chat-input').oninput = resizeComposer;
 $('chat-input').onkeydown = event => {
+  if (mentionKeydown(event)) return;
   if (window.Commands?.keydown(event)) return;
   // ↑ in an empty composer edits your last message; Escape leaves editing or replying.
   if (event.key === 'ArrowUp' && !$('chat-input').value && !event.shiftKey && !event.altKey && !event.metaKey && !event.ctrlKey) { const last = lastEditable(); if (last) { event.preventDefault(); startEdit(last); } return; }
@@ -1176,7 +1206,8 @@ function buildActions() {
     button('More reactions', icon(['M12 5v14M5 12h14']), { action: 'more' }),
     button('Reply', icon(['M9 17l-5-5 5-5', 'M4 12h11a5 5 0 0 1 5 5v2']), { action: 'reply' }),
     button('Edit', icon(['M12 20h9', 'M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z']), { action: 'edit' }),
-    button('Copy text', icon(['M8 8h12v12H8z', 'M4 16V4h12']), { action: 'copy' }));
+    button('Copy text', icon(['M8 8h12v12H8z', 'M4 16V4h12']), { action: 'copy' }),
+    button('Message info', icon(['M12 8h.01', 'M11 12h1v4h1', 'M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18z']), { action: 'info' }));
 }
 buildActions();
 function showActions(row) {
@@ -1186,6 +1217,7 @@ function showActions(row) {
   for (const node of bar.querySelectorAll('[data-react], [data-action="more"]')) node.hidden = !canReact(record);
   bar.querySelector('[data-action="edit"]').hidden = !canEdit(record);
   bar.querySelector('[data-action="copy"]').hidden = !shownText(record).trim() || !navigator.clipboard;
+  bar.querySelector('[data-action="info"]').hidden = !(groupChat && record.direction === 'outgoing' && accountChat);
   for (const node of bar.querySelectorAll('[data-react]')) node.setAttribute('aria-pressed', String((record.reactions?.me || []).includes(node.dataset.react)));
   bar.hidden = false;
   const section = $('chat-log').closest('.chat-section').getBoundingClientRect(), box = row.getBoundingClientRect();
@@ -1200,7 +1232,7 @@ async function react(id, emoji, on) {
   const record = shown.get(id);
   if (!canReact(record)) return;
   if (on === undefined) on = !(record.reactions?.me || []).includes(emoji);
-  const distinct = new Set([...record.reactions?.me || [], ...record.reactions?.peer || []]);
+  const distinct = new Set(Object.values(record.reactions || {}).flat());
   if (on && !distinct.has(emoji) && distinct.size >= (window.ChatStore.MAX_REACTIONS || 20)) { chatStatus('This message already has as many different reactions as it can hold.'); return; }
   try {
     await window.App.onReact(id, emoji, on);
@@ -1294,6 +1326,7 @@ $('msg-actions').addEventListener('click', event => {
   if (action === 'more') openEmojiPicker(emoji => react(id, emoji, true));
   else if (action === 'reply') startReply(record);
   else if (action === 'edit') startEdit(record);
+  else if (action === 'info') { hideActions(); window.Groups?.receiptInfo(record); }
   else if (action === 'copy') { navigator.clipboard.writeText(shownText(record)).then(() => chatStatus('Copied.'), () => chatStatus('Couldn’t copy. Select the text instead.')); hideActions(); }
 });
 // Pointer devices: the bar follows the hovered message. Touch: a tap on a bubble shows it; swipe right replies.
@@ -1395,9 +1428,9 @@ function updateJump() {
 $('jump-newest').onclick = () => { const log = $('chat-log'); log.scrollTo({ top: log.scrollHeight, behavior: reducedMotion() ? 'auto' : 'smooth' }); unseenBelow = 0; updateJump(); };
 
 // ---------- Typing indicator ----------
-function showTyping(on) {
+function showTyping(on, text) {
   $('typing').hidden = !on;
-  if (on) $('typing-text').textContent = `${peerLabel()} ${peerLabel() === 'They' ? 'are' : 'is'} typing`;
+  if (on) $('typing-text').textContent = text || `${peerLabel()} ${peerLabel() === 'They' ? 'are' : 'is'} typing`;
 }
 
 // ---------- Find in conversation ----------
@@ -1500,8 +1533,58 @@ function takeLink(text) {
   linkDraft = null; removedLinks.clear(); clearTimeout(unfurlTimer); paintLinkDraft();
   return link;
 }
+// ---------- @mentions in the composer (docs/m4-groups.md §5.2) ----------
+let mentionState = null;
+const mentionable = () => { const info = groupChat ? window.Groups?.info() : null; return info ? info.members.filter(member => member.userId !== info.me) : []; };
+/** In order, not necessarily adjacent: "bb" finds "bob_b". */
+const fuzzy = (query, name) => { let at = 0; for (const character of name) if (character === query[at]) at++; return at === query.length; };
+function mentionsIn(text) {
+  const people = mentionable(), ids = new Set();
+  for (const match of text.matchAll(/(?:^|[^a-z0-9_])@([a-z0-9_]{3,20})(?![a-z0-9_])/gi)) { const person = people.find(member => member.username === match[1].toLowerCase()); if (person) ids.add(person.userId); }
+  return [...ids].slice(0, 64);
+}
+function closeMentions() { mentionState = null; $('mention-popup').hidden = true; $('chat-input').removeAttribute('aria-activedescendant'); }
+function updateMentions() {
+  const input = $('chat-input'), caret = input.selectionStart ?? input.value.length;
+  const match = groupChat ? /(?:^|\s)@([a-z0-9_]{0,20})$/i.exec(input.value.slice(0, caret)) : null;
+  if (!match) { closeMentions(); return; }
+  const query = match[1].toLowerCase();
+  const items = mentionable().filter(member => fuzzy(query, member.username))
+    .sort((a, b) => (b.username.startsWith(query)) - (a.username.startsWith(query)) || a.username.localeCompare(b.username)).slice(0, 8);
+  if (!items.length) { closeMentions(); return; }
+  mentionState = { start: caret - match[1].length - 1, caret, items, index: Math.min(mentionState?.index || 0, items.length - 1) };
+  paintMentions();
+}
+function paintMentions() {
+  const popup = $('mention-popup');
+  popup.replaceChildren(...mentionState.items.map((member, index) => {
+    const option = element('li', 'cmd-item'); option.id = `mention-${index}`; option.setAttribute('role', 'option');
+    option.setAttribute('aria-selected', String(index === mentionState.index));
+    option.append(element('span', 'avatar small', member.username[0].toUpperCase()), element('span', 'cmd-name', `@${member.username}`));
+    option.onmousedown = event => { event.preventDefault(); pickMention(member); };
+    return option;
+  }));
+  popup.hidden = false;
+  $('chat-input').setAttribute('aria-activedescendant', `mention-${mentionState.index}`);
+}
+function pickMention(member) {
+  const input = $('chat-input'), { start, caret } = mentionState, insert = `@${member.username} `;
+  input.value = input.value.slice(0, start) + insert + input.value.slice(caret);
+  input.setSelectionRange?.(start + insert.length, start + insert.length);
+  closeMentions(); resizeComposer(); composerChanged(); input.focus?.();
+}
+function mentionKeydown(event) {
+  if (!mentionState || $('mention-popup').hidden) return false;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { mentionState.index = (mentionState.index + (event.key === 'ArrowDown' ? 1 : -1) + mentionState.items.length) % mentionState.items.length; paintMentions(); }
+  else if (event.key === 'Enter' || event.key === 'Tab') pickMention(mentionState.items[mentionState.index]);
+  else if (event.key === 'Escape') closeMentions();
+  else return false;
+  event.preventDefault(); return true;
+}
+$('chat-input').addEventListener('blur', () => setTimeout(closeMentions, 150));
 function composerChanged() {
   const text = $('chat-input').value;
+  updateMentions();
   $('chat-form').dataset.empty = String(!text.trim());
   scheduleUnfurl();
   window.App?.onTyping?.(Boolean(text.trim()) && !editing);
@@ -1593,17 +1676,20 @@ window.App = {
   get readReceipts() { return readReceiptsOn(); },
   openConversation(next) {
     if (active && conversationId !== next.conversationId) throw new Error('busy');
-    if (conversationId !== next.conversationId) { resetComposerContext(); showTyping(false); }
+    if (conversationId !== next.conversationId) { resetComposerContext(); showTyping(false); closeMentions(); }
     conversationId = selectedHistory = next.conversationId; peerName = next.peerName; peerKey = next.peerId || null; accountChat = true; transcriptSignature = '';
+    groupChat = Boolean(next.group); composable = true;
     window.Theme?.use(conversationId);
     if (!active) { validInvite = false; chatStatus(''); }
     // With a keyboard, opening a chat puts the cursor in the message box (phones keep their keyboard closed).
     refreshHistory().then(() => { if (window.matchMedia?.('(pointer: fine)')?.matches) $('chat-input').focus?.(); });
   },
-  closeConversation() { if (!active) { resetComposerContext(); showTyping(false); accountChat = false; conversationId = null; peerKey = null; selectedHistory = ''; window.Theme?.use(null); refreshHistory(); } },
+  closeConversation() { if (!active) { resetComposerContext(); showTyping(false); closeMentions(); accountChat = false; groupChat = false; conversationId = null; peerKey = null; selectedHistory = ''; window.Theme?.use(null); refreshHistory(); } },
+  setPeerName(name) { if (groupChat && peerName !== name) { peerName = name; transcriptSignature = ''; refreshHistory(); } },
+  setComposable(on) { if (composable !== on) { composable = on; updateComposer(); } },
   async start(next) {
     if (active) { cleanup('Switching conversation…'); }
-    lifecycle++; roomId = next.roomId; token = next.token; validInvite = true; peerBurned = false;
+    lifecycle++; roomId = next.roomId; token = next.token; validInvite = true; peerBurned = false; groupChat = false;
     conversationId = selectedHistory = next.conversationId; peerName = next.peerName; peerKey = next.peerId || peerKey; accountChat = true; window.Theme?.use(conversationId);
     $('remote').closest('figure').querySelector('figcaption').textContent = next.peerName;
     // audioOnly: a video call answered with the microphone only; the camera can be added later.

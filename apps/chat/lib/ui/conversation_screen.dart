@@ -1,21 +1,19 @@
 import 'dart:async';
-import 'dart:io' show File, Platform;
+import 'dart:io' show Platform;
 
 import 'package:cross_file/cross_file.dart';
 import 'package:desktop_drop/desktop_drop.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
-import 'package:uuid/uuid.dart';
-import 'package:video_player/video_player.dart';
 
 import '../app/app_controller.dart';
 import '../app/chat_settings.dart';
 import '../core/api.dart';
 import '../crypto/chat_crypto.dart';
 import '../messaging/attachments.dart';
+import '../messaging/messenger.dart' show companionNotice;
 import '../store/message.dart';
 import '../theme/theme_prefs.dart';
 import 'command_palette.dart';
@@ -23,6 +21,7 @@ import 'conversation_view.dart';
 import 'safety_sheet.dart';
 import 'theme_picker.dart';
 import 'widgets/common.dart';
+import 'sending.dart';
 import 'widgets/voice_recorder.dart';
 
 class ConversationScreen extends ConsumerStatefulWidget {
@@ -32,20 +31,29 @@ class ConversationScreen extends ConsumerStatefulWidget {
   ConsumerState<ConversationScreen> createState() => _ConversationScreenState();
 }
 
-class _ConversationScreenState extends ConsumerState<ConversationScreen> {
+class _ConversationScreenState extends ConsumerState<ConversationScreen> with AttachmentSending {
   List<ChatMessage>? _messages;
   SafetyNumber? _safety;
   StreamSubscription<String?>? _changes;
   late final AppController _app = ref.read(appProvider.notifier);
   late final String _conversationId = _app.messenger!.conversationWith(widget.contactId);
-  late final AttachmentService _attachments = ref.read(attachmentsProvider);
+  AttachmentService get _attachments => attachmentService;
+
+  @override
+  String get conversationId => _conversationId;
+
+  @override
+  SendAttachment get sendAttachment => (attachment, {replyTo, disappearAfter}) async {
+    final contact = _contact;
+    if (contact == null) return;
+    await _app.messenger!.send(contact, '', attachment: attachment, replyTo: replyTo, disappearAfter: disappearAfter);
+  };
   late final ChatSearch _search = ref.read(chatSearchProvider.notifier);
   final _view = GlobalKey<ConversationViewState>();
   late final AppLifecycleListener _lifecycle;
   bool _focused = true;
   bool _dropping = false;
   final List<ChatMessage> _unreported = [];
-  final Map<String, Future<void> Function()> _retries = {};
 
   @override
   void initState() {
@@ -98,127 +106,6 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
     if (contact != null) unawaited(_app.messenger?.typingChanged(contact, on: false));
     Future.microtask(() => _search.clear(this));
     super.dispose();
-  }
-
-  // ---------- Attachments ----------
-  Future<List<XFile>> _pick({required bool media}) async {
-    final files = await FilePicker.pickFiles(type: media ? FileType.media : FileType.any);
-    return [for (final f in files) f.xFile];
-  }
-
-  Future<FileFacts> _facts(XFile file, Uint8List bytes, String kind) async {
-    if (kind == 'image') {
-      final facts = await imageFactsInBackground(bytes);
-      return FileFacts(width: facts.width, height: facts.height, thumb: facts.thumb);
-    }
-    if (kind == 'video' && file.path.isNotEmpty) {
-      // Best effort: the platform player reads the size and length; no poster frame is made here.
-      final player = VideoPlayerController.file(File(file.path));
-      try {
-        await player.initialize().timeout(const Duration(seconds: 5));
-        final size = player.value.size;
-        return FileFacts(
-          width: size.width >= 1 ? size.width.round() : null,
-          height: size.height >= 1 ? size.height.round() : null,
-          duration: player.value.duration.inMilliseconds / 1000,
-        );
-      } catch (_) {
-        return const FileFacts();
-      } finally {
-        unawaited(player.dispose());
-      }
-    }
-    return const FileFacts();
-  }
-
-  Future<void> _attach(List<XFile> files, {ReplyTo? replyTo, Duration? disappearAfter}) async {
-    final contact = _contact;
-    if (contact == null) return;
-    for (final file in files) {
-      if (await file.length() > maxAttachmentBytes) {
-        if (mounted) showSnack(context, '${file.name} is larger than 25 MB, so it can\'t be sent.');
-        continue;
-      }
-      final bytes = await file.readAsBytes();
-      final mime = file.mimeType ?? mimeFor(file.name);
-      final kind = kindFor(mime);
-      final upload = PendingUpload(id: const Uuid().v4(), conversationId: _conversationId, name: cleanName(file.name), kind: kind, bytes: bytes, replyTo: replyTo);
-      _attachments.addPending(upload);
-      Future<void> run() async {
-        upload.error.value = null;
-        upload.progress.value = 0;
-        try {
-          final facts = await _facts(file, bytes, kind);
-          final attachment = await _attachments.upload(bytes: bytes, name: file.name, mime: mime, kind: kind, facts: facts, onProgress: (v) => upload.progress.value = v);
-          await _app.messenger!.send(contact, '', attachment: attachment, replyTo: upload.replyTo, disappearAfter: disappearAfter);
-          _attachments.removePending(upload.id);
-          _retries.remove(upload.id);
-        } catch (e) {
-          upload.error.value = e.toString();
-        }
-      }
-
-      _retries[upload.id] = run;
-      replyTo = null; // Only the first file of a batch carries the reply.
-      unawaited(run());
-    }
-  }
-
-  Future<void> _sendVoice(VoiceNote note, {ReplyTo? replyTo, Duration? disappearAfter}) async {
-    final contact = _contact;
-    if (contact == null) return;
-    final upload = PendingUpload(id: const Uuid().v4(), conversationId: _conversationId, name: 'Voice message', kind: 'voice', bytes: note.bytes, replyTo: replyTo);
-    _attachments.addPending(upload);
-    Future<void> run() async {
-      upload.error.value = null;
-      try {
-        final attachment = await _attachments.upload(
-          bytes: note.bytes,
-          name: 'voice.m4a',
-          mime: 'audio/mp4',
-          kind: 'voice',
-          facts: FileFacts(duration: (note.seconds * 10).round() / 10, waveform: note.waveform),
-          onProgress: (v) => upload.progress.value = v,
-        );
-        await _app.messenger!.send(contact, '', attachment: attachment, replyTo: replyTo, disappearAfter: disappearAfter);
-        _attachments.removePending(upload.id);
-        _retries.remove(upload.id);
-      } catch (e) {
-        upload.error.value = e.toString();
-      }
-    }
-
-    _retries[upload.id] = run;
-    unawaited(run());
-  }
-
-  /// The sender-side preview (§4): the server fetches the page, this device makes the thumb.
-  Future<LinkPreview?> _unfurl(String url) async {
-    if (!ref.read(chatSettingsProvider).linkPreviews) return null;
-    try {
-      final api = ref.read(apiProvider);
-      final data = await api.unfurl(url);
-      String? clip(Object? v, int max) {
-        if (v is! String) return null;
-        final s = v.replaceAll(RegExp(r'\s+'), ' ').trim();
-        if (s.isEmpty) return null;
-        return s.length <= max ? s : '${s.substring(0, max - 1)}…';
-      }
-
-      final title = clip(data['title'], 200), description = clip(data['description'], 300), site = clip(data['site'], 60);
-      if (title == null && description == null) return null;
-      String? thumb;
-      final image = data['image'];
-      if (image is String && LinkPreview.isHttpsUrl(image)) {
-        try {
-          final bytes = await api.unfurlImage(image);
-          thumb = await thumbInBackground(bytes);
-        } catch (_) {}
-      }
-      return LinkPreview(url: url, title: title, description: description, site: site, thumb: thumb);
-    } catch (_) {
-      return null;
-    }
   }
 
   Future<void> _call(Contact contact, String kind) async {
@@ -291,10 +178,19 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
         return;
       }
     }
+    // The decision binds to the identity whose code is shown now.
+    final shown = (await crypto.peer(widget.contactId))?.identity;
     if (!mounted || safety == null) return;
     final result = await showSafetySheet(context, contact.username, safety);
     if (result != null) {
-      await _app.reviewedKey(widget.contactId, verified: result == SafetyAction.verify);
+      try {
+        await _app.reviewedKey(widget.contactId, verified: result == SafetyAction.verify, shown: shown);
+      } on CryptoException catch (e) {
+        if (e.code != 'mismatch') rethrow;
+        if (mounted) showSnack(context, "${contact.username}'s security code changed again. Review the new one.");
+        await _loadSafety();
+        return;
+      }
       if (result == SafetyAction.unverify) await crypto.setVerified(widget.contactId, false);
       await _loadSafety();
     }
@@ -359,7 +255,10 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
         ),
         body: _messages == null
             ? const SizedBox.shrink()
-            : _dropTarget(
+            : _onPrimaryNotice(
+                show: state.companion && !state.movedChats.contains(widget.contactId),
+                color: tokens.muted,
+                child: _dropTarget(
                 accent: tokens.accent,
                 child: ValueListenableBuilder<List<PendingUpload>>(
                   valueListenable: _attachments.uploads,
@@ -385,9 +284,20 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
                   ),
                 ),
               ),
+              ),
       ),
     );
   }
+
+  /// A linked device sends here only once the chat moved to MLS (m5 §8); until then it is on the primary.
+  Widget _onPrimaryNotice({required bool show, required Color color, required Widget child}) => !show
+      ? child
+      : Column(
+          children: [
+            Padding(padding: const EdgeInsets.all(12), child: Text(companionNotice, key: const Key('companion-notice'), style: TextStyle(color: color))),
+            Expanded(child: child),
+          ],
+        );
 
   static final _desktop = !kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
 
@@ -399,7 +309,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> {
       onDragExited: (_) => setState(() => _dropping = false),
       onDragDone: (details) {
         setState(() => _dropping = false);
-        unawaited(_attach(details.files));
+        unawaited(attachFiles(details.files));
       },
       child: Stack(
         children: [
@@ -434,26 +344,23 @@ class _ScreenActions extends ConversationActions {
   @override
   Future<void> edit(ChatMessage message, String text) async => s._app.messenger!.edit(contact, message, text);
   @override
-  Future<List<XFile>> pickFiles({required bool media}) => s._pick(media: media);
+  Future<List<XFile>> pickFiles({required bool media}) => s.pickFiles(media: media);
   @override
-  Future<void> attach(List<XFile> files, {ReplyTo? replyTo, Duration? disappearAfter}) => s._attach(files, replyTo: replyTo, disappearAfter: disappearAfter);
+  Future<void> attach(List<XFile> files, {ReplyTo? replyTo, Duration? disappearAfter}) => s.attachFiles(files, replyTo: replyTo, disappearAfter: disappearAfter);
   @override
-  Future<void> sendVoice(VoiceNote note, {ReplyTo? replyTo, Duration? disappearAfter}) => s._sendVoice(note, replyTo: replyTo, disappearAfter: disappearAfter);
+  Future<void> sendVoice(VoiceNote note, {ReplyTo? replyTo, Duration? disappearAfter}) => s.sendVoiceNote(note, replyTo: replyTo, disappearAfter: disappearAfter);
   @override
   void typing(bool on) => unawaited(s._app.messenger?.typingChanged(s._contact ?? contact, on: on));
   @override
   void displayed(List<ChatMessage> messages) => s._displayed(messages);
   @override
-  Future<LinkPreview?> unfurl(String url) => s._unfurl(url);
+  Future<LinkPreview?> unfurl(String url) => s.unfurlLink(url);
   @override
   AttachmentService get attachments => s._attachments;
   @override
   bool get canRecord => true;
   @override
-  void retryUpload(PendingUpload upload) => unawaited(s._retries[upload.id]?.call());
+  void retryUpload(PendingUpload upload) => s.retryUpload(upload);
   @override
-  void removeUpload(PendingUpload upload) {
-    s._retries.remove(upload.id);
-    s._attachments.removePending(upload.id);
-  }
+  void removeUpload(PendingUpload upload) => s.removeUpload(upload);
 }

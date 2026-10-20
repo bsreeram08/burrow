@@ -46,6 +46,8 @@ dependencies:
   firebase_core: ^4.15.0
   firebase_messaging: ^16.7.0
   crypto: ^3.0.7
+  # Ed25519 verification of contacts' device lists (pure Dart; the account key itself stays in chatcore).
+  ed25519_edwards: ^0.3.1
   share_plus: ^13.3.1
   uuid: ^4.6.0
   shared_preferences: ^2.5.6
@@ -64,6 +66,8 @@ dependencies:
   desktop_drop: ^0.8.0
   cross_file: ^0.3.5+5
   characters: ^1.4.1
+  mobile_scanner: ^7.4.2
+  qr_flutter: ^4.1.0
 
 dev_dependencies:
   flutter_test:

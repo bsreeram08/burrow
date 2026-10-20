@@ -71,6 +71,28 @@ class RustChatCrypto implements ChatCrypto {
   }
 
   @override
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  }) => _call(() async {
+    final signed = jsonDecode(
+      await core.signDeviceList(
+        userId: userId,
+        publishedSign: publishedSign,
+        listJson: jsonEncode(list),
+        headListJson: head == null ? null : jsonEncode(head.list),
+        headSignature: head?.signature,
+      ),
+    ) as Map<String, dynamic>;
+    return (signature: signed['signature'] as String, certs: (signed['certs'] as Map).cast<String, String>());
+  });
+
+  @override
+  Future<String> deviceMetaSignature(String userId) => _call(() => core.deviceMetaSignature(userId: userId));
+
+  @override
   Future<void> resetLocal(String name) async {
     final path = await _path(name);
     for (final suffix in ['', '-wal', '-shm', '-journal']) {
@@ -150,6 +172,26 @@ class RustChatCrypto implements ChatCrypto {
   Future<void> setVerified(String contactId, bool verified) => _call(() => core.setVerified(contactId: contactId, verified: verified));
 
   @override
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records) => _call(() async {
+    final p = await core.acceptSuccession(contactId: contactId, recordsJson: jsonEncode(records));
+    return PinnedPeer(identity: Identity(dh: p.identity.dh, sign: p.identity.sign), verified: p.verified, changed: p.changed, blocked: p.blocked);
+  });
+
+  @override
+  Future<void> acceptChangeFor(String contactId, Identity shown) =>
+      _call(() => core.acceptChangeFor(contactId: contactId, identity: core.Identity(dh: shown.dh, sign: shown.sign)));
+
+  @override
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown) =>
+      _call(() => core.setVerifiedFor(contactId: contactId, verified: verified, identity: core.Identity(dh: shown.dh, sign: shown.sign)));
+
+  @override
+  Future<PinnedPeer?> peer(String contactId) => _call(() async {
+    final p = await core.peer(contactId: contactId);
+    return p == null ? null : PinnedPeer(identity: Identity(dh: p.identity.dh, sign: p.identity.sign), verified: p.verified, changed: p.changed, blocked: p.blocked);
+  });
+
+  @override
   Future<void> acceptChange(String contactId) => _call(() => core.acceptChange(contactId: contactId));
 
   @override
@@ -163,6 +205,10 @@ class RustChatCrypto implements ChatCrypto {
 
   @override
   Future<void> resetIdentity() => _call(core.resetIdentity);
+
+  @override
+  Future<String> proveIdentity(String userId, String deviceId, String challenge) =>
+      _call(() => core.proveIdentity(userId: userId, deviceId: deviceId, challenge: challenge));
 
   @override
   SasCommitment sasCommit() => _sync(() {

@@ -6,20 +6,24 @@ use std::fmt;
 pub struct ChatError {
     pub code: Option<String>,
     pub message: String,
+    /// Extra classification some failures carry (a rejected group commit: `signed-content` or `tag`, see
+    /// `mls::engine::CommitCheck`). Reported beside `code` by the JSON commands.
+    pub class: Option<String>,
 }
 
 impl ChatError {
     pub fn coded(code: &str, message: &str) -> Self {
-        Self { code: Some(code.to_string()), message: message.to_string() }
+        Self { code: Some(code.to_string()), message: message.to_string(), class: None }
     }
     pub fn transient(message: impl Into<String>) -> Self {
-        Self { code: None, message: message.into() }
+        Self { code: None, message: message.into(), class: None }
     }
     pub fn malformed() -> Self { Self::coded("malformed", "Invalid envelope") }
     pub fn replay() -> Self { Self::coded("replay", "Replayed or duplicate message") }
     pub fn storage(message: impl fmt::Display) -> Self {
         Self::coded("storage", &format!("Key storage failed: {message}"))
     }
+    pub fn with_class(mut self, class: &str) -> Self { self.class = Some(class.to_string()); self }
     pub fn code(&self) -> Option<&str> { self.code.as_deref() }
 }
 

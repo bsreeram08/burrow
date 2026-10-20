@@ -104,6 +104,16 @@ class CryptoException implements Exception {
   String toString() => message;
 }
 
+class PinnedPeer {
+  const PinnedPeer({required this.identity, required this.verified, required this.changed, required this.blocked});
+  final Identity identity;
+  final bool verified;
+
+  /// A different identity than the first one was recorded; [blocked] until the user reviews it.
+  final bool changed;
+  final bool blocked;
+}
+
 class SafetyNumber {
   const SafetyNumber({
     required this.number,
@@ -198,6 +208,28 @@ abstract class ChatCrypto {
   /// security-code change; upload it with takeover semantics afterwards.
   Future<void> resetIdentity();
 
+  /// Proves to the server that this device holds the account identity key, for one device-claim
+  /// challenge (docs/devices.md): the identity key's signature over the claim bytes, which the core builds
+  /// itself, so it signs nothing else. Base64url.
+  Future<String> proveIdentity(String userId, String deviceId, String challenge);
+
+  /// Signs the account's next DeviceList and its device certificates with the account identity key
+  /// (docs/devices.md). The core validates [list] (devices.js validateList), requires it to name [userId] and
+  /// [publishedSign] (the identity the server publishes) to be its own key, and signs only the canonical bytes
+  /// it builds itself.
+  /// [head] is the list the server serves now with its signature: the core remembers the last list it signed
+  /// or saw and signs only the next one, following [head] if it verifies under its own key.
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  });
+
+  /// The seed of the key that seals device labels in the list ([deviceMetaKey]): the identity key's signature
+  /// of the fixed devicemeta label and [userId] only. Secret; never sent anywhere.
+  Future<String> deviceMetaSignature(String userId);
+
   /// Records an identity seen from the server (key-change events). A
   /// different identity than the pinned one is flagged and blocks sending.
   Future<void> notePeer(String contactId, Identity identity);
@@ -208,6 +240,18 @@ abstract class ChatCrypto {
     String theirUsername,
   );
   Future<void> setVerified(String contactId, bool verified);
+
+  /// Accepts a changed code, or marks it verified, only if the pinned identity is still [shown] (the one the
+  /// user reviewed). Throws [CryptoException] code `mismatch` if it changed again meanwhile.
+  Future<void> acceptChangeFor(String contactId, Identity shown);
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown);
+
+  /// A contact moved their account key with a signed succession chain (m5 §5.3): verify [records] (oldest
+  /// first) from the pinned identity; on success the pin moves to the new identity and keeps `verified`.
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records);
+
+  /// The identity pinned for [contactId] (a contact, or a group member pinned on first use), or null.
+  Future<PinnedPeer?> peer(String contactId);
   Future<void> acceptChange(String contactId);
 
   // ---- Call verification (verify-v1) ----

@@ -634,3 +634,53 @@ body[data-rich="yes"] .composer[data-empty="true"]:not([data-editing="true"]) #c
   .lightbox-stage img { transition: transform .2s ease; }
   .msg-actions:not([hidden]) { animation: menu-in .12s ease-out; }
 }
+.device-list { list-style: none; margin: 8px 0; padding: 0; display: grid; gap: 8px; }
+.device-row { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center; border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+.device-row small { grid-column: 1; color: var(--muted); }
+.device-row .device-remove { grid-column: 2; grid-row: 1 / span 2; }
+.device-row[data-state="pending"] { border-style: dashed; }
+
+/* ---------- Groups and channels (groups.js, docs/m4-groups.md) ---------- */
+.convo-list, #contact-list { list-style: none; margin: 0; padding: 0; }
+.list-section { margin-top: 14px; }
+.list-section .empty { padding: 10px 12px 14px; text-align: left; }
+.section-head { display: flex; align-items: center; gap: 4px; padding: 0 4px 4px; }
+.section-head h2 { flex: 1; margin: 0; font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+.icon-button.small { width: 30px; height: 30px; padding: 0; }
+.icon-button.small .icon { width: 18px; height: 18px; }
+.contact.group .avatar { border-radius: 14px; }
+.contact.is-channel .avatar { font-size: 20px; color: var(--muted); }
+.contact.status-left .contact-text, .contact.status-removed .contact-text { opacity: .65; }
+.mention-badge { background: var(--warn); color: var(--bg); }
+.avatar.small { width: 28px; height: 28px; font-size: 13px; }
+/* What only one kind of conversation has. */
+body[data-kind="group"] :is(#conv-voice, #conv-video, #conv-safety, #conv-rotate, #conv-remove, #conv-burn) { display: none; }
+body:not([data-kind="group"]) :is(#conv-info, #conv-leave) { display: none; }
+#group-banner .danger { background: var(--danger, #e5484d); border-color: transparent; color: #fff; }
+/* Mentions: a quiet pill, and a stronger one when it is you. */
+.mention { padding: 0 3px; border-radius: 5px; background: color-mix(in srgb, var(--accent) 18%, transparent); color: inherit; font-weight: 600; }
+.mention-me { background: color-mix(in srgb, var(--warn) 30%, transparent); }
+#chat-log li.mentions-me { box-shadow: inset 3px 0 0 var(--warn); }
+#mention-popup li { grid-template-columns: 28px 1fr; align-items: center; }
+/* Dialogs with lists of people and channels. */
+.group-card { width: min(100%, 460px); max-height: min(86vh, 720px); overflow-y: auto; }
+.group-card h3 { margin: 16px 0 6px; font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.group-card input[type="text"], .group-card input[type="search"] { width: 100%; }
+.pick-list { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+.pick-list li { display: flex; align-items: center; gap: 10px; padding: 6px 4px; border-bottom: 1px solid var(--line); }
+.pick-list li.empty { display: block; border: 0; padding: 12px 4px; text-align: left; }
+.pick-list .pick { display: flex; align-items: center; gap: 10px; flex: 1; cursor: pointer; }
+.pick-list .browse-row button, .pick-list .member-row button { flex: none; }
+#group-info-edit { display: grid; gap: 6px; }
+#group-info-edit button { justify-self: start; }
+#group-info-add button { margin-top: 8px; }
+
+/* ---------- Linking a device (link.js) ---------- */
+.device-link-card { width: min(100%, 420px); }
+.device-link-qr-box { text-align: center; }
+.device-link-qr { width: min(240px, 70vw); margin: 8px auto; background: #fff; border-radius: 12px; padding: 6px; }
+.device-link-qr svg { display: block; width: 100%; height: auto; }
+.device-link-code { font: 600 20px/1.4 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .08em; color: var(--text) !important; margin: 4px 0 12px !important; }
+.device-link-video { width: 100%; border-radius: 12px; background: #000; }
+#device-link-new { margin-top: 8px; }
+.device-link-card input { width: 100%; margin-bottom: 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; padding: 11px 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .06em; }

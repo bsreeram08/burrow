@@ -1,5 +1,7 @@
 // Runs the WebAssembly messaging core (crates/chatcore-wasm) for one account, off the page's main thread.
 // Only the leader tab of an account starts this worker (see core.js), so there is exactly one writer.
+// A worker serves one store: the account's 1:1 core (`core`), or the MLS group store that runs beside signal.js
+// (`mls`, docs/m4-groups.md §9: its own database and its own associated-data label, so rows never cross).
 //
 // Storage: IndexedDB `webrtc-bun-core-v1-<userId>`, object store `kv`. Every value is sealed with AES-256-GCM
 // under a non-extractable AES key kept in its own database (`webrtc-bun-core-key-v1`), with associated data
@@ -12,7 +14,8 @@
 // and reloaded from disk on the next call, so memory never runs ahead of storage.
 const KEY_DB = 'webrtc-bun-core-key-v1', MARKER = '__marker';
 const encoder = new TextEncoder(), decoder = new TextDecoder();
-let userId = null, ChatCore = null, core = null, sealKey = null, queue = Promise.resolve();
+let userId = null, storeName = null, ChatCore = null, core = null, sealKey = null, queue = Promise.resolve();
+const STORES = { core: { db: id => `webrtc-bun-core-v1-${id}`, label: 'core1' }, mls: { db: id => `webrtc-bun-mls-v1-${id}`, label: 'mls1' } };
 
 const coded = (code, message) => Object.assign(new Error(message), { code });
 function request(req) {
@@ -47,7 +50,7 @@ async function sealingKey() {
   }
   return (sealKey = key);
 }
-const aad = row => encoder.encode(`core1|${userId}|${row}`);
+const aad = row => encoder.encode(`${STORES[storeName].label}|${userId}|${row}`);
 async function seal(row, text) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   return { iv, ct: new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: aad(row) }, await sealingKey(), encoder.encode(text))) };
@@ -60,7 +63,7 @@ async function unseal(row, value) {
 /** Opens the account's core from disk. Fails closed: any row that doesn't authenticate refuses the whole store. */
 async function open() {
   await loadModule();
-  const db = await openDb(`webrtc-bun-core-v1-${userId}`);
+  const db = await openDb(STORES[storeName].db(userId));
   const tx = db.transaction('kv'), store = tx.objectStore('kv');
   const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
   const rows = {};
@@ -103,7 +106,14 @@ self.onmessage = event => {
   const { id, op } = event.data || {};
   queue = queue.then(async () => {
     try {
-      if (op === 'open') { if (userId && userId !== event.data.userId) throw new Error('worker serves another account'); userId = event.data.userId; if (!core) await open(); return { ok: true }; }
+      if (op === 'open') {
+        const name = event.data.store || 'core';
+        if (!Object.hasOwn(STORES, name) || typeof event.data.userId !== 'string') throw new Error('unknown store');
+        if (userId && (userId !== event.data.userId || storeName !== name)) throw new Error('worker serves another store');
+        userId = event.data.userId; storeName = name;
+        if (!core) await open();
+        return { ok: true };
+      }
       if (op === 'call') return await call(event.data.command);
       throw new Error('unknown op');
     } catch (error) {

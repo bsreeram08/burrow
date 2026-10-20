@@ -37,11 +37,14 @@ async function person() {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2 });
   await context.grantPermissions(['camera', 'microphone'], { origin });
   if (wasm) await context.addInitScript(() => localStorage.setItem('core-backend-test', 'wasm'));
+  // This suite tests the 1:1 Double Ratchet protocol itself: chats stay on it (m5 §8 moves them; linking.mjs covers that).
+  await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
   const page = await context.newPage(); pages.push(page);
   page.on('pageerror', error => { throw error; }); page.on('console', message => { if (message.text().includes('JOINDEBUG')) console.log(message.text()); });
   const cdp = await context.newCDPSession(page);
   await cdp.send('WebAuthn.enable');
-  await cdp.send('WebAuthn.addVirtualAuthenticator', { options: { protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+  const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', { options: { protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
+  page.authenticator = { cdp, authenticatorId };
   return page;
 }
 const visible = (page, selector) => page.locator(selector).waitFor({ state: 'visible', timeout: 15000 });
@@ -102,8 +105,58 @@ try {
   const [codeA, codeB] = [await safety(alice), await safety(bob)];
   if (!/^(\d{5} ){11}\d{5}$/.test(codeA) || codeA !== codeB) throw new Error(`Safety numbers differ: ${codeA} / ${codeB}`);
   await shot(alice, 'e2e-2-safety');
+  if (!wasm) {
+    // M1: each account's key holder signed device list v1 on its own; contacts verify it against the pinned code.
+    await bob.waitForFunction(() => /alice has 1 device in a list signed by this security code \(version 1\)/.test(document.getElementById('safety-devices').textContent), null, { timeout: 15000 });
+    if (!(await bob.locator('#key-banner').isHidden())) throw new Error('Publishing the device list raised a security-code warning');
+    step('device lists published automatically: bob verified alice\'s list against her security code, with no warning');
+  }
   await alice.click('#safety-verify'); await bob.click('#safety-close');
   step('safety numbers match on both devices; alice marked bob verified');
+
+  if (!wasm) {
+    // A server that adds a device to alice's list cannot make bob trust it: the AIK signature no longer matches.
+    await bob.route('**/api/devices/alice', async route => {
+      const response = await route.fetch(), view = await response.json();
+      view.list.devices.push({ deviceId: 'zzzzzzzzzzzzzzzzzzzzzz', addedAt: 1, meta: '' });
+      await route.fulfill({ response, json: view });
+    });
+    await bob.click('#conv-menu summary'); await bob.click('#conv-safety'); await visible(bob, '#safety');
+    await bob.waitForFunction(() => /alice's device list failed verification \(signature\)/.test(document.getElementById('safety-devices').textContent), null, { timeout: 15000 });
+    await bob.unroute('**/api/devices/alice'); await bob.click('#safety-close');
+    step('a device injected by the server into alice\'s list was rejected by bob\'s client');
+
+    // Settings → Devices: alice's browser is the primary. A second browser signed in to her account shows up
+    // as pending (it holds no keys); removing it signs it out and closes its stream.
+    await alice.click('#conv-back'); await alice.click('#account-menu summary'); await alice.click('#account-settings');
+    await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row').length === 1 && /This browser · Primary/.test(document.getElementById('device-list').textContent), null, { timeout: 15000 });
+    // Her label is sealed inside the signed list: the primary opens it, the server only ever stored ciphertext.
+    const ownLabel = await alice.textContent('#device-list .device-row strong');
+    if (!/ on /.test(ownLabel)) throw new Error(`The primary did not open its sealed device label: ${ownLabel}`);
+    if (serverBytes().includes(ownLabel)) throw new Error('The device label reached the server in clear');
+    const second = await person();
+    const { credentials } = await alice.authenticator.cdp.send('WebAuthn.getCredentials', { authenticatorId: alice.authenticator.authenticatorId });
+    for (const credential of credentials) await second.authenticator.cdp.send('WebAuthn.addCredential', { authenticatorId: second.authenticator.authenticatorId, credential });
+    await second.goto(origin); await visible(second, '#welcome'); await second.click('#signin'); await visible(second, '#chats');
+    await visible(second, '#device-banner');
+    if (!/Link this browser from your primary device/.test(await second.textContent('#device-banner-text'))) throw new Error('The inactive browser does not offer linking from the primary');
+    await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row[data-state="pending"]').length === 1, null, { timeout: 15000 });
+    await alice.locator('.devices-settings').scrollIntoViewIfNeeded(); await shot(alice, 'devices-1-settings');
+    await alice.click('#device-list .device-row[data-state="pending"] .device-remove');
+    await visible(second, '#welcome');
+    await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row').length === 1 && /Device removed/.test(document.getElementById('devices-status').textContent), null, { timeout: 15000 });
+    // The copied passkey advanced its signature counter; hand the newer counter back to alice's authenticator so
+    // her later sign-in is not mistaken for a cloned authenticator.
+    const { credentials: used } = await second.authenticator.cdp.send('WebAuthn.getCredentials', { authenticatorId: second.authenticator.authenticatorId });
+    for (const credential of used) {
+      await alice.authenticator.cdp.send('WebAuthn.removeCredential', { authenticatorId: alice.authenticator.authenticatorId, credentialId: credential.credentialId });
+      await alice.authenticator.cdp.send('WebAuthn.addCredential', { authenticatorId: alice.authenticator.authenticatorId, credential });
+    }
+    await second.context().close(); pages.splice(pages.indexOf(second), 1);
+    await alice.evaluate(() => { document.getElementById('settings').open = false; });
+    await alice.click('#contact-list .contact.mutual .row-button'); await visible(alice, '#conv-head');
+    step('Settings → Devices: sealed label shown on the primary; a second browser was asked to link from the primary, appeared as pending, and removing it signed it out');
+  }
 
   // Offline delivery: bob signs out; the envelope waits on the server, which cannot read it.
   await bob.click('#conv-back'); await bob.click('#account-menu summary'); await bob.click('#signout'); await visible(bob, '#welcome');
@@ -114,7 +167,8 @@ try {
   await bob.click('#signin'); await visible(bob, '#chats');
   await bob.click('#contact-list .contact.mutual .row-button');
   await bob.waitForFunction(m => document.getElementById('chat-log').textContent.includes(m), marker, { timeout: 15000 });
-  await alice.waitForFunction(() => [...document.querySelectorAll('#chat-log li.outgoing')].at(-1)?.dataset.status === 'delivered', null, { timeout: 15000 });
+  // Bob has the conversation open, so his read receipt may overtake the delivery receipt: either proves arrival.
+  await alice.waitForFunction(() => ['delivered', 'read'].includes([...document.querySelectorAll('#chat-log li.outgoing')].at(-1)?.dataset.status), null, { timeout: 15000 });
   if (serverBytes().includes(marker)) throw new Error('Plaintext reached the server database');
   step('message sent while bob was signed out arrived decrypted after he signed in; the server database never held the text');
 

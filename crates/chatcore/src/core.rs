@@ -8,6 +8,7 @@
 //! receive for that contact) is refused as transient, and redelivery simply decrypts again.
 use std::collections::{BTreeMap, VecDeque};
 
+use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -47,6 +48,9 @@ pub struct PeerRecord {
     pub changed: bool,
     #[serde(default)]
     pub blocked: bool,
+    /// Account keys this contact moved on from by signed succession (oldest first); see `accept_succession`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub previous: Vec<PreviousKey>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -110,6 +114,27 @@ struct Pending {
     fresh: Option<(u64, Handshake)>,
 }
 
+mod companion;
+pub use companion::{Account, LinkAccepted, PinExport};
+
+/// What a primary remembers of the last device list it signed (`devlist:last`).
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+struct ListMemory {
+    version: u64,
+    hash: String,
+    #[serde(default, rename = "userId")]
+    user_id: String,
+    #[serde(default)]
+    devices: Vec<String>,
+}
+
+/// An account key a contact (or this account) moved on from, with the time of the succession.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviousKey {
+    pub sign: String,
+    pub until: u64,
+}
+
 pub struct Core {
     store: Box<dyn Store>,
     /// A missing identity may be generated only in a brand-new store or after an explicit `reset_identity`.
@@ -117,6 +142,11 @@ pub struct Core {
     pending: BTreeMap<String, Pending>,
     pending_order: VecDeque<String>,
     next_pending: u64,
+    /// This device's MLS groups and, on a delivery service, the public group state (loaded on first use).
+    #[cfg(feature = "mls")]
+    mls: Option<crate::mls::engine::Groups>,
+    #[cfg(feature = "ds")]
+    mls_ds: Option<crate::mls::engine::Ds>,
 }
 
 fn same_identity(a: &IdentityPub, b: &IdentityPub) -> bool { a.dh == b.dh && a.sign == b.sign }
@@ -148,14 +178,23 @@ fn only(record: SessionRecord, sid: &str) -> SessionRecord {
 impl Core {
     pub fn new(store: Box<dyn Store>) -> Self {
         let may_create_identity = store.allows_new_identity();
-        Self { store, may_create_identity, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 1 }
+        Self { store, may_create_identity, pending: BTreeMap::new(), pending_order: VecDeque::new(), next_pending: 1,
+            #[cfg(feature = "mls")]
+            mls: None,
+            #[cfg(feature = "ds")]
+            mls_ds: None,
+        }
     }
 
     fn get<T: for<'de> Deserialize<'de>>(&mut self, key: &str) -> Result<Option<T>> {
         self.store.get(key)?.map(from_value).transpose()
     }
 
+    /// Whether this key database holds a 1:1 identity (never creates one).
+    pub fn has_identity(&mut self) -> Result<bool> { Ok(self.get::<Identity>("identity")?.is_some()) }
+
     pub fn identity(&mut self) -> Result<Identity> {
+        if self.store.get("account")?.is_some() { return Err(ChatError::coded("companion", "This device does not hold the account's identity key")); }
         if let Some(identity) = self.get::<Identity>("identity")? { return Ok(identity); }
         // Never mint a new identity because one went missing from an existing key database.
         if !self.may_create_identity { return Err(ChatError::storage("identity missing from the key database")); }
@@ -163,6 +202,70 @@ impl Core {
         self.store.put("identity", to_value(&identity))?;
         self.may_create_identity = false;
         Ok(identity)
+    }
+
+    /// Proves this device holds the account identity key for one device-claim challenge (docs/devices.md):
+    /// signs `claim_bytes` only, never caller-chosen bytes, and never creates an identity.
+    pub fn prove_identity(&mut self, user_id: &str, device_id: &str, challenge: &str) -> Result<String> {
+        self.reject_companion()?;
+        let bytes = claim_bytes(user_id, device_id, challenge)?;
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
+    }
+
+    /// Signs this account's next DeviceList and one certificate per device it names (docs/devices.md). The
+    /// list is parsed and validated here (devices.js `validateList`), must name `user_id`, and the account's
+    /// published identity (`published_sign`, as the server serves it) must be this core's own identity key: the
+    /// AIK signs only the canonical list and certificate bytes built here, never caller-chosen bytes.
+    ///
+    /// The core also remembers the last list it signed or saw (`devlist:last`: version and hash) and signs only
+    /// the next one: `version == last + 1` naming the last hash (version 1 only when nothing is known), or the very
+    /// same list again (a publish that failed). Another device of the account may have signed newer lists since;
+    /// `head` is the list the server serves now with its signature, and moves the memory forward only if that
+    /// signature verifies under this core's own key. A head older than the memory is ignored; a different list at
+    /// the same version is a fork and is refused.
+    pub fn sign_device_list(&mut self, user_id: &str, published_sign: &str, list_json: &str, head: Option<&crate::devicelist::ListHead>) -> Result<crate::devicelist::SignedList> {
+        self.reject_companion()?;
+        use crate::devicelist::{cert_bytes, list_bytes, list_hash, parse_list, SignedList};
+        let list = parse_list(list_json)?;
+        if list.user_id != user_id { return Err(ChatError::coded("invalid", "The device list names another account")); }
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        if identity.public.sign != published_sign { return Err(ChatError::coded("mismatch", "This device does not hold the account's published identity key")); }
+        let key = SigningKey::from_bytes(&identity.sign.0);
+        let mut last = self.get::<ListMemory>("devlist:last")?;
+        if let Some(head) = head {
+            let served = parse_list(&head.list_json)?;
+            if served.user_id != user_id { return Err(ChatError::coded("invalid", "The served device list names another account")); }
+            let signature = crate::primitives::unb64(&head.signature, Some(64)).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
+            let signature = ed25519_dalek::Signature::from_slice(&signature).map_err(|_| ChatError::coded("invalid", "The served device list has a malformed signature"))?;
+            key.verifying_key().verify_strict(&list_bytes(&served), &signature).map_err(|_| ChatError::coded("invalid", "The served device list is not signed by this account's identity key"))?;
+            let seen = ListMemory { version: served.version, hash: list_hash(&served), user_id: user_id.to_string(), devices: served.devices.iter().map(|d| d.device_id.clone()).collect() };
+            match &last {
+                Some(known) if seen.version < known.version => {}
+                Some(known) if seen.version == known.version && seen.hash != known.hash => return Err(ChatError::coded("invalid", "The served device list forks the last one this identity signed")),
+                _ => last = Some(seen),
+            }
+        }
+        let hash = list_hash(&list);
+        let follows = match &last {
+            None => list.version == 1,
+            Some(known) => (list.version == known.version + 1 && list.prev_hash == known.hash) || (list.version == known.version && hash == known.hash),
+        };
+        if !follows { return Err(ChatError::coded("invalid", "The device list does not follow the last one this identity signed")); }
+        // Remembered before anything is signed: a signature that cannot be recorded is never handed out.
+        self.store.put("devlist:last", to_value(&ListMemory { version: list.version, hash, user_id: user_id.to_string(), devices: list.devices.iter().map(|d| d.device_id.clone()).collect() }))?;
+        let certs = list.devices.iter().map(|device| (device.device_id.clone(), b64(&key.sign(&cert_bytes(user_id, device)).to_bytes()))).collect();
+        Ok(SignedList { signature: b64(&key.sign(&list_bytes(&list)).to_bytes()), certs })
+    }
+
+    /// The AIK's signature over `"webrtc-bun-devicemeta-v1" ‖ userId` only (devices.js `deviceMetaKey`): the
+    /// seed of the key that seals device labels inside the list. Deterministic (RFC 8032), so every holder of
+    /// the AIK derives the same key. Keep it on the device; it is a key, not something to publish.
+    pub fn device_meta_signature(&mut self, user_id: &str) -> Result<String> {
+        self.reject_companion()?;
+        let bytes = crate::devicelist::meta_bytes(user_id)?;
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
     }
 
     /// Current signed prekey, rotated weekly (`max_age_ms`); replay records under a retired prekey go with it.
@@ -209,7 +312,7 @@ impl Core {
         let known = self.peer(contact)?;
         if let Some(known) = &known { if same_identity(&known.identity, public) { return Ok((known.clone(), Vec::new(), false)); } }
         let changed = known.is_some();
-        let record = PeerRecord { identity: public.clone(), verified: false, changed, blocked: changed };
+        let record = PeerRecord { identity: public.clone(), verified: false, changed, blocked: changed, previous: Vec::new() };
         let mut writes = vec![Write::Put(format!("peer:{contact}"), to_value(&record))];
         if changed { writes.push(Write::Delete(format!("sessions:{contact}"))); }
         Ok((record, writes, changed))
@@ -231,6 +334,7 @@ impl Core {
     fn sessions(&mut self, contact: &str) -> Result<SessionRecord> { Ok(self.get(&format!("sessions:{contact}"))?.unwrap_or_default()) }
 
     pub fn encrypt_to(&mut self, contact: &str, plaintext_json: &str, bundle: Option<&Bundle>) -> Result<EncryptOutcome> {
+        self.reject_companion()?;
         serde_json::from_str::<Value>(plaintext_json).map_err(|_| ChatError::coded("invalid", "Plaintext must be JSON"))?;
         self.assert_sendable(contact)?;
         let mut record = self.sessions(contact)?;
@@ -269,6 +373,7 @@ impl Core {
     /// Authenticates and decrypts without advancing the stored ratchet. `published` is the identity the
     /// server publishes for this contact (defence in depth only — circular if the server is the attacker).
     pub fn decrypt_from(&mut self, contact: &str, envelope: &str, published: Option<&IdentityPub>) -> Result<Decrypted> {
+        self.reject_companion()?;
         let parsed = parse_envelope(envelope)?;
         let record = self.sessions(contact)?;
         let snapshot = self.store.get(&format!("sessions:{contact}"))?;
@@ -362,7 +467,11 @@ impl Core {
         Ok(Some(Safety { number, verified: peer.verified, changed: peer.changed, blocked: peer.blocked }))
     }
 
-    pub fn set_verified(&mut self, contact: &str, verified: bool) -> Result<()> {
+    pub fn set_verified(&mut self, contact: &str, verified: bool) -> Result<()> { self.set_verified_for(contact, verified, None) }
+    /// With `identity`: only if that is exactly the code the user was shown (the pinned identity now). Otherwise
+    /// `mismatch`, and the caller shows the new code for review instead.
+    pub fn set_verified_for(&mut self, contact: &str, verified: bool, identity: Option<&IdentityPub>) -> Result<()> {
+        self.expect_identity(contact, identity)?;
         if let Some(mut peer) = self.peer(contact)? {
             peer.verified = verified;
             if verified { peer.changed = false; }
@@ -373,13 +482,24 @@ impl Core {
     }
 
     /// The user reviewed a changed security code and keeps messaging (without marking it verified).
-    pub fn accept_change(&mut self, contact: &str) -> Result<()> {
+    pub fn accept_change(&mut self, contact: &str) -> Result<()> { self.accept_change_for(contact, None) }
+    /// [`Core::accept_change`] for exactly the identity the user reviewed (see [`Core::set_verified_for`]).
+    pub fn accept_change_for(&mut self, contact: &str, identity: Option<&IdentityPub>) -> Result<()> {
+        self.expect_identity(contact, identity)?;
         if let Some(mut peer) = self.peer(contact)? {
             peer.changed = false;
             peer.blocked = false;
             self.store.put(&format!("peer:{contact}"), to_value(&peer))?;
         }
         Ok(())
+    }
+
+    fn expect_identity(&mut self, contact: &str, identity: Option<&IdentityPub>) -> Result<()> {
+        let Some(shown) = identity else { return Ok(()) };
+        match self.peer(contact)? {
+            Some(peer) if same_identity(&peer.identity, shown) => Ok(()),
+            _ => Err(ChatError::coded("mismatch", "The security code changed again. Review the new one.")),
+        }
     }
 
     pub fn forget(&mut self, contact: &str) -> Result<()> { self.store.delete(&format!("sessions:{contact}")) }
@@ -412,11 +532,30 @@ impl Core {
         self.pending.clear();
         self.pending_order.clear();
         for prefix in ["sessions:", "opk:", "claim:", "claims:"] { self.store.delete_prefix(prefix)?; }
-        self.store.batch(vec![Write::Delete("identity".into()), Write::Delete("spk".into()), Write::Delete("opk-next".into())])?;
+        self.store.batch(vec![Write::Delete("identity".into()), Write::Delete("spk".into()), Write::Delete("opk-next".into()), Write::Delete("devlist:last".into())])?;
         self.may_create_identity = true; // The explicit user action is the only other way to a new identity.
         Ok(())
     }
 
     #[doc(hidden)]
     pub fn store_mut(&mut self) -> &mut dyn Store { self.store.as_mut() }
+
+    /// This device's MLS groups (namespace `mls`) with the store they persist to. Reloaded from the store after a
+    /// failed write, so memory never runs ahead of disk.
+    #[cfg(feature = "mls")]
+    pub fn groups(&mut self) -> Result<(&mut crate::mls::engine::Groups, &mut dyn Store)> {
+        if self.mls.as_ref().is_none_or(|groups| groups.is_stale()) { self.mls = Some(crate::mls::engine::Groups::load(self.store.as_mut(), "mls")?); }
+        Ok((self.mls.as_mut().expect("loaded"), self.store.as_mut()))
+    }
+
+    /// Delivery-service group state (namespace `mlsds`: public state only, no secrets).
+    #[cfg(feature = "ds")]
+    pub fn ds(&mut self) -> Result<(&mut crate::mls::engine::Ds, &mut dyn Store)> {
+        if self.mls_ds.as_ref().is_none_or(|ds| ds.is_stale()) { self.mls_ds = Some(crate::mls::engine::Ds::new(self.store.as_mut())?); }
+        Ok((self.mls_ds.as_mut().expect("loaded"), self.store.as_mut()))
+    }
+
+    /// The account identity key (AIK) that certifies this user's devices.
+    #[cfg(feature = "mls")]
+    pub(crate) fn account_signing_key(&mut self) -> Result<ed25519_dalek::SigningKey> { Ok(ed25519_dalek::SigningKey::from_bytes(&self.identity()?.sign.0)) }
 }

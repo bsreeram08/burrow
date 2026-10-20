@@ -19,6 +19,7 @@ struct Flaky { inner: MemoryStore, fail: Arc<AtomicUsize> }
 impl Store for Flaky {
     fn get(&mut self, key: &str) -> chatcore::Result<Option<Value>> { self.inner.get(key) }
     fn delete_prefix(&mut self, prefix: &str) -> chatcore::Result<()> { self.inner.delete_prefix(prefix) }
+    fn scan(&mut self, prefix: &str) -> chatcore::Result<Vec<(String, Value)>> { self.inner.scan(prefix) }
     fn batch(&mut self, writes: Vec<Write>) -> chatcore::Result<()> {
         if self.fail.load(Ordering::SeqCst) > 0 { self.fail.fetch_sub(1, Ordering::SeqCst); return Err(ChatError::storage("injected")); }
         self.inner.batch(writes)
@@ -604,3 +605,145 @@ fn an_existing_key_database_never_mints_a_new_identity_on_its_own() {
     assert_ne!(core.identity().unwrap().public, first);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn identity_proofs_sign_only_the_claim_bytes_and_match_devices_js() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    // The same bytes as packages/signaling/public/devices.js claimBytes (vector pinned in tests/unit/devices.test.ts).
+    let bytes = protocol::claim_bytes("user_1", &"a".repeat(22), &"A".repeat(43)).unwrap();
+    assert_eq!(hex(&Sha256::digest(&bytes)), "2238b7912ca08441271c164e5591d1f62afd2ae2afec60aa8b5a49054366ef40");
+    let mut alice = party();
+    let identity = alice.core.prekeys(NOW, None).unwrap().identity;
+    let challenge = URL_SAFE_NO_PAD.encode([7u8; 32]);
+    let signature = alice.core.prove_identity("user_1", &"b".repeat(22), &challenge).unwrap();
+    let key = VerifyingKey::from_bytes(&URL_SAFE_NO_PAD.decode(&identity.sign).unwrap().try_into().unwrap()).unwrap();
+    let signature = Signature::from_slice(&URL_SAFE_NO_PAD.decode(signature).unwrap()).unwrap();
+    assert!(key.verify(&protocol::claim_bytes("user_1", &"b".repeat(22), &challenge).unwrap(), &signature).is_ok());
+    // Never a general signing oracle: anything that is not a well-formed claim is refused.
+    for (user, device, nonce) in [("no spaces", "b".repeat(22), challenge.clone()), ("user_1", "short".into(), challenge.clone()), ("user_1", "b".repeat(22), "A".repeat(42)), ("user_1", "b".repeat(22), URL_SAFE_NO_PAD.encode([1u8; 33]))] {
+        assert!(alice.core.prove_identity(user, &device, &nonce).is_err());
+    }
+    // And it never mints an identity in an empty store.
+    assert!(party().core.prove_identity("user_1", &"b".repeat(22), &challenge).is_err());
+}
+
+#[test]
+fn device_lists_are_validated_and_signed_inside_the_core_and_match_devices_js() {
+    use chatcore::devicelist::{cert_bytes, list_bytes, meta_bytes, parse_list};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    // The fixed vector of tests/unit/devices.test.ts and apps/chat/test/devices_test.dart.
+    let meta = URL_SAFE_NO_PAD.encode([9u8; 40]);
+    let vector = json!({ "v": 1, "userId": "user_1", "version": 2, "prevHash": "A".repeat(43), "devices": [
+        { "deviceId": "a".repeat(22), "addedAt": 1_800_000_000_123u64, "meta": meta }, { "deviceId": "b".repeat(22), "addedAt": 7, "meta": "" } ] });
+    let list = parse_list(&vector.to_string()).unwrap();
+    assert_eq!(hex(&Sha256::digest(list_bytes(&list))), "31f9b6f38de5a0d6180afcf54233e7272add9dd22c49e86e40fa3a7c48e938e6");
+    assert_eq!(hex(&Sha256::digest(cert_bytes("user_1", &list.devices[0]))), "5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea");
+    assert_eq!(hex(&Sha256::digest(meta_bytes("user_1").unwrap())), "64af139533103232deb371d33f3f5879ff5c4d2259c243745d86b10f4b7b1c44");
+    // Key order doesn't matter; the canonical bytes do.
+    let reordered = r#"{"devices":[{"meta":"","addedAt":7,"deviceId":"bbbbbbbbbbbbbbbbbbbbbb"}],"prevHash":"","version":1,"userId":"user_1","v":1}"#;
+    assert!(parse_list(reordered).is_ok());
+
+    let mut alice = party();
+    let identity = alice.core.prekeys(NOW, None).unwrap().identity;
+    let key = VerifyingKey::from_bytes(&URL_SAFE_NO_PAD.decode(&identity.sign).unwrap().try_into().unwrap()).unwrap();
+    let verify = |bytes: &[u8], sig: &str| key.verify(bytes, &Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap()).is_ok();
+    // The vector is a version 2 list: this identity last signed a version 1 whose hash is the vector's prevHash.
+    alice.core.store_mut().put("devlist:last", json!({ "version": 1, "hash": "A".repeat(43) })).unwrap();
+    let signed = alice.core.sign_device_list("user_1", &identity.sign, &vector.to_string(), None).unwrap();
+    assert!(verify(&list_bytes(&list), &signed.signature));
+    assert_eq!(signed.certs.len(), 2);
+    for device in &list.devices { assert!(verify(&cert_bytes("user_1", device), &signed.certs[&device.device_id])); }
+    let seed = alice.core.device_meta_signature("user_1").unwrap();
+    assert!(verify(&meta_bytes("user_1").unwrap(), &seed));
+    assert_eq!(seed, alice.core.device_meta_signature("user_1").unwrap(), "deterministic");
+
+    // Refused: another account's list, a published identity that isn't this core's, malformed lists.
+    assert!(alice.core.sign_device_list("user_2", &identity.sign, &vector.to_string(), None).is_err());
+    assert_eq!(alice.core.sign_device_list("user_1", &"B".repeat(43), &vector.to_string(), None).unwrap_err().code.as_deref(), Some("mismatch"));
+    let good = json!({ "v": 1, "userId": "user_1", "version": 1, "prevHash": "", "devices": [{ "deviceId": "a".repeat(22), "addedAt": 1, "meta": "" }, { "deviceId": "b".repeat(22), "addedAt": 1, "meta": "" }] });
+    let with = |path: &str, value: Value| { let mut v = good.clone(); *v.pointer_mut(path).unwrap() = value; v };
+    let devices = good["devices"].as_array().unwrap().clone();
+    let mut extra = good.clone(); extra["extra"] = json!(true);
+    let mut entry_extra = good.clone(); entry_extra["devices"][0]["platform"] = json!("web");
+    let bad = [
+        extra, entry_extra,
+        with("/devices", json!([devices[1], devices[0]])), with("/devices", json!([devices[0], devices[0]])),
+        with("/version", json!(2)), with("/prevHash", json!("A".repeat(43))), with("/version", json!(0)), with("/version", json!(1.5)),
+        with("/devices", json!([])), with("/devices/0/meta", json!("too-short")), with("/userId", json!("no spaces")),
+        with("/devices", json!((0..17).map(|i| json!({ "deviceId": format!("{i:02}{}", "x".repeat(20)), "addedAt": 1, "meta": "" })).collect::<Vec<_>>())),
+        { let mut v = with("/version", json!(2)); v["prevHash"] = json!(format!("{}B", "A".repeat(42))); v },
+    ];
+    for list in bad { assert!(alice.core.sign_device_list("user_1", &identity.sign, &list.to_string(), None).is_err(), "{list}"); }
+    assert!(alice.core.sign_device_list("user_1", &identity.sign, "not json", None).is_err());
+    assert!(alice.core.device_meta_signature("no spaces").is_err());
+    // Never mints an identity in an empty store.
+    assert!(party().core.sign_device_list("user_1", &identity.sign, &good.to_string(), None).is_err());
+}
+
+#[test]
+fn the_core_signs_only_the_next_device_list_and_follows_lists_signed_by_its_other_devices() {
+    use chatcore::devicelist::{list_hash, parse_list, ListHead};
+    let list = |version: u64, prev: &str, ids: &[&str]| json!({ "v": 1, "userId": "user_1", "version": version, "prevHash": prev,
+        "devices": ids.iter().map(|id| json!({ "deviceId": id.repeat(22), "addedAt": 1, "meta": "" })).collect::<Vec<_>>() }).to_string();
+    let hash = |text: &str| list_hash(&parse_list(text).unwrap());
+    let mut a = party();
+    let identity = a.core.prekeys(NOW, None).unwrap().identity;
+    let sign = |core: &mut Core, text: &str, head: Option<&ListHead>| core.sign_device_list("user_1", &identity.sign, text, head);
+    let (v1, other_v1) = (list(1, "", &["a"]), list(1, "", &["a", "b"]));
+    let v2 = list(2, &hash(&v1), &["a", "b"]);
+    let v3 = list(3, &hash(&v2), &["a"]);
+
+    // From nothing: only version 1. Then only the next, naming the last hash; the same list again is a retry.
+    assert!(sign(&mut a.core, &v2, None).is_err());
+    let first = sign(&mut a.core, &v1, None).unwrap();
+    assert_eq!(sign(&mut a.core, &v1, None).unwrap(), first, "re-signing the same list (a publish that failed) is deterministic");
+    assert!(sign(&mut a.core, &other_v1, None).is_err(), "a different list at the same version is a fork");
+    assert!(sign(&mut a.core, &v3, None).is_err(), "no skipping ahead");
+    assert!(sign(&mut a.core, &list(2, &"A".repeat(43), &["a", "b"]), None).is_err(), "must name the last hash");
+    sign(&mut a.core, &v2, None).unwrap();
+    assert!(sign(&mut a.core, &v1, None).is_err(), "no going back");
+    sign(&mut a.core, &v2, None).unwrap();
+
+    // Another device of the account (same identity key) signs the next lists; the served head carries this one along.
+    let mut b = party();
+    let row = a.core.store_mut().get("identity").unwrap().unwrap();
+    b.core.store_mut().put("identity", row).unwrap();
+    sign(&mut b.core, &v1, None).unwrap();
+    sign(&mut b.core, &v2, None).unwrap();
+    let v3_signed = sign(&mut b.core, &v3, None).unwrap();
+    let v4 = list(4, &hash(&v3), &["a", "b"]);
+    assert!(sign(&mut a.core, &v4, None).is_err(), "without the head, a stale device cannot continue");
+    let head = ListHead { list_json: v3.clone(), signature: v3_signed.signature.clone() };
+    sign(&mut a.core, &v4, Some(&head)).unwrap();
+    // The memory moved: v4 again is a retry, v3 is behind, and an older head changes nothing.
+    sign(&mut a.core, &v4, None).unwrap();
+    assert!(sign(&mut a.core, &v3, None).is_err());
+    let old = sign(&mut b.core, &v2, None).map(|signed| ListHead { list_json: v2.clone(), signature: signed.signature });
+    assert!(old.is_err(), "b has already signed past v2 and refuses it itself");
+
+    // A head must verify under this identity, name this account, and not fork what was signed.
+    let mut c = party();
+    let c_id = c.core.prekeys(NOW, None).unwrap().identity;
+    let foreign = c.core.sign_device_list("user_1", &c_id.sign, &v1, None).unwrap();
+    let v5 = list(5, &hash(&v4), &["a"]);
+    assert!(sign(&mut a.core, &v5, Some(&ListHead { list_json: v4.clone(), signature: foreign.signature })).is_err(), "signed by another identity");
+    assert!(sign(&mut a.core, &v5, Some(&ListHead { list_json: v4.clone(), signature: "A".repeat(86) })).is_err());
+    let elsewhere = v4.replace("user_1", "user_2");
+    assert!(sign(&mut a.core, &v5, Some(&ListHead { list_json: elsewhere, signature: v3_signed.signature.clone() })).is_err(), "another account's list");
+    let v4_fork = list(4, &hash(&v3), &["a"]);
+    let forked = sign(&mut b.core, &v4_fork, None).unwrap();
+    assert!(sign(&mut a.core, &v5, Some(&ListHead { list_json: v4_fork, signature: forked.signature })).is_err(), "a different list at the version this core signed");
+    // A refused request records nothing: the real chain still continues.
+    sign(&mut a.core, &v5, None).unwrap();
+
+    // A new identity (explicit reset) starts a new history.
+    a.core.reset_identity().unwrap();
+    assert!(a.core.store_mut().get("devlist:last").unwrap().is_none());
+    let fresh = a.core.prekeys(NOW, None).unwrap().identity;
+    assert!(a.core.sign_device_list("user_1", &fresh.sign, &v5, None).is_err());
+    a.core.sign_device_list("user_1", &fresh.sign, &v1, None).unwrap();
+}
+
+fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }

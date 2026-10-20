@@ -11,9 +11,11 @@
   const accounts = new Map();
   const failure = result => Object.assign(new Error(result.error || 'Messaging core failed'), result.code ? { code: result.code } : {});
 
-  function account(userId) {
-    if (accounts.has(userId)) return accounts.get(userId);
-    const channel = new BroadcastChannel(`chatcore:${userId}`);
+  // `store`: 'core' (the 1:1 core) or 'mls' (groups beside signal.js; `instance` names its database, see groups.js).
+  function account(userId, store = 'core', instance = userId) {
+    const tag = store === 'core' ? userId : `${store}:${instance}`;
+    if (accounts.has(tag)) return accounts.get(tag);
+    const channel = new BroadcastChannel(store === 'core' ? `chatcore:${userId}` : `chatcore-${store}:${instance}`);
     const waiting = new Map();
     let worker = null, nextId = 0, leader = false, opened = null;
     const state = { leader: () => leader };
@@ -35,7 +37,7 @@
       leader = true;
       worker = new Worker('/core-worker.js', { type: 'module' });
       worker.onmessage = event => settle(event.data.id, event.data.result);
-      opened = toWorker({ op: 'open', userId });
+      opened = toWorker({ op: 'open', userId: instance, store });
     }
     // Followers' calls arrive here; only the leader answers.
     channel.onmessage = async event => {
@@ -49,7 +51,7 @@
     // Decide before the first call: take the lock if it's free, otherwise follow and queue to take over. The
     // lock is held until this page goes away (the promise never settles); then the next waiting tab takes it.
     // (A tab's own BroadcastChannel never hears its own messages, so a call must not go out before this.)
-    const lockName = `chatcore:${userId}`, hold = () => new Promise(() => {});
+    const lockName = store === 'core' ? `chatcore:${userId}` : `chatcore-${store}:${instance}`, hold = () => new Promise(() => {});
     const decided = !navigator.locks ? (becomeLeader(), Promise.resolve()) : new Promise(resolve => {
       navigator.locks.request(lockName, { ifAvailable: true }, lock => {
         if (lock) { becomeLeader(); resolve(); return hold(); }
@@ -62,7 +64,7 @@
       await decided;
       if (leader) {
         const open = await opened;
-        if (open?.error) { opened = toWorker({ op: 'open', userId }); throw failure(open); }
+        if (open?.error) { opened = toWorker({ op: 'open', userId: instance, store }); throw failure(open); }
         return toWorker({ op: 'call', command });
       }
       const id = `${tab}:${++nextId}`;
@@ -70,8 +72,18 @@
       channel.postMessage({ type: 'request', id, from: tab, command });
       return answer;
     };
-    accounts.set(userId, state);
+    accounts.set(tag, state);
     return state;
+  }
+
+  /**
+   * The MLS group store for an account on this device (docs/m4-groups.md §9): a core of its own, so the 1:1 core
+   * is untouched. `instance` names its database (user, device and account key), so a new device id or identity
+   * starts a fresh store instead of reusing one whose certificate no longer fits. Returns `run(command)`.
+   */
+  function groupStore(userId, instance) {
+    const state = account(userId, 'mls', instance);
+    return async command => { const result = await state.call(command); if ('error' in result) throw failure(result); return result.ok; };
   }
 
   /** A signal.js-compatible box backed by the WebAssembly core. */
@@ -114,13 +126,15 @@
         return record;
       },
       safety: (me, contactId, them) => run({ cmd: 'safety', me, contact: contactId, them }),
-      setVerified: (contactId, verified) => run({ cmd: 'setVerified', contact: contactId, verified }),
-      acceptChange: contactId => run({ cmd: 'acceptChange', contact: contactId }),
+      setVerified: (contactId, verified, identity) => run({ cmd: 'setVerified', contact: contactId, verified, ...(identity ? { identity } : {}) }),
+      acceptChange: (contactId, identity) => run({ cmd: 'acceptChange', contact: contactId, ...(identity ? { identity } : {}) }),
       peer: contactId => run({ cmd: 'peer', contact: contactId }),
       forget: contactId => run({ cmd: 'forget', contact: contactId }),
       rotate: contactId => run({ cmd: 'rotate', contact: contactId }),
       sessionInfo: contactId => run({ cmd: 'sessionInfo', contact: contactId }),
       resetIdentity: () => run({ cmd: 'resetIdentity' }),
+      // Signs only the device-claim bytes (chatcore claim_bytes) with the identity key: docs/devices.md.
+      proveIdentity: (userId, deviceId, challenge) => run({ cmd: 'proveIdentity', userId, deviceId, challenge }),
     };
   }
 
@@ -178,5 +192,10 @@
     channel.postMessage({ backend: mine });
     return next => channel.postMessage({ backend: next });
   }
-  window.Core = Object.freeze({ box, supported, backend, setBackend, hasKeys, guard });
+  /** A test-only local switch (e.g. 'dm-move-test'), honoured only where the server allows test flags (loopback). */
+  async function testFlag(name) {
+    if (!await testFlagsOn()) return null;
+    try { return localStorage.getItem(name); } catch { return null; }
+  }
+  window.Core = Object.freeze({ box, groupStore, supported, backend, setBackend, hasKeys, guard, testFlag });
 })();

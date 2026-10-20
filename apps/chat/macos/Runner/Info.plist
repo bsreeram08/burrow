@@ -29,7 +29,7 @@
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Video calls use your camera only after you start or accept a call.</string>
+	<string>Video calls use your camera only after you start or accept a call, and linking a device scans its code.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Calls and voice messages use your microphone only while you are in a call or recording.</string>
 </dict>

@@ -92,6 +92,26 @@ pub fn verify_signed_prekey(identity: &IdentityPub, spk: &PublishedSignedPreKey)
     Ok(())
 }
 
+/// What the account identity key signs to prove, to the server, that a device holds it when claiming the
+/// account's messaging inbox (packages/signaling/public/devices.js `claimBytes`; docs/devices.md):
+/// `u16 len ‖ "webrtc-bun-deviceclaim-v1" ‖ u16 len ‖ userId ‖ u16 len ‖ deviceId ‖ u8 len ‖ challenge`.
+/// Built here from validated parts so the core is never a general signing oracle: the label is fixed and the
+/// challenge is the server's 32-byte single-use nonce.
+pub fn claim_bytes(user_id: &str, device_id: &str, challenge: &str) -> Result<Vec<u8>> {
+    let invalid = || ChatError::transient("Invalid identity claim");
+    let id_ok = |text: &str, min: usize, max: usize| (min..=max).contains(&text.len()) && is_b64(text);
+    if !id_ok(user_id, 1, 64) || !(device_id.len() == 22 && is_b64(device_id)) { return Err(invalid()); }
+    let nonce = unb64(challenge, Some(32)).map_err(|_| invalid())?;
+    let mut out = Vec::new();
+    for text in [&b"webrtc-bun-deviceclaim-v1"[..], user_id.as_bytes(), device_id.as_bytes()] {
+        out.extend_from_slice(&(text.len() as u16).to_be_bytes());
+        out.extend_from_slice(text);
+    }
+    out.push(nonce.len() as u8);
+    out.extend_from_slice(&nonce);
+    Ok(out)
+}
+
 pub fn identity_bytes(public: &IdentityPub) -> Result<Vec<u8>> {
     Ok(concat(&[&unb64(&public.dh, Some(32))?, &unb64(&public.sign, Some(32))?]))
 }

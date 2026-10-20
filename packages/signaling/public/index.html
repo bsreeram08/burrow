@@ -17,6 +17,11 @@
   <script src="/app.js" defer></script>
   <script src="/theme.js" defer></script>
   <script src="/alerts.js" defer></script>
+  <script src="/devices.js" defer></script>
+  <script src="/qr.js" defer></script>
+  <script src="/link.js" defer></script>
+  <script src="/devicelink.js" defer></script>
+  <script src="/groups.js" defer></script>
   <script src="/account.js" defer></script>
   <script src="/install.js" defer></script>
 </head>
@@ -29,11 +34,17 @@
     <button id="conv-voice" class="icon-button" type="button" aria-label="Voice call"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></svg></button>
     <button id="conv-video" class="icon-button" type="button" aria-label="Video call"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2"/></svg></button>
     <details id="conv-menu" class="menu"><summary aria-label="Conversation options"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/></svg></summary>
-      <div class="menu-panel"><button id="conv-find" type="button">Find in conversation</button><button id="conv-safety" type="button">Security code</button><button id="conv-rotate" type="button">Reset secure session</button><button id="conv-theme" type="button">Chat theme</button><button id="conv-burn" class="danger-text" type="button" disabled>Burn conversation</button><button id="conv-remove" class="danger-text" type="button">Remove contact</button></div></details>
+      <div class="menu-panel"><button id="conv-find" type="button">Find in conversation</button><button id="conv-info" type="button">Members and info</button><button id="conv-pin" type="button">Pin to top</button><button id="conv-safety" type="button">Security code</button><button id="conv-rotate" type="button">Reset secure session</button><button id="conv-theme" type="button">Chat theme</button><button id="conv-burn" class="danger-text" type="button" disabled>Burn conversation</button><button id="conv-remove" class="danger-text" type="button">Remove contact</button><button id="conv-leave" class="danger-text" type="button">Leave</button></div></details>
   </header>
   <div id="key-banner" class="key-banner" role="alert" hidden>
     <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg>
     <span id="key-banner-text"></span><button id="key-banner-review" type="button">Review</button>
+  </div>
+  <div id="group-banner" class="key-banner" role="alert" hidden>
+    <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg>
+    <span id="group-banner-text"></span>
+    <button id="group-review" type="button" hidden>Review</button><button id="group-rejoin" type="button" hidden>Rejoin</button>
+    <button id="group-dismiss" type="button" hidden>Dismiss</button><button id="group-rollback" class="danger" type="button" hidden>Roll back</button><button id="group-remove-author" class="danger" type="button" hidden>Remove their device</button>
   </div>
 
   <div class="topbar session-only">
@@ -59,6 +70,7 @@
     <h2 id="welcome-title">Sign in</h2>
     <p class="note">Use a passkey — your fingerprint, face or screen lock. No passwords.</p>
     <button id="signin" class="primary wide" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M17 6l3 3M15 8l2 2"/></svg><span>Sign in with passkey</span></button>
+    <button id="signin-link" class="wide" type="button">Link to my other device</button>
     <details id="register-panel"><summary>Have an invite? Create account</summary>
       <form id="register-form">
         <label for="register-invite">Invite code</label>
@@ -99,11 +111,31 @@
     <div id="device-banner" class="notify-banner" role="alert" hidden>
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
       <p id="device-banner-text">Encrypted messaging for this account is active on another device or browser. Messages are not sent or received here.</p>
-      <div class="notify-actions"><button id="device-takeover" class="primary" type="button">Use this device instead</button></div>
+      <div class="notify-actions"><button id="device-link-this" class="primary" type="button" hidden>Link this browser</button><button id="device-takeover" class="primary" type="button">Use this device instead</button><button id="device-recover" class="link" type="button" hidden>I can’t use my other devices</button></div>
     </div>
     <p id="chats-status" role="status" aria-live="polite"></p>
-    <ul id="contact-list" aria-label="Chats"></ul>
-    <p id="contacts-empty" class="empty">Your chats appear here. Add someone by their username above, or invite them from the ⋯ menu.</p>
+    <section id="pinned-section" class="list-section" aria-labelledby="pinned-head" hidden>
+      <div class="section-head"><h2 id="pinned-head">Pinned</h2></div>
+      <ul id="pinned-list" class="convo-list" aria-labelledby="pinned-head"></ul>
+    </section>
+    <section class="list-section" aria-labelledby="channels-head">
+      <div class="section-head"><h2 id="channels-head">Channels</h2>
+        <button id="channels-browse" class="icon-button small" type="button" aria-label="Browse channels" title="Browse channels"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/></svg></button>
+        <button id="channels-new" class="icon-button small" type="button" aria-label="New channel" title="New channel"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div>
+      <ul id="channel-list" class="convo-list" aria-labelledby="channels-head"></ul>
+      <p id="channels-empty" class="empty">Channels keep a topic in one place. Start one, or browse the public ones to join.</p>
+    </section>
+    <section class="list-section" aria-labelledby="groups-head">
+      <div class="section-head"><h2 id="groups-head">Groups</h2>
+        <button id="groups-new" class="icon-button small" type="button" aria-label="New group" title="New group"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button></div>
+      <ul id="group-list" class="convo-list" aria-labelledby="groups-head"></ul>
+      <p id="groups-empty" class="empty">Pick two or more people to start a group.</p>
+    </section>
+    <section class="list-section" aria-labelledby="dms-head">
+      <div class="section-head"><h2 id="dms-head">Direct messages</h2></div>
+      <ul id="contact-list" class="convo-list" aria-label="Direct messages"></ul>
+      <p id="contacts-empty" class="empty">Your chats appear here. Add someone by their username above, or invite them from the ⋯ menu.</p>
+    </section>
   </section>
 
   <p class="guest-divider">Or join with a one-time call link</p>
@@ -157,6 +189,7 @@
     <p id="safety-number" class="safety-number"></p>
     <p id="safety-state"></p>
     <p id="safety-rotation" class="note"></p>
+    <p id="safety-devices" class="note"></p>
     <div class="dialog-actions"><button id="safety-close" type="button">Close</button><button id="safety-accept" type="button" hidden>Accept new code</button><button id="safety-verify" class="primary" type="button">Mark as verified</button></div>
   </div></div>
 
@@ -194,6 +227,100 @@
     <div class="dialog-actions"><button id="core-confirm-cancel" type="button">Cancel</button><button id="core-confirm-yes" class="danger" type="button">Reset keys and switch</button></div>
   </div></div>
 
+  <div id="group-new" class="dialog" role="dialog" aria-modal="true" aria-labelledby="group-new-title" hidden><div class="dialog-card group-card">
+    <form id="group-new-form">
+      <h2 id="group-new-title">New group</h2>
+      <p id="group-new-hint" class="note"></p>
+      <label for="group-new-name" class="sr-only">Name</label><input id="group-new-name" type="text" maxlength="64" autocomplete="off" placeholder="Name (optional)">
+      <fieldset id="group-new-visibility" class="segmented-field" hidden><legend>Who can find it</legend><div class="segmented">
+        <label><input type="radio" name="group-visibility" value="private" checked><span>Private</span></label><label><input type="radio" name="group-visibility" value="public"><span>Public</span></label>
+      </div></fieldset>
+      <h3>People</h3>
+      <ul id="group-new-people" class="pick-list" aria-label="People to add"></ul>
+      <p id="group-new-status" class="note" role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="group-new-cancel" type="button">Cancel</button><button id="group-new-create" class="primary" type="submit">Create</button></div>
+    </form>
+  </div></div>
+
+  <div id="channel-browser" class="dialog" role="dialog" aria-modal="true" aria-labelledby="channel-browser-title" hidden><div class="dialog-card group-card">
+    <h2 id="channel-browser-title">Browse channels</h2>
+    <label for="channel-browser-filter" class="sr-only">Find a channel</label><input id="channel-browser-filter" type="search" autocomplete="off" placeholder="Find a channel">
+    <ul id="channel-browser-list" class="pick-list" aria-label="Public channels"></ul>
+    <p id="channel-browser-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="channel-browser-close" type="button">Close</button><button id="channel-browser-new" class="primary" type="button">Start a channel</button></div>
+  </div></div>
+
+  <div id="group-info" class="dialog" role="dialog" aria-modal="true" aria-labelledby="group-info-title" hidden><div class="dialog-card group-card">
+    <h2 id="group-info-title"></h2>
+    <p id="group-info-kind" class="note"></p>
+    <div id="group-info-edit">
+      <label for="group-info-name">Name</label><input id="group-info-name" type="text" maxlength="64" autocomplete="off">
+      <label for="group-info-topic">Topic</label><input id="group-info-topic" type="text" maxlength="256" autocomplete="off" placeholder="What this conversation is for">
+      <button id="group-info-save" type="button">Save for everyone</button>
+    </div>
+    <h3>Members</h3>
+    <ul id="group-info-members" class="pick-list" aria-label="Members"></ul>
+    <div id="group-info-add"><h3>Add people</h3><ul id="group-info-people" class="pick-list" aria-label="People to add"></ul><button id="group-info-add-button" type="button">Add</button></div>
+    <p class="note">Messages are end-to-end encrypted for every member's devices. People who join later see messages from when they joined.</p>
+    <p id="group-info-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="group-info-leave" class="danger-text" type="button">Leave</button><button id="group-info-close" class="primary" type="button">Done</button></div>
+  </div></div>
+
+  <div id="group-leave-confirm" class="dialog" role="alertdialog" aria-labelledby="group-leave-title" hidden><div class="dialog-card">
+    <h2 id="group-leave-title">Leave this conversation?</h2>
+    <p>You stop receiving its messages. What's already on this device stays. If you're its only admin, the person who joined earliest becomes one.</p>
+    <div class="dialog-actions"><button id="group-leave-cancel" type="button">Stay</button><button id="group-leave-yes" class="danger" type="button">Leave</button></div>
+  </div></div>
+
+  <div id="group-remove-confirm" class="dialog" role="alertdialog" aria-labelledby="group-remove-title" hidden><div class="dialog-card">
+    <h2 id="group-remove-title">Remove that device?</h2>
+    <p id="group-remove-text"></p>
+    <div class="dialog-actions"><button id="group-remove-cancel" type="button">Keep it</button><button id="group-remove-yes" class="danger" type="button">Roll back and remove</button></div>
+  </div></div>
+
+  <div id="pin-review" class="dialog" role="dialog" aria-modal="true" aria-labelledby="pin-review-title" hidden><div class="dialog-card">
+    <h2 id="pin-review-title">Security code changed</h2>
+    <p>Their account key is not the one this device knew. That happens when they reinstall or reset their keys, and also when someone tries to pose as them. Compare the new code with them in person or on a call before you trust it.</p>
+    <h3>Before</h3><p id="pin-review-before" class="safety-number"></p>
+    <h3>Now</h3><p id="pin-review-after" class="safety-number"></p>
+    <p id="pin-review-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="pin-review-cancel" type="button">Not now</button><button id="pin-review-accept" type="button">Accept new code</button><button id="pin-review-verify" class="primary" type="button">Mark as verified</button></div>
+  </div></div>
+
+  <div id="receipt-info" class="dialog" role="dialog" aria-modal="true" aria-labelledby="receipt-title" hidden><div class="dialog-card">
+    <h2 id="receipt-title">Message info</h2>
+    <h3>Read by</h3><ul id="receipt-read" class="pick-list"></ul>
+    <h3>Not read yet</h3><ul id="receipt-waiting" class="pick-list"></ul>
+    <p id="receipt-note" class="note"></p>
+    <div class="dialog-actions"><button id="receipt-close" class="primary" type="button">Done</button></div>
+  </div></div>
+
+  <div id="link-dialog" class="dialog" role="dialog" aria-modal="true" aria-labelledby="link-title" hidden><div class="dialog-card device-link-card">
+    <h2 id="link-title">Link a device</h2>
+    <p id="link-hint" class="note"></p>
+    <div id="link-qr-box" class="device-link-qr-box" hidden><div id="link-qr" class="device-link-qr"></div><p id="link-code-note" class="note">Or type this code on the other device:</p><p id="link-code" class="device-link-code"></p></div>
+    <div id="link-entry" hidden>
+      <form id="link-code-form"><label id="link-code-label" for="link-code-input">Code from your other device</label>
+        <input id="link-code-input" autocomplete="off" spellcheck="false" autocapitalize="characters" inputmode="text" placeholder="1234 5678 9012">
+        <div class="dialog-actions"><button id="link-scan" type="button" hidden>Scan its code</button><button id="link-code-submit" class="primary" type="submit">Link</button></div></form>
+      <div id="link-scan-box" hidden><video id="link-video" class="device-link-video" playsinline muted></video></div>
+    </div>
+    <div id="link-confirm" hidden>
+      <p>Check that both screens show the same numbers:</p><p id="link-sas" class="safety-number"></p>
+      <div class="dialog-actions"><button id="link-mismatch" class="danger" type="button">They don’t match</button><button id="link-match" class="primary" type="button">They match</button></div>
+    </div>
+    <p id="link-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="link-alt" class="link" type="button" hidden></button><button id="link-cancel" type="button">Cancel</button></div>
+  </div></div>
+
+  <div id="recovery" class="dialog" role="alertdialog" aria-labelledby="recovery-title" hidden><div class="dialog-card">
+    <h2 id="recovery-title">Start over on this device?</h2>
+    <p>Only do this if you can’t reach any device where you’re signed in. This browser gets new keys, and your old devices are signed out.</p>
+    <p>Everyone you talk to will see that your security code changed. People who verified you will need to check it again before they trust it. In groups and channels you’ll come back once they’ve checked it.</p>
+    <p>Messages stay on the devices that have them; this browser starts empty.</p>
+    <div class="dialog-actions"><button id="recovery-cancel" type="button">Keep trying to link</button><button id="recovery-yes" class="danger" type="button">Start over here</button></div>
+  </div></div>
+
   <div id="remove-confirm" class="dialog" role="alertdialog" aria-labelledby="remove-title" hidden><div class="dialog-card">
     <h2 id="remove-title">Remove this contact?</h2>
     <p>You stop seeing each other online and can no longer call or message until one of you adds the other again. Messages on this device stay.</p>
@@ -228,6 +355,7 @@
     </div>
     <form id="chat-form" class="composer" data-empty="true">
       <ul id="cmd-popup" class="cmd-popup" role="listbox" aria-label="Suggestions" hidden></ul>
+      <ul id="mention-popup" class="cmd-popup" role="listbox" aria-label="People to mention" hidden></ul>
       <div id="record-bar" class="record-bar" hidden>
         <button id="record-cancel" class="icon-button" type="button" aria-label="Cancel recording"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
         <span class="record-dot" aria-hidden="true"></span><span id="record-time" class="record-time" role="timer">0:00</span>
@@ -263,6 +391,13 @@
       <label class="toggle"><input id="notify-toggle" type="checkbox"> Notify me about messages and calls on this device</label>
       <label class="toggle"><input id="ring-silent" type="checkbox"> Silent: no ringtone or vibration</label>
       <p id="notify-status" class="note" role="status" aria-live="polite"></p>
+    </div>
+    <div class="account-only devices-settings">
+      <h3>Devices</h3>
+      <p class="note">The device that holds your keys is the primary. It signs the list of your devices; contacts check that signature, so the server cannot add a device they would trust.</p>
+      <ul id="device-list" class="device-list" aria-label="Your devices"></ul>
+      <button id="device-link-new" type="button" hidden>Link a new device</button>
+      <p id="devices-status" class="note" role="status" aria-live="polite"></p>
     </div>
     <div class="account-only">
       <h3>Security</h3>

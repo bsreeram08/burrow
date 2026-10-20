@@ -2,7 +2,8 @@
 //! (tests/interop), the WASM build (the browser worker and the node interop party). One command object
 //! in; `{"ok": value}` or `{"error": message, "code": code|null}` out. Commands: identity, prekeys, opks,
 //! encrypt, decrypt, commit, abort, rotate, sessionInfo, sids, resetIdentity, safety, peer, notePeer,
-//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce.
+//! setVerified, acceptChange, forget, rotationInterval, sas, sasCommitment, sasCheck, sasNonce, proveIdentity; with the
+//! `mls` feature the `mls*` group commands and with `ds` the `ds*` delivery-service commands (crate::mls::commands).
 use serde_json::{json, Value};
 
 use crate::core::Core;
@@ -12,12 +13,25 @@ use crate::sas;
 use crate::EncryptOutcome;
 
 /// Runs one command and wraps the outcome the way every driver reports it.
+/// The optional `identity` of `acceptChange` / `setVerified`: the exact code the user was shown.
+fn shown_identity(command: &Value) -> crate::error::Result<Option<IdentityPub>> {
+    match command.get("identity") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map(Some).map_err(|_| ChatError::coded("invalid", "malformed identity")),
+    }
+}
+
 pub fn respond(core: &mut Core, command: &Value) -> Value {
     match run(core, command) {
         Ok(value) => json!({ "ok": value }),
-        Err(error) => json!({ "error": error.message, "code": error.code }),
+        Err(error) => match &error.class {
+            Some(class) => json!({ "error": error.message, "code": error.code, "class": class }),
+            None => json!({ "error": error.message, "code": error.code }),
+        },
     }
 }
+
+fn now(command: &Value) -> u64 { command.get("now").and_then(Value::as_u64).unwrap_or(0) }
 
 fn text(command: &Value, key: &str) -> Result<String, ChatError> {
     command.get(key).and_then(Value::as_str).map(str::to_string).ok_or_else(|| ChatError::transient(format!("missing {key}")))
@@ -26,7 +40,7 @@ fn text(command: &Value, key: &str) -> Result<String, ChatError> {
 pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
     let cmd = text(command, "cmd")?;
     match cmd.as_str() {
-        "identity" => Ok(json!(core.identity()?.public)),
+        "identity" => Ok(json!(core.public_identity()?)),
         "prekeys" => {
             let now = command.get("now").and_then(Value::as_u64).unwrap_or(0);
             let max_age = command.get("maxAge").and_then(Value::as_u64);
@@ -66,14 +80,15 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
             let record = core.store_mut().get(&format!("sessions:{contact}"))?;
             Ok(record.and_then(|value| value.get("order").cloned()).unwrap_or(json!([])))
         }
+        "proveIdentity" => Ok(json!(core.prove_identity(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "challenge")?)?)),
         "resetIdentity" => { core.reset_identity()?; Ok(Value::Null) }
         "safety" => Ok(match core.safety(&text(command, "me")?, &text(command, "contact")?, &text(command, "them")?)? {
             Some(safety) => json!({ "number": safety.number, "verified": safety.verified, "changed": safety.changed, "blocked": safety.blocked }),
             None => Value::Null,
         }),
         "peer" => Ok(json!(core.peer(&text(command, "contact")?)?)),
-        "setVerified" => { core.set_verified(&text(command, "contact")?, command.get("verified").and_then(Value::as_bool).unwrap_or(true))?; Ok(Value::Null) }
-        "acceptChange" => { core.accept_change(&text(command, "contact")?)?; Ok(Value::Null) }
+        "setVerified" => { core.set_verified_for(&text(command, "contact")?, command.get("verified").and_then(Value::as_bool).unwrap_or(true), shown_identity(command)?.as_ref())?; Ok(Value::Null) }
+        "acceptChange" => { core.accept_change_for(&text(command, "contact")?, shown_identity(command)?.as_ref())?; Ok(Value::Null) }
         "forget" => { core.forget(&text(command, "contact")?)?; Ok(Value::Null) }
         "abort" => { core.abort(&text(command, "pendingId")?); Ok(Value::Null) }
         "notePeer" => {
@@ -92,7 +107,53 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
         }
         "sasCommitment" => Ok(json!(sas::commitment(&text(command, "nonce")?)?)),
         "sasCheck" => Ok(json!(sas::check_reveal(&text(command, "commitment")?, &text(command, "nonce")?))),
-        other => Err(ChatError::transient(format!("unknown command {other}"))),
+        // Linked devices (docs/m5-linking.md): the link crypto, pins, succession.
+        // The account's next DeviceList and certificates, signed in the core (docs/devices.md "App list signing").
+        "signDeviceList" => {
+            let list = match command.get("list") { Some(Value::String(text)) => text.clone(), Some(value @ Value::Object(_)) => value.to_string(), _ => return Err(ChatError::coded("invalid", "list must be the device list")) };
+            let head = match command.get("head") {
+                None | Some(Value::Null) => None,
+                Some(value) => Some(crate::devicelist::ListHead {
+                    list_json: match value.get("list") { Some(Value::String(text)) => text.clone(), Some(v @ Value::Object(_)) => v.to_string(), _ => return Err(ChatError::coded("invalid", "head.list must be the served list")) },
+                    signature: text(value, "signature")?,
+                }),
+            };
+            Ok(json!(core.sign_device_list(&text(command, "userId")?, &text(command, "published")?, &list, head.as_ref())?))
+        }
+        "linkQr" => Ok(json!({ "qr": core.link_qr(&text(command, "linkId")?, now(command))? })),
+        "linkAccept" => Ok(json!(core.link_accept(&text(command, "qr")?, now(command))?)),
+        "linkComplete" => Ok(json!({ "code": core.link_complete(&text(command, "linkId")?, &text(command, "eph")?, now(command))? })),
+        "linkSeal" => Ok(json!(core.link_seal(&text(command, "linkId")?, &text(command, "plaintext")?, now(command))?)),
+        "linkOpen" => Ok(json!(core.link_open(&text(command, "linkId")?, &text(command, "data")?, now(command))?)),
+        // Short-code rendezvous (docs/m5-linking.md §1.7).
+        "linkCommit" => Ok(json!({ "commit": core.link_commit(&text(command, "linkId")?, &text(command, "deviceId")?, now(command))? })),
+        "linkReveal" => { let (eph, nonce) = core.link_reveal(&text(command, "linkId")?, &text(command, "eph")?, now(command))?; Ok(json!({ "eph": eph, "nonce": nonce })) }
+        "linkLookup" => Ok(json!({ "eph": core.link_lookup(&text(command, "linkId")?, &text(command, "deviceN")?, &text(command, "commit")?, &text(command, "deviceP")?, now(command))? })),
+        "linkOpenCommitment" => Ok(json!({ "code": core.link_open_commitment(&text(command, "linkId")?, &text(command, "eph")?, &text(command, "nonce")?, now(command))? })),
+        "linkCompleteCode" => Ok(json!({ "code": core.link_complete_code(&text(command, "linkId")?, &text(command, "eph")?, &text(command, "deviceP")?, now(command))? })),
+        "linkEnd" => { core.link_end(&text(command, "linkId")?)?; Ok(Value::Null) }
+        "exportPins" => Ok(json!(core.export_pins()?)),
+        "importPins" => {
+            let pins: Vec<crate::core::PinExport> = serde_json::from_value(command.get("pins").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid pins"))?;
+            Ok(json!(core.import_pins(&pins)?))
+        }
+        "successionStart" => Ok(json!(core.succession_start()?)),
+        "successionComplete" => Ok(json!(core.succession_complete(command.get("record").unwrap_or(&Value::Null), &text(command, "signature")?)?)),
+        "signSuccession" => Ok(core.sign_succession(&text(command, "userId")?, &text(command, "published")?, &text(command, "newSign")?, &text(command, "newDh")?, command.get("at").and_then(Value::as_u64).unwrap_or(0))?),
+        "retireIdentity" => {
+            let identity: IdentityPub = serde_json::from_value(command.get("identity").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid identity"))?;
+            core.retire_identity(&text(command, "userId")?, &identity, command.get("at").and_then(Value::as_u64).unwrap_or(0))?;
+            Ok(Value::Null)
+        }
+        "acceptSuccession" => {
+            let records = command.get("records").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "records must be a list"))?;
+            Ok(json!(core.accept_succession(&text(command, "contact")?, records)?))
+        }
+        other => {
+            #[cfg(any(feature = "mls", feature = "ds"))]
+            if let Some(result) = crate::mls::commands::run(core, other, command) { return result; }
+            Err(ChatError::transient(format!("unknown command {other}")))
+        }
     }
 }
 

@@ -13,10 +13,18 @@ import 'package:image/image.dart' as img;
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
+import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
+import 'package:private_chat/crypto/chat_crypto.dart' show CryptoException;
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
+import 'package:private_chat/crypto/link_crypto.dart';
+import 'package:private_chat/crypto/rust_group_crypto.dart';
 import 'package:private_chat/messaging/attachments.dart';
+import 'package:private_chat/messaging/group_messenger.dart';
+import 'package:private_chat/messaging/group_sync.dart';
+import 'package:private_chat/messaging/linking.dart';
 import 'package:private_chat/messaging/messenger.dart';
+import 'package:private_chat/messaging/succession.dart';
 import 'package:private_chat/store/message.dart';
 import 'package:private_chat/store/message_store.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -50,6 +58,7 @@ void main() {
     sqfliteFfiInit();
     final me = User(id: env['CROSS_ME_ID']!, username: env['CROSS_ME_NAME']!);
     final web = Contact(id: env['CROSS_PEER_ID']!, username: env['CROSS_PEER_NAME']!, state: ContactState.mutual, online: true);
+    final third = Contact(id: env['CROSS_THIRD_ID']!, username: env['CROSS_THIRD_NAME']!, state: ContactState.mutual, online: true);
     final api = Api(baseUrl: base!, clientName: 'ios')..token = env['CROSS_TOKEN']!;
     final crypto = RustChatCrypto(
       directory: () async => dir,
@@ -71,8 +80,13 @@ void main() {
       ack: events.ack,
     );
     messenger.notices.listen(notices.add);
+    GroupMessenger? groups;
     events.events.listen((event) {
-      if (event is EnvelopeEvent) messenger.receive(event);
+      if (event is EnvelopeEvent) {
+        messenger.receive(event);
+      } else {
+        groups?.onEvent(event);
+      }
     });
     await events.connect();
     final conversation = messenger.conversationWith(web.id!);
@@ -92,8 +106,19 @@ void main() {
     describe = () async => 'messages: ${[for (final m in await messages()) '${m.direction.name} ${m.status.name} "${m.body}"']}\nnotices: $notices';
 
     // 1. Keys: this device is the active one for the account.
+    // It announced its device with the published identity, so the server routes the account's inbox to it.
     expect(await messenger.checkActive(), isTrue);
-    await signal('ready');
+    // The server accepts the Rust core's identity proof (chatcore prove_identity) for a fresh challenge.
+    final local = await messenger.device(), challenge = await api.deviceChallenge();
+    final claimed = await api.announceDevice(
+      local.deviceId,
+      deviceKey: local.publicKey,
+      challenge: challenge,
+      signature: local.sign(bindBytes(me.id, local.deviceId, challenge)),
+      identityProof: await crypto.proveIdentity(me.id, local.deviceId, challenge),
+    );
+    expect(claimed['primary'], isTrue);
+    await signal('ready', local.deviceId);
 
     // 2. Web → app: the web client opens the session (X3DH from signal.js, decrypted by the Rust core).
     await waitFor('sent-1');
@@ -122,7 +147,6 @@ void main() {
     }
     final linked = await find('web link preview', (m) => m.link != null);
     expect((linked.link!.url, linked.link!.title), ('https://example.com/web', 'Web link'));
-    await until(() async => sawTyping, 'typing from web');
     await signal('web-rich-ok');
 
     // 3d. The same from the app.
@@ -150,9 +174,13 @@ void main() {
     await messenger.send(web, '', attachment: await attachments.upload(bytes: file, name: 'app-notes.bin', mime: 'application/octet-stream', kind: 'file'));
     await messenger.send(web, 'see https://example.com/app', link: const LinkPreview(url: 'https://example.com/app', title: 'App link', site: 'example.com'));
     await find('app link delivered', (m) => m.text == 'see https://example.com/app' && reached(m));
-    await messenger.typingChanged(web, on: true);
     await signal('app-rich', jsonEncode({'target': theirs.id, 'ours': ours.id, 'image': sha(png), 'file': sha(file)}));
     await waitFor('app-rich-ok');
+
+    // 3b. Devices: the web's signed device list verifies against the identity pinned for it, and is pinned.
+    var devices = const DeviceCheck.failed('none');
+    await until(() async => (devices = await messenger.verifyContactDevices(web) ?? devices).ok, "web's device list verifies");
+    expect(devices.version, greaterThanOrEqualTo(1));
 
     // 4. Safety numbers: the web compares its 60 digits with ours.
     final safety = await crypto.safety(me.username, web.id!, web.username);
@@ -183,7 +211,223 @@ void main() {
     // 8. Burn from the web deletes this conversation here.
     await waitFor('burned');
     await until(() async => (await messages()).isEmpty, 'conversation burned');
-    await signal('done');
+
+    // 9. Groups over MLS (docs/m4-groups.md): the app publishes its signed device list (a listed device),
+    // creates its group identity with the same Rust core and uploads KeyPackages.
+    expect(await messenger.syncDevices(), isTrue, reason: messenger.deviceWarning ?? 'device list published');
+    final device = await messenger.device();
+    final sync = GroupSync(
+      api: api,
+      crypto: const RustGroupCrypto(),
+      store: store,
+      me: me,
+      device: () async => device,
+      platform: 'ios',
+      ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: messenger.verifiedOwnDevices,
+      sendCursor: events.cursor,
+      ackWelcome: events.ack,
+    );
+    groups = GroupMessenger(api: api, sync: sync, chatCrypto: crypto, store: store, me: me, contacts: () => [web, third]);
+    final g = groups;
+    g.notices.listen(notices.add);
+    sync.notices.listen(notices.add);
+    await g.start();
+    expect(g.ready, isTrue, reason: g.unavailable);
+    await signal('groups-ready');
+
+    // 9a. The web created a group with the app: the Welcome arrives, the name comes from the encrypted meta.
+    final groupId = await waitFor('group-created', timeout: const Duration(seconds: 120));
+    Future<List<ChatMessage>> inGroup() => store.list(groupId);
+    describe = () async => 'group: ${[for (final m in await inGroup()) '${m.direction.name} ${m.senderName} "${m.body}" ${m.reactions.byWho}']}\nnotices: $notices';
+    await until(() async => (await store.group(groupId))?.name == 'Cross team', 'group joined and named', timeout: const Duration(seconds: 90));
+    Future<ChatMessage> inGroupFind(String what, bool Function(ChatMessage) test) async {
+      await until(() async => (await inGroup()).any(test), what, timeout: const Duration(seconds: 90));
+      return (await inGroup()).firstWhere(test);
+    }
+
+    // 9b. Web → app in the group: a message mentioning the app, and an image.
+    final webGroup = jsonDecode(await waitFor('group-web-sent', timeout: const Duration(seconds: 120))) as Map<String, dynamic>;
+    final hello = await inGroupFind('web group message', (m) => m.text.startsWith('hello group from web'));
+    expect((hello.sender, hello.senderName), (web.id, web.username));
+    expect(hello.mentions, [me.id]);
+    expect((await store.group(groupId))!.mentioned, isTrue);
+    final webImage = await inGroupFind('web group image', (m) => !m.outgoing && m.attachment?.kind == 'image');
+    expect(sha(await attachments.open(webImage.attachment!)), webGroup['image'], reason: 'image bytes identical');
+
+    // 9c. App → web: a reaction, a message, a file.
+    await g.react(groupId, hello, '👍', on: true);
+    final appMessage = await g.send(groupId, 'hello group from app');
+    final groupFile = Uint8List.fromList(List.generate(40000, (i) => (i * 13 + 5) % 256));
+    await g.send(groupId, '', attachment: await attachments.upload(bytes: groupFile, name: 'group-notes.bin', mime: 'application/octet-stream', kind: 'file'));
+    await until(() async => (await inGroup()).where((m) => m.outgoing && m.status != MessageStatus.queued).length >= 2, 'group messages sequenced');
+    await signal('group-app-sent', jsonEncode({'id': appMessage.id, 'file': sha(groupFile)}));
+
+    // 9d. The web's reaction on our message, by person.
+    await waitFor('group-web-reacted', timeout: const Duration(seconds: 120));
+    await inGroupFind('web reaction on the app message', (m) => m.id == appMessage.id && m.reactions.of(web.id!).contains('😂'));
+
+    // 9e. The app creates its own private channel with the web (the web joins from the app's Welcome), adds a
+    // third person who reads from then on, and removes them again.
+    final own = await g.create(GroupKindName.private, name: 'App team', topic: 'from the app', memberIds: [web.id!]);
+    await signal('app-group', own.id);
+    await waitFor('app-group-joined', timeout: const Duration(seconds: 120));
+    await waitFor('third-ready', timeout: const Duration(seconds: 120));
+    await g.addMembers(own.id, [third.id!]);
+    expect((await g.members(own.id, refresh: true)).map((m) => m.username).toSet(), {me.username, web.username, third.username});
+    await g.send(own.id, 'welcome third');
+    await signal('group-added');
+    await waitFor('group-third-ok', timeout: const Duration(seconds: 120));
+    await g.removeMember(own.id, third.id!);
+    expect((await g.members(own.id, refresh: true)).map((m) => m.username).toSet(), {me.username, web.username});
+    await signal('group-removed');
+    await waitFor('group-removal-seen', timeout: const Duration(seconds: 120));
+
+    // 10. M5 linking (docs/m5-linking.md §1): a new web browser shows its QR text; the app, as the primary,
+    // takes it, both show the same 6 digits, and the app publishes the list naming it, signs its MLS certificate
+    // and sends the sealed grant and bundle.
+    final qrText = await waitFor('web-link-qr', timeout: const Duration(seconds: 120));
+    final linkCtx = LinkContext(api: api, crypto: crypto, link: const RustLinkCrypto(), messenger: messenger, store: store, contacts: () => [web, third]);
+    final primary = await PrimaryLink.fromQr(linkCtx, qrText);
+    final laptop = await primary.waitHello(timeout: const Duration(seconds: 90));
+    expect(laptop.platform, 'web');
+    await signal('app-link-code', primary.code);
+    await waitFor('web-link-code-ok', timeout: const Duration(seconds: 60));
+    await primary.approve();
+    await signal('app-link-approved', laptop.deviceId);
+    // The linked browser joins our private channel by itself; it reads what the app sends from then on.
+    await waitFor('laptop-ready', timeout: const Duration(seconds: 180));
+    await g.send(own.id, 'hello laptop');
+    await signal('app-sent-laptop');
+
+    // 11. Revocation (§4): the app revokes the laptop, publishes the list without it, and removes its leaf.
+    await waitFor('laptop-read', timeout: const Duration(seconds: 120));
+    expect(await api.revokeDevice(laptop.deviceId), [laptop.deviceId]);
+    await messenger.publishNextList();
+    describe = () async {
+      final verified = await messenger.verifiedOwnDevices();
+      return 'own list: listed ${verified?.listed} dropped ${verified?.dropped}; members ${[for (final m in await g.crypto.members(own.id)) '${m.userId}/${m.deviceId}']}; laptop ${laptop.deviceId}; notices ${notices.reversed.take(4).toList()}';
+    };
+    // From every group it joined (both channels: it is our device).
+    await until(() async {
+      await g.sync.removeDroppedOwnLeaves();
+      for (final id in [own.id, groupId]) {
+        if ((await g.crypto.members(id)).any((m) => m.deviceId == laptop.deviceId)) return false;
+      }
+      return true;
+    }, 'revoked leaf removed', timeout: const Duration(seconds: 90));
+    await g.send(own.id, 'after revoking the laptop');
+    await signal('app-revoked');
+    await waitFor('revoke-seen', timeout: const Duration(seconds: 120));
+
+    // 12. The 1:1 chat moves to MLS (m5 §8): the web keeps the Double Ratchet (its test flag), the app is the first
+    // sender. History stays in the chat; the web's reply, its read receipt and its typing come through the DM group.
+    messenger.groups = g;
+    final viaGroup = <String>[];
+    final counted = g.dmIncoming;
+    g.dmIncoming = (peer) {
+      viaGroup.add(peer);
+      counted?.call(peer);
+    };
+    describe = () async => 'messages: ${[for (final m in await messages()) '${m.direction.name} ${m.status.name} "${m.body}"']}\nnotices: $notices';
+    await waitFor('dm-before', timeout: const Duration(seconds: 120));
+    final before = await find('the web message before the move', (m) => m.text == 'before the move');
+    await messenger.send(web, 'first via mls');
+    String? dm;
+    await until(() async => (dm = await g.dmChannelWith(web.id!)) != null, 'the chat moved to its DM group');
+    await find('sent through the DM group', (m) => m.text == 'first via mls' && statusRank(m.status) >= statusRank(MessageStatus.sent));
+    await signal('dm-moved', dm ?? '');
+    await waitFor('dm-replied', timeout: const Duration(seconds: 150));
+    await find('the web reply via MLS', (m) => m.text == 'reply via mls' && !m.outgoing);
+    expect(viaGroup, contains(web.id), reason: 'the reply came through the DM group, not the Double Ratchet');
+    expect((await messages()).any((m) => m.id == before.id), isTrue, reason: 'history before the move stays');
+    await find('read via the DM group', (m) => m.text == 'first via mls' && m.status == MessageStatus.read);
+    sawTyping = false;
+    await signal('dm-typing-ready');
+    await until(() async => sawTyping, 'typing through the DM group');
+    await signal('dm-ok');
+    await g.dispose();
     await events.close();
+    await messenger.dispose();
+
+    // 13. The app as a companion device of the web's account (m5 §1, §1.6, §3): a fresh key database shows a QR,
+    // the web (its primary) takes the text, both show the same digits, and the grant is checked before the
+    // Rust core enters companion mode. Then, without the account's keys, it joins the web account's channels
+    // by itself (names from the bundle) and sends in the moved DM through its group.
+    final linkPrefs = MemoryDevicePrefs();
+    final newDevice = await localDevice(linkPrefs, '__link__');
+    await crypto.init('keys-link-${newDevice.deviceId}');
+    final linkApi = Api(baseUrl: base, clientName: 'macos');
+    final newLink = await NewDeviceLink.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: newDevice, platform: 'macos', label: 'Mac app');
+    await signal('app-link-qr', newLink.qr ?? '');
+    stderr.writeln('app: link started, waiting for the offer');
+    final digits = await newLink.waitOffer(timeout: const Duration(minutes: 2));
+    stderr.writeln('app: offered, code $digits, hello sent');
+    await signal('app-link-sas', digits);
+    final setup = await newLink.waitGrant(timeout: const Duration(minutes: 2));
+    expect(setup.user.id, web.id);
+    expect((await const RustLinkCrypto().account())?.userId, web.id, reason: 'the core is a companion of the web account');
+    await expectLater(crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: 0), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'companion')));
+    final linkedUser = setup.user, appContact = Contact(id: me.id, username: me.username, state: ContactState.mutual, online: true);
+    await linkPrefs.writeDevice(linkedUser.id, (await linkPrefs.readDevice('__link__'))!);
+    linkPrefs.setPin(linkedUser.id, linkedUser.id, setup.pin);
+    final linkedStore = await MessageStore.open(databaseFactoryFfi, '$dir/messages-companion.db');
+    final linkedEvents = EventsClient(url: Uri.parse(base.replaceFirst('http', 'ws')).replace(path: '/api/events'), token: setup.token);
+    final companion = Messenger(api: linkApi, crypto: crypto, store: linkedStore, me: linkedUser, contactById: (id) => id == me.id ? appContact : null, mutualContacts: () => [appContact], ack: linkedEvents.ack, devices: linkPrefs)
+      ..companion = true;
+    GroupMessenger? linkedGroups;
+    final linkedSync = GroupSync(
+      api: linkApi,
+      crypto: const RustGroupCrypto(),
+      store: linkedStore,
+      me: linkedUser,
+      device: companion.device,
+      platform: 'macos',
+      ensurePinned: (ids, {force = false}) async => await linkedGroups?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: companion.verifiedOwnDevices,
+      companion: true,
+      sendCursor: linkedEvents.cursor,
+      ackWelcome: linkedEvents.ack,
+    );
+    linkedSync.notices.listen(notices.add);
+    linkedGroups = GroupMessenger(api: linkApi, sync: linkedSync, chatCrypto: crypto, store: linkedStore, me: linkedUser, contacts: () => [appContact]);
+    final lg = linkedGroups;
+    companion.groups = lg;
+    linkedEvents.events.listen((event) {
+      if (event is! EnvelopeEvent) lg.onEvent(event);
+    });
+    await linkedEvents.connect();
+    await installLinkBundle(setup.bundle, linkedStore);
+    expect(await companion.checkActive(), isFalse);
+    await lg.start();
+    expect(lg.ready, isTrue, reason: lg.unavailable);
+    describe = () async => 'companion groups: ${[for (final c in await linkedStore.groups()) '${c.kind.wire} ${c.name} ${c.membership.name} moved=${c.movedAt != null}']}\njoin errors: ${linkedSync.joinErrors}\nnotices: $notices';
+    await until(() async => (await linkedStore.group(groupId))?.name == 'Cross team', 'the companion app joined "Cross team", named from the bundle', timeout: const Duration(seconds: 120));
+    await until(() async => await lg.dmChannelWith(me.id) != null, 'the companion app holds the moved DM', timeout: const Duration(seconds: 120));
+    await companion.send(appContact, 'from the linked app');
+    await until(() async => (await linkedStore.list(companion.conversationWith(me.id))).any((m) => m.text == 'from the linked app' && m.status == MessageStatus.sent), 'sent through the DM group');
+    await signal('app-linked-sent');
+    await waitFor('linked-seen', timeout: const Duration(seconds: 120));
+
+    // 14. Primary transfer (m5 §5.2): the linked app takes the web account over. It shows a code, the web (the
+    // primary) confirms the same digits and signs the account over; the app publishes the record, its new keys
+    // and list v1 naming the web, and certifies the web's leaf; the web steps down to a linked device and still
+    // reads what the new primary sends.
+    final take = await TakeOver.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: await companion.device(), platform: 'macos');
+    await signal('app-take-qr', take.qr);
+    await signal('app-take-sas', await take.waitOffer(timeout: const Duration(minutes: 2)));
+    String? takeMarker;
+    await take.run(companion, platform: 'macos', markers: (read: () async => takeMarker, write: (String? v) async => takeMarker = v), timeout: const Duration(minutes: 2));
+    expect(takeMarker, isNull, reason: 'the resume marker is cleared once the take-over is done');
+    final newKey = await crypto.identity();
+    expect((await linkApi.keyCount()).identity?['sign'], newKey.sign, reason: 'the server serves the new account key');
+    expect(await const RustLinkCrypto().account(), isNull, reason: 'the core holds the account key now');
+    await lg.send(groupId, 'from the new primary');
+    await until(() async => (await linkedStore.list(groupId)).any((m) => m.text == 'from the new primary' && m.status == MessageStatus.sent), 'the new primary sends in "Cross team"');
+    await signal('app-took-over', newKey.sign);
+    await waitFor('takeover-seen', timeout: const Duration(seconds: 150));
+    await lg.dispose();
+    await linkedEvents.close();
+    await signal('done');
   }, skip: base == null ? 'run through tests/cross-client/run.ts' : false, timeout: const Timeout(Duration(minutes: 5)));
 }

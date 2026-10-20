@@ -7,6 +7,9 @@ import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthe
 import { packetBudget } from '../stun-server/native/server';
 import { requestLimiter } from './rate-limit';
 import type { Push } from './push';
+import { migrate } from './migrations';
+import { createDevices } from './devices';
+import type { Channels } from './channels';
 
 // Accounts identify people and introduce them; message content never reaches this module.
 // The server learns usernames, the contact graph, presence and passkey public keys.
@@ -16,7 +19,7 @@ export type SessionUser = User & { session: string; client: string };
 export const NATIVE_CLIENTS = new Set(['ios', 'android', 'macos', 'windows', 'linux']);
 /** Oldest app versions the server still supports; apps below these show "update required". */
 export const MIN_CLIENT = { ios: '1.0.0', android: '1.0.0', macos: '1.0.0', windows: '1.0.0', linux: '1.0.0' };
-export type EventsConnection = { kind: 'events'; userId: string; session: string; allow: () => boolean; sent: Set<string> };
+export type EventsConnection = { kind: 'events'; userId: string; session: string; allow: () => boolean; sent: Set<string>; groups: Map<string, number> };
 export type Calls = {
     /** Opens (or for calls, replaces) the pair's room and issues fresh participant credentials. */
     pairRoom(users: string[], requester: string, kind: 'chat' | 'voice' | 'video'): { roomId: string; token: string; peerToken?: string } | 'busy' | 'full';
@@ -28,7 +31,7 @@ export type Calls = {
     /** Whether a live pair room is waiting for this user to join. */
     ringingFor?(userId: string, roomId: string): boolean;
 };
-const MAILBOX_TTL = 30 * 86400000, MAILBOX_MAX_COUNT = 1000, MAILBOX_MAX_BYTES = 50 * 1024 * 1024, SENDER_MAX_COUNT = 200, SENDER_MAX_BYTES = 10 * 1024 * 1024, ENVELOPE_MAX = 65536, EPHEMERAL_MAX = 2048, MAX_PREKEYS = 200, INFLIGHT = 32;
+const MAILBOX_TTL = 30 * 86400000, MAILBOX_MAX_COUNT = 1000, MAILBOX_MAX_BYTES = 50 * 1024 * 1024, SENDER_MAX_COUNT = 200, SENDER_MAX_BYTES = 10 * 1024 * 1024, ENVELOPE_MAX = 65536, MAX_PREKEYS = 200, INFLIGHT = 32;
 const KEY = /^[A-Za-z0-9_-]{43}$/, SIGNATURE = /^[A-Za-z0-9_-]{86}$/, MESSAGE_ID = /^[A-Za-z0-9_-]{22}$/, RESERVED = new Set(['count']);
 const DAY = 86400000, INVITE_LIFETIME = 7 * DAY, SESSION_LIFETIME = 30 * DAY, FLOW_LIFETIME = 5 * 60000, REQUEST_LIFETIME = 30 * DAY, MAX_PENDING_REQUESTS = 20;
 const USERNAME = /^[a-z0-9_]{3,20}$/, INVITE = /^[A-Za-z0-9_-]{22}$/, FLOW = /^[A-Za-z0-9_-]{22}$/, TOKEN = /^[A-Za-z0-9_-]{43}$/;
@@ -49,25 +52,8 @@ export function openDatabase(dataDir: string) {
     const db = new Database(path, { create: true, strict: true });
     chmodSync(path, 0o600);
     db.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000;');
-    db.exec(`
-        CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS credentials (id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, public_key BLOB NOT NULL, counter INTEGER NOT NULL, transports TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS invites (code_hash TEXT PRIMARY KEY, created_by TEXT REFERENCES users(id) ON DELETE SET NULL, expires_at INTEGER NOT NULL, used_by TEXT REFERENCES users(id) ON DELETE SET NULL);
-        CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, expires_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS contacts (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, contact_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, created_at INTEGER NOT NULL, PRIMARY KEY (user_id, contact_id));
-        -- Requests are addressed to a username whether or not it exists, so sending one reveals nothing.
-        -- Public keys only. Private keys never leave devices.
-        CREATE TABLE IF NOT EXISTS identity_keys (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, dh TEXT NOT NULL, sign TEXT NOT NULL, updated_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS signed_prekeys (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, key_id INTEGER NOT NULL, key TEXT NOT NULL, signature TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS one_time_prekeys (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, key_id INTEGER NOT NULL, key TEXT NOT NULL, PRIMARY KEY (user_id, key_id));
-        -- End-to-end encrypted envelopes waiting for their recipient; deleted on acknowledgement or after 30 days.
-        CREATE TABLE IF NOT EXISTS mailbox (id TEXT PRIMARY KEY, recipient_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, sender_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, envelope BLOB NOT NULL, created_at INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS mailbox_recipient ON mailbox (recipient_id, created_at);
-        CREATE INDEX IF NOT EXISTS mailbox_age ON mailbox (created_at);
-        CREATE TABLE IF NOT EXISTS contact_requests (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, username TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (user_id, username));
-    `);
-    // Which client a session belongs to: 'web' sessions live in a cookie, native ones in a bearer token.
-    if (!db.query<{ name: string }, []>('PRAGMA table_info(sessions)').all().some(column => column.name === 'client')) db.exec("ALTER TABLE sessions ADD COLUMN client TEXT NOT NULL DEFAULT 'web'");
+    // Schema changes are numbered migrations (migrations.ts), applied in order and recorded in user_version.
+    migrate(db);
     return db;
 }
 
@@ -90,10 +76,14 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     // Passkeys made in the Android app sign the app's key hash as their origin; iOS apps sign the web origin.
     const expectedOrigins = (client: string) => client === 'web' ? options.origin : [options.origin, ...(options.androidOrigins ?? [])];
     const listeners = new Map<string, Set<ServerWebSocket<EventsConnection>>>();
+    // Group delivery (channels.ts) plugs in here: it fans the log and Welcomes out through the same streams.
+    let channels: Channels | undefined;
     const allowAuth = requestLimiter({ perSource: 10, global: 100 });
-    const allowSend = requestLimiter({ perSource: 20, global: 2000 }), allowEphemeral = requestLimiter({ perSource: 10, global: 2000 }), allowBundle = requestLimiter({ perSource: 3, global: 500 });
+    const allowSend = requestLimiter({ perSource: 20, global: 2000 }), allowBundle = requestLimiter({ perSource: 3, global: 500 });
     // Each registration pushes a nonce to the claimed device, so one account may not trigger many per second.
     const allowRegister = requestLimiter({ perSource: 5, global: 200 });
+    const allowDevices = requestLimiter({ perSource: 20, global: 400 });
+    const allowChallenges = requestLimiter({ perSource: 30, global: 2000 }); // Sign-in and reconnect bursts, per account.
 
     const userByName = (username: string) => db.query<User, [string]>('SELECT id, username FROM users WHERE username = ?').get(username);
     const inviteUsable = (code: string) => Boolean(db.query('SELECT 1 FROM invites WHERE code_hash = ? AND used_by IS NULL AND expires_at > ?').get(hash(code), now()));
@@ -107,6 +97,12 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     function announce(userId: string) {
         for (const contact of mutualIds(userId)) notify(contact, { type: 'presence', id: userId, online: online(userId) });
     }
+    const devices = createDevices({
+        db, now, notify: (userId, event) => notify(userId, event), mutualIds: id => mutualIds(id),
+        sessionsEnded(userId, sessions) { for (const session of sessions) push?.forgetSession(session); closeDeadStreams(userId); },
+        inboxChanged(userId) { for (const socket of listeners.get(userId) ?? []) pump(socket); },
+        devicesRevoked(userId, ids) { channels?.devicesRevoked(userId, ids); },
+    });
     /** A fresh session token; only its hash is stored. Web sessions become a cookie, native ones a bearer token. */
     function startSession(userId: string, client = 'web') {
         const token = random(32), expiresAt = now() + SESSION_LIFETIME;
@@ -115,8 +111,10 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     }
     const sessionCookie = (token: string) => `${cookieName}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_LIFETIME / 1000}${secure ? '; Secure' : ''}`;
     /** Native sign-in answers with a bearer token in the body; browsers get an HttpOnly cookie. */
-    function signedIn(user: User, client: string, status: number) {
+    function signedIn(user: User, client: string, status: number, deviceId?: string) {
         const session = startSession(user.id, client);
+        // A linked device's session is bound to its device from the start (docs/m5-linking.md §1.1 step 9).
+        if (deviceId) db.query('UPDATE sessions SET device_id = ? WHERE token_hash = ?').run(deviceId, hash(session.token));
         return client === 'web' ? json({ user }, status, { 'Set-Cookie': sessionCookie(session.token) }) : json({ user, session }, status);
     }
     function bearerToken(request: Request) {
@@ -195,7 +193,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     }
 
     const prekeyCount = (userId: string) => db.query<{ count: number }, [string]>('SELECT COUNT(*) AS count FROM one_time_prekeys WHERE user_id = ?').get(userId)!.count;
-    function uploadKeys(user: User, body: Record<string, any> | null) {
+    function uploadKeys(user: SessionUser, body: Record<string, any> | null) {
         const identity = body?.identity, spk = body?.signedPreKey, oneTime = body?.oneTimePreKeys ?? [];
         const keyId = (value: unknown) => Number.isSafeInteger(value) && (value as number) > 0 && (value as number) < 2 ** 31;
         if (!identity || !KEY.test(identity.dh) || !KEY.test(identity.sign)) return json({ error: 'Invalid identity key' }, 400);
@@ -214,7 +212,12 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 if (prekeyCount(user.id) > MAX_PREKEYS) throw new Error('prekeys');
             })();
         } catch { return json({ error: `At most ${MAX_PREKEYS} one-time prekeys may wait on the server.` }, 400); }
-        // Contacts re-check this identity; a change shows them a security-code notice.
+        // A new identity voids lists signed by the old one (and announces 'devices' to the account and its contacts).
+        if (changed) devices.identityChanged(user.id);
+        // A new identity (first or changed) moves the messaging inbox to the uploading session's device.
+        devices.keysUploaded(user, changed || !existing);
+        // Contacts re-check this identity; a change shows them a security-code notice. ('keys' is kept for one
+        // release for clients that predate the 'devices' event.)
         if (changed || !existing) for (const contact of mutualIds(user.id)) notify(contact, { type: 'keys', id: user.id });
         // This account's other devices learn that messaging moved away from them.
         if (changed) notify(user.id, { type: 'keys', id: user.id });
@@ -222,16 +225,20 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     }
     /** Sends waiting envelopes in order, bounded by in-flight count and socket buffering. */
     function pump(socket: ServerWebSocket<EventsConnection>) {
-        const { userId, sent } = socket.data;
+        const { userId, session, sent } = socket.data;
         if (sent.size >= INFLIGHT || socket.readyState !== 1) return;
+        // Envelopes are addressed to devices; a stream reads its own device's inbox (legacy clients: the primary's).
+        const device = devices.inboxFor(userId, session);
+        if (!device) { channels?.pump(socket); return; } // An unbound session of an account whose messaging device is known: no 1:1 envelopes for it.
         const rows = db.query<{ id: string; sender_id: string; username: string; envelope: Uint8Array; created_at: number }, [string, number]>(
-            'SELECT m.id, m.sender_id, u.username, m.envelope, m.created_at FROM mailbox m JOIN users u ON u.id = m.sender_id WHERE m.recipient_id = ? AND m.created_at > ? ORDER BY m.created_at, m.id LIMIT 128').all(userId, now() - MAILBOX_TTL);
+            'SELECT m.id, m.sender_id, u.username, m.envelope, m.created_at FROM device_inbox m JOIN users u ON u.id = m.sender_id WHERE m.device_id = ? AND m.created_at > ? ORDER BY m.created_at, m.id LIMIT 128').all(device, now() - MAILBOX_TTL);
         for (const row of rows) {
             if (sent.has(row.id)) continue;
             if (sent.size >= INFLIGHT || socket.getBufferedAmount() > 16384) break;
             sent.add(row.id);
             socket.send(JSON.stringify({ type: 'envelope', id: row.id, from: { id: row.sender_id, username: row.username }, envelope: Buffer.from(row.envelope).toString('base64url'), createdAt: row.created_at }));
         }
+        channels?.pump(socket);
     }
     /** Wakes the callee's devices unless an open app confirms the call is ringing on screen. */
     function ringOrPush(callee: string, from: string, kind: 'voice' | 'video', roomId: string) {
@@ -251,7 +258,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             const user = sessionUser(request);
             if (!user) return json({ error: 'Unauthorized' }, 401);
             if ((listeners.get(user.id)?.size ?? 0) >= 8) return json({ error: 'Too many connections' }, 429);
-            if (server.upgrade(request, { data: { kind: 'events', userId: user.id, session: user.session, allow: packetBudget(200), sent: new Set() } })) return undefined;
+            if (server.upgrade(request, { data: { kind: 'events', userId: user.id, session: user.session, allow: packetBudget(200), sent: new Set(), groups: new Map() } })) return undefined;
             return json({ error: 'WebSocket upgrade required' }, 400);
         }
         const path = url.pathname;
@@ -405,7 +412,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 if (target) {
                     const wasMutual = mutual(user.id, target.id);
                     db.query('DELETE FROM contacts WHERE (user_id = ?1 AND contact_id = ?2) OR (user_id = ?2 AND contact_id = ?1)').run(user.id, target.id);
-                    db.query('DELETE FROM mailbox WHERE (sender_id = ?1 AND recipient_id = ?2) OR (sender_id = ?2 AND recipient_id = ?1)').run(user.id, target.id);
+                    db.query('DELETE FROM device_inbox WHERE (sender_id = ?1 AND recipient_id = ?2) OR (sender_id = ?2 AND recipient_id = ?1)').run(user.id, target.id);
                     calls.endPair([user.id, target.id].sort());
                     if (wasMutual) { notify(target.id, { type: 'presence', id: user.id, online: false }); notify(user.id, { type: 'presence', id: target.id, online: false }); }
                     notify(target.id, { type: 'contacts' });
@@ -413,6 +420,30 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 return json({ status: 'removed' });
             }
         }
+        // Challenges are exempt (each announce needs one; they are bounded per session in devices.ts).
+        if (path === '/api/devices/challenge' ? !allowChallenges(user.id) : path.startsWith('/api/devices') && request.method !== 'GET' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
+        if (path === '/api/devices/succession' && request.method === 'PUT') { const [status, result] = devices.putSuccession(user, await readBody(request)); return json(result, status); }
+        if (path === '/api/devices/recert') {
+            if (request.method === 'PUT') { const [status, result] = devices.recertRequest(user, await readBody(request)); return json(result, status); }
+            if (request.method === 'GET') { const [status, result] = devices.recertPending(user); return json(result, status); }
+            if (request.method === 'DELETE') { const [status, result] = devices.recertDone(user); return json(result, status); }
+        }
+        if (path === '/api/devices/recert/mine' && request.method === 'GET') { const [status, result] = devices.recertMine(user); return json(result, status); }
+        const recertMatch = /^\/api\/devices\/recert\/([A-Za-z0-9_-]{22})$/.exec(path);
+        if (recertMatch && request.method === 'PUT') { const [status, result] = devices.recertAnswer(user, recertMatch[1]!, await readBody(request)); return json(result, status); }
+        const revokeMatch = /^\/api\/devices\/([A-Za-z0-9_-]{22})\/revoke$/.exec(path);
+        if (revokeMatch && request.method === 'POST') { const [status, result] = devices.revokeAny(user, revokeMatch[1]!); return json(result, status); }
+        if (path === '/api/devices/list' && request.method === 'PUT') { const [status, result] = devices.publish(user, await readBody(request)); return json(result, status); }
+        if (path === '/api/devices/challenge' && request.method === 'POST') { const [status, result] = devices.challenge(user); return json(result, status); }
+        if (path === '/api/devices/announce' && request.method === 'POST') { const [status, result] = devices.announce(user, await readBody(request)); return json(result, status); }
+        const devicesMatch = /^\/api\/devices\/(?:([a-z0-9_]{3,20})|([A-Za-z0-9_-]{22}))$/.exec(path);
+        if (devicesMatch?.[1] && request.method === 'GET') {
+            const owner = userByName(devicesMatch[1]);
+            // Your own devices, or a mutual contact's signed list (never another account's pending devices or labels).
+            if (!owner || (owner.id !== user.id && !mutual(user.id, owner.id))) return json({ error: 'You can only see your own and your contacts\' devices.' }, 403);
+            return json(devices.view(owner, user));
+        }
+        if (devicesMatch?.[2] && request.method === 'DELETE') { const [status, result] = devices.remove(user, devicesMatch[2], await readBody(request)); return json(result, status); }
         if (path === '/api/keys' && request.method === 'PUT') return uploadKeys(user, await readBody(request));
         if (path === '/api/keys/count' && request.method === 'GET') {
             const spk = db.query<{ key_id: number }, [string]>('SELECT key_id FROM signed_prekeys WHERE user_id = ?').get(user.id);
@@ -445,25 +476,23 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             const raw = body!.envelope;
             const envelope = typeof raw === 'string' && raw.length <= Math.ceil(ENVELOPE_MAX * 4 / 3) && /^[A-Za-z0-9_-]+$/.test(raw) ? Buffer.from(raw, 'base64url') : null;
             if (!envelope || envelope.length === 0 || envelope.length > ENVELOPE_MAX || envelope.toString('base64url') !== raw) return json({ error: 'Invalid envelope' }, 400);
-            // Ephemeral envelopes (typing) go only to streams open right now: never stored, pushed or acknowledged.
-            if (body!.ephemeral === true) {
-                if (envelope.length > EPHEMERAL_MAX) return json({ error: 'Ephemeral envelopes are at most 2 KB.' }, 413);
-                if (!allowEphemeral(user.id)) return json({ error: 'Rate limited' }, 429);
-                const frame = JSON.stringify({ type: 'envelope', id: random(16), from: { id: user.id, username: user.username }, envelope: raw, createdAt: now(), ephemeral: true });
-                let delivered = 0;
-                // A stream that is already backed up skips it rather than buffering more.
-                for (const socket of listeners.get(target.id) ?? []) if (socket.getBufferedAmount() <= 16384 && socket.send(frame) > 0) delivered++;
-                return json({ delivered: delivered > 0 }, 202);
-            }
+            // Typing hints no longer use the Double Ratchet: they travel over MLS groups (docs/m5-linking.md §9).
+            if (body!.ephemeral === true) return json({ error: 'Typing hints travel over MLS groups now.' }, 410);
             if (body!.ephemeral !== undefined && body!.ephemeral !== false) return json({ error: 'Invalid envelope' }, 400);
             if (!allowSend(user.id)) return json({ error: 'Rate limited' }, 429);
-            const pending = db.query<{ count: number; bytes: number }, [string]>('SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(envelope)), 0) AS bytes FROM mailbox WHERE recipient_id = ?').get(target.id)!;
+            // A pair that moved to an MLS DM sends the old way for 60 days at most (docs/m5-linking.md §8.4).
+            const [pairA, pairB] = [user.id, target.id].sort();
+            const moved = db.query<{ created_at: number }, [string, string]>('SELECT c.created_at FROM dm_pairs p JOIN channels c ON c.id = p.channel_id WHERE p.user_a = ? AND p.user_b = ?').get(pairA!, pairB!);
+            if (moved && now() - moved.created_at > 60 * DAY) return json({ error: 'This conversation moved to the new encryption.' }, 410);
+            // M1: one messaging device per account (the identity-key holder), so one inbox row per envelope.
+            const device = devices.primary(target.id);
+            const pending = db.query<{ count: number; bytes: number }, [string]>('SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(envelope)), 0) AS bytes FROM device_inbox WHERE device_id = ?').get(device)!;
             if (pending.count >= MAILBOX_MAX_COUNT || pending.bytes + envelope.length > MAILBOX_MAX_BYTES) return json({ error: `${target.username}'s mailbox is full. Try again once they have been online.` }, 507);
             // One contact may hold only a share of someone's mailbox, so a flood cannot block everyone else.
-            const mine = db.query<{ count: number; bytes: number }, [string, string]>('SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(envelope)), 0) AS bytes FROM mailbox WHERE recipient_id = ? AND sender_id = ?').get(target.id, user.id)!;
+            const mine = db.query<{ count: number; bytes: number }, [string, string]>('SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(envelope)), 0) AS bytes FROM device_inbox WHERE device_id = ? AND sender_id = ?').get(device, user.id)!;
             if (mine.count >= SENDER_MAX_COUNT || mine.bytes + envelope.length > SENDER_MAX_BYTES) return json({ error: `Too many undelivered messages to ${target.username}. They arrive once ${target.username} is online.` }, 429);
             const id = random(16), createdAt = now();
-            db.query('INSERT INTO mailbox (id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?)').run(id, target.id, user.id, envelope, createdAt);
+            db.query('INSERT INTO device_inbox (id, device_id, recipient_id, sender_id, envelope, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, device, target.id, user.id, envelope, createdAt);
             if (online(target.id)) for (const socket of listeners.get(target.id) ?? []) pump(socket);
             else self.pushNotify?.(target.id, { type: 'message', from: user.username });
             return json({ id, createdAt }, 201);
@@ -492,7 +521,14 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     }
 
     const self = {
-        handle, notify, sessionUser, online, pump,
+        handle, notify, sessionUser, online, pump, devices,
+        /** For channels.ts: the account directory it needs, and the plug for group delivery. */
+        mutual, userByName,
+        streams: (userId: string) => listeners.get(userId) ?? [],
+        pumpUser(userId: string) { for (const socket of listeners.get(userId) ?? []) pump(socket); },
+        attach(next: Channels) { channels = next; },
+        /** A session for a linked device (docs/m5-linking.md §1.1 step 9), as sign-in answers: cookie for the web, bearer for native apps. */
+        issueSession(user: User, client: string, deviceId: string) { return signedIn(user, client, 200, deviceId); },
         roomEnded(users: string[], roomId: string, code = 1000) {
             for (const id of users) notify(id, { type: 'ended', roomId });
             clearTimeout(ringAcks.get(roomId)); ringAcks.delete(roomId);
@@ -511,8 +547,9 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             db.query('DELETE FROM sessions WHERE expires_at <= ?').run(now());
             for (const [id, value] of flows) if (value.expiresAt <= now()) flows.delete(id);
             closeDeadStreams();
-            db.query('DELETE FROM mailbox WHERE created_at <= ?').run(now() - MAILBOX_TTL);
+            db.query('DELETE FROM device_inbox WHERE created_at <= ?').run(now() - MAILBOX_TTL);
             push?.sweep();
+            channels?.sweep();
         },
         events: {
             open(socket: ServerWebSocket<EventsConnection>) {
@@ -522,6 +559,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 set.add(socket); listeners.set(userId, set);
                 socket.send(JSON.stringify({ type: 'hello', online: mutualIds(userId).filter(online) }));
                 if (first) announce(userId);
+                devices.touch(socket.data.session);
                 // A contact may already be waiting in a conversation room for us.
                 for (const waiting of calls.waitingFor(userId)) {
                     const from = db.query<User, [string]>('SELECT id, username FROM users WHERE id = ?').get(waiting.peerId);
@@ -540,9 +578,12 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                     if (calls.ringingFor?.(socket.data.userId, message.roomId)) { clearTimeout(ringAcks.get(message.roomId)); ringAcks.delete(message.roomId); }
                     return;
                 }
+                if (message?.type === 'cursor' && channels && Object.keys(message).length === 3 && typeof message.channel === 'string' && Number.isSafeInteger(message.seq)) { channels.cursorFrame(socket, message); return; }
                 if (!message || message.type !== 'ack' || Object.keys(message).length !== 2 || typeof message.id !== 'string' || !MESSAGE_ID.test(message.id)) { socket.close(1008, 'Invalid event message'); return; }
-                // Only the recipient's own envelopes can be deleted.
-                db.query('DELETE FROM mailbox WHERE id = ? AND recipient_id = ?').run(message.id, socket.data.userId);
+                // Only envelopes in this stream's own device inbox can be deleted.
+                const device = devices.inboxFor(socket.data.userId, socket.data.session);
+                if (device) db.query('DELETE FROM device_inbox WHERE id = ? AND device_id = ?').run(message.id, device);
+                channels?.ackWelcome(socket, message.id);
                 socket.data.sent.delete(message.id);
                 pump(socket);
             },
@@ -558,6 +599,8 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             createUser(username: string) { const id = random(16); db.query('INSERT INTO users (id, username, created_at) VALUES (?, ?, ?)').run(id, username, now()); return { id, username }; },
             cookie(userId: string) { return sessionCookie(startSession(userId).token).split(';')[0]!; },
             bearer(userId: string, client = 'ios') { return startSession(userId, client).token; },
+            /** The device whose inbox receives this account's envelopes (created as a placeholder if needed). */
+            primaryDevice(userId: string) { return devices.primary(userId); },
         },
     };
     return self;

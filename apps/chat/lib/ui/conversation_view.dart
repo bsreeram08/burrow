@@ -7,6 +7,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../messaging/attachments.dart';
+import '../messaging/group_messenger.dart' show GroupPerson;
+import '../text/fuzzy.dart';
 import '../store/message.dart';
 import '../text/markdown.dart';
 import '../text/timeline.dart';
@@ -74,6 +76,14 @@ class ConversationView extends StatefulWidget {
     this.typing = false,
     this.uploads = const [],
     this.actions = const ConversationActions(),
+    this.nameOf,
+    this.members = const [],
+    this.me = '',
+    this.typingText,
+    this.banner,
+    this.readOnly,
+    this.emptyText,
+    this.onReadInfo,
   });
 
   final ChatTokens tokens;
@@ -97,6 +107,31 @@ class ConversationView extends StatefulWidget {
   final bool typing;
   final List<PendingUpload> uploads;
   final ConversationActions actions;
+
+  /// Groups (docs/m4-groups.md): names a member by user id. Its presence switches the view to group mode:
+  /// sender names per message, system rows, per-person reactions, mentions.
+  final String Function(String userId)? nameOf;
+
+  /// Groups: current members, for `@` autocomplete.
+  final List<GroupPerson> members;
+
+  /// This account's user id (groups: excluded from autocomplete).
+  final String me;
+
+  /// Groups: "alice and bob are typing".
+  final String? typingText;
+
+  /// Shown above the messages (frozen or paused channel).
+  final Widget? banner;
+
+  /// When set, the composer is replaced by this notice ("You left this group").
+  final String? readOnly;
+  final String? emptyText;
+
+  /// Groups: "Read by" for one of our messages.
+  final void Function(ChatMessage message)? onReadInfo;
+
+  bool get group => nameOf != null;
 
   @override
   State<ConversationView> createState() => ConversationViewState();
@@ -208,7 +243,43 @@ class ConversationViewState extends State<ConversationView> {
       _stopTyping();
     }
     if (_editing == null) _scheduleUnfurl(text);
+    _updateMention();
     setState(() {}); // Send vs mic.
+  }
+
+  // ---------- @ mentions (groups) ----------
+  List<GroupPerson> _mentionOptions = const [];
+  int _mentionIndex = 0;
+  int _mentionStart = -1;
+
+  void _updateMention() {
+    if (!widget.group) return;
+    final caret = _input.selection.baseOffset;
+    final before = caret < 0 || caret > _input.text.length ? _input.text : _input.text.substring(0, caret);
+    final match = RegExp(r'(^|[^A-Za-z0-9_])@([A-Za-z0-9_]{0,20})$').firstMatch(before);
+    if (match == null) {
+      _mentionOptions = const [];
+      _mentionStart = -1;
+      return;
+    }
+    _mentionStart = match.start + match.group(1)!.length;
+    final candidates = [for (final m in widget.members) if (m.userId != widget.me) m];
+    _mentionOptions = fuzzyFilter(match.group(2)!, candidates, (m) => m.username).take(6).toList();
+    _mentionIndex = _mentionIndex.clamp(0, _mentionOptions.isEmpty ? 0 : _mentionOptions.length - 1);
+  }
+
+  void _insertMention(GroupPerson person) {
+    if (_mentionStart < 0) return;
+    final caret = _input.selection.baseOffset < 0 ? _input.text.length : _input.selection.baseOffset;
+    final text = _input.text.replaceRange(_mentionStart, caret, '@${person.username} ');
+    final offset = _mentionStart + person.username.length + 2;
+    _input.value = TextEditingValue(text: text, selection: TextSelection.collapsed(offset: offset));
+    setState(() {
+      _mentionOptions = const [];
+      _mentionStart = -1;
+      _mentionIndex = 0;
+    });
+    _focus.requestFocus();
   }
 
   void _stopTyping() {
@@ -325,8 +396,23 @@ class ConversationViewState extends State<ConversationView> {
   static final _desktop = !kIsWeb && (Platform.isMacOS || Platform.isWindows || Platform.isLinux);
 
   KeyEventResult _composerKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent) return KeyEventResult.ignored;
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
     final key = event.logicalKey;
+    if (_mentionOptions.isNotEmpty) {
+      if (key == LogicalKeyboardKey.arrowDown || key == LogicalKeyboardKey.arrowUp) {
+        setState(() => _mentionIndex = (_mentionIndex + (key == LogicalKeyboardKey.arrowDown ? 1 : -1)) % _mentionOptions.length);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.enter || key == LogicalKeyboardKey.tab) {
+        _insertMention(_mentionOptions[_mentionIndex]);
+        return KeyEventResult.handled;
+      }
+      if (key == LogicalKeyboardKey.escape) {
+        setState(() => _mentionOptions = const []);
+        return KeyEventResult.handled;
+      }
+    }
+    if (event is! KeyDownEvent) return KeyEventResult.ignored;
     if (key == LogicalKeyboardKey.escape && (_editing != null || _replyTo != null)) {
       _cancelCompose();
       return KeyEventResult.handled;
@@ -377,7 +463,8 @@ class ConversationViewState extends State<ConversationView> {
   // ---------- Messages ----------
   Future<void> _menu(ChatMessage m) async {
     final sendable = !(m.outgoing && m.status == MessageStatus.queued);
-    final result = await showMessageMenu(context, message: m, tokens: widget.tokens, canEdit: _canEdit(m), canReact: sendable);
+    if (m.system) return;
+    final result = await showMessageMenu(context, message: m, tokens: widget.tokens, canEdit: _canEdit(m), canReact: sendable, canInfo: widget.onReadInfo != null && m.outgoing && m.status != MessageStatus.queued);
     if (!mounted || result == null) return;
     switch (result) {
       case String emoji:
@@ -389,6 +476,8 @@ class ConversationViewState extends State<ConversationView> {
       case MessageAction.copy:
         await Clipboard.setData(ClipboardData(text: m.body));
         if (mounted) showSnack(context, 'Copied.');
+      case MessageAction.info:
+        widget.onReadInfo?.call(m);
     }
   }
 
@@ -401,7 +490,7 @@ class ConversationViewState extends State<ConversationView> {
   }
 
   void _report(ChatMessage m) {
-    if (m.outgoing || m.status != MessageStatus.delivered || !_reported.add(m.id)) return;
+    if (m.outgoing || m.system || m.status != MessageStatus.delivered || !_reported.add(m.id)) return;
     _toReport.add(m);
     if (_toReport.length == 1) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -415,7 +504,7 @@ class ConversationViewState extends State<ConversationView> {
 
   // ---------- Scrolling, find, jump ----------
   List<_Row> _rows() => [
-    if (widget.typing) const _TypingRow(),
+    if (widget.typing || widget.typingText != null) const _TypingRow(),
     for (final u in widget.uploads.reversed) _UploadRow(u),
     for (final e in _timeline.reversed) _EntryRow(e),
   ];
@@ -494,10 +583,15 @@ class ConversationViewState extends State<ConversationView> {
 
   String? _quotedAuthor(ReplyTo reply) {
     for (final m in widget.messages) {
-      if (m.id == reply.id) return m.outgoing ? 'You' : widget.peerName;
+      if (m.id == reply.id) return m.outgoing ? 'You' : _author(m);
     }
     return null;
   }
+
+  /// Who wrote an incoming message: the peer, or in a group its sender as it was received.
+  String _author(ChatMessage m) => !widget.group ? widget.peerName : (m.senderName ?? (m.sender == null ? '' : widget.nameOf!(m.sender!)));
+
+  Set<String> _mentionNames(ChatMessage m) => m.mentions.isEmpty || !widget.group ? const {} : {for (final id in m.mentions) widget.nameOf!(id).toLowerCase()};
 
   @override
   Widget build(BuildContext context) {
@@ -535,6 +629,7 @@ class ConversationViewState extends State<ConversationView> {
                 ),
               ),
             ),
+          ?widget.banner,
           if (_finding) _findBar(t),
           Expanded(
             child: Wallpaper(
@@ -547,7 +642,7 @@ class ConversationViewState extends State<ConversationView> {
                       child: Padding(
                         padding: const EdgeInsets.all(32),
                         child: Text(
-                          'No messages yet. What you send here is end-to-end encrypted: only you and ${widget.peerName} can read it.',
+                          widget.emptyText ?? 'No messages yet. What you send here is end-to-end encrypted: only you and ${widget.peerName} can read it.',
                           textAlign: TextAlign.center,
                           style: TextStyle(color: t.muted),
                         ),
@@ -595,7 +690,19 @@ class ConversationViewState extends State<ConversationView> {
           ),
           if (widget.status != null && widget.status!.isNotEmpty)
             Padding(padding: const EdgeInsets.fromLTRB(16, 4, 16, 0), child: Text(widget.status!, style: TextStyle(color: t.muted, fontSize: 12))),
-          _composer(t),
+          if (widget.readOnly != null)
+            Material(
+              color: t.surface2,
+              child: SafeArea(
+                top: false,
+                child: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Text(widget.readOnly!, key: const Key('read-only'), textAlign: TextAlign.center, style: TextStyle(color: t.muted)),
+                ),
+              ),
+            )
+          else
+            _composer(t),
         ],
       ),
     );
@@ -610,7 +717,10 @@ class ConversationViewState extends State<ConversationView> {
   Widget _buildRow(_Row row, ChatTokens t, String? findQuery) {
     switch (row) {
       case _TypingRow():
-        return KeyedSubtree(key: const ValueKey('typing'), child: Align(alignment: Alignment.centerLeft, child: TypingIndicator(name: widget.peerName, tokens: t)));
+        return KeyedSubtree(
+          key: const ValueKey('typing'),
+          child: Align(alignment: Alignment.centerLeft, child: TypingIndicator(name: widget.peerName, line: widget.typingText, tokens: t)),
+        );
       case _UploadRow(:final upload):
         return KeyedSubtree(
           key: ValueKey('upload-${upload.id}'),
@@ -621,6 +731,15 @@ class ConversationViewState extends State<ConversationView> {
       case _EntryRow(entry: MessageEntry(:final message, :final first, :final last)):
         _report(message);
         final m = message;
+        if (m.system) {
+          return KeyedSubtree(
+            key: ValueKey(m.id),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Center(child: Text(m.text, style: TextStyle(color: t.muted, fontSize: 12.5, fontStyle: FontStyle.italic))),
+            ),
+          );
+        }
         return KeyedSubtree(
           key: ValueKey(m.id),
           child: KeyedSubtree(
@@ -633,8 +752,10 @@ class ConversationViewState extends State<ConversationView> {
               first: first,
               last: last,
               display: widget.display,
-              peerName: widget.peerName,
-              peerId: widget.peerId,
+              peerName: m.outgoing ? widget.peerName : _author(m),
+              peerId: m.sender ?? widget.peerId,
+              nameOf: widget.nameOf,
+              mentionNames: _mentionNames(m),
               quotedAuthor: m.replyTo == null ? null : _quotedAuthor(m.replyTo!),
               highlighted: _highlight == m.id,
               findQuery: findQuery,
@@ -728,9 +849,34 @@ class ConversationViewState extends State<ConversationView> {
                 _contextBar(
                   t,
                   icon: Icons.reply_rounded,
-                  title: 'Replying to ${_replyTo!.outgoing ? 'yourself' : widget.peerName}',
+                  title: 'Replying to ${_replyTo!.outgoing ? 'yourself' : _author(_replyTo!)}',
                   body: _replyTo!.body.isNotEmpty ? plainText(_replyTo!.body) : _attachmentLabel(_replyTo!.attachment),
                   closeLabel: 'Cancel reply',
+                ),
+              if (_mentionOptions.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(4, 0, 4, 6),
+                  child: Material(
+                    key: const Key('mention-list'),
+                    color: t.surface2,
+                    clipBehavior: Clip.antiAlias,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12), side: BorderSide(color: t.line)),
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        for (var i = 0; i < _mentionOptions.length; i++)
+                        ListTile(
+                          key: ValueKey('mention-${_mentionOptions[i].username}'),
+                          dense: true,
+                          selected: i == _mentionIndex,
+                          selectedTileColor: t.okBg,
+                          leading: CircleAvatar(radius: 12, backgroundColor: t.nameColor(_mentionOptions[i].userId), child: Text(_mentionOptions[i].username[0].toUpperCase(), style: const TextStyle(fontSize: 12, color: Colors.white))),
+                          title: Text('@${_mentionOptions[i].username}', style: TextStyle(color: t.text)),
+                          onTap: () => _insertMention(_mentionOptions[i]),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               if (_link != null && _editing == null)
                 Padding(

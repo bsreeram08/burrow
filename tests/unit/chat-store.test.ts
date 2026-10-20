@@ -525,3 +525,84 @@ describe('phase 1 message content: replies, attachments, link previews, reaction
     expect(restored[1]).toMatchObject({ text: 'typo', editedText: 'fixed', status: 'read' });
   });
 });
+
+describe('groups and channels (docs/m4-groups.md §10)', () => {
+  const GROUP = 'g'.repeat(22), ALICE = 'A'.repeat(22), BOB = 'B'.repeat(22);
+  const incoming = (values: Record<string, unknown> = {}) => ({ v: 1, type: 'message', id: crypto.randomUUID(), text: 'hello all', createdAt: NOW, expiresAt: null, ...values });
+  const groupStore = () => fixture().store as any;
+
+  test('a group message names its sender from the MLS credential; mentions ride only in groups', async () => {
+    const store = groupStore();
+    const payload = incoming({ mentions: [BOB] });
+    expect(store.checkPayload(payload)).toBe('message');
+    expect(await store.receive(GROUP, payload, { from: ALICE, fromName: 'alice' })).toBe('stored');
+    expect((await store.list())[0]).toMatchObject({ conversationId: GROUP, from: ALICE, fromName: 'alice', mentions: [BOB], direction: 'incoming' });
+    await expect(store.receive(GROUP, incoming())).rejects.toMatchObject({ code: 'invalid' }); // no sender
+    await expect(store.receive(ROOM, incoming({ mentions: [BOB] }))).rejects.toMatchObject({ code: 'invalid' }); // not in 1:1
+    await expect(store.receive(GROUP, incoming({ kind: 'poll', poll: { question: 'q?', options: ['a', 'b'] } }), { from: ALICE })).rejects.toMatchObject({ code: 'invalid' });
+    for (const mentions of [[], ['short'], [BOB, BOB], Array(65).fill(0).map((_, i) => `${i}`.padStart(22, 'x'))]) expect(() => store.checkPayload(incoming({ mentions }))).toThrow();
+    // The same id from someone else is a conflict, never a duplicate.
+    await expect(store.receive(GROUP, payload, { from: BOB, fromName: 'bob' })).rejects.toMatchObject({ code: 'conflict' });
+    // Senders never on our own rows; read-by never on theirs.
+    await expect(store.put(message({ conversationId: GROUP, from: ALICE } as any))).rejects.toThrow();
+    await expect(store.put(message({ conversationId: GROUP, direction: 'incoming', status: 'delivered', from: ALICE, readBy: [BOB] } as any))).rejects.toThrow();
+  });
+
+  test('meta and leave are exact; group control payloads keep the Phase 1 shapes', () => {
+    const store = groupStore();
+    expect(store.checkPayload({ v: 1, type: 'meta', id: crypto.randomUUID(), name: 'Weekend', topic: '', at: NOW })).toBe('meta');
+    expect(store.checkPayload({ v: 1, type: 'leave', id: crypto.randomUUID() })).toBe('leave');
+    for (const bad of [{ name: 'x'.repeat(65) }, { topic: 'y'.repeat(257) }, { at: -1 }, { name: 'a\nb' }, { extra: 1 }]) expect(() => store.checkPayload({ v: 1, type: 'meta', id: crypto.randomUUID(), name: 'n', topic: '', at: NOW, ...bad })).toThrow();
+    expect(() => store.checkPayload({ v: 1, type: 'leave', id: crypto.randomUUID(), who: ALICE })).toThrow();
+  });
+
+  test('reactions are kept per person; edits only from the message\'s own sender; read-by collects readers', async () => {
+    const store = groupStore();
+    const theirs = incoming(), mine = message({ conversationId: GROUP, status: 'sent' });
+    await store.receive(GROUP, theirs, { from: ALICE, fromName: 'alice' });
+    await store.put(mine);
+    expect(await store.react(GROUP, theirs.id, BOB, '👍', true)).toBe(true);
+    expect(await store.react(GROUP, theirs.id, 'me', '👍', true)).toBe(true);
+    await expect(store.react(GROUP, theirs.id, 'peer', '👍', true)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(store.react(ROOM, theirs.id, BOB, '👍', true)).rejects.toMatchObject({ code: 'invalid' });
+    expect(await store.edit(GROUP, theirs.id, BOB, 'not yours', NOW + 1)).toBe(false);
+    expect(await store.edit(GROUP, theirs.id, ALICE, 'fixed', NOW + 1)).toBe(true);
+    expect(await store.markReadBy(GROUP, [mine.id, theirs.id], BOB)).toEqual([mine.id]);
+    expect(await store.markReadBy(GROUP, [mine.id], BOB)).toEqual([]);
+    expect(await store.markReadBy(GROUP, [mine.id], ALICE)).toEqual([mine.id]);
+    const [a, b] = await store.list() as any[];
+    const byId = new Map([[a.id, a], [b.id, b]]);
+    expect(byId.get(theirs.id)).toMatchObject({ reactions: { [BOB]: ['👍'], me: ['👍'] }, editedText: 'fixed' });
+    expect(byId.get(mine.id)).toMatchObject({ readBy: [BOB, ALICE] });
+    // A redelivered copy keeps the later mutations.
+    expect(await store.receive(GROUP, theirs, { from: ALICE, fromName: 'alice' })).toBe('duplicate');
+  });
+
+  test('a group keeps its newest 500 messages (the oldest go) instead of refusing new ones', async () => {
+    const store = groupStore();
+    for (let i = 0; i < 502; i++) expect(await store.receive(GROUP, incoming({ createdAt: NOW + i, text: `m${i}` }), { from: ALICE })).toBe('stored');
+    const kept = (await store.list()).filter((record: any) => record.conversationId === GROUP);
+    expect(kept).toHaveLength(500);
+    expect(kept[0].text).toBe('m2');
+    expect(kept.at(-1).text).toBe('m501');
+  });
+
+  test('membership lines in a group are all kept (no one-a-minute merging), once per id', async () => {
+    const store = groupStore();
+    const [a, b] = [crypto.randomUUID(), crypto.randomUUID()];
+    expect(await store.note(GROUP, a, 'alice added bob')).toBe(true);
+    expect(await store.note(GROUP, b, 'dave joined')).toBe(true);
+    expect(await store.note(GROUP, b, 'dave joined')).toBe(false);
+    expect((await store.list()).map((record: any) => record.text).sort()).toEqual(['alice added bob', 'dave joined']);
+  });
+
+  test('M5: the mls-dm pointer is an exact payload, and history from another device keeps an imported mark', async () => {
+    const store = groupStore();
+    const pointer = { v: 1, type: 'mls-dm', id: crypto.randomUUID(), channel: 'c'.repeat(22), at: NOW };
+    expect(store.checkPayload(pointer)).toBe('mls-dm');
+    for (const bad of [{ channel: 'short' }, { at: -1 }, { extra: 1 }]) expect(() => store.checkPayload({ ...pointer, ...bad })).toThrow();
+    const record = message({ status: 'delivered', imported: true } as any);
+    expect(await store.put(record)).toMatchObject({ imported: true });
+    await expect(store.put(message({ imported: false } as any))).rejects.toThrow();
+  });
+});

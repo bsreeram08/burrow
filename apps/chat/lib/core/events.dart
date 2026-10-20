@@ -23,6 +23,9 @@ sealed class AccountEvent {
         'presence' => Presence(m['id'] as String, m['online'] as bool),
         'contacts' => const ContactsChanged(),
         'keys' => KeysChanged(m['id'] as String),
+        'devices' => DevicesChanged(m['id'] as String, needsList: m['needsList'] == true),
+        'link' => LinkEvent(m['id'] as String, m['event'] as String),
+        'recert' => RecertEvent(m['id'] as String, deviceId: m['deviceId'] as String?, answered: m['answered'] == true),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
           fromId: (m['from'] as Map)['id'] as String,
@@ -39,6 +42,49 @@ sealed class AccountEvent {
           createdAt: m['createdAt'] as int,
           ephemeral: m['ephemeral'] == true,
         ),
+        'group' => GroupEvent(
+          channel: m['channel'] as String,
+          seq: m['seq'] as int,
+          epoch: m['epoch'] as int,
+          kind: m['kind'] as String,
+          fromUserId: (m['from'] as Map)['userId'] as String,
+          fromDeviceId: (m['from'] as Map)['deviceId'] as String,
+          message: m['message'] as String?,
+          createdAt: m['createdAt'] as int,
+          large: m['large'] == true,
+        ),
+        'welcome' => WelcomeEvent(
+          id: m['id'] as String,
+          channel: m['channel'] as String,
+          from: m['from'] as String,
+          epoch: m['epoch'] as int,
+          seq: m['seq'] as int,
+          welcome: m['welcome'] as String?,
+          tree: m['tree'] as String?,
+          createdAt: m['createdAt'] as int,
+          large: m['large'] == true,
+        ),
+        'channel' => ChannelEvent(
+          id: m['id'] as String,
+          change: m['change'] as String,
+          seq: m['seq'] as int?,
+          digest: m['digest'] as String?,
+          deviceId: m['deviceId'] as String?,
+          oldest: m['oldest'] as int?,
+          action: m['action'] as String?,
+          author: m['author'] as String?,
+          by: m['by'] as String?,
+          byUser: m['byUser'] as String?,
+          signature: m['signature'] as String?,
+        ),
+        'keypackages' => KeyPackagesLow(m['remaining'] as int),
+        'ephemeral' => GroupEphemeral(
+          channel: m['channel'] as String,
+          fromUserId: (m['from'] as Map)['userId'] as String,
+          fromDeviceId: (m['from'] as Map)['deviceId'] as String,
+          message: m['message'] as String,
+          createdAt: m['createdAt'] as int,
+        ),
         _ => null,
       };
     } catch (_) {
@@ -50,6 +96,30 @@ sealed class AccountEvent {
 class Hello extends AccountEvent {
   const Hello(this.online);
   final List<String> online;
+}
+
+/// An account's device list changed (ours or a contact's): re-verify it.
+class DevicesChanged extends AccountEvent {
+  const DevicesChanged(this.id, {this.needsList = false});
+  final String id;
+
+  /// To the primary after a revocation: publish the next list without the revoked device.
+  final bool needsList;
+}
+
+/// A companion certificate request (to the primary) or its answer (to the companion, [answered]), m5 §5.2.2.
+class RecertEvent extends AccountEvent {
+  const RecertEvent(this.id, {this.deviceId, this.answered = false});
+  final String id;
+  final String? deviceId;
+  final bool answered;
+}
+
+/// A link session of this account moved on: hello, offer, grant or a new sealed message.
+class LinkEvent extends AccountEvent {
+  const LinkEvent(this.id, this.event);
+  final String id;
+  final String event;
 }
 
 class Presence extends AccountEvent {
@@ -100,6 +170,93 @@ class EnvelopeEvent extends AccountEvent {
   final String fromUsername;
   final String envelope;
   final int createdAt;
+}
+
+/// The next log entry of a channel for this device (never our own). [message] is null when [large]:
+/// fetch it from the channel's log.
+class GroupEvent extends AccountEvent {
+  const GroupEvent({
+    required this.channel,
+    required this.seq,
+    required this.epoch,
+    required this.kind,
+    required this.fromUserId,
+    required this.fromDeviceId,
+    required this.message,
+    required this.createdAt,
+    this.large = false,
+  });
+  final String channel;
+  final int seq;
+  final int epoch;
+
+  /// `commit` or `app`.
+  final String kind;
+  final String fromUserId;
+  final String fromDeviceId;
+  final String? message;
+  final int createdAt;
+  final bool large;
+}
+
+/// A Welcome for this device; acknowledge it (`ack` with [id]) once the group is stored.
+class WelcomeEvent extends AccountEvent {
+  const WelcomeEvent({
+    required this.id,
+    required this.channel,
+    required this.from,
+    required this.epoch,
+    required this.seq,
+    required this.welcome,
+    required this.tree,
+    required this.createdAt,
+    this.large = false,
+  });
+  final String id;
+  final String channel;
+  final String from;
+  final int epoch;
+  final int seq;
+  final String? welcome;
+  final String? tree;
+  final int createdAt;
+  final bool large;
+}
+
+/// A channel changed: joined, invited, updated, left, frozen (+seq, digest), thawed, remove-needed (+deviceId), gap (+oldest).
+class ChannelEvent extends AccountEvent {
+  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.byUser, this.signature});
+  final String id;
+  final String change;
+  final int? seq;
+  final String? digest;
+  final String? deviceId;
+  final int? oldest;
+
+  /// `rolled-back`: the admin's resolution as signed with its MLS leaf key (author may be ""), and its device.
+  final String? action;
+  final String? author;
+  final String? by;
+
+  /// The resolving admin's user id: the signer must be exactly (byUser, by).
+  final String? byUser;
+  final String? signature;
+}
+
+/// A live-only group message (typing): never logged, processed only when the channel is idle.
+class GroupEphemeral extends AccountEvent {
+  const GroupEphemeral({required this.channel, required this.fromUserId, required this.fromDeviceId, required this.message, required this.createdAt});
+  final String channel;
+  final String fromUserId;
+  final String fromDeviceId;
+  final String message;
+  final int createdAt;
+}
+
+/// This device's one-time KeyPackages are running low.
+class KeyPackagesLow extends AccountEvent {
+  const KeyPackagesLow(this.remaining);
+  final int remaining;
 }
 
 /// Signed out by the server (code 4401): stop reconnecting.
@@ -162,8 +319,9 @@ class EventsClient {
     _retry = Timer(delay, connect);
   }
 
-  /// The only client messages the server accepts: envelope acks and "ringing".
+  /// The client messages the server accepts: envelope and Welcome acks, channel cursors and "ringing".
   void ack(String id) => _send({'type': 'ack', 'id': id});
+  void cursor(String channel, int seq) => _send({'type': 'cursor', 'channel': channel, 'seq': seq});
   void ringing(String roomId) => _send({'type': 'ringing', 'roomId': roomId});
 
   void _send(Map<String, Object?> message) {

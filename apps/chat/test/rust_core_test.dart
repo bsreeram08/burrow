@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
 import 'package:flutter_test/flutter_test.dart';
+import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/crypto/chat_crypto.dart';
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
 
@@ -32,6 +33,39 @@ void main() {
     expect(upload.oneTimePreKeys, hasLength(100));
     await core.init('account'); // Reopen: same sealed database, same identity.
     expect(await core.identity(), identity);
+  }, skip: skip);
+
+  test('the core proves the identity key for a device claim, and refuses anything that is not one', () async {
+    final core = crypto(MemoryStoreKeys());
+    await core.init('claims');
+    final identity = await core.identity(), challenge = 'B' * 42 + 'A', device = 'd' * 22;
+    final proof = await core.proveIdentity('user_1', device, challenge);
+    expect(verifyBytes(identity.sign, claimBytes('user_1', device, challenge), proof), isTrue);
+    expect(verifyBytes(identity.sign, claimBytes('user_2', device, challenge), proof), isFalse);
+    // Never a general signing oracle: a malformed challenge, device or account is refused.
+    for (final args in [['user_1', device, 'short'], ['user_1', 'nope', challenge], ['no spaces', device, challenge]]) {
+      await expectLater(core.proveIdentity(args[0], args[1], args[2]), throwsA(isA<CryptoException>()));
+    }
+  }, skip: skip);
+
+  test('the core validates and signs device lists, and seeds the label key, for its own identity only', () async {
+    final core = crypto(MemoryStoreKeys());
+    await core.init('lists');
+    final identity = await core.identity();
+    const user = 'uuuuuuuuuuuuuuuuuuuuuu', device = 'dddddddddddddddddddddd';
+    final seed = await core.deviceMetaSignature(user);
+    expect(verifyBytes(identity.sign, metaSeedBytes(user), seed), isTrue);
+    final key = deviceMetaKey(seed);
+    final entry = <String, Object?>{'deviceId': device, 'addedAt': 1700000000000, 'meta': sealMeta(key, user, device, label: 'Mac app', platform: 'macos')};
+    final list = <String, Object?>{'v': 1, 'userId': user, 'version': 1, 'prevHash': '', 'devices': [entry]};
+    final signed = await core.signDeviceList(user, identity.sign, list);
+    final check = verifyView(userId: user, aikSign: identity.sign, list: list, signature: signed.signature, certs: signed.certs);
+    expect(check.ok, isTrue, reason: check.reason);
+    expect(openMeta(key, user, device, entry['meta']! as String), {'label': 'Mac app', 'platform': 'macos'});
+    // Refused: another account's list, an identity that isn't this core's, a malformed list.
+    await expectLater(core.signDeviceList('vvvvvvvvvvvvvvvvvvvvvv', identity.sign, list), throwsA(isA<CryptoException>()));
+    await expectLater(core.signDeviceList(user, 'B' * 43, list), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'mismatch')));
+    await expectLater(core.signDeviceList(user, identity.sign, {...list, 'extra': 1}), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'invalid')));
   }, skip: skip);
 
   Matcher locked() => throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'storage').having((e) => e.keysLocked, 'keysLocked', isTrue));

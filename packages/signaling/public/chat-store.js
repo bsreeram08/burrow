@@ -10,12 +10,19 @@
   // Phase 1 content (docs/phase1-protocol.md §1–3). `replyTo`, `attachment` and `link` arrive with the message
   // and never change. `reactions` ({me, peer}: emoji lists) and `editedText`/`editedAt` are later mutations.
   const CONTENT = ['replyTo', 'attachment', 'link'], MUTABLE = ['reactions', 'editedText', 'editedAt'];
+  // Groups and channels (docs/m4-groups.md §10): the conversation id is the 22-character channel id. Incoming
+  // records name their sender (`from`, and `fromName` as it was then); `mentions` arrive with the message;
+  // `readBy` (user ids) is a later mutation of our own messages. Reactions are kept per person: `me` or a user id.
+  const GROUP = ['from', 'fromName', 'mentions', 'readBy'], MAX_MENTIONS = 64, MAX_READERS = 1000, GROUP_KEEP = 500;
+  // `imported: true`: history a linked device received from your other device (docs/m5-linking.md §2), shown as such.
+  const LOCAL = ['imported'];
   const STATUSES = ['queued', 'sent', 'delivered', 'read', 'uncertain'], RANK = { queued: 0, uncertain: 0, sent: 1, delivered: 2, read: 3 };
   const MAX_PAYLOAD = 16384, MAX_BLOB = 25 * 1024 * 1024, MAX_REACTIONS = 20, MAX_READ_IDS = 100;
   const ATTACHMENT_KINDS = ['image', 'video', 'audio', 'voice', 'file'];
   const B64URL = /^[A-Za-z0-9_-]+$/, MIME = /^[a-z0-9][a-z0-9.+-]{0,40}\/[a-z0-9][a-z0-9.+-]{0,60}(?:;[ -~]{0,60})?$/i, CUSTOM = /^:[a-z0-9_+-]{2,32}:$/; // Custom emoji names as the server allows them.
   const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-  const ROOM = /^[A-Za-z0-9_-]{43}$/;
+  const ROOM = /^(?:[A-Za-z0-9_-]{22}|[A-Za-z0-9_-]{43})$/, USER = /^[A-Za-z0-9_-]{22}$/, USERNAME = /^[a-z0-9_]{3,20}$/;
+  const isGroup = conversationId => typeof conversationId === 'string' && conversationId.length === 22;
   const FORMAT = 'webrtc-bun-chat-backup';
   const aad = encoder.encode(`${FORMAT}:1:PBKDF2-SHA256:${ITERATIONS}:AES-256-GCM`);
   let database;
@@ -74,8 +81,10 @@
     out.name = out.name.replace(INVISIBLE, '').trim() || 'file';
     return out;
   }
-  function cleanReactions(reactions) {
-    if (!fieldsWithin(reactions, ['me', 'peer'])) throw new Error('Invalid reactions.');
+  const userList = (value, max) => Array.isArray(value) && value.length >= 1 && value.length <= max && value.every(id => typeof id === 'string' && USER.test(id)) && new Set(value).size === value.length;
+  function cleanReactions(reactions, group) {
+    const people = reactions && typeof reactions === 'object' && !Array.isArray(reactions) ? Object.keys(reactions) : null;
+    if (!people || (group ? people.length > MAX_READERS + 1 || !people.every(who => who === 'me' || USER.test(who)) : !fieldsWithin(reactions, ['me', 'peer']))) throw new Error('Invalid reactions.');
     const out = {}, all = new Set();
     for (const [who, list] of Object.entries(reactions)) {
       if (!Array.isArray(list) || !list.every(emojiOk) || new Set(list).size !== list.length) throw new Error('Invalid reactions.');
@@ -88,7 +97,7 @@
   const voteOk = (value, count) => value === null || Number.isSafeInteger(value) && value >= 0 && value < count;
   function cleanRich(message) {
     const extra = Object.keys(message).filter(key => !FIELDS.includes(key));
-    if (extra.some(key => !OPTIONAL.includes(key) && !CONTENT.includes(key) && !MUTABLE.includes(key))) throw new Error('Invalid chat message.');
+    if (extra.some(key => !OPTIONAL.includes(key) && !CONTENT.includes(key) && !MUTABLE.includes(key) && !GROUP.includes(key) && !LOCAL.includes(key))) throw new Error('Invalid chat message.');
     const out = {};
     if (message.kind === undefined) { if (message.poll !== undefined || message.votes !== undefined) throw new Error('Invalid chat message.'); return out; }
     if (message.direction === 'system' || !['action', 'poll'].includes(message.kind)) throw new Error('Invalid chat message.');
@@ -116,7 +125,19 @@
           message.expiresAt > message.createdAt && message.expiresAt <= Math.min(8640000000000000, message.createdAt + MAX_AGE))) {
       throw new Error('Invalid chat message. Only message content and delivery metadata are allowed.');
     }
-    const rich = cleanRich(message);
+    const rich = cleanRich(message), group = isGroup(message.conversationId);
+    if (GROUP.some(key => message[key] !== undefined)) {
+      // Senders only on incoming group rows (always there), mentions only in groups, read-by only on our own.
+      const incoming = message.direction === 'incoming';
+      if (!group || incoming !== (message.from !== undefined) || (message.fromName !== undefined && !incoming) ||
+          !optional(message.from, value => typeof value === 'string' && USER.test(value)) || !optional(message.fromName, value => typeof value === 'string' && USERNAME.test(value)) ||
+          !optional(message.mentions, value => userList(value, MAX_MENTIONS)) || !optional(message.readBy, value => message.direction === 'outgoing' && userList(value, MAX_READERS))) throw new Error('Invalid chat message.');
+      for (const key of GROUP) if (message[key] !== undefined) rich[key] = Array.isArray(message[key]) ? [...message[key]] : message[key];
+    } else if (group && message.direction === 'incoming') throw new Error('Invalid chat message.');
+    if (message.imported !== undefined) {
+      if (message.imported !== true || message.direction === 'system') throw new Error('Invalid chat message.');
+      rich.imported = true;
+    }
     const extra = Object.keys(message).filter(key => CONTENT.includes(key) || MUTABLE.includes(key));
     if (extra.length) {
       if (message.direction === 'system' || rich.kind === 'poll' && (message.attachment !== undefined || message.link !== undefined)) throw new Error('Invalid chat message.');
@@ -124,7 +145,7 @@
         if (message.replyTo !== undefined) rich.replyTo = cleanReply(message.replyTo);
         if (message.attachment !== undefined) rich.attachment = cleanAttachment(message.attachment);
         if (message.link !== undefined) rich.link = cleanLink(message.link, message.text);
-        if (message.reactions !== undefined) { const reactions = cleanReactions(message.reactions); if (Object.keys(reactions).length) rich.reactions = reactions; }
+        if (message.reactions !== undefined) { const reactions = cleanReactions(message.reactions, group); if (Object.keys(reactions).length) rich.reactions = reactions; }
         if ((message.editedText === undefined) !== (message.editedAt === undefined)) throw new Error('Invalid edit.');
         if (message.editedText !== undefined) {
           if (typeof message.editedText !== 'string' || message.editedText.length === 0 && !rich.attachment || bytes(message.editedText) > 4096 ||
@@ -143,8 +164,8 @@
   const sorted = messages => messages.sort((a, b) => a.createdAt - b.createdAt || key(a).localeCompare(key(b)));
   // Same message: identical fields, kind, poll, reply, attachment and link. Votes, reactions and edits are
   // later mutations and never conflict; the original `text` stays immutable so a redelivery still matches.
-  const sameContent = (a, b) => FIELDS.every(field => field === 'status' || a[field] === b[field]) && a.kind === b.kind &&
-    ['poll', ...CONTENT].every(field => JSON.stringify(a[field]) === JSON.stringify(b[field]));
+  const sameContent = (a, b) => FIELDS.every(field => field === 'status' || a[field] === b[field]) && a.kind === b.kind && a.from === b.from &&
+    ['poll', 'mentions', ...CONTENT].every(field => JSON.stringify(a[field]) === JSON.stringify(b[field]));
   /** Delivery only moves forward once confirmed: delivered and read are never downgraded, and read beats delivered. */
   const forward = (previous, status) => ['delivered', 'read'].includes(previous) && RANK[previous] >= RANK[status] ? previous : status;
   function combine(previous, next) {
@@ -155,6 +176,7 @@
     const merged = { ...next, status: forward(previous.status, next.status) };
     if (previous.votes) merged.votes = previous.votes;
     if (previous.reactions) merged.reactions = previous.reactions;
+    if (previous.readBy) merged.readBy = previous.readBy;
     if (previous.editedAt !== undefined && !(next.editedAt > previous.editedAt)) { merged.editedText = previous.editedText; merged.editedAt = previous.editedAt; }
     return merged;
   }
@@ -193,6 +215,7 @@
           if (active.size > MAX_MESSAGES) throw new Error('Device chat storage exceeds the 2,000-message limit.');
           const update = change(active, now);
           if (update.clear) store.clear();
+          for (const record of update.deletes || []) store.delete([record.conversationId, record.id]);
           for (const message of update.writes || []) store.put(message);
           result = update.result;
         } catch (error) { failure = error; tx.abort(); }
@@ -219,7 +242,7 @@
    * contact cannot crowd out the others) and 'full' (the 2,000-message device cap). Nothing is evicted.
    * Resolves to 'stored', 'duplicate' or 'expired'.
    */
-  async function receive(conversationId, payload) {
+  async function receive(conversationId, payload, sender) {
     let message, createdAt = payload?.createdAt, expiresAt = payload?.expiresAt;
     // A sender whose clock runs ahead must not lose messages (nor pin them to the end of every list):
     // date them on arrival and keep their disappearing lifetime.
@@ -230,6 +253,12 @@
     }
     const rich = payload?.kind === undefined ? {} : payload.kind === 'poll' ? { kind: 'poll', poll: payload.poll } : { kind: payload.kind };
     for (const field of CONTENT) if (payload?.[field] !== undefined) rich[field] = payload[field];
+    // A group message names its sender (from the MLS credential, never the payload) and may carry mentions.
+    if (isGroup(conversationId)) {
+      if (rich.kind === 'poll') throw coded('invalid', 'Invalid incoming message.');
+      rich.from = sender?.from; if (sender?.fromName !== undefined) rich.fromName = sender.fromName;
+      if (payload?.mentions !== undefined) rich.mentions = payload.mentions;
+    } else if (payload?.mentions !== undefined) throw coded('invalid', 'Invalid incoming message.');
     try { message = validate({ id: payload?.id, conversationId, direction: 'incoming', text: payload?.text, createdAt, status: 'delivered', expiresAt, ...rich }); }
     catch { throw coded('invalid', 'Invalid incoming message.'); }
     if (expired(message)) return 'expired';
@@ -239,6 +268,14 @@
       if (previous) {
         if (!sameContent(previous, message)) throw coded('conflict', 'A message identifier was reused with different content.');
         return { result: 'duplicate' };
+      }
+      // A group keeps its newest 500 messages: the oldest go, instead of refusing the new one (one sender can
+      // still crowd out only that group). DMs refuse the 501st incoming message, as before.
+      if (isGroup(conversationId)) {
+        const mine = sorted([...active.values()].filter(value => value.conversationId === conversationId));
+        const over = Math.max(0, mine.length + 1 - GROUP_KEEP, active.size + 1 - MAX_MESSAGES);
+        if (over > mine.length) throw coded('full', 'This device holds 2,000 messages. Clear chat history to receive more.');
+        return { writes: [message], deletes: mine.slice(0, over), result: 'stored' };
       }
       if (fromPeer(active, conversationId) >= MAX_PER_CONVERSATION) throw coded('conversation-full', 'This conversation holds 500 incoming messages.');
       if (active.size >= MAX_MESSAGES) throw coded('full', 'This device holds 2,000 messages. Clear chat history to receive more.');
@@ -262,7 +299,8 @@
       // a link preview; content is validated by receive().
       case 'message': {
         const base = ['v', 'type', 'id', 'text', 'createdAt', 'expiresAt'];
-        if (!base.every(key => keys.includes(key)) || keys.some(key => !base.includes(key) && !['kind', 'poll', ...CONTENT].includes(key))) break;
+        if (!base.every(key => keys.includes(key)) || keys.some(key => !base.includes(key) && !['kind', 'poll', 'mentions', ...CONTENT].includes(key))) break;
+        if (payload.mentions !== undefined && !userList(payload.mentions, MAX_MENTIONS)) break;
         if (payload.kind === undefined ? !('poll' in payload) && !('kind' in payload) : payload.kind === 'action' ? !('poll' in payload) : payload.kind === 'poll' && 'poll' in payload) return payload.type;
         break;
       }
@@ -273,6 +311,11 @@
       case 'vote': if (size === 5 && typeof payload.poll === 'string' && UUID.test(payload.poll) && (payload.option === null || Number.isSafeInteger(payload.option) && payload.option >= 0 && payload.option < MAX_OPTIONS)) return payload.type; break;
       case 'rotate': if (size === 4 && ['manual', 'scheduled'].includes(payload.reason)) return payload.type; break;
       case 'policy': if (size === 4 && Number.isSafeInteger(payload.rotateEveryMs) && payload.rotateEveryMs >= 0) return payload.type; break;
+      // Groups only (docs/m4-groups.md §5): an admin's name and topic, and "remove me".
+      case 'meta': if (size === 6 && typeof payload.name === 'string' && [...payload.name].length <= 64 && !/[\u0000-\u001f]/.test(payload.name) && typeof payload.topic === 'string' && [...payload.topic].length <= 256 && isInt(payload.at, 0, 8640000000000000)) return payload.type; break;
+      case 'leave': if (size === 3) return payload.type; break;
+      // The last Double Ratchet message of a 1:1 chat: it continues in this MLS DM group (docs/m5-linking.md §8.2).
+      case 'mls-dm': if (size === 5 && typeof payload.channel === 'string' && USER.test(payload.channel) && isInt(payload.at, 0, 8640000000000000)) return payload.type; break;
     }
     throw bad();
   }
@@ -280,11 +323,19 @@
    * A local, never-sent system line (e.g. "secure session reset"), stored once per id. Peer-triggered lines
    * count toward the same caps as incoming messages, and one written within a minute of the previous
    * system line in that conversation replaces it instead of adding a row, so a contact cannot flood them.
+   * Groups keep each line (who joined, left, was added) under their newest-500 rule instead.
    */
   async function note(conversationId, id, text) {
     const message = validate({ id, conversationId, direction: 'system', text, createdAt: Date.now(), status: 'delivered', expiresAt: null }, true);
     return transaction((active, now) => {
       if (active.has(key(message))) return { result: false };
+      // A group keeps every membership line (the server rate-limits commits, and the newest-500 rule bounds them).
+      if (isGroup(conversationId)) {
+        const mine = sorted([...active.values()].filter(value => value.conversationId === conversationId));
+        const over = Math.max(0, mine.length + 1 - GROUP_KEEP, active.size + 1 - MAX_MESSAGES);
+        if (over > mine.length) throw coded('full', 'This device holds 2,000 messages. Clear chat history to receive more.');
+        return { writes: [message], deletes: mine.slice(0, over), result: true };
+      }
       const recent = [...active.values()].filter(value => value.conversationId === conversationId && value.direction === 'system' && now - value.createdAt < 60000).at(-1);
       if (recent) return { writes: [{ ...recent, text: message.text, createdAt: Math.max(recent.createdAt, message.createdAt) }], result: false };
       if (fromPeer(active, conversationId) >= MAX_PER_CONVERSATION) throw coded('conversation-full', 'This conversation holds 500 incoming messages.');
@@ -305,20 +356,23 @@
       return { writes: [{ ...poll, votes: { ...poll.votes, [voter]: option } }], result: true };
     });
   }
+  /** 'me' and 'peer' in a 1:1 chat; 'me' or a user id in a group. */
+  const personOk = (conversationId, who) => who === 'me' || (isGroup(conversationId) ? typeof who === 'string' && USER.test(who) : who === 'peer');
   /**
-   * Toggles one person's reaction on a message in this conversation ('me' or 'peer'; 1:1 chats have two).
+   * Toggles one person's reaction on a message in this conversation ('me' or 'peer'; in a group 'me' or a user id).
    * Each person holds a set of emoji; at most 20 distinct emoji per message. Unknown targets are ignored.
    * Updates in place, so reactions add no rows. Resolves true when the target exists.
    */
   async function react(conversationId, targetId, who, emoji, on) {
-    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !['me', 'peer'].includes(who) || !emojiOk(emoji) || typeof on !== 'boolean') throw coded('invalid', 'Invalid reaction.');
+    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !personOk(conversationId, who) || !emojiOk(emoji) || typeof on !== 'boolean') throw coded('invalid', 'Invalid reaction.');
     return transaction(active => {
       const target = active.get(`${conversationId}:${targetId.toLowerCase()}`);
       if (!target || target.direction === 'system') return { result: false };
-      const reactions = { me: [...target.reactions?.me || []], peer: [...target.reactions?.peer || []] }, mine = reactions[who];
+      const reactions = Object.fromEntries(Object.entries(target.reactions || {}).map(([person, list]) => [person, [...list]]));
+      const mine = reactions[who] ||= [];
       if (on === mine.includes(emoji)) return { result: true };
       if (on) {
-        if (new Set([...reactions.me, ...reactions.peer, emoji]).size > MAX_REACTIONS) return { result: true };
+        if (new Set([...Object.values(reactions).flat(), emoji]).size > MAX_REACTIONS) return { result: true };
         mine.push(emoji);
       } else reactions[who] = mine.filter(value => value !== emoji);
       const next = { ...target }; delete next.reactions;
@@ -333,11 +387,12 @@
    * link previews are not editable. Resolves true when the edit is now the shown text.
    */
   async function edit(conversationId, targetId, who, text, editedAt) {
-    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !['me', 'peer'].includes(who) ||
+    if (typeof conversationId !== 'string' || !ROOM.test(conversationId) || typeof targetId !== 'string' || !UUID.test(targetId) || !personOk(conversationId, who) ||
         typeof text !== 'string' || bytes(text) > 4096 || !isInt(editedAt, 0, 8640000000000000)) throw coded('invalid', 'Invalid edit.');
     return transaction(active => {
       const target = active.get(`${conversationId}:${targetId.toLowerCase()}`);
-      if (!target || target.direction !== (who === 'me' ? 'outgoing' : 'incoming') || target.kind === 'poll') return { result: false };
+      // In a group only the message's own sender edits it.
+      if (!target || target.direction !== (who === 'me' ? 'outgoing' : 'incoming') || target.kind === 'poll' || (who !== 'me' && who !== 'peer' && target.from !== who)) return { result: false };
       if (!text.trim() && !target.attachment) return { result: false };
       if (target.editedAt !== undefined && editedAt <= target.editedAt) return { result: editedAt === target.editedAt && text === target.editedText };
       return { writes: [validate({ ...target, editedText: text, editedAt })], result: true };
@@ -354,6 +409,21 @@
       for (const id of new Set(ids.map(value => value.toLowerCase()))) {
         const record = active.get(`${conversationId}:${id}`);
         if (record?.direction === direction && record.status !== 'read' && (direction === 'incoming' || ['sent', 'delivered', 'uncertain'].includes(record.status))) writes.push({ ...record, status: 'read' });
+      }
+      return { writes, result: writes.map(record => record.id) };
+    });
+  }
+  /**
+   * A group member read these messages of ours: their user id joins each one's `readBy` (unknown ids and other
+   * people's messages are ignored). Resolves the ids changed.
+   */
+  async function markReadBy(conversationId, ids, reader) {
+    if (!isGroup(conversationId) || !Array.isArray(ids) || ids.length > MAX_READ_IDS || !ids.every(id => typeof id === 'string' && UUID.test(id)) || typeof reader !== 'string' || !USER.test(reader)) throw coded('invalid', 'Invalid read receipt.');
+    return transaction(active => {
+      const writes = [];
+      for (const id of new Set(ids.map(value => value.toLowerCase()))) {
+        const record = active.get(`${conversationId}:${id}`);
+        if (record?.direction === 'outgoing' && !(record.readBy || []).includes(reader) && (record.readBy || []).length < MAX_READERS) writes.push({ ...record, readBy: [...record.readBy || [], reader] });
       }
       return { writes, result: writes.map(record => record.id) };
     });
@@ -487,5 +557,25 @@
       return { writes: [...writes.values()], result: count };
     });
   }
-  window.ChatStore = Object.freeze({ put, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, react, edit, markRead, checkPayload, inboundDisposition, emojiOk, MAX_OPTIONS, MAX_BLOB, MAX_REACTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
+  /**
+   * History a linked device received from your other device (docs/m5-linking.md §2): every record validated like a
+   * backup, marked `imported`, never an outbound queue, never overwriting what is here. Resolves the count added.
+   */
+  async function importLinked(records) {
+    if (!Array.isArray(records) || records.length > MAX_MESSAGES) throw new Error('Invalid history.');
+    const incoming = [];
+    for (const record of records) {
+      if (record?.direction === 'system') continue;
+      try {
+        const clean = validate({ ...record, imported: true });
+        incoming.push(clean.direction === 'outgoing' && !['delivered', 'read'].includes(clean.status) ? { ...clean, status: 'uncertain' } : clean);
+      } catch {} // One bad record is skipped, not the whole history.
+    }
+    return transaction((active, now) => {
+      const writes = [];
+      for (const message of incoming) if (!expired(message, now) && !active.has(key(message)) && active.size + writes.length < MAX_MESSAGES) writes.push(message);
+      return { writes, result: writes.length };
+    });
+  }
+  window.ChatStore = Object.freeze({ put, importLinked, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, react, edit, markRead, markReadBy, checkPayload, inboundDisposition, emojiOk, isGroup, MAX_OPTIONS, MAX_BLOB, MAX_REACTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
 })();

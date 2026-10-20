@@ -58,7 +58,7 @@ List<TimelineEntry> buildTimeline(List<ChatMessage> messages, {DateTime? now}) {
     final newDay = previous == null || _day(previous.createdAt) != day;
     if (newDay) out.add(DayDivider(day, dayLabel(day, at)));
     bool joins(ChatMessage? a, ChatMessage? b) =>
-        a != null && b != null && a.direction == b.direction && _day(a.createdAt) == _day(b.createdAt) && (b.createdAt - a.createdAt).abs() <= groupGapMs;
+        a != null && b != null && !a.system && !b.system && a.direction == b.direction && a.sender == b.sender && _day(a.createdAt) == _day(b.createdAt) && (b.createdAt - a.createdAt).abs() <= groupGapMs;
     out.add(MessageEntry(m, first: !joins(previous, m), last: !joins(m, next)));
   }
   return out;

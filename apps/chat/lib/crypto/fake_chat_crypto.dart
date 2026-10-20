@@ -25,6 +25,28 @@ class FakeChatCrypto implements ChatCrypto {
   /// Tests: make the next [init] fail as a locked key database.
   bool locked = false;
 
+  /// Device lists signed so far (tests); the fake key can't make a verifiable signature.
+  final List<Map<String, Object?>> signedLists = [];
+
+  String _fakeSig(List<int> bytes) => base64Url.encode(sha256.convert([...utf8.encode(me.sign), ...bytes]).bytes + List.filled(32, 0)).replaceAll('=', '');
+
+  @override
+  Future<({String signature, Map<String, String> certs})> signDeviceList(
+    String userId,
+    String publishedSign,
+    Map<String, Object?> list, {
+    ({Map<String, Object?> list, String signature})? head,
+  }) async {
+    if (publishedSign != me.sign) throw const CryptoException('not the published identity', code: 'mismatch');
+    if (list['userId'] != userId) throw const CryptoException('another account', code: 'invalid');
+    signedLists.add(list);
+    final devices = (list['devices']! as List).cast<Map>();
+    return (signature: _fakeSig(utf8.encode(jsonEncode(list))), certs: {for (final d in devices) d['deviceId'] as String: _fakeSig(utf8.encode(d['deviceId'] as String))});
+  }
+
+  @override
+  Future<String> deviceMetaSignature(String userId) async => _fakeSig(utf8.encode('meta:$userId'));
+
   @override
   Future<void> init(String dbPath) async {
     if (locked) throw const CryptoException('key database could not be unlocked', code: 'storage', keysLocked: true);
@@ -119,6 +141,10 @@ class FakeChatCrypto implements ChatCrypto {
   @override
   Future<SessionInfo?> sessionInfo(String contactId) async => sessions[contactId];
 
+  /// Not a signature: the fake identity has no real key. Readable so tests can see what was proven.
+  @override
+  Future<String> proveIdentity(String userId, String deviceId, String challenge) async => 'proof:${me.sign}:$userId:$deviceId:$challenge';
+
   @override
   Future<void> resetIdentity() async {
     me = Identity(dh: 'fake-dh-${_random.nextInt(1 << 31)}', sign: 'fake-sign');
@@ -137,6 +163,38 @@ class FakeChatCrypto implements ChatCrypto {
         ..blocked = true
         ..verified = false;
     }
+  }
+
+  /// Tests: the fake accepts a chain whose first record names the pinned key and whose last names the new one.
+  @override
+  Future<PinnedPeer> acceptSuccession(String contactId, List<Map<String, dynamic>> records) async {
+    final p = _peers[contactId];
+    if (p == null || records.isEmpty || records.first['oldSign'] != p.identity.sign) throw const CryptoException('the chain does not start at the pinned key', code: 'invalid');
+    p.identity = Identity(dh: records.last['newDh'] as String, sign: records.last['newSign'] as String);
+    p
+      ..changed = false
+      ..blocked = false;
+    return PinnedPeer(identity: p.identity, verified: p.verified, changed: false, blocked: false);
+  }
+
+  @override
+  Future<void> acceptChangeFor(String contactId, Identity shown) async {
+    final p = _peers[contactId];
+    if (p != null && p.identity != shown) throw const CryptoException('the code changed again', code: 'mismatch');
+    await acceptChange(contactId);
+  }
+
+  @override
+  Future<void> setVerifiedFor(String contactId, bool verified, Identity shown) async {
+    final p = _peers[contactId];
+    if (p != null && p.identity != shown) throw const CryptoException('the code changed again', code: 'mismatch');
+    await setVerified(contactId, verified);
+  }
+
+  @override
+  Future<PinnedPeer?> peer(String contactId) async {
+    final p = _peers[contactId];
+    return p == null ? null : PinnedPeer(identity: p.identity, verified: p.verified, changed: p.changed, blocked: p.blocked);
   }
 
   @override

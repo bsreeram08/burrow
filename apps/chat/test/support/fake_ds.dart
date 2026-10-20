@@ -107,6 +107,18 @@ class FakeDs {
     if (path == '/api/channels' && method == 'GET') {
       return _json({'channels': [for (final c in channels.values) if (c.members.values.any((m) => m.userId == userId)) c.describe(userId, deviceId)]});
     }
+    final identity = RegExp(r'^/api/users/([A-Za-z0-9_-]+)/identity$').firstMatch(path);
+    if (identity != null) {
+      final user = devices.values.where((d) => d.userId == identity[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      return _json({'userId': user.userId, 'username': user.username, 'identity': {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
+    }
+    final published = RegExp(r'^/api/keys/([a-z0-9_]+)/identity$').firstMatch(path);
+    if (published != null) {
+      final user = devices.values.where((d) => d.username == published[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      return _json({'userId': user.userId, 'identity': {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
+    }
     if (path == '/api/channels/directory' && method == 'GET') {
       return _json({'channels': [for (final c in channels.values) if (c.kind == 'public') {'id': c.id, 'name': c.name, 'members': c.users.length, 'member': c.users.contains(userId)}]});
     }
@@ -131,6 +143,14 @@ class FakeDs {
         final seq = channel.append('app', userId, deviceId, message);
         _fanOut(channel, seq);
         return _json({'epoch': channel.epoch, 'seq': seq, 'digest': digest(message)}, 201);
+      case ('ephemeral', 'POST'):
+        if (member == null) return _error('No such channel.', 404);
+        final message = body['message']! as String;
+        if (_mls(message)['epoch'] != channel.epoch) return _error('The group moved on.', 409, {'epoch': channel.epoch});
+        for (final device in channel.members.keys.where((d) => d != deviceId)) {
+          _push(device, GroupEphemeral(channel: channel.id, fromUserId: userId, fromDeviceId: deviceId, message: message, createdAt: DateTime.now().millisecondsSinceEpoch));
+        }
+        return _json({'delivered': true}, 202);
       case ('commits', 'POST') || ('join', 'POST'):
         final external = action == 'join';
         if (!external && member == null) return _error('No such channel.', 404);

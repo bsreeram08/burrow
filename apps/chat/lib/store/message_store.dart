@@ -65,7 +65,7 @@ class MessageStore {
       CREATE TABLE conversations (
         id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT '',
         cursor INTEGER NOT NULL DEFAULT 0, membership TEXT NOT NULL DEFAULT 'active', frozen TEXT,
-        pinned INTEGER NOT NULL DEFAULT 0, unread INTEGER NOT NULL DEFAULT 0, mentioned INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0, unread INTEGER NOT NULL DEFAULT 0, mentioned INTEGER NOT NULL DEFAULT 0, meta_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL)''');
   }
 

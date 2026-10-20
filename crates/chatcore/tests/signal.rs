@@ -628,4 +628,56 @@ fn identity_proofs_sign_only_the_claim_bytes_and_match_devices_js() {
     assert!(party().core.prove_identity("user_1", &"b".repeat(22), &challenge).is_err());
 }
 
+#[test]
+fn device_lists_are_validated_and_signed_inside_the_core_and_match_devices_js() {
+    use chatcore::devicelist::{cert_bytes, list_bytes, meta_bytes, parse_list};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+    // The fixed vector of tests/unit/devices.test.ts and apps/chat/test/devices_test.dart.
+    let meta = URL_SAFE_NO_PAD.encode([9u8; 40]);
+    let vector = json!({ "v": 1, "userId": "user_1", "version": 2, "prevHash": "A".repeat(43), "devices": [
+        { "deviceId": "a".repeat(22), "addedAt": 1_800_000_000_123u64, "meta": meta }, { "deviceId": "b".repeat(22), "addedAt": 7, "meta": "" } ] });
+    let list = parse_list(&vector.to_string()).unwrap();
+    assert_eq!(hex(&Sha256::digest(list_bytes(&list))), "31f9b6f38de5a0d6180afcf54233e7272add9dd22c49e86e40fa3a7c48e938e6");
+    assert_eq!(hex(&Sha256::digest(cert_bytes("user_1", &list.devices[0]))), "5115e92bead7431b81c136519282f62e4a85a21c7907d8c3f97571205dcebcea");
+    assert_eq!(hex(&Sha256::digest(meta_bytes("user_1").unwrap())), "64af139533103232deb371d33f3f5879ff5c4d2259c243745d86b10f4b7b1c44");
+    // Key order doesn't matter; the canonical bytes do.
+    let reordered = r#"{"devices":[{"meta":"","addedAt":7,"deviceId":"bbbbbbbbbbbbbbbbbbbbbb"}],"prevHash":"","version":1,"userId":"user_1","v":1}"#;
+    assert!(parse_list(reordered).is_ok());
+
+    let mut alice = party();
+    let identity = alice.core.prekeys(NOW, None).unwrap().identity;
+    let key = VerifyingKey::from_bytes(&URL_SAFE_NO_PAD.decode(&identity.sign).unwrap().try_into().unwrap()).unwrap();
+    let verify = |bytes: &[u8], sig: &str| key.verify(bytes, &Signature::from_slice(&URL_SAFE_NO_PAD.decode(sig).unwrap()).unwrap()).is_ok();
+    let signed = alice.core.sign_device_list("user_1", &identity.sign, &vector.to_string()).unwrap();
+    assert!(verify(&list_bytes(&list), &signed.signature));
+    assert_eq!(signed.certs.len(), 2);
+    for device in &list.devices { assert!(verify(&cert_bytes("user_1", device), &signed.certs[&device.device_id])); }
+    let seed = alice.core.device_meta_signature("user_1").unwrap();
+    assert!(verify(&meta_bytes("user_1").unwrap(), &seed));
+    assert_eq!(seed, alice.core.device_meta_signature("user_1").unwrap(), "deterministic");
+
+    // Refused: another account's list, a published identity that isn't this core's, malformed lists.
+    assert!(alice.core.sign_device_list("user_2", &identity.sign, &vector.to_string()).is_err());
+    assert_eq!(alice.core.sign_device_list("user_1", &"B".repeat(43), &vector.to_string()).unwrap_err().code.as_deref(), Some("mismatch"));
+    let good = json!({ "v": 1, "userId": "user_1", "version": 1, "prevHash": "", "devices": [{ "deviceId": "a".repeat(22), "addedAt": 1, "meta": "" }, { "deviceId": "b".repeat(22), "addedAt": 1, "meta": "" }] });
+    let with = |path: &str, value: Value| { let mut v = good.clone(); *v.pointer_mut(path).unwrap() = value; v };
+    let devices = good["devices"].as_array().unwrap().clone();
+    let mut extra = good.clone(); extra["extra"] = json!(true);
+    let mut entry_extra = good.clone(); entry_extra["devices"][0]["platform"] = json!("web");
+    let bad = [
+        extra, entry_extra,
+        with("/devices", json!([devices[1], devices[0]])), with("/devices", json!([devices[0], devices[0]])),
+        with("/version", json!(2)), with("/prevHash", json!("A".repeat(43))), with("/version", json!(0)), with("/version", json!(1.5)),
+        with("/devices", json!([])), with("/devices/0/meta", json!("too-short")), with("/userId", json!("no spaces")),
+        with("/devices", json!((0..17).map(|i| json!({ "deviceId": format!("{i:02}{}", "x".repeat(20)), "addedAt": 1, "meta": "" })).collect::<Vec<_>>())),
+        { let mut v = with("/version", json!(2)); v["prevHash"] = json!(format!("{}B", "A".repeat(42))); v },
+    ];
+    for list in bad { assert!(alice.core.sign_device_list("user_1", &identity.sign, &list.to_string()).is_err(), "{list}"); }
+    assert!(alice.core.sign_device_list("user_1", &identity.sign, "not json").is_err());
+    assert!(alice.core.device_meta_signature("no spaces").is_err());
+    // Never mints an identity in an empty store.
+    assert!(party().core.sign_device_list("user_1", &identity.sign, &good.to_string()).is_err());
+}
+
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() }

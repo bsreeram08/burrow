@@ -6,6 +6,7 @@
 pub mod api;
 pub mod commands;
 pub mod core;
+pub mod devicelist;
 pub mod error;
 #[cfg(any(feature = "mls", feature = "ds"))]
 pub mod mls;

@@ -46,6 +46,14 @@ describe('device list format', () => {
         const reordered = { devices: list.devices.map(device => ({ meta: device.meta, addedAt: device.addedAt, deviceId: device.deviceId })), prevHash: list.prevHash, version: 2, userId: 'user_1', v: 1 };
         expect(Buffer.from(F.listBytes(reordered)).equals(Buffer.from(F.listBytes(list)))).toBe(true);
     });
+    test('device-meta seed bytes, key and sealing are pinned (same vector in chatcore and apps/chat)', async () => {
+        let seeded: Uint8Array | null = null;
+        const key = await F.deviceMetaKey('user_1', async (bytes: Uint8Array) => { seeded = bytes; return new Uint8Array(64).fill(7); });
+        expect(createHash('sha256').update(seeded!).digest('hex')).toBe('64af139533103232deb371d33f3f5879ff5c4d2259c243745d86b10f4b7b1c44');
+        // Sealed by the app (apps/chat/test/devices_test.dart) under HKDF(seed = 64 × 0x07) with IV = 12 × 0x03.
+        const sealed = 'AwMDAwMDAwMDAwMDGHB1mKscvERwIyTohJwm7EUEWZwtQS_mptDtAQajSQK2noBM4pRz0d5LshDjOeUsDYriASS_';
+        expect(await F.openMeta(key, 'user_1', 'a'.repeat(22), sealed)).toEqual({ label: 'Mac app', platform: 'macos' });
+    });
     test('non-canonical or malformed lists are refused', () => {
         const good = listOf('user_1', 1, '', [deviceId(), deviceId()]);
         const bad = [

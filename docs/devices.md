@@ -68,12 +68,21 @@ The schema is numbered with `PRAGMA user_version` (`packages/signaling/migration
 
 A newer database than the code is refused. On first load after the upgrade:
 
-- **The active device becomes primary automatically.** It is the browser or app holding the published identity. A signal.js browser publishes list v1. The app and the WASM core claim the inbox by announcing.
+- **The active device becomes primary automatically.** It is the browser or app holding the published identity. A signal.js browser and the app publish list v1. The WASM core claims the inbox by announcing.
 - **Inactive browsers stay as before.** They announce as pending and show "Link this browser from your primary device". Linking itself is M5. Until then, "Use this device instead" remains (a key change for contacts).
 - **Safety numbers don't change**, because the AIK is today's identity key.
 
+## App list signing (M4)
+
+The app's identity-key holder publishes the account's list like the web's (account.js `syncDevices`, ported as `Messenger.syncDevices`): it verifies the served list against its own pin, then publishes version + 1 naming this device and every listed device the server still has. The AIK stays inside chatcore, which exposes two narrow calls:
+
+- **`sign_device_list(user_id, published_sign, list_json)`** parses the list and validates it exactly as `validateList` does (exact keys, canonical base64url, 1–16 devices sorted by id, version and `prevHash` rules), requires it to name `user_id` and `published_sign` (the identity the server publishes) to be the core's own key, and signs only the `listBytes` and per-device `certBytes` it builds itself. It returns `{signature, certs}`; it never signs caller-supplied bytes.
+- **`device_meta_signature(user_id)`** signs only `text16("webrtc-bun-devicemeta-v1") ‖ text16(userId)`: the seed of the label key (`deviceMetaKey`). The app derives the key and seals `{label, platform}` like devices.js (`sealMeta`, `devices.dart`).
+
+The vectors are shared: list and certificate bytes (`31f9b6f3…`, `5115e92b…`), the meta seed bytes (`64af1395…`), and a meta key and sealed label for a fixed seed and IV, in `tests/unit/devices.test.ts`, `crates/chatcore/tests/signal.rs` and `apps/chat/test/devices_test.dart`. `bun run test:cross-client` checks that the server accepts the app's list (the app's device is `listed` and uses groups).
+
 ## Not yet (M1 scope notes)
 
-- **App list signing.** The app and the WebAssembly core don't sign device lists yet: the AIK is inside chatcore (M2 adds list signing there). They verify and pin contacts' lists, and claim their inbox by announcing.
+- **WebAssembly core list signing.** The browser's experimental WebAssembly core doesn't sign device lists yet; it verifies and pins contacts' lists and claims its inbox by announcing.
 - **Companions.** There are no companion devices: a list names only the primary, plus devices a later M5 link adds. The owner can remove pending devices from Settings → Devices (web).
 - **Labels on pending devices.** Pending devices have no sealed label (only the primary can seal), so they show their client kind.

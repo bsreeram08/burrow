@@ -187,6 +187,30 @@ impl Core {
         Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
     }
 
+    /// Signs this account's next DeviceList and one certificate per device it names (docs/devices.md). The
+    /// list is parsed and validated here (devices.js `validateList`), must name `user_id`, and the account's
+    /// published identity (`published_sign`, as the server serves it) must be this core's own identity key: the
+    /// AIK signs only the canonical list and certificate bytes built here, never caller-chosen bytes.
+    pub fn sign_device_list(&mut self, user_id: &str, published_sign: &str, list_json: &str) -> Result<crate::devicelist::SignedList> {
+        use crate::devicelist::{cert_bytes, list_bytes, parse_list, SignedList};
+        let list = parse_list(list_json)?;
+        if list.user_id != user_id { return Err(ChatError::coded("invalid", "The device list names another account")); }
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        if identity.public.sign != published_sign { return Err(ChatError::coded("mismatch", "This device does not hold the account's published identity key")); }
+        let key = SigningKey::from_bytes(&identity.sign.0);
+        let certs = list.devices.iter().map(|device| (device.device_id.clone(), b64(&key.sign(&cert_bytes(user_id, device)).to_bytes()))).collect();
+        Ok(SignedList { signature: b64(&key.sign(&list_bytes(&list)).to_bytes()), certs })
+    }
+
+    /// The AIK's signature over `"webrtc-bun-devicemeta-v1" ‖ userId` only (devices.js `deviceMetaKey`): the
+    /// seed of the key that seals device labels inside the list. Deterministic (RFC 8032), so every holder of
+    /// the AIK derives the same key. Keep it on the device; it is a key, not something to publish.
+    pub fn device_meta_signature(&mut self, user_id: &str) -> Result<String> {
+        let bytes = crate::devicelist::meta_bytes(user_id)?;
+        let identity = self.get::<Identity>("identity")?.ok_or_else(|| ChatError::storage("identity missing from the key database"))?;
+        Ok(b64(&SigningKey::from_bytes(&identity.sign.0).sign(&bytes).to_bytes()))
+    }
+
     /// Current signed prekey, rotated weekly (`max_age_ms`); replay records under a retired prekey go with it.
     pub fn prekeys(&mut self, now: u64, max_age_ms: Option<u64>) -> Result<PrekeyUpload> {
         let me = self.identity()?;

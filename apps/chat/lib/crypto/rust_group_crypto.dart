@@ -33,7 +33,7 @@ class RustGroupCrypto implements GroupCrypto {
   static GroupCommit _commit(core.MlsOutgoing o) =>
       GroupCommit(groupId: o.groupId, commit: o.commit, welcome: o.welcome, digest: o.digest, epoch: o.epoch.toInt());
   static GroupMember _member(core.MlsMember m) =>
-      GroupMember(leaf: m.leaf, userId: m.userId, deviceId: m.deviceId, platform: m.platform, admin: m.admin);
+      GroupMember(leaf: m.leaf, userId: m.userId, deviceId: m.deviceId, platform: m.platform, admin: m.admin, stale: m.stale);
 
   @override
   Future<GroupDevice> initDevice({required String userId, required String deviceId, required String platform, required int issuedAt}) => _call(() async {
@@ -121,8 +121,8 @@ class RustGroupCrypto implements GroupCrypto {
       _call(() => core.mlsSignResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author));
 
   @override
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) =>
-      _call(() async => (await core.mlsVerifyResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author, by: by, signature: signature)).userId);
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature}) =>
+      _call(() async => (await core.mlsVerifyResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author, by: by, byUser: byUser, signature: signature)).userId);
 
   @override
   Future<void> receiveCommit(String pendingId) => _call(() => core.mlsReceiveCommit(pendingId: pendingId));
@@ -136,10 +136,9 @@ class RustGroupCrypto implements GroupCrypto {
   @override
   Future<GroupRoles> roles(String groupId) => _call(() async => _fromRoles(await core.mlsRoles(groupId: groupId)));
 
-  /// Not in this core build yet (mls-core is adding mlsInspectGroup): refuse, so nothing auto-joins unchecked.
   @override
-  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) async =>
-      throw const CryptoException('This version of the encryption core cannot check a group before joining it.', code: 'unsupported');
+  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) =>
+      _call(() async => [for (final m in await core.mlsInspectGroup(groupInfo: groupInfo, tree: tree)) _member(m)]);
 
   @override
   Future<GroupView> view(String groupId) => _call(() async => _view(await core.mlsGroupView(groupId: groupId)));

@@ -7,7 +7,7 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 /// Opens the account's key database, sealed with `store_key` (32 bytes from the platform keystore).
 /// `expect_existing`: the keystore already held this key, so the database must exist (fails closed otherwise).
@@ -294,6 +294,7 @@ Future<String> mlsSignResolution({
 
 /// Verifies a resolution signed by device `by`, which must be an admin device in this device's own tree.
 /// Returns the signer (`user_id`, `device_id`); `auth` for a bad signature, `invalid` otherwise.
+/// `by_user`: the signer must be exactly (by_user, by).
 Future<MlsRemoval> mlsVerifyResolution({
   required String groupId,
   required String action,
@@ -301,6 +302,7 @@ Future<MlsRemoval> mlsVerifyResolution({
   required String digest,
   required String author,
   required String by,
+  required String byUser,
   required String signature,
 }) => RustLib.instance.api.crateApiMlsVerifyResolution(
   groupId: groupId,
@@ -309,6 +311,7 @@ Future<MlsRemoval> mlsVerifyResolution({
   digest: digest,
   author: author,
   by: by,
+  byUser: byUser,
   signature: signature,
 );
 
@@ -338,6 +341,211 @@ Future<String> mlsValidatePayload({
   sender: sender,
   senderIsAdmin: senderIsAdmin,
   targetSender: targetSender,
+);
+
+/// New device (QR): ephemeral key and link secret for `link_id`; returns the QR text.
+Future<String> linkQr({required String linkId, required BigInt nowMs}) =>
+    RustLib.instance.api.crateApiLinkQr(linkId: linkId, nowMs: nowMs);
+
+/// Primary: checks a scanned QR and derives the keys.
+Future<LinkAccepted> linkAccept({required String qr, required BigInt nowMs}) =>
+    RustLib.instance.api.crateApiLinkAccept(qr: qr, nowMs: nowMs);
+
+/// New device (QR): the primary's ephemeral key arrived; returns the confirmation code.
+Future<String> linkComplete({
+  required String linkId,
+  required String eph,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkComplete(
+  linkId: linkId,
+  eph: eph,
+  nowMs: nowMs,
+);
+
+Future<String> linkSeal({
+  required String linkId,
+  required String plaintext,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkSeal(
+  linkId: linkId,
+  plaintext: plaintext,
+  nowMs: nowMs,
+);
+
+Future<String> linkOpen({
+  required String linkId,
+  required String data,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkOpen(
+  linkId: linkId,
+  data: data,
+  nowMs: nowMs,
+);
+
+/// Short-code rendezvous, new device: commits to an ephemeral key before the primary's is known.
+Future<String> linkCommit({
+  required String linkId,
+  required String deviceId,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkCommit(
+  linkId: linkId,
+  deviceId: deviceId,
+  nowMs: nowMs,
+);
+
+/// New device, after the primary's key arrived: opens its commitment for the primary to check.
+Future<LinkReveal> linkReveal({
+  required String linkId,
+  required String ephP,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkReveal(
+  linkId: linkId,
+  ephP: ephP,
+  nowMs: nowMs,
+);
+
+/// Primary, after looking a code up: remembers the commitment; returns the ephemeral key to offer.
+Future<String> linkLookup({
+  required String linkId,
+  required String deviceN,
+  required String commit,
+  required String deviceP,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkLookup(
+  linkId: linkId,
+  deviceN: deviceN,
+  commit: commit,
+  deviceP: deviceP,
+  nowMs: nowMs,
+);
+
+/// Primary: checks the revealed key against the commitment, derives the keys; returns the confirmation code.
+Future<String> linkOpenCommitment({
+  required String linkId,
+  required String ephN,
+  required String nonce,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkOpenCommitment(
+  linkId: linkId,
+  ephN: ephN,
+  nonce: nonce,
+  nowMs: nowMs,
+);
+
+/// New device (code): derives the keys; returns the confirmation code.
+Future<String> linkCompleteCode({
+  required String linkId,
+  required String ephP,
+  required String deviceP,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiLinkCompleteCode(
+  linkId: linkId,
+  ephP: ephP,
+  deviceP: deviceP,
+  nowMs: nowMs,
+);
+
+Future<void> linkEnd({required String linkId}) =>
+    RustLib.instance.api.crateApiLinkEnd(linkId: linkId);
+
+Future<List<PinExport>> exportPins() =>
+    RustLib.instance.api.crateApiExportPins();
+
+Future<int> importPins({required List<PinExport> pins}) =>
+    RustLib.instance.api.crateApiImportPins(pins: pins);
+
+/// New device: installs the grant (the account's public identity and this device's MLS certificate) and
+/// enters companion mode. Returns the installed certificate.
+Future<MlsDeviceCert> companionSetup({
+  required String userId,
+  required Identity identity,
+  required String certJson,
+}) => RustLib.instance.api.crateApiCompanionSetup(
+  userId: userId,
+  identity: identity,
+  certJson: certJson,
+);
+
+/// Primary: the MLS certificate JSON for a linked device's leaf key (a device in the last list it signed).
+Future<String> signDeviceCert({
+  required String userId,
+  required String deviceId,
+  required String platform,
+  required String leafSigKey,
+  required BigInt issuedAt,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiSignDeviceCert(
+  userId: userId,
+  deviceId: deviceId,
+  platform: platform,
+  leafSigKey: leafSigKey,
+  issuedAt: issuedAt,
+  nowMs: nowMs,
+);
+
+/// Companion becoming primary: mints the identity it will publish.
+Future<Identity> successionStart() =>
+    RustLib.instance.api.crateApiSuccessionStart();
+
+Future<Identity> successionComplete({
+  required String recordJson,
+  required String signature,
+}) => RustLib.instance.api.crateApiSuccessionComplete(
+  recordJson: recordJson,
+  signature: signature,
+);
+
+/// Old primary: the signed succession record (JSON with `signature`).
+Future<String> signSuccession({
+  required String userId,
+  required String publishedSign,
+  required String newSign,
+  required String newDh,
+  required BigInt at,
+}) => RustLib.instance.api.crateApiSignSuccession(
+  userId: userId,
+  publishedSign: publishedSign,
+  newSign: newSign,
+  newDh: newDh,
+  at: at,
+);
+
+/// Old primary steps down to a companion of the account under `new_identity`.
+Future<void> retireIdentity({
+  required String userId,
+  required Identity newIdentity,
+  required BigInt at,
+}) => RustLib.instance.api.crateApiRetireIdentity(
+  userId: userId,
+  newIdentity: newIdentity,
+  at: at,
+);
+
+/// Contact: follows the served `succession` records (JSON list) from the pinned identity; verification kept.
+Future<Peer> acceptSuccession({
+  required String contactId,
+  required String recordsJson,
+}) => RustLib.instance.api.crateApiAcceptSuccession(
+  contactId: contactId,
+  recordsJson: recordsJson,
+);
+
+/// The members of a served GroupInfo/tree after the join validation, without joining.
+Future<List<MlsMember>> mlsInspectGroup({
+  required String groupInfo,
+  required String tree,
+}) => RustLib.instance.api.crateApiMlsInspectGroup(
+  groupInfo: groupInfo,
+  tree: tree,
+);
+
+/// A DM pointer's group passes only if it is the DM of this account and `peer` and every leaf chains to the pins.
+Future<void> mlsCheckDm({
+  required String groupId,
+  required String peerUserId,
+}) => RustLib.instance.api.crateApiMlsCheckDm(
+  groupId: groupId,
+  peerUserId: peerUserId,
 );
 
 /// A core failure. `code` is the web client's vocabulary (replay, malformed, auth, …); `None` is transient.
@@ -410,6 +618,52 @@ class Identity {
           runtimeType == other.runtimeType &&
           dh == other.dh &&
           sign == other.sign;
+}
+
+class LinkAccepted {
+  final String linkId;
+
+  /// The primary's ephemeral key, to offer to the server.
+  final String eph;
+
+  /// The confirmation code, "123 456".
+  final String code;
+
+  const LinkAccepted({
+    required this.linkId,
+    required this.eph,
+    required this.code,
+  });
+
+  @override
+  int get hashCode => linkId.hashCode ^ eph.hashCode ^ code.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LinkAccepted &&
+          runtimeType == other.runtimeType &&
+          linkId == other.linkId &&
+          eph == other.eph &&
+          code == other.code;
+}
+
+class LinkReveal {
+  final String eph;
+  final String nonce;
+
+  const LinkReveal({required this.eph, required this.nonce});
+
+  @override
+  int get hashCode => eph.hashCode ^ nonce.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LinkReveal &&
+          runtimeType == other.runtimeType &&
+          eph == other.eph &&
+          nonce == other.nonce;
 }
 
 /// The core's verdict on a commit at the current epoch, checked against this device's own tree like the
@@ -530,12 +784,16 @@ class MlsMember {
   final String platform;
   final bool admin;
 
+  /// A device of an identity its user left: it can't act and may be removed (m5 §7).
+  final bool stale;
+
   const MlsMember({
     required this.leaf,
     required this.userId,
     required this.deviceId,
     required this.platform,
     required this.admin,
+    required this.stale,
   });
 
   @override
@@ -544,7 +802,8 @@ class MlsMember {
       userId.hashCode ^
       deviceId.hashCode ^
       platform.hashCode ^
-      admin.hashCode;
+      admin.hashCode ^
+      stale.hashCode;
 
   @override
   bool operator ==(Object other) =>
@@ -555,7 +814,8 @@ class MlsMember {
           userId == other.userId &&
           deviceId == other.deviceId &&
           platform == other.platform &&
-          admin == other.admin;
+          admin == other.admin &&
+          stale == other.stale;
 }
 
 /// A commit to submit to the delivery service for `epoch`, with the Welcome for added devices.
@@ -731,6 +991,56 @@ class Peer {
           verified == other.verified &&
           changed == other.changed &&
           blocked == other.blocked;
+}
+
+/// One pin as it travels in a link bundle.
+class PinExport {
+  final String contact;
+  final Identity identity;
+  final bool verified;
+  final List<PreviousKey> previous;
+
+  const PinExport({
+    required this.contact,
+    required this.identity,
+    required this.verified,
+    required this.previous,
+  });
+
+  @override
+  int get hashCode =>
+      contact.hashCode ^
+      identity.hashCode ^
+      verified.hashCode ^
+      previous.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PinExport &&
+          runtimeType == other.runtimeType &&
+          contact == other.contact &&
+          identity == other.identity &&
+          verified == other.verified &&
+          previous == other.previous;
+}
+
+class PreviousKey {
+  final String sign;
+  final BigInt until;
+
+  const PreviousKey({required this.sign, required this.until});
+
+  @override
+  int get hashCode => sign.hashCode ^ until.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PreviousKey &&
+          runtimeType == other.runtimeType &&
+          sign == other.sign &&
+          until == other.until;
 }
 
 class Safety {

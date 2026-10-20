@@ -176,44 +176,29 @@ void main() {
     expect((await store.get(conversation(), out.id))!.status, MessageStatus.sent);
   });
 
-  group('typing', () {
-    test('never opens a session, then goes ephemeral and throttled once the peer has written', () async {
-      await messenger.typingChanged(alice, on: true);
-      expect(posted, isEmpty, reason: 'no confirmed session yet');
+  group('typing (docs/m5-linking.md §9)', () {
+    test('never travels over the Double Ratchet: only through a moved chat\'s group, when there is one', () async {
       await deliver(message('hi'));
       await settle();
       posted.clear();
       await messenger.typingChanged(alice, on: true);
-      await messenger.typingChanged(alice, on: true);
-      expect(posted, hasLength(1), reason: 'one on:true per 4 s');
-      expect(posted.single['ephemeral'], isTrue);
-      expect(inner(posted.single), {'v': 1, 'type': 'typing', 'id': isA<String>(), 'at': now, 'on': true});
-      now += 4001;
+      expect(posted, isEmpty, reason: 'no 1:1 typing envelopes');
+      final viaGroup = <bool>[];
+      messenger.dmTyping = (contact, on) async => viaGroup.add(on);
       await messenger.typingChanged(alice, on: true);
       await messenger.typingChanged(alice, on: false);
-      await messenger.typingChanged(alice, on: false);
-      expect(posted.map((p) => inner(p)['on']), [true, true, false], reason: 'on:false only after an on:true');
+      expect(viaGroup, [true, false]);
+      expect(posted, isEmpty);
     });
 
-    test('a live typing envelope shows the indicator, is never acknowledged, and stale ones are dropped', () async {
+    test('a live typing envelope that still arrives is ignored, untouched', () async {
       await deliver(message('hi'));
-      final changes = <Set<String>>[];
-      messenger.typingChanges.listen(changes.add);
       final before = acks.length;
       await deliver({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now, 'on': true}, ephemeral: true);
-      expect(messenger.typing, {'alice-id'});
-      expect(acks, hasLength(before), reason: 'the server keeps nothing to delete');
-      await deliver({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now, 'on': false}, ephemeral: true);
       expect(messenger.typing, isEmpty);
-      await deliver({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now - 16000, 'on': true}, ephemeral: true);
-      expect(messenger.typing, isEmpty, reason: 'older than 15 s');
-      await deliver({'v': 1, 'type': 'typing', 'id': const Uuid().v4(), 'at': now, 'on': true}, ephemeral: true);
-      await deliver(message('sent it'));
-      expect(messenger.typing, isEmpty, reason: 'a message from them ends their typing');
-      await deliver(message('a stored message on an ephemeral envelope is ignored'), ephemeral: true);
-      expect(await store.list(conversation()), hasLength(2));
-      await settle();
-      expect(changes, isNotEmpty);
+      expect(acks, hasLength(before));
+      messenger.showTyping('alice-id', true);
+      expect(messenger.typing, {'alice-id'}, reason: 'a moved chat shows typing from its group');
     });
   });
 

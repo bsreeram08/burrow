@@ -550,8 +550,11 @@ class AppController extends Notifier<AppState> {
     final contact = contactById(contactId);
     if (contact == null) return;
     try {
-      final identity = Identity.fromJson(await _api.publishedIdentity(contact.username));
-      await _crypto.notePeer(contactId, identity);
+      // The devices view also serves any succession chain, so a moved account keeps its verification.
+      final view = await _api.devices(contact.username);
+      final served = view['identity'];
+      if (served is! Map<String, dynamic>) return;
+      await messenger?.followIdentity(contact, Identity.fromJson(served), view['succession']);
       final safety = await _crypto.safety(state.user!.username, contactId, contact.username);
       if (safety != null && (safety.changed || safety.blocked)) state = state.copyWith(keyChanged: {...state.keyChanged, contactId});
       unawaited(messenger?.flush());

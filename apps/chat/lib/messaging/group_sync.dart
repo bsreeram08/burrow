@@ -895,7 +895,7 @@ class GroupSync {
     if (event.action != 'rollback' || by == null || byUser == null || signature == null || author == null) return false;
     try {
       // The signer is matched as (user, device), never by device id alone.
-      final signer = await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, signature: signature);
+      final signer = await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, byUser: byUser, signature: signature);
       if (signer != byUser) throw const CryptoException('the resolution was signed by another user', code: 'invalid');
     } catch (_) {
       _notice('A rollback notice for a group could not be verified and was ignored.');

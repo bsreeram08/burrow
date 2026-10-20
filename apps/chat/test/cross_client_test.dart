@@ -143,7 +143,6 @@ void main() {
     }
     final linked = await find('web link preview', (m) => m.link != null);
     expect((linked.link!.url, linked.link!.title), ('https://example.com/web', 'Web link'));
-    await until(() async => sawTyping, 'typing from web');
     await signal('web-rich-ok');
 
     // 3d. The same from the app.
@@ -171,7 +170,6 @@ void main() {
     await messenger.send(web, '', attachment: await attachments.upload(bytes: file, name: 'app-notes.bin', mime: 'application/octet-stream', kind: 'file'));
     await messenger.send(web, 'see https://example.com/app', link: const LinkPreview(url: 'https://example.com/app', title: 'App link', site: 'example.com'));
     await find('app link delivered', (m) => m.text == 'see https://example.com/app' && reached(m));
-    await messenger.typingChanged(web, on: true);
     await signal('app-rich', jsonEncode({'target': theirs.id, 'ours': ours.id, 'image': sha(png), 'file': sha(file)}));
     await waitFor('app-rich-ok');
 

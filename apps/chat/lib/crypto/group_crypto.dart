@@ -173,9 +173,10 @@ abstract class GroupCrypto {
   /// An admin's resolution of a frozen channel, signed with this device's MLS leaf key (m4-groups §7).
   Future<String> signResolution(String groupId, {required String action, required int seq, required String digest, required String author});
 
-  /// Checks a resolution signed by device [by]: it must be an admin device in this device's own tree. Returns
-  /// the signer's user id; throws [CryptoException] (`auth` bad signature, `invalid` otherwise).
-  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature});
+  /// Checks a resolution signed by device [by] of user [byUser]: it must be exactly that admin device in this
+  /// device's own tree. Returns the signer's user id; throws [CryptoException] (`auth` bad signature,
+  /// `invalid` otherwise).
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String byUser, required String signature});
   Future<void> receiveAbort(String pendingId);
 
   Future<List<GroupMember>> members(String groupId);

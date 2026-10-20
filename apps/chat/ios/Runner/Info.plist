@@ -67,7 +67,7 @@
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
 	<key>NSCameraUsageDescription</key>
-	<string>Video calls use your camera only after you start or accept a call.</string>
+	<string>Video calls use your camera only after you start or accept a call, and linking a device scans its code.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Pick photos and videos to send. They are encrypted on this device before they leave it.</string>
 	<key>NSMicrophoneUsageDescription</key>

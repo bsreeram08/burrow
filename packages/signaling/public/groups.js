@@ -52,13 +52,13 @@
 
   // ---------- HTTP ----------
   /** Like account.js api(), but answers with the status instead of throwing (409/423 are part of the protocol). */
-  async function call(path, method = 'GET', payload) {
+  async function call(path, method = 'GET', payload, { retry = true } = {}) {
     // A burst (a chat moving to MLS, a device joining its groups) can meet the server's rate limits: those are
     // momentary, so wait a little and try again rather than failing the operation.
     for (let attempt = 0; ; attempt++) {
       const response = await fetch(path, { method, cache: 'no-store', credentials: 'same-origin', headers: payload === undefined ? {} : { 'Content-Type': 'application/json' }, body: payload === undefined ? undefined : JSON.stringify(payload) });
       const body = await response.json().catch(() => ({}));
-      if (response.status !== 429 || attempt >= 5) return { status: response.status, body };
+      if (response.status !== 429 || !retry || attempt >= 5) return { status: response.status, body };
       await sleep(250 * 2 ** attempt + Math.random() * 250);
     }
   }
@@ -565,7 +565,8 @@
     const digest = POISON.exec(error.message || '')?.[1];
     const ch = channels.get(id);
     if (digest) ch.rejected = { seq: entry.seq, digest }; // This device's own verdict, for resolving it later.
-    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }) : { status: -1, body: {} };
+    // A report's 429 is a once-a-minute rule, not a burst: no automatic retry here.
+    const result = digest ? await call(`/api/channels/${id}/poison`, 'POST', { seq: entry.seq, digest }, { retry: false }) : { status: -1, body: {} };
     if (result.status === 202 || result.status === 200 || (result.status === 409 && result.body.frozen)) {
       // 202 answers `{ frozen: true }`; 409 names the commit the channel is frozen on.
       setFrozen(id, typeof result.body.frozen === 'object' ? result.body.frozen : { seq: entry.seq, digest });
@@ -576,7 +577,13 @@
       setTimeout(() => { if (usable(channels.get(id))) enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); }, 30000);
       return 'stop';
     }
-    // The report can't be made (dismissed before, or not the latest commit any more): this device can't follow; rejoin.
+    // Not the latest commit any more: it may simply have been rolled back meanwhile. Then the log goes on without it.
+    if (result.status === 409 && digest) {
+      const now = await call(`/api/channels/${id}/log?after=${entry.seq - 1}`);
+      const same = now.status === 200 && now.body.entries.some(item => item.seq === entry.seq && item.message === entry.message);
+      if (!same) { setTimeout(() => { if (usable(channels.get(id))) enqueue(id, () => syncInner(id)).catch(error => failed(id, error)); }, 0); return 'stop'; }
+    }
+    // The report can't be made (dismissed before, or the commit stays and can't be reported): this device can't follow; rejoin.
     await resyncInner(id).catch(() => {});
     return 'stop';
   }

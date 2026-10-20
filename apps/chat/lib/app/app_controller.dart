@@ -273,6 +273,10 @@ class AppController extends Notifier<AppState> {
   GroupMessenger? groups;
   MessageStore? store;
   String? viewingGroup;
+  final _linkEvents = StreamController<LinkEvent>.broadcast();
+
+  /// `link` frames for this account (hello, offer, grant, message).
+  Stream<LinkEvent> get linkEvents => _linkEvents.stream;
   final _subscriptions = <StreamSubscription<Object?>>[];
   String? viewingContact;
   Timer? _missTimer;
@@ -477,6 +481,9 @@ class AppController extends Notifier<AppState> {
         }
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
+      case LinkEvent():
+        // Screens running a link (the primary's side) wait on these instead of polling.
+        if (!_linkEvents.isClosed) _linkEvents.add(event);
       case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow() || GroupEphemeral():
         unawaited(groups?.onEvent(event).catchError((_) {}));
       case Incoming():

@@ -557,5 +557,25 @@
       return { writes: [...writes.values()], result: count };
     });
   }
-  window.ChatStore = Object.freeze({ put, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, react, edit, markRead, markReadBy, checkPayload, inboundDisposition, emojiOk, isGroup, MAX_OPTIONS, MAX_BLOB, MAX_REACTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
+  /**
+   * History a linked device received from your other device (docs/m5-linking.md §2): every record validated like a
+   * backup, marked `imported`, never an outbound queue, never overwriting what is here. Resolves the count added.
+   */
+  async function importLinked(records) {
+    if (!Array.isArray(records) || records.length > MAX_MESSAGES) throw new Error('Invalid history.');
+    const incoming = [];
+    for (const record of records) {
+      if (record?.direction === 'system') continue;
+      try {
+        const clean = validate({ ...record, imported: true });
+        incoming.push(clean.direction === 'outgoing' && !['delivered', 'read'].includes(clean.status) ? { ...clean, status: 'uncertain' } : clean);
+      } catch {} // One bad record is skipped, not the whole history.
+    }
+    return transaction((active, now) => {
+      const writes = [];
+      for (const message of incoming) if (!expired(message, now) && !active.has(key(message)) && active.size + writes.length < MAX_MESSAGES) writes.push(message);
+      return { writes, result: writes.length };
+    });
+  }
+  window.ChatStore = Object.freeze({ put, importLinked, list, clear, removeConversation, setStatus, exportBackup, importBackup, receive, note, vote, react, edit, markRead, markReadBy, checkPayload, inboundDisposition, emojiOk, isGroup, MAX_OPTIONS, MAX_BLOB, MAX_REACTIONS, isMessageId: id => typeof id === 'string' && UUID.test(id) });
 })();

@@ -62,13 +62,13 @@
     try { unread = JSON.parse(localStorage.getItem(`unread-v1:${me.id}`) || '{}') || {}; } catch { unread = {}; }
     ready = setupKeys(user);
     // Groups and channels (groups.js) start once this device's keys and device list are in place.
-    ready.then(ok => { if (ok && me?.id === user.id && !inactive) window.Groups?.start(groupContext()); });
+    ready.then(ok => { if (ok && me?.id === user.id && !inactive) window.Groups?.start(groupContext()); if (ok && me?.id === user.id) window.DeviceLink?.attach(linkContext()); });
     window.Theme?.setAccount(user.id); App.accountId = user.id; App.myName = user.username; App.rescheduleReminders?.(); loadEmoji();
     $('rotation-every').value = String(myRotation());
     loadContacts(); connectEvents(); window.Alerts?.signedIn();
   }
   function signedOut(message = '') {
-    window.Groups?.stop(); delete body.dataset.kind; linked = null;
+    window.Groups?.stop(); window.DeviceLink?.attach(null); delete body.dataset.kind; linked = null;
     me = null; contacts = []; current = null; pairs.clear(); box = null; deviceView = null; announced = ''; metaKey = null; deviceWarning = ''; deviceNotice = ''; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
     clearTimeout(retryTimer); clearTimeout(flushTimer); const previous = events; events = null; previous?.close();
     if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true;
@@ -255,6 +255,41 @@
     deviceView = await api(`/api/devices/${me.username}`);
     renderDevices();
   }
+  /**
+   * Linking (docs/m5-linking.md §1.1 step 7): the next signed list, with the new device. The current list must be
+   * one we signed (verified against our pin); every device it names that the server still lists stays.
+   */
+  async function addToList(newId, { label, platform }) {
+    const id = (await localDevice()).deviceId, own = (await box.prekeys()).identity;
+    const view = await api(`/api/devices/${me.username}`);
+    if (!view.list) throw new Error('Your device list isn’t published yet. Try again in a moment.');
+    const pins = readPins();
+    const check = await Devices.verifyView({ userId: me.id, aikSign: own.sign, list: view.list, signature: view.signature, certs: view.certs, pin: pins[me.id] });
+    if (!check.ok) throw new Error(`The device list on the server isn’t one this device signed (${check.reason}). Nothing was linked.`);
+    pins[me.id] = check.pin; writePins(pins);
+    const keep = view.list.devices.filter(device => device.deviceId !== newId && view.devices.some(row => row.id === device.deviceId && row.state === 'listed'));
+    const added = { deviceId: newId, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, newId, { label, platform }) };
+    const list = { v: 1, userId: me.id, version: view.list.version + 1, prevHash: check.hash, devices: [...keep, added].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
+    const signed = await signList(list);
+    await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
+    await pinOwn(signed);
+    return { version: list.version, hash: await Devices.hash(Devices.listBytes(list)) };
+  }
+  function linkContext() {
+    return {
+      me: () => me, notice: text => say('chats-status', text), platformName, addToList, signWithIdentity, contacts: () => contacts,
+      async isPrimary() {
+        if (!box || linked || inactive) return false;
+        const view = await api(`/api/devices/${me.username}`).catch(() => null);
+        return Boolean(view?.devices?.some(row => row.current && row.primary));
+      },
+      aikSign: async () => { const identity = (await box.prekeys()).identity; return { dh: identity.dh, sign: identity.sign }; },
+      metaKeyBytes: () => Devices.deviceMetaKeyBytes(me.id, rawSign),
+      peer: contactId => box.peer(contactId),
+      async peerOfConversation(id) { for (const contact of contacts) if (contact.state === 'mutual' && await pairId(contact.id) === id) return contact.id; return null; },
+      devicesChanged: () => api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}),
+    };
+  }
   const platformName = platform => ({ web: 'Web browser', ios: 'iPhone app', android: 'Android app', macos: 'Mac app', windows: 'Windows app', linux: 'Linux app' })[platform] || 'Device';
   async function renderDevices() {
     const list = $('device-list');
@@ -263,7 +298,8 @@
     if (!deviceView?.devices) { list.replaceChildren(); return; }
     const amPrimary = deviceView.devices.some(row => row.current && row.primary);
     // Only the identity-key holder can open the sealed labels; other browsers show the kind of client.
-    const key = amPrimary && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : null;
+    const linkedKey = linked ? localStorage.getItem(`device-meta-key-v1:${me.id}`) : null;
+    const key = amPrimary && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : linkedKey ? await Devices.metaKeyFromBytes(Devices.unb64(linkedKey)).catch(() => null) : null;
     const rows = [];
     for (const row of deviceView.devices) {
       const item = document.createElement('li'); item.className = 'device-row'; item.dataset.deviceId = row.id; item.dataset.state = row.state;

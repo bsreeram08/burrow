@@ -199,7 +199,7 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     await w.until(() => w.requests.filter(request => request.path.endsWith('/commits')).length === own + 1, 'redone');
     expect(joined).toBe(1);
     expect(w.of('mlsForget').length).toBeGreaterThan(0);
-    expect(w.of('mlsCommit').at(-1).removes).toEqual([{ userId: BOB }]);
+    expect(w.of('mlsCommit').at(-1)!.removes).toEqual([{ userId: BOB }]);
   });
 
   test('5. a changed code of someone met in a group pauses the group and is only accepted from an explicit review', async () => {

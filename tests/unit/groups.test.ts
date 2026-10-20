@@ -48,7 +48,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
     ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
-    ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : [202, { frozen: true }]],
+    ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : options.poison === 409 ? [409, { error: 'That is not the latest sequenced commit.' }] : [202, { frozen: true }]],
     ['POST', /^\/api\/channels\/\w+\/cursor$/, () => [200, {}]],
     ['GET', /^\/api\/channels\/\w+\/join-info$/, () => [200, { epoch: 3, seq: 6, groupInfo: 'gi', tree: 't' }]],
     ['POST', /^\/api\/channels\/\w+\/join$/, () => [201, { epoch: 4, seq: 7, digest: sha('join') }]],
@@ -429,5 +429,27 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     const stored = await w.storeList();
     expect(stored.map((record: any) => [record.conversationId, record.direction, record.text, record.from])).toEqual([[PAIR, 'incoming', 'hello over MLS', undefined]]);
     expect(w.of('mlsCheckDm').length).toBe(2);
+  });
+
+  test('3e. a report refused because the commit was rolled back meanwhile reads on; it never rejoins (or retries a 429 report)', async () => {
+    const bad = { seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('bad commit'), createdAt: Date.now() };
+    const w = world({ poison: 409 });
+    let rolledBack = false;
+    w.log.current = after => (rolledBack ? [] : after <= 4 ? [bad] : []);
+    w.handlers.mlsReceive = () => { rolledBack = true; throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    w.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false });
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/poison')), 'reported');
+    await w.settle();
+    expect(w.requests.filter(request => /\/join(-info)?$/.test(request.path))).toEqual([]);
+    expect(w.of('mlsForget')).toEqual([]);
+    expect(w.Groups.debug(G).status).toBe('active');
+    const limited = world({ log: after => after <= 4 ? [bad] : [], poison: 429 });
+    limited.handlers.mlsReceive = () => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    limited.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false });
+    await limited.start();
+    await limited.until(() => limited.requests.some(request => request.path.endsWith('/poison')), 'reported');
+    await Bun.sleep(400);
+    expect(limited.requests.filter(request => request.path.endsWith('/poison'))).toHaveLength(1); // no burst retries of a 429 report
   });
 });

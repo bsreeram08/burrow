@@ -302,7 +302,17 @@
      * Trust on first use. A different identity (either half) is recorded as a change: verification is
      * cleared and sending is blocked until the user accepts the new security code (acceptChange).
      */
-    async function notePeer(contactId, pub) {
+    // Pin writes for one contact never interleave (a read-then-write each); separate from the session locks, so a
+    // pin noted inside a decrypt can't wait on itself.
+    const pinLocks = new Map();
+    function pinLock(contactId, task) {
+      const next = (pinLocks.get(contactId) || Promise.resolve()).then(task);
+      pinLocks.set(contactId, next.catch(() => {}));
+      return next;
+    }
+    const pinMismatch = () => Object.assign(new Error('The security code changed again.'), { code: 'mismatch' });
+    function notePeer(contactId, pub) { return pinLock(contactId, () => notePeerNow(contactId, pub)); }
+    async function notePeerNow(contactId, pub) {
       const known = await backend.get(`peer:${contactId}`);
       if (known && sameIdentity(known.identity, pub)) return known;
       // Any change blocks sending until the user accepts it: a server that swaps in its own key must
@@ -458,14 +468,21 @@
       if (!peer) return null;
       return { number: await safetyNumber({ username: myUsername, identity: me.pub }, { username: theirUsername, identity: peer.identity }), verified: peer.verified, changed: peer.changed, blocked: Boolean(peer.blocked) };
     }
-    async function setVerified(contactId, verified) {
-      const peer = await backend.get(`peer:${contactId}`);
-      if (peer) await backend.put(`peer:${contactId}`, { ...peer, verified, changed: verified ? false : peer.changed, blocked: false });
+    /** `identity`, if given: only that exact pinned identity is marked (a different one pinned meanwhile: 'mismatch'). */
+    function setVerified(contactId, verified, identity) {
+      return pinLock(contactId, async () => {
+        const peer = await backend.get(`peer:${contactId}`);
+        if (peer && identity && !sameIdentity(peer.identity, identity)) throw pinMismatch();
+        if (peer) await backend.put(`peer:${contactId}`, { ...peer, verified, changed: verified ? false : peer.changed, blocked: false });
+      });
     }
-    /** The user reviewed a changed security code and chose to keep messaging (without marking it verified). */
-    async function acceptChange(contactId) {
-      const peer = await backend.get(`peer:${contactId}`);
-      if (peer) await backend.put(`peer:${contactId}`, { ...peer, changed: false, blocked: false });
+    /** The user reviewed a changed security code and chose to keep messaging (without marking it verified). `identity`: as in setVerified. */
+    function acceptChange(contactId, identity) {
+      return pinLock(contactId, async () => {
+        const peer = await backend.get(`peer:${contactId}`);
+        if (peer && identity && !sameIdentity(peer.identity, identity)) throw pinMismatch();
+        if (peer) await backend.put(`peer:${contactId}`, { ...peer, changed: false, blocked: false });
+      });
     }
     return { identity, prekeys, oneTimePreKeys, encryptTo, decryptFrom, notePeer, safety, setVerified, acceptChange, rotate, sessionInfo, resetIdentity, peer: contactId => backend.get(`peer:${contactId}`), forget: contactId => backend.delete(`sessions:${contactId}`) };
   }

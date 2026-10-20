@@ -406,7 +406,7 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
 
   test('9b. a commit refused because a member\'s account key moved without a record is reported, not retried as a race', async () => {
     const GONE = 'Z'.repeat(22);
-    const w = world({ own: { listed: [DEV], dropped: [GONE] }, commit: () => [409, { error: 'A member\'s identity key does not match the one this channel was built on.' }] });
+    const w = world({ own: { listed: [DEV], dropped: [GONE] }, commit: () => [409, { error: 'A member\'s identity key does not match the one this channel was built on.', code: 'identity', userId: BOB }] });
     w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, admin: true }, { leaf: 2, userId: ME, deviceId: GONE, admin: true }];
     await w.start();
     await w.until(() => w.requests.some(request => request.path.endsWith('/commits')), 'committed');

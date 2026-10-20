@@ -126,8 +126,8 @@
         return record;
       },
       safety: (me, contactId, them) => run({ cmd: 'safety', me, contact: contactId, them }),
-      setVerified: (contactId, verified) => run({ cmd: 'setVerified', contact: contactId, verified }),
-      acceptChange: contactId => run({ cmd: 'acceptChange', contact: contactId }),
+      setVerified: (contactId, verified, identity) => run({ cmd: 'setVerified', contact: contactId, verified, ...(identity ? { identity } : {}) }),
+      acceptChange: (contactId, identity) => run({ cmd: 'acceptChange', contact: contactId, ...(identity ? { identity } : {}) }),
       peer: contactId => run({ cmd: 'peer', contact: contactId }),
       forget: contactId => run({ cmd: 'forget', contact: contactId }),
       rotate: contactId => run({ cmd: 'rotate', contact: contactId }),

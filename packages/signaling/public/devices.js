@@ -163,6 +163,34 @@
     const last = path.at(-1);
     return last.newSign === served.sign && last.newDh === served.dh ? path : null;
   }
+  /**
+   * A contact's succession is followed only from an identity the user accepted: a pin whose code changed and waits for
+   * review (`changed`/`blocked`) could be the server's own key, and a chain from it proves nothing. Resolves the path
+   * from `record` (the 1:1 pin) to `served`, or null (then the usual review applies).
+   */
+  async function successionFrom(userId, record, served, records) {
+    if (!record?.identity || record.changed || record.blocked) return null;
+    return verifySuccession(userId, record.identity, served, records);
+  }
+  /**
+   * Our own devices as the served list names them, only if that list verifies under our account key moving forward
+   * from our pin (never the server's word), each with its sealed label opened (`metaKey`). null otherwise. What a new
+   * key may re-sign (a transfer's list v1, a companion's certificate, m5 §5.2) comes only from here.
+   */
+  async function ownDevices({ userId, aikSign, view, pin, metaKey }) {
+    if (!view?.list) return null;
+    const check = await verifyView({ userId, aikSign, list: view.list, signature: view.signature, certs: view.certs, pin });
+    if (!check.ok) return null;
+    const devices = [];
+    for (const device of view.list.devices) devices.push({ ...device, described: metaKey ? await openMeta(metaKey, userId, device.deviceId, device.meta).catch(() => null) : null });
+    return { pin: check.pin, devices };
+  }
+  /** m5 §5.2.2: the platform to certify for `deviceId`, from our signed list's sealed label; null for this device or one the list doesn't name. */
+  function recertPlatform(owned, deviceId, selfId) {
+    if (!owned || deviceId === selfId) return null;
+    const platform = owned.devices.find(device => device.deviceId === deviceId)?.described?.platform;
+    return PLATFORMS.includes(platform) ? platform : null;
+  }
   async function hash(bytes) { return b64(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))); }
   async function verifyBytes(aikSign, bytes, signature) {
     if (typeof aikSign !== 'string' || !KEY.test(aikSign) || typeof signature !== 'string' || !SIG.test(signature)) return false;
@@ -293,5 +321,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

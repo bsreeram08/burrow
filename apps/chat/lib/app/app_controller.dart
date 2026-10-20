@@ -16,8 +16,12 @@ import '../core/api.dart';
 import '../core/devices.dart';
 import '../core/events.dart';
 import '../crypto/chat_crypto.dart';
+import '../crypto/group_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
+import '../crypto/rust_group_crypto.dart';
 import '../messaging/attachments.dart';
+import '../messaging/group_messenger.dart';
+import '../messaging/group_sync.dart';
 import '../messaging/messenger.dart';
 import '../store/message_store.dart';
 import '../theme/theme_prefs.dart';
@@ -71,6 +75,9 @@ final tokenStoreProvider = Provider<TokenStore>((ref) => SecureTokenStore());
 /// The Rust core (crates/chatcore) through flutter_rust_bridge. Tests and the demo override this
 /// with FakeChatCrypto.
 final cryptoProvider = Provider<ChatCrypto>((ref) => RustChatCrypto());
+
+/// Groups over MLS: the same Rust core (its group engine). Tests and the demo override this with FakeGroupCrypto.
+final groupCryptoProvider = Provider<GroupCrypto>((ref) => const RustGroupCrypto());
 
 /// Rotation settings for an account on this device (account.js `rotation-*` keys in localStorage).
 final rotationPrefsProvider = Provider<Future<RotationPrefs> Function(String userId)>((ref) => (userId) async {
@@ -162,6 +169,10 @@ class AppState {
     this.inactiveDevice = false,
     this.keysLocked = false,
     this.typing = const {},
+    this.groups = const [],
+    this.groupTyping = const {},
+    this.pausedGroups = const {},
+    this.groupsUnavailable,
   });
   final AuthPhase phase;
   final User? user;
@@ -183,6 +194,18 @@ class AppState {
   /// Contacts typing to us right now.
   final Set<String> typing;
 
+  /// Group conversations on this device (docs/m4-groups.md), with unread and mention marks.
+  final List<GroupConversation> groups;
+
+  /// Group id → user ids typing there.
+  final Map<String, List<String>> groupTyping;
+
+  /// Groups paused until a member's security code is reviewed (group id → user id).
+  final Map<String, String> pausedGroups;
+
+  /// Why groups are off on this device, if they are.
+  final String? groupsUnavailable;
+
   AppState copyWith({
     AuthPhase? phase,
     User? user,
@@ -198,6 +221,11 @@ class AppState {
     bool? inactiveDevice,
     bool? keysLocked,
     Set<String>? typing,
+    List<GroupConversation>? groups,
+    Map<String, List<String>>? groupTyping,
+    Map<String, String>? pausedGroups,
+    String? groupsUnavailable,
+    bool clearGroupsUnavailable = false,
   }) => AppState(
     phase: phase ?? this.phase,
     user: user ?? this.user,
@@ -210,6 +238,10 @@ class AppState {
     inactiveDevice: inactiveDevice ?? this.inactiveDevice,
     keysLocked: keysLocked ?? this.keysLocked,
     typing: typing ?? this.typing,
+    groups: groups ?? this.groups,
+    groupTyping: groupTyping ?? this.groupTyping,
+    pausedGroups: pausedGroups ?? this.pausedGroups,
+    groupsUnavailable: clearGroupsUnavailable ? null : groupsUnavailable ?? this.groupsUnavailable,
   );
 }
 
@@ -218,7 +250,9 @@ class AppController extends Notifier<AppState> {
   ChatCrypto get _crypto => ref.read(cryptoProvider);
   EventsClient? _events;
   Messenger? messenger;
+  GroupMessenger? groups;
   MessageStore? store;
+  String? viewingGroup;
   final _subscriptions = <StreamSubscription<Object?>>[];
   String? viewingContact;
   Timer? _missTimer;
@@ -293,6 +327,36 @@ class AppController extends Notifier<AppState> {
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
     );
     messenger = m;
+    final sync = GroupSync(
+      api: _api,
+      crypto: ref.read(groupCryptoProvider),
+      store: dbStore,
+      me: user,
+      device: m.device,
+      platform: _api.client,
+      ensurePinned: (ids) async => groups?.ensurePinned(ids),
+      pinProblem: (ids) async => groups?.pinProblem(ids),
+      sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
+      ackWelcome: events.ack,
+    );
+    final g = GroupMessenger(
+      api: _api,
+      sync: sync,
+      chatCrypto: _crypto,
+      store: dbStore,
+      me: user,
+      contacts: () => state.contacts,
+      viewing: () => viewingGroup,
+      readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
+    );
+    groups = g;
+    _subscriptions
+      ..add(sync.notices.listen((text) => state = state.copyWith(notice: text)))
+      ..add(g.notices.listen((text) => state = state.copyWith(notice: text)))
+      ..add(dbStore.groupChanges.listen((_) => unawaited(_loadGroups())))
+      ..add(sync.membershipChanges.listen((_) => unawaited(_loadGroups())))
+      ..add(g.typingChanges.listen((typing) => state = state.copyWith(groupTyping: typing)))
+      ..add(sync.pausedChanges.listen((paused) => state = state.copyWith(pausedGroups: paused)));
     _subscriptions
       ..add(events.events.listen(_onEvent))
       ..add(m.notices.listen((text) => state = state.copyWith(notice: text)))
@@ -302,6 +366,7 @@ class AppController extends Notifier<AppState> {
       ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
       ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
     state = state.copyWith(phase: AuthPhase.signedIn, user: user, clearNotice: true);
+    await _loadGroups();
     unawaited(_checkActive());
     await loadContacts();
     unawaited(events.connect());
@@ -310,6 +375,42 @@ class AppController extends Notifier<AppState> {
       unawaited(m.verifyContactDevices(contact).catchError((_) => null));
     }
   }
+
+  Future<void> _loadGroups() async {
+    final s = store;
+    if (s == null) return;
+    try {
+      final list = await s.groups();
+      state = state.copyWith(groups: list);
+    } catch (_) {}
+  }
+
+  GroupConversation? groupById(String id) {
+    for (final g in state.groups) {
+      if (g.id == id) return g;
+    }
+    return null;
+  }
+
+  /// Groups after the device is the account's active one: group identity, Welcomes, every log.
+  Future<void> _startGroups() async {
+    final g = groups;
+    if (g == null) return;
+    try {
+      await g.start();
+    } catch (error) {
+      g.unavailable ??= 'Groups could not start on this device: $error';
+    }
+    state = g.unavailable == null ? state.copyWith(clearGroupsUnavailable: true) : state.copyWith(groupsUnavailable: g.unavailable);
+    await _loadGroups();
+  }
+
+  void openGroup(String id) {
+    viewingGroup = id;
+    unawaited(groups?.markRead(id));
+  }
+
+  void closeGroup() => viewingGroup = null;
 
   Contact? contactById(String id) {
     for (final c in state.contacts) {
@@ -337,6 +438,8 @@ class AppController extends Notifier<AppState> {
       case Hello(:final online):
         state = state.copyWith(contacts: [for (final c in state.contacts) c.copyWith(online: online.contains(c.id))]);
         unawaited(_checkActive());
+        // A reconnect: Welcomes and logs that waited (frames resume from the cursors).
+        if (groups?.ready ?? false) unawaited(groups!.sync.fetchWelcomes().then((_) => groups?.sync.refresh()).catchError((_) {}));
       case Presence(:final id, :final online):
         state = state.copyWith(contacts: [for (final c in state.contacts) c.id == id ? c.copyWith(online: online) : c]);
       case ContactsChanged():
@@ -351,7 +454,7 @@ class AppController extends Notifier<AppState> {
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
       case GroupEvent() || WelcomeEvent() || ChannelEvent() || KeyPackagesLow() || GroupEphemeral():
-        break;
+        unawaited(groups?.onEvent(event).catchError((_) {}));
       case Incoming():
         _incoming(event);
       case Ended(:final roomId):
@@ -368,6 +471,7 @@ class AppController extends Notifier<AppState> {
     try {
       final active = await messenger?.checkActive();
       if (active != null) state = state.copyWith(inactiveDevice: !active);
+      if (active == true && !(groups?.ready ?? true)) await _startGroups();
     } catch (e) {
       state = state.copyWith(notice: 'Could not check encryption keys: $e');
     }
@@ -499,6 +603,8 @@ class AppController extends Notifier<AppState> {
     }
     state = state.copyWith(keyChanged: {...state.keyChanged}..remove(contactId));
     unawaited(messenger?.flush());
+    // Channels paused for this person's security code carry on.
+    unawaited(groups?.sync.resume(contactId));
   }
 
   void dismissNotice() => state = state.copyWith(clearNotice: true);
@@ -535,6 +641,8 @@ class AppController extends Notifier<AppState> {
     await state.call?.end('Signed out.');
     await messenger?.dispose();
     messenger = null;
+    await groups?.dispose();
+    groups = null;
     await store?.close();
     store = null;
   }

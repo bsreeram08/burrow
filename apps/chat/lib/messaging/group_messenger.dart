@@ -176,6 +176,17 @@ class GroupMessenger {
     return _members[groupId] = people;
   }
 
+  /// The members last loaded, without waiting (the list and headers).
+  List<GroupPerson>? cachedMembers(String groupId) => _members[groupId];
+
+  /// What a group is called on screen: its name, else the other members' names (§5.3).
+  String displayName(GroupConversation group) {
+    if (group.name.isNotEmpty) return group.name;
+    final others = [for (final m in _members[group.id] ?? const <GroupPerson>[]) if (m.userId != me.id) m.username];
+    if (others.isEmpty) return group.kind.isChannel ? 'Unnamed channel' : 'New group';
+    return others.length <= 3 ? others.join(', ') : '${others.take(3).join(', ')} +${others.length - 3}';
+  }
+
   Future<bool> isAdmin(String groupId, [String? userId]) async {
     try {
       return (await crypto.roles(groupId)).isAdmin(userId ?? me.id);

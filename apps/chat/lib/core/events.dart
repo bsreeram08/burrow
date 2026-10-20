@@ -73,6 +73,7 @@ sealed class AccountEvent {
           action: m['action'] as String?,
           author: m['author'] as String?,
           by: m['by'] as String?,
+          byUser: m['byUser'] as String?,
           signature: m['signature'] as String?,
         ),
         'keypackages' => KeyPackagesLow(m['remaining'] as int),
@@ -215,7 +216,7 @@ class WelcomeEvent extends AccountEvent {
 
 /// A channel changed: joined, invited, updated, left, frozen (+seq, digest), thawed, remove-needed (+deviceId), gap (+oldest).
 class ChannelEvent extends AccountEvent {
-  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.signature});
+  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.byUser, this.signature});
   final String id;
   final String change;
   final int? seq;
@@ -227,6 +228,9 @@ class ChannelEvent extends AccountEvent {
   final String? action;
   final String? author;
   final String? by;
+
+  /// The resolving admin's user id: the signer must be exactly (byUser, by).
+  final String? byUser;
   final String? signature;
 }
 

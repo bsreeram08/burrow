@@ -273,12 +273,43 @@ class FakeGroupCrypto implements GroupCrypto {
     var leaf = 0;
     return [
       for (final m in g.members)
-        GroupMember(leaf: leaf++, userId: m['userId']! as String, deviceId: m['deviceId']! as String, platform: m['platform']! as String, admin: g.roles.isAdmin(m['userId']! as String)),
+        GroupMember(
+          leaf: leaf++,
+          userId: m['userId']! as String,
+          deviceId: m['deviceId']! as String,
+          platform: m['platform']! as String,
+          admin: g.roles.isAdmin(m['userId']! as String),
+          stale: staleDevices.contains(m['deviceId']),
+        ),
     ];
   }
 
   @override
   Future<GroupRoles> roles(String groupId) async => _group(groupId).roles;
+
+  /// Tests: devices whose leaves read as stale (an identity their user left).
+  final Set<String> staleDevices = {};
+
+  /// Tests: when false, inspecting refuses like a core without the command.
+  bool canInspect = true;
+
+  @override
+  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) async {
+    if (!canInspect) throw const CryptoException('cannot inspect', code: 'unsupported');
+    final g = _Group.fromJson(_decode(groupInfo));
+    var leaf = 0;
+    return [
+      for (final m in g.members)
+        GroupMember(
+          leaf: leaf++,
+          userId: m['userId']! as String,
+          deviceId: m['deviceId']! as String,
+          platform: m['platform']! as String,
+          admin: g.roles.isAdmin(m['userId']! as String),
+          stale: staleDevices.contains(m['deviceId']),
+        ),
+    ];
+  }
 }
 
 List<Map<String, Object?>> _list(Object? value) => [for (final m in (value as List? ?? const [])) (m as Map).cast<String, Object?>()];

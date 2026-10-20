@@ -27,8 +27,12 @@ class Party {
   final MessageStore store;
   final List<GroupDelivery> delivered;
 
+  /// [own]: this account's verified device list as the test wants the party to see it.
+  OwnDeviceList? own;
+
   static Future<Party> join(FakeDs ds, String name) async {
     final user = User(id: '${name}_${'x' * (21 - name.length)}', username: name);
+    late Party party;
     final prefs = MemoryDevicePrefs();
     final device = await localDevice(prefs, user.id);
     final api = ds.client(userId: user.id, username: name, deviceId: device.deviceId);
@@ -44,8 +48,11 @@ class Party {
       device: () async => device,
       platform: 'ios',
       ensurePinned: (_, {force = false}) async => const <String>[],
+      verifiedOwnDevices: () async => party.own,
       backoff: (_) => Duration.zero,
-    )..onDelivery = (d) async => delivered.add(d);
+    )
+      ..removalJitter = (() => Duration.zero)
+      ..onDelivery = (d) async => delivered.add(d);
     ds.listen(device.deviceId, (event) {
       switch (event) {
         case GroupEvent():
@@ -58,7 +65,8 @@ class Party {
       }
     });
     await sync.ensureReady();
-    return Party._(user, sync, crypto, store, delivered);
+    party = Party._(user, sync, crypto, store, delivered);
+    return party;
   }
 }
 
@@ -316,7 +324,7 @@ void main() {
     for (var i = 0; i < 100 && (await bob.store.group(group.id))?.frozen == null; i++) {
       await Future<void>.delayed(const Duration(milliseconds: 5));
     }
-    ds.forgeRollback = 'forged';
+    ds.forgeByUser = carol.user.id; // a valid signature, but the notice names another user
     await bob.sync.resolve(group.id, rollback: true);
     await Future<void>.delayed(const Duration(milliseconds: 300));
     expect(notices.any((n) => n.contains('could not be verified')), isTrue);
@@ -331,5 +339,67 @@ void main() {
     expect(const CommitCheck(authenticated: false, signedContentInvalid: true, cls: 'tag', author: member).blame, isNull);
     expect(const CommitCheck(authenticated: true, signedContentInvalid: true, cls: 'signed-content', author: joiner).blame, isNull);
     expect(const CommitCheck(authenticated: true, signedContentInvalid: true, cls: 'signed-content').blame, isNull);
+  });
+
+  group('own devices (m5 §3, §4)', () {
+    test('an own leaf goes only when a verified list dropped that device; hints, missing devices and unverifiable lists remove nothing', () async {
+      final alice2 = await Party.join(ds, 'alice'); // a second device of alice's account
+      final group = await alice.sync.create(GroupKindName.private);
+      await alice.sync.add(group.id, [bob.user.id, alice.user.id]);
+      await until(() => bob.crypto.groups.contains(group.id) && alice2.crypto.groups.contains(group.id));
+      Future<Set<String>> devices() async => {for (final m in await alice.crypto.members(group.id)) m.deviceId};
+      expect(await devices(), contains(alice2.crypto.deviceId));
+
+      alice.own = null;
+      expect(await alice.sync.removeDroppedOwnLeaves(), 0, reason: 'unverifiable list: nothing');
+      alice.own = OwnDeviceList(listed: {alice.crypto.deviceId}, dropped: const {});
+      expect(await alice.sync.removeDroppedOwnLeaves(), 0, reason: 'merely missing: nothing');
+      await alice.sync.onChannel(ChannelEvent(id: group.id, change: 'remove-device', deviceId: alice2.crypto.deviceId));
+      await settle();
+      expect(await devices(), contains(alice2.crypto.deviceId), reason: 'a frame is only a hint');
+
+      alice.own = OwnDeviceList(listed: {alice.crypto.deviceId}, dropped: {alice2.crypto.deviceId});
+      await alice.sync.onChannel(ChannelEvent(id: group.id, change: 'remove-device', deviceId: alice2.crypto.deviceId));
+      for (var i = 0; i < 100 && (await devices()).contains(alice2.crypto.deviceId); i++) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+      expect(await devices(), isNot(contains(alice2.crypto.deviceId)));
+      expect(await devices(), contains(bob.crypto.deviceId), reason: 'only (alice, that device)');
+    });
+
+    test('a leaf the core marks stale is removed without a tombstone', () async {
+      final alice2 = await Party.join(ds, 'alice');
+      final group = await alice.sync.create(GroupKindName.private);
+      await alice.sync.add(group.id, [alice.user.id]);
+      await until(() => alice2.crypto.groups.contains(group.id));
+      alice.crypto.staleDevices.add(alice2.crypto.deviceId);
+      alice.own = OwnDeviceList(listed: {alice.crypto.deviceId, alice2.crypto.deviceId}, dropped: const {});
+      expect(await alice.sync.removeDroppedOwnLeaves(), 1);
+    });
+
+    test("a channel of ours is joined only when the checked tree has a current leaf of a verified listed device", () async {
+      final alice2 = await Party.join(ds, 'alice');
+      final group = await alice.sync.create(GroupKindName.private);
+      await alice.sync.add(group.id, [bob.user.id]);
+      await until(() => ds.channels[group.id]!.groupInfoEpoch == ds.channels[group.id]!.epoch, 'GroupInfo published');
+
+      alice2.own = null;
+      expect(await alice2.sync.joinOwnChannels(), 0, reason: 'no verified list');
+      alice2.own = OwnDeviceList(listed: {alice2.crypto.deviceId}, dropped: const {});
+      expect(await alice2.sync.joinOwnChannels(), 0, reason: "the tree's device of ours isn't in our verified list");
+      alice2.own = OwnDeviceList(listed: {alice.crypto.deviceId, alice2.crypto.deviceId}, dropped: const {});
+      alice2.crypto.canInspect = false;
+      expect(await alice2.sync.joinOwnChannels(), 0, reason: 'fail closed without the check');
+      alice2.crypto.canInspect = true;
+      alice2.crypto.staleDevices.add(alice.crypto.deviceId);
+      expect(await alice2.sync.joinOwnChannels(), 0, reason: 'only a current leaf counts');
+      alice2.crypto.staleDevices.clear();
+      expect(await alice2.sync.joinOwnChannels(), 1);
+      expect(alice2.crypto.groups, contains(group.id));
+      // Never a channel this device left.
+      await alice2.store.updateGroup(group.id, (g) => g.copyWith(membership: Membership.left));
+      ds.channels[group.id]!.members.remove(alice2.crypto.deviceId);
+      expect(await alice2.sync.joinOwnChannels(), 0);
+    });
   });
 }

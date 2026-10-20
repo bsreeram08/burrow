@@ -75,12 +75,16 @@ class PendingGroupCommit {
 }
 
 class GroupMember {
-  const GroupMember({required this.leaf, required this.userId, required this.deviceId, required this.platform, required this.admin});
+  const GroupMember({required this.leaf, required this.userId, required this.deviceId, required this.platform, required this.admin, this.stale = false});
   final int leaf;
   final String userId;
   final String deviceId;
   final String platform;
   final bool admin;
+
+  /// A device of an identity its user left (recovery, or a succession that did not cover it): it can't act and
+  /// may be removed (m5 §7).
+  final bool stale;
 }
 
 /// One device to remove ([deviceId] null: every device of [userId]).
@@ -177,4 +181,8 @@ abstract class GroupCrypto {
   Future<List<GroupMember>> members(String groupId);
   Future<GroupRoles> roles(String groupId);
   Future<GroupView> view(String groupId);
+
+  /// The members of a served GroupInfo and tree after whole-group validation, without joining (m5 §3). Throws
+  /// when the core can't check it; callers then join nothing (fail closed).
+  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree);
 }

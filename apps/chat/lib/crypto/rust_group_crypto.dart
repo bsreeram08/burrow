@@ -136,6 +136,11 @@ class RustGroupCrypto implements GroupCrypto {
   @override
   Future<GroupRoles> roles(String groupId) => _call(() async => _fromRoles(await core.mlsRoles(groupId: groupId)));
 
+  /// Not in this core build yet (mls-core is adding mlsInspectGroup): refuse, so nothing auto-joins unchecked.
+  @override
+  Future<List<GroupMember>> inspectGroup(String groupInfo, String tree) async =>
+      throw const CryptoException('This version of the encryption core cannot check a group before joining it.', code: 'unsupported');
+
   @override
   Future<GroupView> view(String groupId) => _call(() async => _view(await core.mlsGroupView(groupId: groupId)));
 }

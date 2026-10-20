@@ -26,6 +26,9 @@ class FakeDs {
   /// Tests: replace the admin's leaf signature in `rolled-back` (a server forging the notice).
   String? forgeRollback;
 
+  /// Tests: a different user id on `rolled-back` than the resolving admin's.
+  String? forgeByUser;
+
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
 
@@ -255,7 +258,7 @@ class FakeDs {
         }
         for (final u in channel.users) {
           if (body['action'] == 'rollback') {
-            _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String, action: 'rollback', author: author, by: deviceId, signature: (forgeRollback ?? body['leafSignature']) as String));
+            _notifyUser(u, ChannelEvent(id: channel.id, change: 'rolled-back', seq: rolled['seq'] as int, digest: rolled['digest'] as String, action: 'rollback', author: author, by: deviceId, byUser: forgeByUser ?? userId, signature: (forgeRollback ?? body['leafSignature']) as String));
           }
           _notifyUser(u, ChannelEvent(id: channel.id, change: 'thawed'));
         }

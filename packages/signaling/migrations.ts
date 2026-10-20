@@ -124,6 +124,14 @@ const MIGRATIONS: ((db: Database) => void)[] = [
                 PRIMARY KEY (user_id, seq));
         `);
     },
+    // 5: the authenticated events that let the delivery service's validator replace a pinned account key.
+    db => {
+        db.exec(`
+            -- The last time an authenticated path changed the user's identity key (PUT /api/keys with a new identity), and to what.
+            -- The MLS validator re-pins a key only to the one recorded here (or follows a verified succession chain).
+            CREATE TABLE identity_changes (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, aik TEXT NOT NULL, event TEXT NOT NULL, at INTEGER NOT NULL);
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

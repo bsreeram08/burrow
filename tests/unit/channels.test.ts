@@ -1031,6 +1031,9 @@ suite('identity change in a channel (docs/m5-linking.md §7)', () => {
         const w = await populated();
         const fresh = new Client(Core).call({ cmd: 'identity' });
         run('UPDATE identity_keys SET sign = ?, dh = ? WHERE user_id = ?', fresh.sign, fresh.dh, w.bob.id);
+        // Without the authenticated event (PUT /api/keys records it) the DS refuses to replace Bob's pinned key.
+        expect((await w.a1.commit(w.channel, { update: true })).status).toBe(409);
+        run("INSERT OR REPLACE INTO identity_changes (user_id, aik, event, at) VALUES (?, ?, 'keys-put', 0)", w.bob.id, fresh.sign);
         // Before M5 this was a 409 "identity changed" for every commit in every channel Bob is in.
         const update = await w.a1.commit(w.channel, { update: true });
         expect(update.status).toBe(201);

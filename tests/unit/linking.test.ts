@@ -512,3 +512,55 @@ suite('revocation, succession, DM facts', () => {
         expect((await ask('alice', bobCookie)).body.channel).toBe('D'.repeat(22));
     });
 });
+
+suite('primary transfer relay (purpose: transfer)', () => {
+    test('a listed companion starts it with its own session, only the primary offers, sealed messages flow, and nothing creates a device or a session', async () => {
+        await start();
+        const alice = account('alice'), c = newcomer('linux');
+        // C is a listed device of the account with a session bound to it (the signed list names it).
+        run("INSERT INTO devices (id, user_id, platform, state, is_primary, sig_key, created_at) VALUES (?, ?, 'linux', 'listed', 0, ?, ?)", c.deviceId, alice.id, c.deviceKey, clock);
+        const next = { v: 1, userId: alice.id, version: 2, prevHash: sha(F.listBytes(alice.list)), devices: [...alice.list.devices, { deviceId: c.deviceId, addedAt: clock, meta: '' }].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
+        const signed = alice.client.call({ cmd: 'signDeviceList', userId: alice.id, published: alice.identity.sign, list: next });
+        expect((await call('PUT', '/api/devices/list', { body: { list: next, signature: signed.signature, certs: signed.certs, deviceId: alice.deviceId }, cookie: alice.cookie })).status).toBe(200);
+        const cCookie = app.accounts!.testing.cookie(alice.id);
+        run('UPDATE sessions SET device_id = ? WHERE token_hash = ?', c.deviceId, createHash('sha256').update(cCookie.split('=')[1]!).digest('hex'));
+
+        // No session, the primary's session (a different device), or a stranger's device: refused.
+        const body = c.start({ purpose: 'transfer' });
+        expect((await call('POST', '/api/link/start', { body })).status).toBe(403);
+        expect((await call('POST', '/api/link/start', { body, cookie: alice.cookie })).status).toBe(403);
+        const stranger = newcomer('linux');
+        expect((await call('POST', '/api/link/start', { body: stranger.start({ purpose: 'transfer' }), cookie: cCookie })).status).toBe(403);
+        const started = await call('POST', '/api/link/start', { body, cookie: cCookie });
+        expect(started.status).toBe(201);
+        const { linkId, claim } = started.body;
+
+        // The companion cannot offer to itself; the primary can, and only the primary.
+        const { qr } = c.client.call({ cmd: 'linkQr', linkId, now: clock });
+        const accepted = alice.client.call({ cmd: 'linkAccept', qr, now: clock });
+        expect((await call('POST', `/api/link/${linkId}/offer`, { body: { eph: accepted.eph }, cookie: cCookie })).status).toBe(403);
+        const offered = await call('POST', `/api/link/${linkId}/offer`, { body: { eph: accepted.eph }, cookie: alice.cookie });
+        expect(offered.status).toBe(201);
+        expect(offered.body).toMatchObject({ purpose: 'transfer', deviceId: c.deviceId });
+        // A transfer adds no device row: C is already listed.
+        expect(rows('SELECT COUNT(*) AS n FROM devices WHERE user_id = ?', alice.id)[0].n).toBe(2);
+        const status = await call('GET', `/api/link/${linkId}`, { claim });
+        expect(c.client.call({ cmd: 'linkComplete', linkId, eph: status.body.eph, now: clock }).code).toBe(accepted.code);
+
+        // Sealed messages both ways (the record to sign, the new identity), opaque to the server.
+        const hello = c.client.call({ cmd: 'linkSeal', linkId, plaintext: JSON.stringify({ v: 1, type: 'transfer-hello', identity: 'x' }) });
+        expect((await call('POST', `/api/link/${linkId}/messages`, { body: { data: hello }, claim })).status).toBe(201);
+        const inbox = await call('GET', `/api/link/${linkId}/messages?after=0`, { cookie: alice.cookie });
+        expect(JSON.parse(alice.client.call({ cmd: 'linkOpen', linkId, data: inbox.body.messages[0].data })).type).toBe('transfer-hello');
+        const reply = alice.client.call({ cmd: 'linkSeal', linkId, plaintext: JSON.stringify({ v: 1, type: 'record' }) });
+        expect((await call('POST', `/api/link/${linkId}/messages`, { body: { data: reply }, cookie: alice.cookie })).status).toBe(201);
+        const back = await call('GET', `/api/link/${linkId}/messages?after=0`, { claim });
+        expect(JSON.parse(c.client.call({ cmd: 'linkOpen', linkId, data: back.body.messages[0].data })).type).toBe('record');
+
+        // The primary grants; a transfer never mints a session: the claim is refused and C keeps the one it has.
+        expect((await call('POST', `/api/link/${linkId}/grant`, { cookie: alice.cookie })).body).toEqual({ status: 'granted' });
+        const signature = b64(sign(null, F.linkClaimBytes(linkId, c.deviceId, claim), c.key));
+        expect((await call('POST', `/api/link/${linkId}/claim`, { body: { claim, signature } })).status).toBe(409);
+        expect((await call('GET', '/api/me', { cookie: cCookie })).body.user.id).toBe(alice.id);
+    });
+});

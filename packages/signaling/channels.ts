@@ -42,6 +42,7 @@ type Deps = {
     sessionDevice(session: string): string | null;
     sigKey(deviceId: string): string | null;
     aikOf(userId: string): string | null;
+    identityChange?(userId: string): { aik: string; event: string } | null;
     mutual(a: string, b: string): boolean;
     userByName(username: string): { id: string; username: string } | null;
     notify(userId: string, event: object): void;

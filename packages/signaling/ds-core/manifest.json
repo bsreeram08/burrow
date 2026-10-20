@@ -16,6 +16,6 @@
   ],
   "wasmBindgen": "0.2.129",
   "rustc": "rustc 1.93.1 (01f6ddf75 2026-02-11)",
-  "source": "59c595621a9406448f8b06cce973289eba66a4d8c847005faf6a5370fde7bdd3",
+  "source": "27c432fca625b601dac019ea96c70a6a4e76dec62a84f9b8be3aee8bac70fd24",
   "host": "darwin-arm64"
 }

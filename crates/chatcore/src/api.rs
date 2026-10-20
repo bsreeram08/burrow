@@ -200,6 +200,26 @@ pub fn mls_init_device(user_id: String, device_id: String, platform: String, iss
     })
 }
 
+/// This device's MLS leaf signature key (base64url), made on first use. A new device sends it in its link hello
+/// before it has a certificate.
+#[cfg(feature = "mls")]
+pub fn mls_device_leaf() -> Result<String> { with_groups(|groups, store| groups.device_leaf(store)) }
+
+/// The account a companion core is linked to (user id and pinned public identity); `None` on a primary.
+#[cfg(feature = "mls")]
+pub fn account() -> Result<Option<Account>> { with(|core| core.account()) }
+
+/// The device re-signs its own, unchanged leaf under the identity this core now holds (after a succession, or to
+/// refresh a certificate). A primary only.
+#[cfg(feature = "mls")]
+pub fn mls_recertify(platform: String, issued_at_ms: u64) -> Result<DeviceCert> {
+    with(|core| {
+        let aik = core.account_signing_key()?;
+        let (groups, store) = core.groups()?;
+        groups.recertify_device(store, &platform, issued_at_ms, &aik)
+    })
+}
+
 /// KeyPackages for the server: `count` one-time ones (1–100), or one last-resort one.
 #[cfg(feature = "mls")]
 pub fn mls_key_packages(count: u32, last_resort: bool) -> Result<Vec<String>> {

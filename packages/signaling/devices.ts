@@ -100,7 +100,7 @@ export function createDevices(deps: Deps) {
      * void: every device drops to pending and a fresh placeholder primary takes the waiting envelopes until the
      * new key holder publishes list v1. Sessions stay signed in, as before.
      */
-    function identityChanged(userId: string) {
+    function identityChanged(userId: string, event = 'keys-put') {
         db.transaction(() => {
             const old = live(userId).map(row => row.id);
             db.query('DELETE FROM device_lists WHERE user_id = ?').run(userId);
@@ -108,8 +108,12 @@ export function createDevices(deps: Deps) {
             const next = primary(userId);
             for (const id of old) db.query('UPDATE device_inbox SET device_id = ? WHERE device_id = ?').run(next, id);
         })();
+        db.query('INSERT OR REPLACE INTO identity_changes (user_id, aik, event, at) VALUES (?, ?, ?, ?)').run(userId, aikOf(userId) ?? '', event, now());
         announceChange(userId);
     }
+
+    /** The last authenticated identity change for the user, which is what lets the MLS validator re-pin their key. */
+    const identityChange = (userId: string) => db.query<{ aik: string; event: string }, [string]>('SELECT aik, event FROM identity_changes WHERE user_id = ?').get(userId);
 
     /** A new signed list from the account's identity-key holder. Returns [status, body]. */
     function publish(user: Caller, body: Record<string, any> | null): [number, object] {
@@ -370,6 +374,6 @@ export function createDevices(deps: Deps) {
 
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, identityChanged, touch, sessionDevice, eligible, sigKey, aikOf };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, identityChanged, identityChange, touch, sessionDevice, eligible, sigKey, aikOf };
 }
 export type Devices = ReturnType<typeof createDevices>;

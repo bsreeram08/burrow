@@ -7,7 +7,7 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`
+// These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 /// Opens the account's key database, sealed with `store_key` (32 bytes from the platform keystore).
 /// `expect_existing`: the keystore already held this key, so the database must exist (fails closed otherwise).
@@ -137,6 +137,113 @@ String sasCode({
   peerNonce: peerNonce,
 );
 
+Future<MlsDeviceCert> mlsInitDevice({
+  required String userId,
+  required String deviceId,
+  required String platform,
+  required BigInt issuedAtMs,
+}) => RustLib.instance.api.crateApiMlsInitDevice(
+  userId: userId,
+  deviceId: deviceId,
+  platform: platform,
+  issuedAtMs: issuedAtMs,
+);
+
+/// `count` one-time KeyPackages (1-100), or one last-resort one.
+Future<List<String>> mlsKeyPackages({
+  required int count,
+  required bool lastResort,
+}) => RustLib.instance.api.crateApiMlsKeyPackages(
+  count: count,
+  lastResort: lastResort,
+);
+
+Future<MlsGroupView> mlsCreateGroup({
+  required String groupId,
+  required MlsRoles roles,
+}) =>
+    RustLib.instance.api.crateApiMlsCreateGroup(groupId: groupId, roles: roles);
+
+/// Builds a commit and keeps it pending: `mls_merge_own` once the delivery service accepted it, `mls_clear_own` on a conflict.
+Future<MlsOutgoing> mlsCommit({
+  required String groupId,
+  required List<String> adds,
+  required List<MlsRemoval> removes,
+  MlsRoles? roles,
+  required bool update,
+}) => RustLib.instance.api.crateApiMlsCommit(
+  groupId: groupId,
+  adds: adds,
+  removes: removes,
+  roles: roles,
+  update: update,
+);
+
+Future<MlsGroupView> mlsMergeOwn({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsMergeOwn(groupId: groupId);
+
+Future<void> mlsClearOwn({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsClearOwn(groupId: groupId);
+
+Future<MlsPendingCommit?> mlsPendingCommit({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsPendingCommit(groupId: groupId);
+
+Future<MlsGroupView> mlsJoin({required String welcome, required String tree}) =>
+    RustLib.instance.api.crateApiMlsJoin(welcome: welcome, tree: tree);
+
+Future<MlsOutgoing> mlsJoinExternal({
+  required String groupInfo,
+  required String tree,
+}) => RustLib.instance.api.crateApiMlsJoinExternal(
+  groupInfo: groupInfo,
+  tree: tree,
+);
+
+Future<void> mlsForgetGroup({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsForgetGroup(groupId: groupId);
+
+Future<String> mlsEncrypt({
+  required String groupId,
+  required String plaintext,
+}) => RustLib.instance.api.crateApiMlsEncrypt(
+  groupId: groupId,
+  plaintext: plaintext,
+);
+
+Future<MlsProcessed> mlsReceive({
+  required String groupId,
+  required String message,
+}) =>
+    RustLib.instance.api.crateApiMlsReceive(groupId: groupId, message: message);
+
+Future<void> mlsReceiveCommit({required String pendingId}) =>
+    RustLib.instance.api.crateApiMlsReceiveCommit(pendingId: pendingId);
+
+Future<void> mlsReceiveAbort({required String pendingId}) =>
+    RustLib.instance.api.crateApiMlsReceiveAbort(pendingId: pendingId);
+
+Future<List<MlsMember>> mlsMembers({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsMembers(groupId: groupId);
+
+Future<MlsRoles> mlsRoles({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsRoles(groupId: groupId);
+
+Future<MlsGroupView> mlsGroupView({required String groupId}) =>
+    RustLib.instance.api.crateApiMlsGroupView(groupId: groupId);
+
+/// Validates one decrypted payload against the v2 schema and the sender's authority; returns its type.
+Future<String> mlsValidatePayload({
+  required String payloadJson,
+  required String sender,
+  required bool senderIsAdmin,
+  String? targetSender,
+}) => RustLib.instance.api.crateApiMlsValidatePayload(
+  payloadJson: payloadJson,
+  sender: sender,
+  senderIsAdmin: senderIsAdmin,
+  targetSender: targetSender,
+);
+
 /// A core failure. `code` is the web client's vocabulary (replay, malformed, auth, …); `None` is transient.
 class CoreError implements FrbException {
   final String? code;
@@ -207,6 +314,257 @@ class Identity {
           runtimeType == other.runtimeType &&
           dh == other.dh &&
           sign == other.sign;
+}
+
+/// This device's group credential: a certificate for its leaf key, signed by the account identity key.
+class MlsDeviceCert {
+  final String userId;
+  final String deviceId;
+  final String platform;
+  final String leafSigKey;
+  final String aikSign;
+  final BigInt issuedAt;
+
+  const MlsDeviceCert({
+    required this.userId,
+    required this.deviceId,
+    required this.platform,
+    required this.leafSigKey,
+    required this.aikSign,
+    required this.issuedAt,
+  });
+
+  @override
+  int get hashCode =>
+      userId.hashCode ^
+      deviceId.hashCode ^
+      platform.hashCode ^
+      leafSigKey.hashCode ^
+      aikSign.hashCode ^
+      issuedAt.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsDeviceCert &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          deviceId == other.deviceId &&
+          platform == other.platform &&
+          leafSigKey == other.leafSigKey &&
+          aikSign == other.aikSign &&
+          issuedAt == other.issuedAt;
+}
+
+/// Public state after a change: the signed GroupInfo and the ratchet tree, for the delivery service and joiners.
+class MlsGroupView {
+  final String groupId;
+  final BigInt epoch;
+  final String groupInfo;
+  final String tree;
+
+  const MlsGroupView({
+    required this.groupId,
+    required this.epoch,
+    required this.groupInfo,
+    required this.tree,
+  });
+
+  @override
+  int get hashCode =>
+      groupId.hashCode ^ epoch.hashCode ^ groupInfo.hashCode ^ tree.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsGroupView &&
+          runtimeType == other.runtimeType &&
+          groupId == other.groupId &&
+          epoch == other.epoch &&
+          groupInfo == other.groupInfo &&
+          tree == other.tree;
+}
+
+enum MlsJoinPolicy { open, invite }
+
+enum MlsKind { group, dm }
+
+class MlsMember {
+  final int leaf;
+  final String userId;
+  final String deviceId;
+  final String platform;
+  final bool admin;
+
+  const MlsMember({
+    required this.leaf,
+    required this.userId,
+    required this.deviceId,
+    required this.platform,
+    required this.admin,
+  });
+
+  @override
+  int get hashCode =>
+      leaf.hashCode ^
+      userId.hashCode ^
+      deviceId.hashCode ^
+      platform.hashCode ^
+      admin.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsMember &&
+          runtimeType == other.runtimeType &&
+          leaf == other.leaf &&
+          userId == other.userId &&
+          deviceId == other.deviceId &&
+          platform == other.platform &&
+          admin == other.admin;
+}
+
+/// A commit to submit to the delivery service for `epoch`, with the Welcome for added devices.
+class MlsOutgoing {
+  final String groupId;
+  final String commit;
+  final String? welcome;
+  final String digest;
+  final BigInt epoch;
+
+  const MlsOutgoing({
+    required this.groupId,
+    required this.commit,
+    this.welcome,
+    required this.digest,
+    required this.epoch,
+  });
+
+  @override
+  int get hashCode =>
+      groupId.hashCode ^
+      commit.hashCode ^
+      welcome.hashCode ^
+      digest.hashCode ^
+      epoch.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsOutgoing &&
+          runtimeType == other.runtimeType &&
+          groupId == other.groupId &&
+          commit == other.commit &&
+          welcome == other.welcome &&
+          digest == other.digest &&
+          epoch == other.epoch;
+}
+
+class MlsPendingCommit {
+  final String digest;
+  final BigInt epoch;
+
+  const MlsPendingCommit({required this.digest, required this.epoch});
+
+  @override
+  int get hashCode => digest.hashCode ^ epoch.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsPendingCommit &&
+          runtimeType == other.runtimeType &&
+          digest == other.digest &&
+          epoch == other.epoch;
+}
+
+/// One log entry, authenticated and decrypted but not persisted: store it, then `mls_receive_commit`.
+/// `kind`: `application`, `commit` (another member's), `own` (our pending commit, found in the log), `removed`.
+class MlsProcessed {
+  final String pendingId;
+  final String kind;
+  final String? plaintext;
+  final MlsMember sender;
+  final BigInt epoch;
+  final String? digest;
+
+  const MlsProcessed({
+    required this.pendingId,
+    required this.kind,
+    this.plaintext,
+    required this.sender,
+    required this.epoch,
+    this.digest,
+  });
+
+  @override
+  int get hashCode =>
+      pendingId.hashCode ^
+      kind.hashCode ^
+      plaintext.hashCode ^
+      sender.hashCode ^
+      epoch.hashCode ^
+      digest.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsProcessed &&
+          runtimeType == other.runtimeType &&
+          pendingId == other.pendingId &&
+          kind == other.kind &&
+          plaintext == other.plaintext &&
+          sender == other.sender &&
+          epoch == other.epoch &&
+          digest == other.digest;
+}
+
+/// One device to remove; every device of the user when `device_id` is `None`.
+class MlsRemoval {
+  final String userId;
+  final String? deviceId;
+
+  const MlsRemoval({required this.userId, this.deviceId});
+
+  @override
+  int get hashCode => userId.hashCode ^ deviceId.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsRemoval &&
+          runtimeType == other.runtimeType &&
+          userId == other.userId &&
+          deviceId == other.deviceId;
+}
+
+/// The group's `roles` extension: who administers it, who may add people, and for a DM its two users.
+class MlsRoles {
+  final MlsKind kind;
+  final List<String> admins;
+  final MlsJoinPolicy joinPolicy;
+  final List<String>? dm;
+
+  const MlsRoles({
+    required this.kind,
+    required this.admins,
+    required this.joinPolicy,
+    this.dm,
+  });
+
+  @override
+  int get hashCode =>
+      kind.hashCode ^ admins.hashCode ^ joinPolicy.hashCode ^ dm.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MlsRoles &&
+          runtimeType == other.runtimeType &&
+          kind == other.kind &&
+          admins == other.admins &&
+          joinPolicy == other.joinPolicy &&
+          dm == other.dm;
 }
 
 class Safety {

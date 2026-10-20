@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -1656451853;
+  int get rustContentHash => 1979869076;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -108,6 +108,76 @@ abstract class RustLibApi extends BaseApi {
     required String dbPath,
     required List<int> storeKey,
     required bool expectExisting,
+  });
+
+  Future<void> crateApiMlsClearOwn({required String groupId});
+
+  Future<MlsOutgoing> crateApiMlsCommit({
+    required String groupId,
+    required List<String> adds,
+    required List<MlsRemoval> removes,
+    MlsRoles? roles,
+    required bool update,
+  });
+
+  Future<MlsGroupView> crateApiMlsCreateGroup({
+    required String groupId,
+    required MlsRoles roles,
+  });
+
+  Future<String> crateApiMlsEncrypt({
+    required String groupId,
+    required String plaintext,
+  });
+
+  Future<void> crateApiMlsForgetGroup({required String groupId});
+
+  Future<MlsGroupView> crateApiMlsGroupView({required String groupId});
+
+  Future<MlsDeviceCert> crateApiMlsInitDevice({
+    required String userId,
+    required String deviceId,
+    required String platform,
+    required BigInt issuedAtMs,
+  });
+
+  Future<MlsGroupView> crateApiMlsJoin({
+    required String welcome,
+    required String tree,
+  });
+
+  Future<MlsOutgoing> crateApiMlsJoinExternal({
+    required String groupInfo,
+    required String tree,
+  });
+
+  Future<List<String>> crateApiMlsKeyPackages({
+    required int count,
+    required bool lastResort,
+  });
+
+  Future<List<MlsMember>> crateApiMlsMembers({required String groupId});
+
+  Future<MlsGroupView> crateApiMlsMergeOwn({required String groupId});
+
+  Future<MlsPendingCommit?> crateApiMlsPendingCommit({required String groupId});
+
+  Future<MlsProcessed> crateApiMlsReceive({
+    required String groupId,
+    required String message,
+  });
+
+  Future<void> crateApiMlsReceiveAbort({required String pendingId});
+
+  Future<void> crateApiMlsReceiveCommit({required String pendingId});
+
+  Future<MlsRoles> crateApiMlsRoles({required String groupId});
+
+  Future<String> crateApiMlsValidatePayload({
+    required String payloadJson,
+    required String sender,
+    required bool senderIsAdmin,
+    String? targetSender,
   });
 
   Future<void> crateApiNotePeer({
@@ -426,6 +496,584 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   );
 
   @override
+  Future<void> crateApiMlsClearOwn({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 9,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsClearOwnConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsClearOwnConstMeta =>
+      const TaskConstMeta(debugName: "mls_clear_own", argNames: ["groupId"]);
+
+  @override
+  Future<MlsOutgoing> crateApiMlsCommit({
+    required String groupId,
+    required List<String> adds,
+    required List<MlsRemoval> removes,
+    MlsRoles? roles,
+    required bool update,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          sse_encode_list_String(adds, serializer);
+          sse_encode_list_mls_removal(removes, serializer);
+          sse_encode_opt_box_autoadd_mls_roles(roles, serializer);
+          sse_encode_bool(update, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 10,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_outgoing,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsCommitConstMeta,
+        argValues: [groupId, adds, removes, roles, update],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsCommitConstMeta => const TaskConstMeta(
+    debugName: "mls_commit",
+    argNames: ["groupId", "adds", "removes", "roles", "update"],
+  );
+
+  @override
+  Future<MlsGroupView> crateApiMlsCreateGroup({
+    required String groupId,
+    required MlsRoles roles,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          sse_encode_box_autoadd_mls_roles(roles, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 11,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_group_view,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsCreateGroupConstMeta,
+        argValues: [groupId, roles],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsCreateGroupConstMeta => const TaskConstMeta(
+    debugName: "mls_create_group",
+    argNames: ["groupId", "roles"],
+  );
+
+  @override
+  Future<String> crateApiMlsEncrypt({
+    required String groupId,
+    required String plaintext,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          sse_encode_String(plaintext, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 12,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsEncryptConstMeta,
+        argValues: [groupId, plaintext],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsEncryptConstMeta => const TaskConstMeta(
+    debugName: "mls_encrypt",
+    argNames: ["groupId", "plaintext"],
+  );
+
+  @override
+  Future<void> crateApiMlsForgetGroup({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 13,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsForgetGroupConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsForgetGroupConstMeta =>
+      const TaskConstMeta(debugName: "mls_forget_group", argNames: ["groupId"]);
+
+  @override
+  Future<MlsGroupView> crateApiMlsGroupView({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 14,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_group_view,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsGroupViewConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsGroupViewConstMeta =>
+      const TaskConstMeta(debugName: "mls_group_view", argNames: ["groupId"]);
+
+  @override
+  Future<MlsDeviceCert> crateApiMlsInitDevice({
+    required String userId,
+    required String deviceId,
+    required String platform,
+    required BigInt issuedAtMs,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(userId, serializer);
+          sse_encode_String(deviceId, serializer);
+          sse_encode_String(platform, serializer);
+          sse_encode_u_64(issuedAtMs, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 15,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_device_cert,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsInitDeviceConstMeta,
+        argValues: [userId, deviceId, platform, issuedAtMs],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsInitDeviceConstMeta => const TaskConstMeta(
+    debugName: "mls_init_device",
+    argNames: ["userId", "deviceId", "platform", "issuedAtMs"],
+  );
+
+  @override
+  Future<MlsGroupView> crateApiMlsJoin({
+    required String welcome,
+    required String tree,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(welcome, serializer);
+          sse_encode_String(tree, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 16,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_group_view,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsJoinConstMeta,
+        argValues: [welcome, tree],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsJoinConstMeta =>
+      const TaskConstMeta(debugName: "mls_join", argNames: ["welcome", "tree"]);
+
+  @override
+  Future<MlsOutgoing> crateApiMlsJoinExternal({
+    required String groupInfo,
+    required String tree,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupInfo, serializer);
+          sse_encode_String(tree, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 17,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_outgoing,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsJoinExternalConstMeta,
+        argValues: [groupInfo, tree],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsJoinExternalConstMeta => const TaskConstMeta(
+    debugName: "mls_join_external",
+    argNames: ["groupInfo", "tree"],
+  );
+
+  @override
+  Future<List<String>> crateApiMlsKeyPackages({
+    required int count,
+    required bool lastResort,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_u_32(count, serializer);
+          sse_encode_bool(lastResort, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 18,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_String,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsKeyPackagesConstMeta,
+        argValues: [count, lastResort],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsKeyPackagesConstMeta => const TaskConstMeta(
+    debugName: "mls_key_packages",
+    argNames: ["count", "lastResort"],
+  );
+
+  @override
+  Future<List<MlsMember>> crateApiMlsMembers({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 19,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_list_mls_member,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsMembersConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsMembersConstMeta =>
+      const TaskConstMeta(debugName: "mls_members", argNames: ["groupId"]);
+
+  @override
+  Future<MlsGroupView> crateApiMlsMergeOwn({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 20,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_group_view,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsMergeOwnConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsMergeOwnConstMeta =>
+      const TaskConstMeta(debugName: "mls_merge_own", argNames: ["groupId"]);
+
+  @override
+  Future<MlsPendingCommit?> crateApiMlsPendingCommit({
+    required String groupId,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 21,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_opt_box_autoadd_mls_pending_commit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsPendingCommitConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsPendingCommitConstMeta => const TaskConstMeta(
+    debugName: "mls_pending_commit",
+    argNames: ["groupId"],
+  );
+
+  @override
+  Future<MlsProcessed> crateApiMlsReceive({
+    required String groupId,
+    required String message,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          sse_encode_String(message, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 22,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_processed,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsReceiveConstMeta,
+        argValues: [groupId, message],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsReceiveConstMeta => const TaskConstMeta(
+    debugName: "mls_receive",
+    argNames: ["groupId", "message"],
+  );
+
+  @override
+  Future<void> crateApiMlsReceiveAbort({required String pendingId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(pendingId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 23,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsReceiveAbortConstMeta,
+        argValues: [pendingId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsReceiveAbortConstMeta => const TaskConstMeta(
+    debugName: "mls_receive_abort",
+    argNames: ["pendingId"],
+  );
+
+  @override
+  Future<void> crateApiMlsReceiveCommit({required String pendingId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(pendingId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 24,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsReceiveCommitConstMeta,
+        argValues: [pendingId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsReceiveCommitConstMeta => const TaskConstMeta(
+    debugName: "mls_receive_commit",
+    argNames: ["pendingId"],
+  );
+
+  @override
+  Future<MlsRoles> crateApiMlsRoles({required String groupId}) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(groupId, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 25,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_mls_roles,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsRolesConstMeta,
+        argValues: [groupId],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsRolesConstMeta =>
+      const TaskConstMeta(debugName: "mls_roles", argNames: ["groupId"]);
+
+  @override
+  Future<String> crateApiMlsValidatePayload({
+    required String payloadJson,
+    required String sender,
+    required bool senderIsAdmin,
+    String? targetSender,
+  }) {
+    return handler.executeNormal(
+      NormalTask(
+        callFfi: (port_) {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_String(payloadJson, serializer);
+          sse_encode_String(sender, serializer);
+          sse_encode_bool(senderIsAdmin, serializer);
+          sse_encode_opt_String(targetSender, serializer);
+          pdeCallFfi(
+            generalizedFrbRustBinding,
+            serializer,
+            funcId: 26,
+            port: port_,
+          );
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_String,
+          decodeErrorData: sse_decode_core_error,
+        ),
+        constMeta: kCrateApiMlsValidatePayloadConstMeta,
+        argValues: [payloadJson, sender, senderIsAdmin, targetSender],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiMlsValidatePayloadConstMeta => const TaskConstMeta(
+    debugName: "mls_validate_payload",
+    argNames: ["payloadJson", "sender", "senderIsAdmin", "targetSender"],
+  );
+
+  @override
   Future<void> crateApiNotePeer({
     required String contactId,
     required Identity identity,
@@ -439,7 +1087,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 9,
+            funcId: 27,
             port: port_,
           );
         },
@@ -469,7 +1117,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 10,
+            funcId: 28,
             port: port_,
           );
         },
@@ -497,7 +1145,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 11,
+            funcId: 29,
             port: port_,
           );
         },
@@ -531,7 +1179,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 12,
+            funcId: 30,
             port: port_,
           );
         },
@@ -560,7 +1208,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 13,
+            funcId: 31,
             port: port_,
           );
         },
@@ -588,7 +1236,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 14,
+            funcId: 32,
             port: port_,
           );
         },
@@ -617,7 +1265,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_u_64(mine, serializer);
           sse_encode_u_64(theirs, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 15)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 33)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_u_64,
@@ -651,7 +1299,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 16,
+            funcId: 34,
             port: port_,
           );
         },
@@ -682,7 +1330,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(peerCommitment, serializer);
           sse_encode_String(peerNonce, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 17)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 35)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_bool,
@@ -715,7 +1363,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           sse_encode_String(remoteSdp, serializer);
           sse_encode_String(myNonce, serializer);
           sse_encode_String(peerNonce, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 18)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 36)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -740,7 +1388,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(nonce, serializer);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 19)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 37)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -762,7 +1410,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       SyncTask(
         callFfi: () {
           final serializer = SseSerializer(generalizedFrbRustBinding);
-          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 20)!;
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 38)!;
         },
         codec: SseCodec(
           decodeSuccessData: sse_decode_String,
@@ -788,7 +1436,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 21,
+            funcId: 39,
             port: port_,
           );
         },
@@ -820,7 +1468,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
-            funcId: 22,
+            funcId: 40,
             port: port_,
           );
         },
@@ -856,6 +1504,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Identity dco_decode_box_autoadd_identity(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_identity(raw);
+  }
+
+  @protected
+  MlsPendingCommit dco_decode_box_autoadd_mls_pending_commit(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_mls_pending_commit(raw);
+  }
+
+  @protected
+  MlsRoles dco_decode_box_autoadd_mls_roles(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_mls_roles(raw);
   }
 
   @protected
@@ -898,6 +1558,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int dco_decode_i_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
+  }
+
+  @protected
   Identity dco_decode_identity(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     final arr = raw as List<dynamic>;
@@ -907,6 +1573,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       dh: dco_decode_String(arr[0]),
       sign: dco_decode_String(arr[1]),
     );
+  }
+
+  @protected
+  List<String> dco_decode_list_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_String).toList();
+  }
+
+  @protected
+  List<MlsMember> dco_decode_list_mls_member(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_mls_member).toList();
+  }
+
+  @protected
+  List<MlsRemoval> dco_decode_list_mls_removal(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return (raw as List<dynamic>).map(dco_decode_mls_removal).toList();
   }
 
   @protected
@@ -922,6 +1606,132 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsDeviceCert dco_decode_mls_device_cert(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return MlsDeviceCert(
+      userId: dco_decode_String(arr[0]),
+      deviceId: dco_decode_String(arr[1]),
+      platform: dco_decode_String(arr[2]),
+      leafSigKey: dco_decode_String(arr[3]),
+      aikSign: dco_decode_String(arr[4]),
+      issuedAt: dco_decode_u_64(arr[5]),
+    );
+  }
+
+  @protected
+  MlsGroupView dco_decode_mls_group_view(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return MlsGroupView(
+      groupId: dco_decode_String(arr[0]),
+      epoch: dco_decode_u_64(arr[1]),
+      groupInfo: dco_decode_String(arr[2]),
+      tree: dco_decode_String(arr[3]),
+    );
+  }
+
+  @protected
+  MlsJoinPolicy dco_decode_mls_join_policy(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return MlsJoinPolicy.values[raw as int];
+  }
+
+  @protected
+  MlsKind dco_decode_mls_kind(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return MlsKind.values[raw as int];
+  }
+
+  @protected
+  MlsMember dco_decode_mls_member(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    return MlsMember(
+      leaf: dco_decode_u_32(arr[0]),
+      userId: dco_decode_String(arr[1]),
+      deviceId: dco_decode_String(arr[2]),
+      platform: dco_decode_String(arr[3]),
+      admin: dco_decode_bool(arr[4]),
+    );
+  }
+
+  @protected
+  MlsOutgoing dco_decode_mls_outgoing(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 5)
+      throw Exception('unexpected arr length: expect 5 but see ${arr.length}');
+    return MlsOutgoing(
+      groupId: dco_decode_String(arr[0]),
+      commit: dco_decode_String(arr[1]),
+      welcome: dco_decode_opt_String(arr[2]),
+      digest: dco_decode_String(arr[3]),
+      epoch: dco_decode_u_64(arr[4]),
+    );
+  }
+
+  @protected
+  MlsPendingCommit dco_decode_mls_pending_commit(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return MlsPendingCommit(
+      digest: dco_decode_String(arr[0]),
+      epoch: dco_decode_u_64(arr[1]),
+    );
+  }
+
+  @protected
+  MlsProcessed dco_decode_mls_processed(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 6)
+      throw Exception('unexpected arr length: expect 6 but see ${arr.length}');
+    return MlsProcessed(
+      pendingId: dco_decode_String(arr[0]),
+      kind: dco_decode_String(arr[1]),
+      plaintext: dco_decode_opt_String(arr[2]),
+      sender: dco_decode_mls_member(arr[3]),
+      epoch: dco_decode_u_64(arr[4]),
+      digest: dco_decode_opt_String(arr[5]),
+    );
+  }
+
+  @protected
+  MlsRemoval dco_decode_mls_removal(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 2)
+      throw Exception('unexpected arr length: expect 2 but see ${arr.length}');
+    return MlsRemoval(
+      userId: dco_decode_String(arr[0]),
+      deviceId: dco_decode_opt_String(arr[1]),
+    );
+  }
+
+  @protected
+  MlsRoles dco_decode_mls_roles(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    final arr = raw as List<dynamic>;
+    if (arr.length != 4)
+      throw Exception('unexpected arr length: expect 4 but see ${arr.length}');
+    return MlsRoles(
+      kind: dco_decode_mls_kind(arr[0]),
+      admins: dco_decode_list_String(arr[1]),
+      joinPolicy: dco_decode_mls_join_policy(arr[2]),
+      dm: dco_decode_opt_list_String(arr[3]),
+    );
+  }
+
+  @protected
   String? dco_decode_opt_String(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_String(raw);
@@ -934,6 +1744,18 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsPendingCommit? dco_decode_opt_box_autoadd_mls_pending_commit(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_mls_pending_commit(raw);
+  }
+
+  @protected
+  MlsRoles? dco_decode_opt_box_autoadd_mls_roles(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_mls_roles(raw);
+  }
+
+  @protected
   Safety? dco_decode_opt_box_autoadd_safety(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_safety(raw);
@@ -943,6 +1765,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   SessionInfo? dco_decode_opt_box_autoadd_session_info(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_session_info(raw);
+  }
+
+  @protected
+  List<String>? dco_decode_opt_list_String(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_list_String(raw);
   }
 
   @protected
@@ -969,6 +1797,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       sid: dco_decode_String(arr[0]),
       startedAt: dco_decode_u_64(arr[1]),
     );
+  }
+
+  @protected
+  int dco_decode_u_32(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw as int;
   }
 
   @protected
@@ -1006,6 +1840,20 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_identity(deserializer));
+  }
+
+  @protected
+  MlsPendingCommit sse_decode_box_autoadd_mls_pending_commit(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_mls_pending_commit(deserializer));
+  }
+
+  @protected
+  MlsRoles sse_decode_box_autoadd_mls_roles(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_mls_roles(deserializer));
   }
 
   @protected
@@ -1048,11 +1896,53 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int sse_decode_i_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getInt32();
+  }
+
+  @protected
   Identity sse_decode_identity(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_dh = sse_decode_String(deserializer);
     var var_sign = sse_decode_String(deserializer);
     return Identity(dh: var_dh, sign: var_sign);
+  }
+
+  @protected
+  List<String> sse_decode_list_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <String>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_String(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<MlsMember> sse_decode_list_mls_member(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <MlsMember>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_mls_member(deserializer));
+    }
+    return ans_;
+  }
+
+  @protected
+  List<MlsRemoval> sse_decode_list_mls_removal(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    var len_ = sse_decode_i_32(deserializer);
+    var ans_ = <MlsRemoval>[];
+    for (var idx_ = 0; idx_ < len_; ++idx_) {
+      ans_.add(sse_decode_mls_removal(deserializer));
+    }
+    return ans_;
   }
 
   @protected
@@ -1067,6 +1957,138 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var len_ = sse_decode_i_32(deserializer);
     return deserializer.buffer.getUint8List(len_);
+  }
+
+  @protected
+  MlsDeviceCert sse_decode_mls_device_cert(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_userId = sse_decode_String(deserializer);
+    var var_deviceId = sse_decode_String(deserializer);
+    var var_platform = sse_decode_String(deserializer);
+    var var_leafSigKey = sse_decode_String(deserializer);
+    var var_aikSign = sse_decode_String(deserializer);
+    var var_issuedAt = sse_decode_u_64(deserializer);
+    return MlsDeviceCert(
+      userId: var_userId,
+      deviceId: var_deviceId,
+      platform: var_platform,
+      leafSigKey: var_leafSigKey,
+      aikSign: var_aikSign,
+      issuedAt: var_issuedAt,
+    );
+  }
+
+  @protected
+  MlsGroupView sse_decode_mls_group_view(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_groupId = sse_decode_String(deserializer);
+    var var_epoch = sse_decode_u_64(deserializer);
+    var var_groupInfo = sse_decode_String(deserializer);
+    var var_tree = sse_decode_String(deserializer);
+    return MlsGroupView(
+      groupId: var_groupId,
+      epoch: var_epoch,
+      groupInfo: var_groupInfo,
+      tree: var_tree,
+    );
+  }
+
+  @protected
+  MlsJoinPolicy sse_decode_mls_join_policy(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return MlsJoinPolicy.values[inner];
+  }
+
+  @protected
+  MlsKind sse_decode_mls_kind(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return MlsKind.values[inner];
+  }
+
+  @protected
+  MlsMember sse_decode_mls_member(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_leaf = sse_decode_u_32(deserializer);
+    var var_userId = sse_decode_String(deserializer);
+    var var_deviceId = sse_decode_String(deserializer);
+    var var_platform = sse_decode_String(deserializer);
+    var var_admin = sse_decode_bool(deserializer);
+    return MlsMember(
+      leaf: var_leaf,
+      userId: var_userId,
+      deviceId: var_deviceId,
+      platform: var_platform,
+      admin: var_admin,
+    );
+  }
+
+  @protected
+  MlsOutgoing sse_decode_mls_outgoing(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_groupId = sse_decode_String(deserializer);
+    var var_commit = sse_decode_String(deserializer);
+    var var_welcome = sse_decode_opt_String(deserializer);
+    var var_digest = sse_decode_String(deserializer);
+    var var_epoch = sse_decode_u_64(deserializer);
+    return MlsOutgoing(
+      groupId: var_groupId,
+      commit: var_commit,
+      welcome: var_welcome,
+      digest: var_digest,
+      epoch: var_epoch,
+    );
+  }
+
+  @protected
+  MlsPendingCommit sse_decode_mls_pending_commit(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_digest = sse_decode_String(deserializer);
+    var var_epoch = sse_decode_u_64(deserializer);
+    return MlsPendingCommit(digest: var_digest, epoch: var_epoch);
+  }
+
+  @protected
+  MlsProcessed sse_decode_mls_processed(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_pendingId = sse_decode_String(deserializer);
+    var var_kind = sse_decode_String(deserializer);
+    var var_plaintext = sse_decode_opt_String(deserializer);
+    var var_sender = sse_decode_mls_member(deserializer);
+    var var_epoch = sse_decode_u_64(deserializer);
+    var var_digest = sse_decode_opt_String(deserializer);
+    return MlsProcessed(
+      pendingId: var_pendingId,
+      kind: var_kind,
+      plaintext: var_plaintext,
+      sender: var_sender,
+      epoch: var_epoch,
+      digest: var_digest,
+    );
+  }
+
+  @protected
+  MlsRemoval sse_decode_mls_removal(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_userId = sse_decode_String(deserializer);
+    var var_deviceId = sse_decode_opt_String(deserializer);
+    return MlsRemoval(userId: var_userId, deviceId: var_deviceId);
+  }
+
+  @protected
+  MlsRoles sse_decode_mls_roles(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var var_kind = sse_decode_mls_kind(deserializer);
+    var var_admins = sse_decode_list_String(deserializer);
+    var var_joinPolicy = sse_decode_mls_join_policy(deserializer);
+    var var_dm = sse_decode_opt_list_String(deserializer);
+    return MlsRoles(
+      kind: var_kind,
+      admins: var_admins,
+      joinPolicy: var_joinPolicy,
+      dm: var_dm,
+    );
   }
 
   @protected
@@ -1086,6 +2108,30 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
     if (sse_decode_bool(deserializer)) {
       return (sse_decode_box_autoadd_identity(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  MlsPendingCommit? sse_decode_opt_box_autoadd_mls_pending_commit(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_mls_pending_commit(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
+  MlsRoles? sse_decode_opt_box_autoadd_mls_roles(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_mls_roles(deserializer));
     } else {
       return null;
     }
@@ -1116,6 +2162,17 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  List<String>? sse_decode_opt_list_String(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_list_String(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   Safety sse_decode_safety(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_number = sse_decode_String(deserializer);
@@ -1139,6 +2196,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  int sse_decode_u_32(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return deserializer.buffer.getUint32();
+  }
+
+  @protected
   BigInt sse_decode_u_64(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return deserializer.buffer.getBigUint64();
@@ -1153,12 +2216,6 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_decode_unit(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  int sse_decode_i_32(SseDeserializer deserializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    return deserializer.buffer.getInt32();
   }
 
   @protected
@@ -1180,6 +2237,24 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_identity(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_mls_pending_commit(
+    MlsPendingCommit self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_mls_pending_commit(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_mls_roles(
+    MlsRoles self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_mls_roles(self, serializer);
   }
 
   @protected
@@ -1215,10 +2290,49 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_i_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putInt32(self);
+  }
+
+  @protected
   void sse_encode_identity(Identity self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.dh, serializer);
     sse_encode_String(self.sign, serializer);
+  }
+
+  @protected
+  void sse_encode_list_String(List<String> self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_String(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_mls_member(
+    List<MlsMember> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_mls_member(item, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_list_mls_removal(
+    List<MlsRemoval> self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.length, serializer);
+    for (final item in self) {
+      sse_encode_mls_removal(item, serializer);
+    }
   }
 
   @protected
@@ -1244,6 +2358,101 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_mls_device_cert(
+    MlsDeviceCert self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.userId, serializer);
+    sse_encode_String(self.deviceId, serializer);
+    sse_encode_String(self.platform, serializer);
+    sse_encode_String(self.leafSigKey, serializer);
+    sse_encode_String(self.aikSign, serializer);
+    sse_encode_u_64(self.issuedAt, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_group_view(MlsGroupView self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.groupId, serializer);
+    sse_encode_u_64(self.epoch, serializer);
+    sse_encode_String(self.groupInfo, serializer);
+    sse_encode_String(self.tree, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_join_policy(
+    MlsJoinPolicy self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_kind(MlsKind self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_member(MlsMember self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_u_32(self.leaf, serializer);
+    sse_encode_String(self.userId, serializer);
+    sse_encode_String(self.deviceId, serializer);
+    sse_encode_String(self.platform, serializer);
+    sse_encode_bool(self.admin, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_outgoing(MlsOutgoing self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.groupId, serializer);
+    sse_encode_String(self.commit, serializer);
+    sse_encode_opt_String(self.welcome, serializer);
+    sse_encode_String(self.digest, serializer);
+    sse_encode_u_64(self.epoch, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_pending_commit(
+    MlsPendingCommit self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.digest, serializer);
+    sse_encode_u_64(self.epoch, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_processed(MlsProcessed self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.pendingId, serializer);
+    sse_encode_String(self.kind, serializer);
+    sse_encode_opt_String(self.plaintext, serializer);
+    sse_encode_mls_member(self.sender, serializer);
+    sse_encode_u_64(self.epoch, serializer);
+    sse_encode_opt_String(self.digest, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_removal(MlsRemoval self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_String(self.userId, serializer);
+    sse_encode_opt_String(self.deviceId, serializer);
+  }
+
+  @protected
+  void sse_encode_mls_roles(MlsRoles self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_mls_kind(self.kind, serializer);
+    sse_encode_list_String(self.admins, serializer);
+    sse_encode_mls_join_policy(self.joinPolicy, serializer);
+    sse_encode_opt_list_String(self.dm, serializer);
+  }
+
+  @protected
   void sse_encode_opt_String(String? self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
 
@@ -1263,6 +2472,32 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_identity(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_pending_commit(
+    MlsPendingCommit? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_mls_pending_commit(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_roles(
+    MlsRoles? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_mls_roles(self, serializer);
     }
   }
 
@@ -1293,6 +2528,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_opt_list_String(
+    List<String>? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_list_String(self, serializer);
+    }
+  }
+
+  @protected
   void sse_encode_safety(Safety self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.number, serializer);
@@ -1306,6 +2554,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.sid, serializer);
     sse_encode_u_64(self.startedAt, serializer);
+  }
+
+  @protected
+  void sse_encode_u_32(int self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    serializer.buffer.putUint32(self);
   }
 
   @protected
@@ -1323,11 +2577,5 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   @protected
   void sse_encode_unit(void self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
-  }
-
-  @protected
-  void sse_encode_i_32(int self, SseSerializer serializer) {
-    // Codec=Sse (Serialization based), see doc to use other codecs
-    serializer.buffer.putInt32(self);
   }
 }

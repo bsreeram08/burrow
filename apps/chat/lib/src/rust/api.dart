@@ -513,6 +513,31 @@ Future<String> signSuccession({
   at: at,
 );
 
+/// A companion follows its account's succession (`record_json` without `signature`), installing `cert_json` (signed
+/// under the new key for this leaf) first when given. Returns the account's new identity.
+Future<Identity> adoptSuccession({
+  required String userId,
+  required String recordJson,
+  required String signature,
+  String? certJson,
+}) => RustLib.instance.api.crateApiAdoptSuccession(
+  userId: userId,
+  recordJson: recordJson,
+  signature: signature,
+  certJson: certJson,
+);
+
+/// New primary: whether a group it holds already has exactly this leaf key for that device of its account (m5 §5.2.2).
+Future<bool> mlsLeafKnown({
+  required String deviceId,
+  required String leafSigKey,
+  required List<String> groups,
+}) => RustLib.instance.api.crateApiMlsLeafKnown(
+  deviceId: deviceId,
+  leafSigKey: leafSigKey,
+  groups: groups,
+);
+
 /// Old primary steps down to a companion of the account under `new_identity`.
 Future<void> retireIdentity({
   required String userId,

@@ -15,7 +15,7 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; frozen?: { seq: number; digest: string } } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number } = {}) {
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
   const handlers: Record<string, (command: Cmd) => any> = {
@@ -40,6 +40,7 @@ function world(options: { log?: (after: number) => any[]; frozen?: { seq: number
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: BOB_DEV } : { resolved: 'dismiss' }]],
     ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
     ['PUT', /^\/api\/channels\/\w+\/group-info$/, () => [200, {}]],
+    ['POST', /^\/api\/channels\/\w+\/poison$/, () => options.poison === 429 ? [429, { error: 'Too many reports from this device. Try again later.' }] : [202, { frozen: true }]],
     ['POST', /^\/api\/channels\/\w+\/cursor$/, () => [200, {}]],
   ];
   async function fetch(path: string, init: any = {}) {
@@ -65,12 +66,13 @@ function world(options: { log?: (after: number) => any[]; frozen?: { seq: number
   context.window = context;
   for (const source of sources) runInNewContext(source, context);
   const Groups = context.Groups;
-  const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => null, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
-    contacts: () => [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {}, review() {} };
+  const dm = { peer: options.dmPeer ?? null };
+  const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
+    contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {} };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
   const settle = () => Bun.sleep(60);
-  return { Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
+  return { dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
     async start() { Groups.start(ctx); await until(() => Groups.enabled(), 'groups enabled'); await settle(); },
     of: (name: string) => calls.filter(command => command.cmd === name) };
 }
@@ -175,5 +177,45 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB }]);
     expect(w.of('setVerified')).toEqual([{ cmd: 'setVerified', contact: BOB, verified: true }]);
     expect(w.Groups.debug(G).status).not.toBe('paused');
+  });
+
+  test('5b. a contact whose key differs from the group store\'s is paused too; only an explicit decision accepts it', async () => {
+    const entry = { seq: 1, epoch: 3, kind: 'app', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('m'), createdAt: Date.now() };
+    const w = world({ contact: true, dmPeer: { identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: true, blocked: false }, log: after => after === 0 ? [entry] : [] });
+    await w.start();
+    await w.until(() => w.Groups.debug(G).status === 'paused', 'paused on the contact');
+    expect(w.of('notePeer')).toEqual([{ cmd: 'notePeer', contact: BOB, identity: { dh: 'dh2', sign: 'sign2' } }]);
+    expect(w.of('acceptChange')).toEqual([]);
+    // Accepting this exact code in the 1:1 safety sheet is the explicit decision; then the group resumes.
+    w.handlers.mlsReceive = () => application(text);
+    await w.Groups.contactAccepted(BOB);
+    expect(w.of('acceptChange')).toEqual([{ cmd: 'acceptChange', contact: BOB }]);
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'resumed');
+  });
+
+  test('3c. this device\'s own report (202 answers { frozen: true }) keeps the commit it froze on, and offers Rollback', async () => {
+    const entry = { seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('bad commit'), createdAt: Date.now() };
+    const w = world({ log: after => after <= 4 ? [entry] : [] });
+    w.handlers.mlsMembers = () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }];
+    w.handlers.mlsReceive = () => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    w.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false }); // the key the server publishes
+    await w.start();
+    w.Groups.open(G);
+    await w.until(() => !w.el('group-rollback').hidden, 'rollback offered');
+    expect(w.requests.find(request => request.path.endsWith('/poison'))!.body).toEqual({ seq: 5, digest: sha('bad commit') });
+    expect(w.el('group-banner-text').textContent).toContain('rejects it too');
+  });
+
+  test('3d. a rate-limited report is retried later: the device neither freezes on its own nor rejoins', async () => {
+    const entry = { seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('bad commit'), createdAt: Date.now() };
+    const w = world({ log: after => after <= 4 ? [entry] : [], poison: 429 });
+    w.handlers.mlsReceive = () => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); };
+    w.setPeer({ identity: { dh: 'dh2', sign: 'sign2' }, verified: false, changed: false, blocked: false });
+    await w.start();
+    await w.until(() => w.requests.some(request => request.path.endsWith('/poison')), 'reported');
+    await w.settle();
+    expect(w.Groups.debug(G)).toMatchObject({ status: 'active', cursor: 0 }); // still before the commit, to report it again
+    expect(w.of('mlsForget')).toEqual([]);
+    expect(w.requests.filter(request => request.path.endsWith('/join-info') || request.path.endsWith('/join'))).toEqual([]);
   });
 });

@@ -769,10 +769,10 @@
   $('safety-verify').onclick = async () => {
     const safety = await box.safety(me.username, current.id, current.username);
     await box.setVerified(current.id, !safety.verified);
-    window.Groups?.pinsChanged(current.id); // Verifying also accepts a changed code: groups waiting on it resume.
+    window.Groups?.contactAccepted(current.id); // An explicit decision on this code: groups waiting on it resume.
     $('safety').hidden = true; updateBanner(); flushOutgoing();
   };
-  $('safety-accept').onclick = async () => { await box.acceptChange(current.id); window.Groups?.pinsChanged(current.id); $('safety').hidden = true; updateBanner(); flushOutgoing(); };
+  $('safety-accept').onclick = async () => { await box.acceptChange(current.id); window.Groups?.contactAccepted(current.id); $('safety').hidden = true; updateBanner(); flushOutgoing(); };
 
   // ---------- Contacts and chat list ----------
   async function loadContacts() {
@@ -930,7 +930,6 @@
       viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
       looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
       socket: () => events, openGroup,
-      review: async userId => { const contact = contactById(userId); if (contact) { await openConversation(contact); openSafety(); } },
     };
   }
   $('channels-new').onclick = () => window.Groups?.openNew('channel');

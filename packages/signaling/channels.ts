@@ -532,6 +532,8 @@ export function createChannels(deps: Deps) {
             throw error;
         }
         announce(channelId, { added, removed });
+        // Sequencing resumes for everyone (members who reported it are waiting for this, as after a dismissal).
+        for (const member of usersOf(members(channelId))) deps.notify(member, { type: 'channel', id: channelId, change: 'thawed' });
         // The author is still a leaf in the restored tree: an admin removes it with an ordinary commit.
         for (const admin of usersOf(members(channelId).filter(row => row.admin))) deps.notify(admin, { type: 'channel', id: channelId, change: 'remove-needed', deviceId: author! });
         return json({ resolved: 'rollback', epoch: channelRow(channelId)!.epoch, seq: body.seq - 1, removeDevice: author! });

@@ -40,7 +40,8 @@ export function clientCore(): { core: CoreClass } | { skip: string } {
     return { core: (createRequire(import.meta.url)(join(stamp, 'cc.js')) as { ChatCore: CoreClass }).ChatCore };
 }
 
-export class CoreError extends Error { constructor(message: string, readonly code: string | null) { super(message); } }
+/** `failureClass`: for a rejected commit (`poison`), whom it blames: 'signed-content' (its author) or 'tag' (nobody). */
+export class CoreError extends Error { constructor(message: string, readonly code: string | null, readonly failureClass: string | null = null) { super(message); } }
 
 /** One chatcore instance with its key database in memory. */
 export class Client {
@@ -48,9 +49,9 @@ export class Client {
     private core;
     constructor(private Core: CoreClass, rows: Record<string, unknown> = {}) { this.rows = { ...rows }; this.core = new Core(JSON.stringify(this.rows), false); }
     call(command: Record<string, unknown>): any {
-        const out = JSON.parse(this.core.call(JSON.stringify(command))) as { ok?: unknown; error?: string; code?: string | null; writes: ({ put: string; value: unknown } | { delete: string })[] };
+        const out = JSON.parse(this.core.call(JSON.stringify(command))) as { ok?: unknown; error?: string; code?: string | null; class?: string; writes: ({ put: string; value: unknown } | { delete: string })[] };
         for (const write of out.writes) { if ('put' in write) this.rows[write.put] = write.value; else delete this.rows[write.delete]; }
-        if (out.error !== undefined) throw new CoreError(out.error, out.code ?? null);
+        if (out.error !== undefined) throw new CoreError(out.error, out.code ?? null, out.class ?? null);
         return out.ok;
     }
     /** Another device of the same account: same identity key, its own store. */

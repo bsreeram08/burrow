@@ -644,6 +644,60 @@ suite('commit classification', () => {
     });
 });
 
+suite('signed-content removal (a faulty DS sequences what the validator would refuse)', () => {
+    test('members blame the author, an admin signs a rollback naming him, the server cuts that device off, members verify the notice and go on', async () => {
+        const w = await populated();
+        const digestOf = (message: string) => createHash('sha256').update(Buffer.from(message, 'base64url')).digest('hex');
+        // Bob's modified client (test build only) signs a commit that removes carol, which only an admin may do.
+        const evil = w.b1.client.call({ cmd: 'mlsTestUnchecked', group: w.channel, removes: [{ userId: w.carol.id }] });
+        w.b1.client.call({ cmd: 'mlsClearOwn', group: w.channel });
+        // An honest commit gives the server a real pre-commit snapshot; the faulty DS then logs bob's commit in its place.
+        const honest = await w.a1.commit(w.channel, { update: true });
+        expect(honest.status).toBe(201);
+        const seq = honest.body.seq as number, digest = digestOf(evil.commit);
+        run('UPDATE group_log SET message = ?, sender_user = ?, sender_device = ?, digest = ? WHERE channel_id = ? AND seq = ?', Buffer.from(evil.commit, 'base64url'), w.bob.id, w.b1.deviceId, digest, w.channel, seq);
+
+        // Two members process it from the log: both reject it as poison, blaming what its author signed.
+        for (const device of [w.a2, w.c1]) {
+            const entry = (await device.must('GET', `/api/channels/${w.channel}/log?after=${seq - 1}`)).entries[0];
+            let failure: any;
+            try { device.client.call({ cmd: 'mlsReceive', group: w.channel, message: entry.message, commit: false, expect: 'commit' }); } catch (error) { failure = error; }
+            expect(failure).toMatchObject({ code: 'poison', failureClass: 'signed-content' });
+            expect(failure.message).toContain(`poison ${digest}`);
+            expect(device.client.call({ cmd: 'mlsCommitAuthor', group: w.channel, message: entry.message })).toMatchObject({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { userId: w.bob.id, deviceId: w.b1.deviceId } });
+        }
+        const watch = w.c1.events(); await watch.opened;
+        expect((await w.c1.api('POST', `/api/channels/${w.channel}/poison`, { seq, digest })).status).toBe(202);
+
+        // The admin (a2) names the author its own tree authenticated, in both signatures: device key (server) and leaf key (members).
+        const author = w.b1.deviceId;
+        const leafSignature = w.a2.client.call({ cmd: 'mlsSignResolution', group: w.channel, action: 'rollback', seq, digest, author });
+        const done = await w.a2.api('POST', `/api/channels/${w.channel}/resolve`, { action: 'rollback', seq, digest, author, leafSignature, signature: w.a2.resolution(w.channel, 'rollback', seq, digest, author) });
+        expect(done).toMatchObject({ status: 200, body: { resolved: 'rollback', seq: seq - 1, removeDevice: author } });
+        expect(rows('SELECT device_id FROM channel_bans WHERE channel_id = ?', w.channel)).toEqual([{ device_id: author }]);
+        expect(rows('SELECT seq FROM group_log WHERE channel_id = ? AND seq = ?', w.channel, seq)).toEqual([]);
+        expect((await w.b1.api('GET', `/api/channels/${w.channel}/log`)).status).toBe(404); // cut off at once
+        expect((await w.b1.send(w.channel, 'still here?')).status).toBe(404);
+
+        // Carol's device checks the notice against its own tree: an admin of this group signed exactly this rollback.
+        let notice: any;
+        do { notice = await watch.next('channel'); } while (notice.change !== 'rolled-back');
+        expect(notice).toMatchObject({ action: 'rollback', seq, digest, author, by: w.a2.deviceId });
+        expect(w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: notice.action, seq: notice.seq, digest: notice.digest, author: notice.author, by: notice.by, signature: notice.signature })).toMatchObject({ userId: w.alice.id, deviceId: w.a2.deviceId });
+        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author: '', by: notice.by, signature: notice.signature })).toThrow(); // not what was signed
+        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author, by: w.b2.deviceId, signature: w.b2.client.call({ cmd: 'mlsSignResolution', group: w.channel, action: 'rollback', seq, digest, author }) })).toThrow(); // not an admin
+
+        // The admin removes bob's device from the tree; the group goes on without it.
+        const removal = await w.a2.commit(w.channel, { removes: [{ userId: w.bob.id, deviceId: author }] });
+        expect(removal.status).toBe(201);
+        for (const device of [w.b2, w.c1]) await device.sync(w.channel);
+        expect((await w.c1.send(w.channel, 'carried on')).status).toBe(201);
+        expect(await w.b2.sync(w.channel)).toEqual(['carried on']);
+        expect(w.c1.client.call({ cmd: 'mlsMembers', group: w.channel }).map((member: any) => member.deviceId)).not.toContain(author);
+        watch.socket.close();
+    });
+});
+
 suite('poison commits', () => {
     /** a1 builds a self-update, and the last byte (a confirmation tag only members can check) is flipped. */
     async function poisoned() {

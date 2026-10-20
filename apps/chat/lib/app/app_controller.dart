@@ -380,6 +380,8 @@ class AppController extends Notifier<AppState> {
       readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
     );
     groups = g;
+    // Moved 1:1 chats travel through their DM groups (m5 §8).
+    m.groups = g;
     _subscriptions
       ..add(sync.notices.listen((text) => state = state.copyWith(notice: text)))
       ..add(g.notices.listen((text) => state = state.copyWith(notice: text)))
@@ -410,7 +412,8 @@ class AppController extends Notifier<AppState> {
     final s = store;
     if (s == null) return;
     try {
-      final list = await s.groups();
+      // A 1:1 chat's DM group shows as that chat, never as a group.
+      final list = [for (final g in await s.groups()) if (g.kind != GroupKindName.dm) g];
       state = state.copyWith(groups: list);
     } catch (_) {}
   }

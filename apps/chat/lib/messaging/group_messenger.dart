@@ -7,6 +7,7 @@ import 'package:uuid/uuid.dart';
 
 import '../core/api.dart';
 import '../core/events.dart';
+import '../core/pair_id.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart';
 import '../store/message.dart';
@@ -515,6 +516,7 @@ class GroupMessenger {
       throw const StoreException('Invalid message', code: 'invalid');
     }
     final type = payload['type'];
+    if (group.kind == GroupKindName.dm) return _deliverDm(delivery, payload);
     if (delivery.live) {
       // Live-only frames carry typing and nothing else.
       if (type != 'typing') throw const StoreException('Not a typing payload', code: 'invalid');
@@ -526,6 +528,11 @@ class GroupMessenger {
     switch (type) {
       case 'message':
         if (payload['kind'] != null) throw const StoreException('Not used in groups', code: 'invalid');
+        // Sent from another device of ours: our own message.
+        if (sender == me.id) {
+          await _storeOwn(group.id, payload);
+          return;
+        }
         if (names[sender] == null && _contact(sender) == null) await members(group.id, refresh: true);
         final senderName = names[sender] ?? _contact(sender)?.username;
         final result = await store.receive(group.id, payload, sender: sender, senderName: senderName != null && usernamePattern.hasMatch(senderName) ? senderName : null);
@@ -558,6 +565,109 @@ class GroupMessenger {
         }
       default:
         // receipt, burn, vote, rotate, policy, a stored typing: not used in groups. Dropped quietly.
+        return;
+    }
+  }
+
+  /// A message one of our other devices sent: stored as our own, already sent.
+  Future<void> _storeOwn(String conversationId, Map<String, Object?> payload) async {
+    final ChatMessage message;
+    try {
+      final text = payload['text']! as String;
+      message = ChatMessage(
+        id: payload['id']! as String,
+        conversationId: conversationId,
+        direction: Direction.outgoing,
+        text: text,
+        createdAt: payload['createdAt']! as int,
+        status: MessageStatus.sent,
+        expiresAt: payload['expiresAt'] as int?,
+        replyTo: payload.containsKey('replyTo') ? ReplyTo.fromJson(payload['replyTo']) : null,
+        attachment: payload.containsKey('attachment') ? Attachment.fromJson(payload['attachment']) : null,
+        link: payload.containsKey('link') ? LinkPreview.fromJson(payload['link'], text) : null,
+        mentions: payload.containsKey('mentions') ? mentionsFromJson(payload['mentions']) : const [],
+      );
+    } catch (_) {
+      throw const StoreException('Invalid message', code: 'invalid');
+    }
+    if (message.expired(_now())) return;
+    await store.put(message);
+  }
+
+  // ---------- 1:1 chats on MLS (docs/m5-linking.md §8) ----------
+  /// Set by the 1:1 layer: a moved chat's message from [peer] arrived (unread), and their typing.
+  void Function(String peer)? dmIncoming;
+  void Function(String peer, bool on)? dmTyping;
+
+  /// The DM group the 1:1 chat with [peerId] moved to, joined and checked here; null while it is on the
+  /// Double Ratchet.
+  Future<String?> dmChannelWith(String peerId) async {
+    for (final g in await store.groups()) {
+      if (g.kind == GroupKindName.dm && g.peer == peerId && g.active && g.dmChecked && g.movedAt != null) return g.id;
+    }
+    return null;
+  }
+
+  /// §8.2: a DM group of the two of us, or null when the other side is already making one.
+  Future<String?> createDm(Contact contact) async {
+    if (!ready) throw StoreException(unavailable ?? 'Groups are not available on this device yet.');
+    return sync.createDm(contact.id!, contact.username);
+  }
+
+  /// §8.3: the pointer's group is ours with [peerId], joined here, and checks out against the pins.
+  Future<bool> acceptDm(String groupId, String peerId) async {
+    final g = await store.group(groupId);
+    if (g == null || g.kind != GroupKindName.dm || g.peer != peerId || !g.active) return false;
+    return sync.checkDm(groupId);
+  }
+
+  Future<void> markMoved(String groupId) => store.updateGroup(groupId, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
+
+  /// One Phase 1 payload in a moved chat; typing goes live-only (§9).
+  Future<void> sendDm(String groupId, Map<String, Object?> payload) async {
+    final json = encodePayload(payload);
+    if (payload['type'] == 'typing') return sync.sendEphemeral(groupId, json);
+    await sync.send(groupId, json);
+  }
+
+  /// A payload in a moved 1:1 chat (§8.4): stored in the chat's own conversation (its pairId) with its 1:1
+  /// meaning. Only the two people count, and only once this device checked that the group is exactly the DM
+  /// of us two, chained to the pinned keys.
+  Future<void> _deliverDm(GroupDelivery delivery, Map<String, Object?> payload) async {
+    final group = delivery.group, peer = group.peer, from = delivery.sender.userId, mine = from == me.id;
+    if (peer == null || (from != peer && !mine)) return;
+    if (delivery.live) {
+      if (payload['type'] != 'typing') throw const StoreException('Not a typing payload', code: 'invalid');
+      final on = payload['on']! as bool, at = payload['at']! as int;
+      if (!group.dmChecked || mine || (on && (_now() - at).abs() > typingFreshMs)) return;
+      dmTyping?.call(peer, on);
+      return;
+    }
+    if (!group.dmChecked && !await sync.checkDmNow(group.id)) throw const StoreException('Not the DM of us two', code: 'invalid');
+    final conversation = pairId(me.id, peer);
+    switch (payload['type']) {
+      case 'message':
+        if (payload.containsKey('mentions') || payload['kind'] != null) throw const StoreException('Not used in a 1:1 chat', code: 'invalid');
+        if (mine) {
+          await _storeOwn(conversation, payload);
+        } else if (await store.receive(conversation, payload) == ReceiveResult.stored) {
+          dmIncoming?.call(peer);
+          dmTyping?.call(peer, false);
+        }
+      case 'react':
+        await store.react(conversation, payload['target']! as String, who: mine ? 'me' : 'peer', emoji: payload['emoji']! as String, on: payload['on']! as bool);
+      case 'edit':
+        final editedAt = math.min(payload['editedAt']! as int, _now() + clockSkewMs);
+        await store.edit(conversation, payload['target']! as String, text: payload['text']! as String, editedAt: editedAt, author: mine ? Direction.outgoing : Direction.incoming);
+      case 'read':
+        final ids = (payload['ids']! as List).cast<String>();
+        if (mine) {
+          await store.markRead(conversation, ids, direction: Direction.incoming);
+        } else if (readReceipts()) {
+          await store.markRead(conversation, ids, direction: Direction.outgoing);
+        }
+      default:
+        // A stored typing, meta, leave or any 1:1 control: nothing in a DM group.
         return;
     }
   }

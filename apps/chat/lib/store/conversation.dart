@@ -52,6 +52,9 @@ class GroupConversation {
     this.unread = 0,
     this.mentioned = false,
     this.metaAt = 0,
+    this.peer,
+    this.dmChecked = false,
+    this.movedAt,
   });
 
   /// The MLS group id (22 base64url characters); also the message store's conversation id.
@@ -72,6 +75,15 @@ class GroupConversation {
 
   /// `at` of the `meta` payload that set [name] and [topic] (latest wins).
   final int metaAt;
+
+  /// A 1:1 chat's DM group (kind dm, docs/m5-linking.md §8): the other person's user id.
+  final String? peer;
+
+  /// This device checked the DM group is exactly the DM of us two, chained to the pinned keys (mlsCheckDm).
+  final bool dmChecked;
+
+  /// When the 1:1 chat with [peer] moved to this group (the pointer was sent or accepted, §8.2–§8.3).
+  final int? movedAt;
   final int createdAt;
 
   bool get active => membership == Membership.active;
@@ -88,6 +100,9 @@ class GroupConversation {
     bool? mentioned,
     GroupKindName? kind,
     int? metaAt,
+    String? peer,
+    bool? dmChecked,
+    int? movedAt,
   }) => GroupConversation(
     id: id,
     kind: kind ?? this.kind,
@@ -101,6 +116,9 @@ class GroupConversation {
     unread: unread ?? this.unread,
     mentioned: mentioned ?? this.mentioned,
     metaAt: metaAt ?? this.metaAt,
+    peer: peer ?? this.peer,
+    dmChecked: dmChecked ?? this.dmChecked,
+    movedAt: movedAt ?? this.movedAt,
   );
 
   Map<String, Object?> toRow() => {
@@ -115,6 +133,9 @@ class GroupConversation {
     'unread': unread,
     'mentioned': mentioned ? 1 : 0,
     'meta_at': metaAt,
+    'peer': peer,
+    'dm_checked': dmChecked ? 1 : 0,
+    'moved_at': movedAt,
     'created_at': createdAt,
   };
 
@@ -130,6 +151,9 @@ class GroupConversation {
     unread: row['unread'] as int? ?? 0,
     mentioned: row['mentioned'] == 1,
     metaAt: row['meta_at'] as int? ?? 0,
+    peer: row['peer'] as String?,
+    dmChecked: row['dm_checked'] == 1,
+    movedAt: row['moved_at'] as int?,
     createdAt: row['created_at']! as int,
   );
 }

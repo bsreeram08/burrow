@@ -41,11 +41,13 @@ class MessageStore {
           await db.execute('CREATE INDEX messages_by_time ON messages (conversation_id, created_at)');
           await _addPhase1Columns(db);
           await _addGroupParts(db);
+          await _addDmParts(db);
         },
         // Additive only: every existing row keeps its content and reads back with the new parts absent.
         onUpgrade: (db, from, _) async {
           if (from < 2) await _addPhase1Columns(db);
           if (from < 3) await _addGroupParts(db);
+          if (from < 4) await _addDmParts(db);
         },
       ),
     );
@@ -55,7 +57,14 @@ class MessageStore {
   /// v2 (phase 1): reply, attachment, link preview, the latest edit and reactions, each as nullable columns.
   /// v3 (M4 groups, docs/m4-groups.md §10): sender, sender name, mentions and read-by of group messages,
   /// system rows, and a `conversations` table for groups.
-  static const schemaVersion = 3;
+  /// v4 (M5, docs/m5-linking.md §8): a 1:1 chat's DM group remembers its peer, whether it was checked, and when the chat moved.
+  static const schemaVersion = 4;
+
+  static Future<void> _addDmParts(DatabaseExecutor db) async {
+    await db.execute('ALTER TABLE conversations ADD COLUMN peer TEXT');
+    await db.execute('ALTER TABLE conversations ADD COLUMN dm_checked INTEGER NOT NULL DEFAULT 0');
+    await db.execute('ALTER TABLE conversations ADD COLUMN moved_at INTEGER');
+  }
 
   static Future<void> _addGroupParts(DatabaseExecutor db) async {
     for (final column in ['sender TEXT', 'sender_name TEXT', 'mentions TEXT', 'read_by TEXT']) {

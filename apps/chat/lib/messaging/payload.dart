@@ -20,7 +20,7 @@ final _control = RegExp(r'[\u0000-\u001f]');
 
 /// Decodes and checks one plaintext. Returns the payload; its `type` is one of
 /// receipt, burn, message, rotate, policy, react, edit, read, typing, and in groups (docs/m4-groups.md §5)
-/// meta and leave. `mentions` is checked here for shape; the store allows it only in groups.
+/// meta and leave, and mls-dm (m5 §8). `mentions` is checked here for shape; the store allows it only in groups.
 Map<String, Object?> checkPayload(String json) {
   if (utf8.encode(json).length > maxPayloadBytes) throw const PayloadException();
   Object? decoded;
@@ -73,6 +73,8 @@ Map<String, Object?> checkPayload(String json) {
           p['at'] is int &&
           validTime(p['at'] as int),
     'leave' => size == 3,
+    // A 1:1 chat's move to its DM group (docs/m5-linking.md §8.2), over the Double Ratchet only.
+    'mls-dm' => exactly(const {'v', 'type', 'id', 'channel', 'at'}) && p['channel'] is String && userIdPattern.hasMatch(p['channel'] as String) && p['at'] is int && validTime(p['at'] as int),
     _ => false,
   };
   if (!ok) throw const PayloadException();

@@ -32,6 +32,11 @@ class FakeDs {
   /// Tests: the next N answers to `commits` are 409s (a concurrent commit won).
   int conflicts = 0;
 
+  /// 1:1 envelopes posted (`{to, envelope}`).
+  final List<Map<String, Object?>> envelopes = [];
+
+  Map<String, String> _identity(String userId) => identityOverride[userId] ?? {'dh': 'dh-$userId', 'sign': 'sign-$userId'};
+
   /// A client for one device of one user.
   Api client({required String userId, required String username, required String deviceId}) {
     devices[deviceId] = (userId: userId, username: username);
@@ -104,12 +109,47 @@ class FakeDs {
       }
       return _json(w);
     }
+    // 1:1 messaging (enough for a chat's move to MLS, m5 §8): keys, envelopes, MLS capability.
+    if (path == '/api/keys/count') return _json({'oneTimePreKeys': 50, 'signedPreKeyId': 1, 'identity': _identity(userId)});
+    if (path == '/api/keys' && method == 'PUT') return _json({});
+    final bundle = RegExp(r'^/api/keys/([a-z0-9_]+)$').firstMatch(path);
+    if (bundle != null) {
+      final user = devices.values.where((d) => d.username == bundle[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      return _json({'userId': user.userId, 'identity': _identity(user.userId), 'signedPreKey': {'id': 1}});
+    }
+    if (path == '/api/messages' && method == 'POST') {
+      final to = devices.values.where((d) => d.username == body['to']).firstOrNull;
+      if (to == null) return _error('No such user.', 404);
+      envelopes.add(body);
+      _notifyUser(
+        to.userId,
+        EnvelopeEvent(id: 'E${(++_ids).toString().padLeft(21, '0')}', fromId: userId, fromUsername: devices[deviceId]!.username, envelope: body['envelope']! as String, createdAt: 1),
+      );
+      return _json({'id': 'm', 'createdAt': 1}, 201);
+    }
+    final capability = RegExp(r'^/api/mls/capability/([a-z0-9_]+)$').firstMatch(path);
+    if (capability != null) {
+      final user = devices.values.where((d) => d.username == capability[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      final dm = channels.values.where((c) => c.dm != null && c.dm!.containsKey(userId) && c.dm!.containsKey(user.userId)).firstOrNull;
+      final capable = devices.entries.where((d) => d.value.userId == user.userId && (keyPackages[d.key]?.isNotEmpty ?? false)).length;
+      return _json({'userId': user.userId, 'devices': capable, 'channel': dm?.id});
+    }
     if (path == '/api/channels' && method == 'POST') {
       final id = body['id']! as String;
       if (channels.containsKey(id)) return _error('That channel id is taken.', 409);
+      Map<String, String>? dm;
+      if (body['kind'] == 'dm') {
+        final peer = devices.values.where((d) => d.username == body['peer']).firstOrNull;
+        if (peer == null) return _error('No such user.', 404);
+        if (channels.values.any((c) => c.dm != null && c.dm!.containsKey(userId) && c.dm!.containsKey(peer.userId))) return _error('You already have a conversation with them.', 409);
+        dm = {userId: devices[deviceId]!.username, peer.userId: peer.username};
+      }
       final info = _mls(body['groupInfo']! as String);
       channels[id] = FakeChannel(id, body['kind']! as String, body['name'] as String?, info['epoch']! as int)
         ..members[deviceId] = FakeMember(userId, 0, 0, admin: true)
+        ..dm = dm
         ..groupInfo = body['groupInfo'] as String;
       return _json({'id': id, 'epoch': 0, 'seq': 0}, 201);
     }
@@ -314,6 +354,9 @@ class FakeChannel {
   int? groupInfoEpoch = 0;
   Map<String, Object?>? frozen;
   Map<String, FakeMember>? previous;
+
+  /// A DM channel's two users (id → username).
+  Map<String, String>? dm;
   final List<String> resolved = [];
   final Map<String, FakeMember> members = {};
   final List<Map<String, Object?>> log = [];
@@ -336,5 +379,6 @@ class FakeChannel {
     'member': members.containsKey(deviceId),
     'cursor': members[deviceId]?.cursor,
     'admin': members.values.any((m) => m.userId == userId && m.admin),
+    if (dm != null) 'peer': {for (final e in dm!.entries) if (e.key != userId) ...{'id': e.key, 'username': e.value}},
   };
 }

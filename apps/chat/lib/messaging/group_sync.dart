@@ -183,6 +183,9 @@ class GroupSync {
   Duration Function() removalJitter = () => Duration(milliseconds: math.Random().nextInt(3000));
   DeliveryHandler? onDelivery;
   Future<void> Function(MembershipChange change)? onMembership;
+
+  /// This device joined a 1:1 chat's DM group (m5 §8.3): a pointer waiting for it can be tried now.
+  void Function(String groupId)? onDmJoined;
   final int Function() _now;
   final Duration Function(int attempt) _backoff;
 
@@ -276,6 +279,47 @@ class GroupSync {
     return store.putGroup(GroupConversation(id: id, kind: kind, name: name, createdAt: _now()));
   }
 
+  /// m5 §8.2: the first sender moves a 1:1 chat to a DM group of the two of us, with every listed device of
+  /// both. Returns the group id, or null when the other side already made one (409: they are the first sender;
+  /// wait for their pointer).
+  Future<String?> createDm(String peerId, String peerUsername) async {
+    await ensureReady();
+    final id = newGroupId();
+    final users = [me.id, peerId]..sort();
+    final view = await crypto.create(id, GroupRoles(kind: GroupKind.dm, admins: users, joinPolicy: JoinPolicy.invite, dm: users));
+    try {
+      await api.createChannel(id: id, kind: GroupKindName.dm.wire, groupInfo: view.groupInfo, tree: view.tree, peer: peerUsername);
+    } catch (error) {
+      await crypto.forget(id);
+      if (error is ApiException && error.status == 409) return null;
+      rethrow;
+    }
+    unawaited(_publishGroupInfo(id, view));
+    await store.putGroup(GroupConversation(id: id, kind: GroupKindName.dm, createdAt: _now(), peer: peerId));
+    await add(id, [peerId, me.id]);
+    await checkDm(id);
+    return id;
+  }
+
+  /// m5 §8.3: whether this DM group is exactly ours with its peer, chained to the pinned keys; remembered.
+  Future<bool> checkDm(String groupId) => _serial(groupId, () => checkDmNow(groupId));
+
+  /// [checkDm] from inside the channel's queue (a delivery).
+  Future<bool> checkDmNow(String groupId) async {
+    final group = await store.group(groupId);
+    final peer = group?.peer;
+    if (group == null || !group.active || group.kind != GroupKindName.dm || peer == null) return false;
+    if (group.dmChecked) return true;
+    try {
+      await crypto.checkDm(groupId, peer);
+    } on CryptoException catch (error) {
+      if (error.keysLocked) rethrow;
+      return false;
+    }
+    await store.updateGroup(groupId, (g) => g.copyWith(dmChecked: true));
+    return true;
+  }
+
   /// Adds every listed device of [userIds] in one commit (KeyPackages claimed 16 users at a time). Returns
   /// the users who have no device that can join yet (`missing`), who are skipped.
   Future<Set<String>> add(String groupId, List<String> userIds) => _serial(groupId, () async {
@@ -293,6 +337,9 @@ class GroupSync {
         }
       }
       missing.removeAll({for (final p in packages) p['userId']});
+      // Our own other devices may be added too (a DM, m5 §8.2), never this one.
+      final local = await device();
+      packages.removeWhere((p) => p['userId'] == me.id && p['deviceId'] == local.deviceId);
     }
 
     await claim();
@@ -715,11 +762,12 @@ class GroupSync {
     final info = await _channelInfo(event.channel);
     await store.putGroup(
       (known ?? GroupConversation(id: event.channel, kind: info.kind, createdAt: _now(), name: info.name ?? ''))
-          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, clearFrozen: true),
+          .copyWith(membership: Membership.active, cursor: event.seq, kind: info.kind, name: info.name ?? known?.name, peer: known?.peer ?? info.peer, clearFrozen: true),
     );
     _dropWelcome(event.id);
     _changed(event.channel);
     await _catchUpNow(event.channel);
+    if (info.kind == GroupKindName.dm) onDmJoined?.call(event.channel);
   });
 
   void _dropWelcome(String id) {
@@ -745,12 +793,14 @@ class GroupSync {
     }
   }
 
-  Future<({GroupKindName kind, String? name})> _channelInfo(String id) async {
+  /// The server's view of a channel; a DM channel names its other person (`peer: {id, username}`).
+  Future<({GroupKindName kind, String? name, String? peer})> _channelInfo(String id) async {
     try {
       final info = await api.channel(id);
-      return (kind: GroupKindName.fromWire(info['kind'] as String), name: info['name'] as String?);
+      final peer = info['peer'];
+      return (kind: GroupKindName.fromWire(info['kind'] as String), name: info['name'] as String?, peer: peer is Map ? peer['id'] as String? : null);
     } catch (_) {
-      return (kind: GroupKindName.private, name: null);
+      return (kind: GroupKindName.private, name: null, peer: null);
     }
   }
 
@@ -806,7 +856,7 @@ class GroupSync {
       final existing = await store.group(groupId);
       final seq = accepted['seq'] as int;
       await store.putGroup(
-        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? ''))
+        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? '', peer: channel.peer))
             .copyWith(membership: Membership.active, cursor: seq, clearFrozen: true),
       );
       _reportCursor(groupId, seq);
@@ -993,6 +1043,9 @@ class GroupSync {
           await _externalJoin(id);
           await _catchUpNow(id);
         });
+        // A moved 1:1 chat (m5 §3 step 5): usable here once it checks out as the DM of the two of us.
+        // Our account moved it; this device never sees the pointer.
+        if (c['kind'] == GroupKindName.dm.wire && await checkDm(id)) await store.updateGroup(id, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
         joined++;
         await Future<void>.delayed(const Duration(milliseconds: 350));
       } catch (_) {

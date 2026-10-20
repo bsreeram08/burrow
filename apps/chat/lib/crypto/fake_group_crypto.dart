@@ -311,7 +311,19 @@ class FakeGroupCrypto implements GroupCrypto {
         ),
     ]);
   }
+
+  /// Tests: peers whose keys are not pinned here (checkDm fails for them).
+  final Set<String> unpinned = {};
+
+  @override
+  Future<void> checkDm(String groupId, String peer) async {
+    final g = _group(groupId), users = ([userId, peer]..sort());
+    final ok = g.roles.kind == GroupKind.dm && _same(g.roles.dm, users) && !unpinned.contains(peer) && g.members.every((m) => users.contains(m['userId']));
+    if (!ok) throw const CryptoException('not the DM of us two', code: 'invalid');
+  }
 }
+
+bool _same(List<String>? a, List<String> b) => a != null && a.length == b.length && [for (var i = 0; i < a.length; i++) a[i] == b[i]].every((x) => x);
 
 List<Map<String, Object?>> _list(Object? value) => [for (final m in (value as List? ?? const [])) (m as Map).cast<String, Object?>()];
 

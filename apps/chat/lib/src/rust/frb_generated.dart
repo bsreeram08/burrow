@@ -165,6 +165,7 @@ abstract class RustLibApi extends BaseApi {
   Future<MlsProcessed> crateApiMlsReceive({
     required String groupId,
     required String message,
+    MlsExpect? expect,
   });
 
   Future<void> crateApiMlsReceiveAbort({required String pendingId});
@@ -923,6 +924,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Future<MlsProcessed> crateApiMlsReceive({
     required String groupId,
     required String message,
+    MlsExpect? expect,
   }) {
     return handler.executeNormal(
       NormalTask(
@@ -930,6 +932,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           final serializer = SseSerializer(generalizedFrbRustBinding);
           sse_encode_String(groupId, serializer);
           sse_encode_String(message, serializer);
+          sse_encode_opt_box_autoadd_mls_expect(expect, serializer);
           pdeCallFfi(
             generalizedFrbRustBinding,
             serializer,
@@ -942,7 +945,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
           decodeErrorData: sse_decode_core_error,
         ),
         constMeta: kCrateApiMlsReceiveConstMeta,
-        argValues: [groupId, message],
+        argValues: [groupId, message, expect],
         apiImpl: this,
       ),
     );
@@ -950,7 +953,7 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
 
   TaskConstMeta get kCrateApiMlsReceiveConstMeta => const TaskConstMeta(
     debugName: "mls_receive",
-    argNames: ["groupId", "message"],
+    argNames: ["groupId", "message", "expect"],
   );
 
   @override
@@ -1549,6 +1552,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsExpect dco_decode_box_autoadd_mls_expect(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return dco_decode_mls_expect(raw);
+  }
+
+  @protected
   MlsPendingCommit dco_decode_box_autoadd_mls_pending_commit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return dco_decode_mls_pending_commit(raw);
@@ -1661,6 +1670,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
       aikSign: dco_decode_String(arr[4]),
       issuedAt: dco_decode_u_64(arr[5]),
     );
+  }
+
+  @protected
+  MlsExpect dco_decode_mls_expect(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return MlsExpect.values[raw as int];
   }
 
   @protected
@@ -1786,6 +1801,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsExpect? dco_decode_opt_box_autoadd_mls_expect(dynamic raw) {
+    // Codec=Dco (DartCObject based), see doc to use other codecs
+    return raw == null ? null : dco_decode_box_autoadd_mls_expect(raw);
+  }
+
+  @protected
   MlsPendingCommit? dco_decode_opt_box_autoadd_mls_pending_commit(dynamic raw) {
     // Codec=Dco (DartCObject based), see doc to use other codecs
     return raw == null ? null : dco_decode_box_autoadd_mls_pending_commit(raw);
@@ -1882,6 +1903,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     return (sse_decode_identity(deserializer));
+  }
+
+  @protected
+  MlsExpect sse_decode_box_autoadd_mls_expect(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    return (sse_decode_mls_expect(deserializer));
   }
 
   @protected
@@ -2021,6 +2048,13 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsExpect sse_decode_mls_expect(SseDeserializer deserializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    var inner = sse_decode_i_32(deserializer);
+    return MlsExpect.values[inner];
+  }
+
+  @protected
   MlsGroupView sse_decode_mls_group_view(SseDeserializer deserializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     var var_groupId = sse_decode_String(deserializer);
@@ -2156,6 +2190,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  MlsExpect? sse_decode_opt_box_autoadd_mls_expect(
+    SseDeserializer deserializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    if (sse_decode_bool(deserializer)) {
+      return (sse_decode_box_autoadd_mls_expect(deserializer));
+    } else {
+      return null;
+    }
+  }
+
+  @protected
   MlsPendingCommit? sse_decode_opt_box_autoadd_mls_pending_commit(
     SseDeserializer deserializer,
   ) {
@@ -2279,6 +2326,15 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   ) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_identity(self, serializer);
+  }
+
+  @protected
+  void sse_encode_box_autoadd_mls_expect(
+    MlsExpect self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_mls_expect(self, serializer);
   }
 
   @protected
@@ -2414,6 +2470,12 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
   }
 
   @protected
+  void sse_encode_mls_expect(MlsExpect self, SseSerializer serializer) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    sse_encode_i_32(self.index, serializer);
+  }
+
+  @protected
   void sse_encode_mls_group_view(MlsGroupView self, SseSerializer serializer) {
     // Codec=Sse (Serialization based), see doc to use other codecs
     sse_encode_String(self.groupId, serializer);
@@ -2514,6 +2576,19 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
     sse_encode_bool(self != null, serializer);
     if (self != null) {
       sse_encode_box_autoadd_identity(self, serializer);
+    }
+  }
+
+  @protected
+  void sse_encode_opt_box_autoadd_mls_expect(
+    MlsExpect? self,
+    SseSerializer serializer,
+  ) {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+
+    sse_encode_bool(self != null, serializer);
+    if (self != null) {
+      sse_encode_box_autoadd_mls_expect(self, serializer);
     }
   }
 

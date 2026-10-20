@@ -253,6 +253,12 @@ pub struct MlsProcessed {
     pub digest: Option<String>,
 }
 
+/// What a log entry's kind says a message is: a refused mismatch is never decrypted or staged.
+pub enum MlsExpect {
+    Application,
+    Commit,
+}
+
 /// One device to remove; every device of the user when `device_id` is `None`.
 pub struct MlsRemoval {
     pub user_id: String,
@@ -280,8 +286,10 @@ pub fn mls_join(welcome: String, tree: String) -> Result<MlsGroupView> { Ok(core
 pub fn mls_join_external(group_info: String, tree: String) -> Result<MlsOutgoing> { Ok(core::mls_join_external(group_info, tree)?.into()) }
 pub fn mls_forget_group(group_id: String) -> Result<()> { Ok(core::mls_forget_group(group_id)?) }
 pub fn mls_encrypt(group_id: String, plaintext: String) -> Result<String> { Ok(core::mls_encrypt(group_id, plaintext)?) }
-pub fn mls_receive(group_id: String, message: String) -> Result<MlsProcessed> {
-    let p = core::mls_receive(group_id, message)?;
+/// `expect`: the log entry's kind (`app` → Application, `commit` → Commit), whenever it is known.
+pub fn mls_receive(group_id: String, message: String, expect: Option<MlsExpect>) -> Result<MlsProcessed> {
+    let expect = expect.map(|e| match e { MlsExpect::Application => chatcore::api::Expect::Application, MlsExpect::Commit => chatcore::api::Expect::Commit });
+    let p = core::mls_receive(group_id, message, expect)?;
     Ok(MlsProcessed { pending_id: p.pending_id, kind: p.kind, plaintext: p.plaintext, sender: p.sender.into(), epoch: p.epoch, digest: p.digest })
 }
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { Ok(core::mls_receive_commit(pending_id)?) }

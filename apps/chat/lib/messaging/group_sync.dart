@@ -388,7 +388,7 @@ class GroupSync {
     final local = await device();
     if (group == null || !group.active || event.fromDeviceId == local.deviceId) return;
     try {
-      final processed = await crypto.receive(event.channel, event.message);
+      final processed = await crypto.receive(event.channel, event.message, expect: ProcessedKind.application);
       if (processed.kind != ProcessedKind.application || processed.plaintext == null) {
         await crypto.receiveAbort(processed.pendingId);
         return;
@@ -470,7 +470,7 @@ class GroupSync {
       // Never our own application messages; our own commit only while one is pending (the answer was lost).
       if (entry.kind == 'commit' && await crypto.pendingCommit(group.id) != null) {
         try {
-          final own = await crypto.receive(group.id, entry.message);
+          final own = await crypto.receive(group.id, entry.message, expect: ProcessedKind.commit);
           await crypto.receiveCommit(own.pendingId);
           unawaited(_publishGroupInfo(group.id, await crypto.view(group.id)));
           _changed(group.id);
@@ -493,7 +493,7 @@ class GroupSync {
     final before = entry.kind == 'commit' ? await crypto.members(group.id) : const <GroupMember>[];
     GroupProcessed processed;
     try {
-      processed = await crypto.receive(group.id, entry.message);
+      processed = await crypto.receive(group.id, entry.message, expect: entry.kind == 'commit' ? ProcessedKind.commit : ProcessedKind.application);
     } on CryptoException catch (error) {
       if (error.keysLocked) {
         keysLocked = true;

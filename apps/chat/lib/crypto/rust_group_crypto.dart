@@ -89,8 +89,16 @@ class RustGroupCrypto implements GroupCrypto {
   Future<String> encrypt(String groupId, String plaintext) => _call(() => core.mlsEncrypt(groupId: groupId, plaintext: plaintext));
 
   @override
-  Future<GroupProcessed> receive(String groupId, String message) => _call(() async {
-    final p = await core.mlsReceive(groupId: groupId, message: message);
+  Future<GroupProcessed> receive(String groupId, String message, {ProcessedKind? expect}) => _call(() async {
+    final p = await core.mlsReceive(
+      groupId: groupId,
+      message: message,
+      expect: switch (expect) {
+        ProcessedKind.application => core.MlsExpect.application,
+        ProcessedKind.commit || ProcessedKind.own || ProcessedKind.removed => core.MlsExpect.commit,
+        null => null,
+      },
+    );
     return GroupProcessed(
       pendingId: p.pendingId,
       kind: ProcessedKind.values.byName(p.kind),

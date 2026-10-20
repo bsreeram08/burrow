@@ -803,10 +803,11 @@ fn wire__crate__api__mls_receive_impl(
                 flutter_rust_bridge::for_generated::SseDeserializer::new(message);
             let api_group_id = <String>::sse_decode(&mut deserializer);
             let api_message = <String>::sse_decode(&mut deserializer);
+            let api_expect = <Option<crate::api::MlsExpect>>::sse_decode(&mut deserializer);
             deserializer.end();
             move |context| {
                 transform_result_sse::<_, crate::api::CoreError>((move || {
-                    let output_ok = crate::api::mls_receive(api_group_id, api_message)?;
+                    let output_ok = crate::api::mls_receive(api_group_id, api_message, api_expect)?;
                     std::result::Result::Ok(output_ok)
                 })())
             }
@@ -1590,6 +1591,18 @@ impl SseDecode for crate::api::MlsDeviceCert {
     }
 }
 
+impl SseDecode for crate::api::MlsExpect {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        let mut inner = <i32>::sse_decode(deserializer);
+        return match inner {
+            0 => crate::api::MlsExpect::Application,
+            1 => crate::api::MlsExpect::Commit,
+            _ => unreachable!("Invalid variant for MlsExpect: {}", inner),
+        };
+    }
+}
+
 impl SseDecode for crate::api::MlsGroupView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
@@ -1742,6 +1755,17 @@ impl SseDecode for Option<crate::api::Identity> {
     fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
         if (<bool>::sse_decode(deserializer)) {
             return Some(<crate::api::Identity>::sse_decode(deserializer));
+        } else {
+            return None;
+        }
+    }
+}
+
+impl SseDecode for Option<crate::api::MlsExpect> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_decode(deserializer: &mut flutter_rust_bridge::for_generated::SseDeserializer) -> Self {
+        if (<bool>::sse_decode(deserializer)) {
+            return Some(<crate::api::MlsExpect>::sse_decode(deserializer));
         } else {
             return None;
         }
@@ -1993,6 +2017,22 @@ impl flutter_rust_bridge::IntoDart for crate::api::MlsDeviceCert {
 impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::MlsDeviceCert {}
 impl flutter_rust_bridge::IntoIntoDart<crate::api::MlsDeviceCert> for crate::api::MlsDeviceCert {
     fn into_into_dart(self) -> crate::api::MlsDeviceCert {
+        self
+    }
+}
+// Codec=Dco (DartCObject based), see doc to use other codecs
+impl flutter_rust_bridge::IntoDart for crate::api::MlsExpect {
+    fn into_dart(self) -> flutter_rust_bridge::for_generated::DartAbi {
+        match self {
+            Self::Application => 0.into_dart(),
+            Self::Commit => 1.into_dart(),
+            _ => unreachable!(),
+        }
+    }
+}
+impl flutter_rust_bridge::for_generated::IntoDartExceptPrimitive for crate::api::MlsExpect {}
+impl flutter_rust_bridge::IntoIntoDart<crate::api::MlsExpect> for crate::api::MlsExpect {
+    fn into_into_dart(self) -> crate::api::MlsExpect {
         self
     }
 }
@@ -2291,6 +2331,22 @@ impl SseEncode for crate::api::MlsDeviceCert {
     }
 }
 
+impl SseEncode for crate::api::MlsExpect {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <i32>::sse_encode(
+            match self {
+                crate::api::MlsExpect::Application => 0,
+                crate::api::MlsExpect::Commit => 1,
+                _ => {
+                    unimplemented!("");
+                }
+            },
+            serializer,
+        );
+    }
+}
+
 impl SseEncode for crate::api::MlsGroupView {
     // Codec=Sse (Serialization based), see doc to use other codecs
     fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
@@ -2409,6 +2465,16 @@ impl SseEncode for Option<crate::api::Identity> {
         <bool>::sse_encode(self.is_some(), serializer);
         if let Some(value) = self {
             <crate::api::Identity>::sse_encode(value, serializer);
+        }
+    }
+}
+
+impl SseEncode for Option<crate::api::MlsExpect> {
+    // Codec=Sse (Serialization based), see doc to use other codecs
+    fn sse_encode(self, serializer: &mut flutter_rust_bridge::for_generated::SseSerializer) {
+        <bool>::sse_encode(self.is_some(), serializer);
+        if let Some(value) = self {
+            <crate::api::MlsExpect>::sse_encode(value, serializer);
         }
     }
 }

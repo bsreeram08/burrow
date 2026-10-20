@@ -138,7 +138,9 @@ abstract class GroupCrypto {
   Future<void> forget(String groupId);
 
   Future<String> encrypt(String groupId, String plaintext);
-  Future<GroupProcessed> receive(String groupId, String message);
+  /// [expect]: what the log entry's kind says it is ([ProcessedKind.application] or [ProcessedKind.commit]);
+  /// a mismatch is refused before anything is staged.
+  Future<GroupProcessed> receive(String groupId, String message, {ProcessedKind? expect});
   Future<void> receiveCommit(String pendingId);
   Future<void> receiveAbort(String pendingId);
 

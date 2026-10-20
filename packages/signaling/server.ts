@@ -237,7 +237,7 @@ export function startSignaling(options: SignalingOptions) {
             if (!allowRequest(source)) return json({ error: 'Rate limited' }, 429);
             if (emoji && accounts && /^\/api\/emoji(\/|$)/.test(url.pathname)) return emoji.handle(request, url, accounts.sessionUser(request), source);
             if (blobs && accounts && /^\/api\/blobs(\/|$)/.test(url.pathname)) return blobs.handle(request, url, accounts.sessionUser(request));
-            if (channels && accounts && /^\/api\/(mls|channels)(\/|$)/.test(url.pathname)) return channels.handle(request, url, accounts.sessionUser(request));
+            if (channels && accounts && /^\/api\/(mls|channels|users)(\/|$)/.test(url.pathname)) return channels.handle(request, url, accounts.sessionUser(request));
             if (accounts && /^\/api\/unfurl(\/|$)/.test(url.pathname)) return unfurl.handle(request, url, accounts.sessionUser(request));
             if (url.pathname.startsWith('/api/')) return accounts ? accounts.handle(request, url, server, source) : json({ error: 'Not found' }, 404);
             const roomMatch = /^\/rooms\/([A-Za-z0-9_-]{43})(\/ice)?$/.exec(url.pathname);

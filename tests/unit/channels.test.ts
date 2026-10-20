@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cpSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { generateKeyPairSync, sign } from 'node:crypto';
+import '../../packages/signaling/public/devices.js';
 import { startSignaling } from '../../packages/signaling/server';
 import { Client, clientCore, enroll, id, pinAll, type Device, type User } from './helpers/mls';
 
@@ -797,5 +799,86 @@ suite('review fixes', () => {
         const frame = await watch.next('group');
         expect(frame.seq).toBeGreaterThan(joined);
         watch.socket.close();
+    });
+});
+
+suite('M4 client additions (docs/m4-groups.md §8)', () => {
+    test('the public channel directory lists public channels with their size, for listed devices only', async () => {
+        const w = await world();
+        const pub = await w.a1.createChannel('public', { name: 'general' });
+        await w.a1.createChannel('private');
+        await w.a1.add(pub.channel, [w.bob.id]);
+        const seen = await w.c1.must('GET', '/api/channels/directory');
+        expect(seen.channels).toEqual([{ id: pub.channel, name: 'general', members: 2, joined: false }]);
+        expect((await w.b1.must('GET', '/api/channels/directory')).channels[0].joined).toBe(true);
+        const stranger = user('erin');
+        expect((await request('/api/channels/directory', 'GET', stranger.cookie)).status).toBe(409); // no device announced
+    });
+
+    test('anyone signed in can look up a user\'s published identity by id, and nothing else', async () => {
+        const w = await world();
+        const stranger = user('erin');
+        const found = await request(`/api/users/${w.carol.id}/identity`, 'GET', stranger.cookie);
+        expect(found.status).toBe(200);
+        expect(await found.json()).toEqual({ userId: w.carol.id, username: 'carol', identity: w.c1.client.call({ cmd: 'identity' }) });
+        expect((await request(`/api/users/${id()}/identity`, 'GET', stranger.cookie)).status).toBe(404);
+        expect((await request(`/api/users/${stranger.id}/identity`, 'GET', stranger.cookie)).status).toBe(404); // no keys yet
+        expect((await fetch(new URL(`/api/users/${w.carol.id}/identity`, app.server.url))).status).toBe(401);
+    });
+
+    test('ephemeral messages reach the other member devices live, once, and are never logged', async () => {
+        const w = await populated();
+        const watchers = [w.a1, w.a2, w.b2, w.c1].map(device => ({ device, watch: device.events() }));
+        for (const { watch } of watchers) { await watch.opened; await watch.next('hello'); }
+        const own = w.b1.events(); await own.opened; await own.next('hello');
+        const seqBefore = one('SELECT seq FROM channels WHERE id = ?', w.channel).seq;
+        const typing = JSON.stringify({ v: 1, type: 'typing', id: crypto.randomUUID(), at: Date.now(), on: true });
+        const message = w.b1.client.call({ cmd: 'mlsEncrypt', group: w.channel, plaintext: typing });
+        const sent = await w.b1.api('POST', `/api/channels/${w.channel}/ephemeral`, { message });
+        expect(sent).toEqual({ status: 202, body: { delivered: true } });
+        for (const { device, watch } of watchers) {
+            const frame = await watch.next('ephemeral');
+            expect(frame).toMatchObject({ channel: w.channel, from: { userId: w.bob.id, deviceId: w.b1.deviceId }, message });
+            expect(device.client.call({ cmd: 'mlsReceive', group: w.channel, message: frame.message }).plaintext).toBe(typing);
+        }
+        await Bun.sleep(100);
+        expect(own.pending('ephemeral')).toEqual([]);
+        expect(one('SELECT seq FROM channels WHERE id = ?', w.channel).seq).toBe(seqBefore);
+        expect(one('SELECT COUNT(*) AS n FROM group_log WHERE channel_id = ? AND seq > ?', w.channel, seqBefore).n).toBe(0);
+        // Bounded, private-message only, current epoch only, members only.
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/ephemeral`, { message: Buffer.alloc(2100).toString('base64url') })).status).toBe(400);
+        const commit = w.a1.client.call({ cmd: 'mlsCommit', group: w.channel, update: true });
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/ephemeral`, { message: commit.commit })).status).toBe(400);
+        w.a1.client.call({ cmd: 'mlsClearOwn', group: w.channel });
+        expect((await w.a1.commit(w.channel, { update: true })).status).toBe(201);
+        const stale = w.b1.client.call({ cmd: 'mlsEncrypt', group: w.channel, plaintext: typing });
+        expect((await w.b1.api('POST', `/api/channels/${w.channel}/ephemeral`, { message: stale })).status).toBe(409);
+        const dave = enroll(ctx, user('dave'), new Client(Core));
+        expect((await dave.api('POST', `/api/channels/${w.channel}/ephemeral`, { message })).status).toBe(404);
+        for (const { watch } of [...watchers, { watch: own }]) watch.socket.close();
+    });
+
+    test('a core without a 1:1 identity takes a certificate signed outside it (the web\'s WebCrypto AIK), once', async () => {
+        await start();
+        const F = (globalThis as any).DeviceFormat;
+        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+        const aik = (publicKey.export({ format: 'jwk' }) as any).x as string;
+        const [userId, deviceId, issuedAt] = [id(), id(), Date.now()];
+        const mlsOnly = new Client(Core);
+        const leaf = mlsOnly.call({ cmd: 'mlsDeviceLeaf' });
+        const sig = sign(null, F.mlsCertBytes(userId, deviceId, 'web', leaf, aik, issuedAt), privateKey).toString('base64url');
+        const cert = F.mlsCertJson(userId, deviceId, 'web', leaf, aik, issuedAt, sig);
+        expect(() => mlsOnly.call({ cmd: 'mlsSetDeviceCert', cert })).toThrow(/account key is needed/);
+        const other = (generateKeyPairSync('ed25519').publicKey.export({ format: 'jwk' }) as any).x;
+        expect(() => mlsOnly.call({ cmd: 'mlsSetDeviceCert', cert, aik: other })).toThrow();
+        expect(mlsOnly.call({ cmd: 'mlsSetDeviceCert', cert, aik })).toMatchObject({ userId, deviceId, leafSigKey: leaf, aikSign: aik });
+        expect(mlsOnly.call({ cmd: 'mlsKeyPackages', count: 1 })).toHaveLength(1);
+        expect(mlsOnly.rows.identity).toBeUndefined(); // no 1:1 identity was minted
+        // A core with its own identity certifies under that key only, whatever the caller names.
+        const holder = new Client(Core);
+        holder.call({ cmd: 'identity' });
+        const leaf2 = holder.call({ cmd: 'mlsDeviceLeaf' });
+        const forged = F.mlsCertJson(userId, deviceId, 'web', leaf2, aik, issuedAt, sign(null, F.mlsCertBytes(userId, deviceId, 'web', leaf2, aik, issuedAt), privateKey).toString('base64url'));
+        expect(() => holder.call({ cmd: 'mlsSetDeviceCert', cert: forged, aik })).toThrow();
     });
 });

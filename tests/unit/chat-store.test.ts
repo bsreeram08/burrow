@@ -586,4 +586,13 @@ describe('groups and channels (docs/m4-groups.md §10)', () => {
     expect(kept[0].text).toBe('m2');
     expect(kept.at(-1).text).toBe('m501');
   });
+
+  test('membership lines in a group are all kept (no one-a-minute merging), once per id', async () => {
+    const store = groupStore();
+    const [a, b] = [crypto.randomUUID(), crypto.randomUUID()];
+    expect(await store.note(GROUP, a, 'alice added bob')).toBe(true);
+    expect(await store.note(GROUP, b, 'dave joined')).toBe(true);
+    expect(await store.note(GROUP, b, 'dave joined')).toBe(false);
+    expect((await store.list()).map((record: any) => record.text).sort()).toEqual(['alice added bob', 'dave joined']);
+  });
 });

@@ -133,7 +133,8 @@ pub trait Directory {
 pub fn verify_credential(directory: &mut dyn Directory, credential: &Credential, leaf_sig_key: &[u8]) -> Result<DeviceCert> {
     let basic = BasicCredential::try_from(credential.clone()).map_err(|_| ChatError::coded("invalid", "not a basic credential"))?;
     let cert = DeviceCert::decode(basic.identity())?;
-    let aik = directory.aik(&cert.user_id)?.ok_or_else(|| ChatError::coded("invalid", "no pinned account key for this user"))?;
+    // The message names the user so a client can pin them (docs/m4-groups.md §3) and retry.
+    let aik = directory.aik(&cert.user_id)?.ok_or_else(|| ChatError::coded("invalid", &format!("no pinned account key for user {}", cert.user_id)))?;
     cert.verify(&aik, leaf_sig_key)?;
     Ok(cert)
 }

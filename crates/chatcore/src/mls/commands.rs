@@ -63,7 +63,14 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
                 return ok(groups.init_device(store, &text(command, "userId")?, &text(command, "deviceId")?, &text(command, "platform")?, issued_at, &aik)?);
             }
             "mlsSetDeviceCert" => {
-                let aik = core.account_signing_key()?.verifying_key().to_bytes();
+                // A core with its own 1:1 identity certifies under that key only. A core without one (the web keeps the
+                // AIK in WebCrypto and runs MLS in a store of its own) takes the account key from its caller, once:
+                // the certificate must verify under it, and a store that holds a certificate never changes account.
+                let aik = if core.has_identity()? {
+                    core.account_signing_key()?.verifying_key().to_bytes()
+                } else {
+                    command.get("aik").and_then(Value::as_str).and_then(crate::mls::cert::key32).ok_or_else(|| ChatError::coded("invalid", "aik: the account key is needed"))?
+                };
                 let (groups, store) = core.groups()?;
                 return ok(groups.set_device_cert(store, &text(command, "cert")?, &aik)?);
             }

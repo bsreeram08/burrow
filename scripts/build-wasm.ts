@@ -34,7 +34,7 @@ const arg = (name: string) => process.argv.includes(name) ? resolve(process.argv
 const check = process.argv.includes('--check');
 type Variant = { name: string; features: string[]; out: string; checkDir: string };
 const variants: Variant[] = [
-    { name: 'browser', features: [], out: join(root, 'packages/signaling/public/core'), checkDir: arg('--core-dir') ?? join(root, 'packages/signaling/public/core') },
+    { name: 'browser', features: ['mls'], out: join(root, 'packages/signaling/public/core'), checkDir: arg('--core-dir') ?? join(root, 'packages/signaling/public/core') },
     { name: 'ds', features: ['ds'], out: join(root, 'packages/signaling/ds-core'), checkDir: arg('--ds-dir') ?? join(root, 'packages/signaling/ds-core') },
 ].filter(variant => (!arg('--core-dir') && !arg('--ds-dir')) || (variant.name === 'browser' ? arg('--core-dir') : arg('--ds-dir')) !== null);
 const CANONICAL_HOST = 'darwin-arm64';

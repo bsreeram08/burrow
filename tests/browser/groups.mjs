@@ -172,6 +172,7 @@ try {
   await carol.type('#chat-input', 'are you in?');
   await carol.press('#chat-input', 'Enter');
   await until(alice, () => document.querySelector('#group-list .mention-badge')?.textContent === '@');
+  await shot(alice, 'sidebar');
   await openGroup(alice, 'Weekend plans');
   await sees(alice, 'are you in?');
   if (!await message(alice, 'are you in?').locator('.mention.mention-me', { hasText: '@alice' }).count()) throw new Error('mention not highlighted');

@@ -143,6 +143,12 @@ pub fn succession_complete(record_json: String, signature: String) -> Result<Ide
     let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed succession record"))?;
     with(|core| core.succession_complete(&record, &signature))
 }
+/// A companion core whose account key lives outside it adopts the succession the old primary signed (see `Core::adopt_succession`).
+#[cfg(feature = "mls")]
+pub fn adopt_succession(user_id: String, record_json: String, signature: String, cert_json: Option<String>) -> Result<IdentityPub> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed succession record"))?;
+    with(|core| core.adopt_succession(&user_id, &record, &signature, cert_json.as_deref()))
+}
 /// Old primary: the signed record (JSON, `signature` included) for the new identity.
 pub fn sign_succession(user_id: String, published_sign: String, new_sign: String, new_dh: String, at: u64) -> Result<String> {
     with(|core| Ok(core.sign_succession(&user_id, &published_sign, &new_sign, &new_dh, at)?.to_string()))

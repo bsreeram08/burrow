@@ -359,3 +359,44 @@ fn the_reveal_is_one_shot_so_a_relay_cannot_grind_the_code_by_offering_other_pri
     assert_eq!(code_of(n.link_reveal(&link, &eph_p, now)).as_deref(), Some("unknown-link"), "burned");
     assert!(n.link_complete_code(&link, &eph_p, &device_p, now).is_err());
 }
+
+#[test]
+fn a_companion_with_its_key_outside_the_core_adopts_a_signed_succession_and_installs_the_new_certificate() {
+    use chatcore::mls::cert::DeviceCert;
+    let mut w = pair();
+    let (link, now) = (id(), 5_000u64);
+    let qr = w.new.link_qr(&link, now).unwrap();
+    let accepted = w.primary.link_accept(&qr, now).unwrap();
+    w.new.link_complete(&link, &accepted.eph, now).unwrap();
+    let device = id();
+    let leaf = { let (groups, store) = w.new.groups().unwrap(); groups.device_leaf(store).unwrap() };
+    w.primary.sign_device_list(&w.user, &w.identity.sign, &list_json(&w.user, 1, "", &[&device]), None).unwrap();
+    let cert = w.primary.sign_device_cert(&w.user, &device, "web", &leaf, now, now).unwrap();
+    w.new.companion_setup(&w.user, &w.identity, &cert).unwrap();
+
+    // The new account key is made outside every core (WebCrypto); the old primary signs the record for it.
+    let next_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+    let next = IdentityPub { dh: b64(&[7u8; 32]), sign: b64(&next_key.verifying_key().to_bytes()) };
+    let signed = w.primary.sign_succession(&w.user, &w.identity.sign, &next.sign, &next.dh, 9_000).unwrap();
+    let (record, signature) = record_of(&signed);
+    let new_cert = String::from_utf8(DeviceCert::issue(&next_key, &w.user, &device, "web", &URL_SAFE_NO_PAD.decode(&leaf).unwrap().try_into().unwrap(), 9_001).unwrap().encode()).unwrap();
+
+    // A primary holds the key itself and uses succession_complete; a record that does not continue from the pin, a
+    // tampered one, another account's, or a certificate under another key changes nothing.
+    assert!(w.primary.adopt_succession(&w.user, &record, &signature, None).is_err());
+    let mut tampered = record.clone();
+    tampered["at"] = json!(9_001);
+    assert_eq!(code_of(w.new.adopt_succession(&w.user, &tampered, &signature, None)).as_deref(), Some("auth"));
+    assert!(w.new.adopt_succession(&id(), &record, &signature, None).is_err());
+    let wrong = String::from_utf8(DeviceCert::issue(&ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]), &w.user, &device, "web", &URL_SAFE_NO_PAD.decode(&leaf).unwrap().try_into().unwrap(), 9_001).unwrap().encode()).unwrap();
+    assert!(w.new.adopt_succession(&w.user, &record, &signature, Some(&wrong)).is_err());
+    assert_eq!(w.new.public_identity().unwrap(), w.identity, "nothing changed yet");
+
+    assert_eq!(w.new.adopt_succession(&w.user, &record, &signature, Some(&new_cert)).unwrap(), next);
+    assert_eq!(w.new.public_identity().unwrap(), next);
+    assert!(w.new.is_companion().unwrap());
+    // The record continued from the old key; it cannot be replayed on the moved pin.
+    assert!(w.new.adopt_succession(&w.user, &record, &signature, None).is_err());
+    let previous = w.new.store_mut().get("own-previous").unwrap().unwrap();
+    assert_eq!(previous, json!([{ "sign": w.identity.sign, "until": 9_000 }]));
+}

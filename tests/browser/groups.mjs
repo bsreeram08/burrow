@@ -317,7 +317,7 @@ try {
   const signed = JSON.parse((await resolved).postData());
   if (signed.action !== 'rollback' || signed.author !== '') throw new Error(`a tag-only failure named an author to remove: ${signed.author}`);
   // Dave's device sees its commit rolled back, rejoins at the restored epoch and adds alice again, this time intact.
-  await sees(dave, 'It was made again', 60000);
+  await sees(dave, 'Your change was undone and redone', 60000);
   await until(bob, id => { const state = window.Groups.debug(id); return state.members.includes('alice') && state.members.includes('dave'); }, general, 60000);
   await say(bob, 'After the rollback');
   await sees(carol, 'After the rollback'); await sees(dave, 'After the rollback');

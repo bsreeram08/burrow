@@ -9,13 +9,14 @@ import { IDBFactory, IDBKeyRange } from 'fake-indexeddb';
 // remove-needed, a changed code of someone met in a group).
 const read = (name: string) => readFileSync(new URL(`../../packages/signaling/public/${name}`, import.meta.url), 'utf8');
 const sources = [read('chat-store.js'), read('groups.js')];
-const G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
+const DEV2 = 'F'.repeat(22), G = 'g'.repeat(22), ME = 'M'.repeat(22), BOB = 'B'.repeat(22), DEV = 'D'.repeat(22), BOB_DEV = 'E'.repeat(22);
 const coded = (code: string | null, message: string) => Object.assign(new Error(message), { code });
 const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number } = {}) {
+  const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
   const handlers: Record<string, (command: Cmd) => any> = {
@@ -24,6 +25,8 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     // Like chatcore: with `identity`, only that exact pinned identity is accepted.
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
     setVerified: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); return null; },
+    mlsSignResolution: () => 'L'.repeat(86),
+    mlsVerifyResolution: command => { if (command.signature !== 'L'.repeat(86) || command.by !== DEV2) throw coded('auth', 'bad resolution signature'); return { userId: ME, deviceId: DEV2 }; },
     mlsCommitAuthor: () => ({ authenticated: true, signedContentInvalid: true, class: 'signed-content', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false } }),
     mlsRoles: () => ({ v: 1, kind: 'group', admins: [ME], joinPolicy: 'invite' }),
     mlsMembers: () => [{ leaf: 0, userId: ME, deviceId: DEV, platform: 'web', admin: true }, { leaf: 1, userId: BOB, deviceId: BOB_DEV, platform: 'web', admin: false }],
@@ -36,9 +39,10 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const routes: [string, RegExp, (body: any, match: RegExpExecArray) => [number, any]][] = [
     ['GET', /^\/api\/mls\/keypackages$/, () => [200, { oneTime: 100, lastResort: true, low: false, max: 100 }]],
     ['GET', /^\/api\/channels$/, () => [200, { channels: [{ id: G, kind: 'private', name: null, epoch: 3, seq: 0, frozen: false, member: true, cursor: 0, admin: true }] }]],
+    ['GET', /^\/api\/channels\/[\w-]{22}$/, () => [200, { id: G, kind: 'private', name: null, epoch: options.epoch ?? 3, seq: 5, frozen: false, member: true, cursor: 5, admin: true }]],
     ['GET', /^\/api\/channels\/\w+\/members$/, () => [200, { members: [{ userId: ME, username: 'me', deviceId: DEV, admin: true }, { userId: BOB, username: 'bob', deviceId: BOB_DEV, admin: false }] }]],
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
-    ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: options.log?.(Number(match[1])) ?? [], more: false, gap: false }]],
+    ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: log.current?.(Number(match[1])) ?? [], more: false, gap: false }]],
     ['GET', /^\/api\/users\/\w+\/identity$/, () => [200, { userId: BOB, username: 'bob', identity: { dh: 'dh2', sign: 'sign2' } }]],
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
     ['POST', /^\/api\/channels\/\w+\/commits$/, () => [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
@@ -77,7 +81,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
   const settle = () => Bun.sleep(60);
-  return { dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
+  return { log, storage, dm, Groups, calls, requests, handlers, ctx, el, app, until, settle, setPeer: (value: any) => { peer = value; },
     async start() { Groups.start(ctx); await until(() => Groups.enabled(), 'groups enabled'); await settle(); },
     of: (name: string) => calls.filter(command => command.cmd === name) };
 }
@@ -116,8 +120,9 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
   });
 
   const frozenEntry = (message = b64('bad commit')) => ({ seq: 5, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message, createdAt: Date.now() });
-  async function frozenWorld(receive: () => any, entry = frozenEntry(), options: { removeDevice?: string; author?: () => any } = {}) {
+  async function frozenWorld(receive: () => any, entry = frozenEntry(), options: { removeDevice?: string; author?: () => any; before?: (storage: Map<string, string>) => void } = {}) {
     const w = world({ log: after => after === 4 ? [entry] : [], removeDevice: options.removeDevice });
+    options.before?.(w.storage);
     w.handlers.mlsReceive = receive;
     if (options.author) w.handlers.mlsCommitAuthor = options.author;
     await w.start();
@@ -192,14 +197,67 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     // This device removes bob (a commit of its own), and the server later reports that very commit rolled back.
     await w.Groups.removeMember(G, BOB);
     const own = w.requests.filter(request => request.path.endsWith('/commits')).length;
-    w.Groups.frame({ type: 'channel', id: G, change: 'rolled-back', seq: 99, digest: 'f'.repeat(64) }); // not ours
+    const signed = { type: 'channel', id: G, change: 'rolled-back', action: 'rollback', author: '', by: DEV2, signature: 'L'.repeat(86) };
+    w.Groups.frame({ ...signed, seq: 99, digest: 'f'.repeat(64) }); // not ours
     await w.settle();
     expect(joined).toBe(0);
-    w.Groups.frame({ type: 'channel', id: G, change: 'rolled-back', seq: 6, digest: sha('commit') });
+    w.Groups.frame({ ...signed, seq: 6, digest: sha('commit') });
     await w.until(() => w.requests.filter(request => request.path.endsWith('/commits')).length === own + 1, 'redone');
     expect(joined).toBe(1);
     expect(w.of('mlsForget').length).toBeGreaterThan(0);
     expect(w.of('mlsCommit').at(-1)!.removes).toEqual([{ userId: BOB }]);
+    expect(w.of('mlsVerifyResolution')[0]).toMatchObject({ group: G, action: 'rollback', seq: 6, digest: sha('commit'), author: '', by: DEV2 });
+  });
+
+  test('6. a rolled-back notice the server could have made up redoes nothing', async () => {
+    const cases: [string, Partial<{ notice: any; epoch: number; log: (after: number) => any[]; later: boolean }>][] = [
+      ['unsigned', { notice: { signature: 'X'.repeat(86) } }],
+      ['signed by a device that is not an admin here', { notice: { by: 'Q'.repeat(22) } }],
+      ['the commit is still in the log', { log: after => after === 5 ? [{ seq: 6, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV }, message: b64('commit'), createdAt: 0 }] : [] }],
+      ['the channel is not at the pre-commit epoch', { epoch: 4 }],
+      ['a later commit was processed since', { later: true, log: after => after < 7 ? [{ seq: 6, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV }, message: b64('commit'), createdAt: 0 }, { seq: 7, epoch: 4, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('later'), createdAt: 0 }].filter(entry => entry.seq > after) : [] }],
+    ];
+    for (const [what, variant] of cases) {
+      const w = world({ epoch: variant.epoch, log: variant.later ? undefined : variant.log });
+      let joined = 0;
+      w.handlers.mlsJoinExternal = () => { joined++; return { groupId: G, commit: b64('join'), digest: sha('join'), epoch: 3 }; };
+      await w.start();
+      await w.Groups.removeMember(G, BOB);
+      if (variant.later) {
+        w.log.current = variant.log;
+        w.handlers.mlsReceive = () => ({ pendingId: 'p9', kind: 'commit', sender: { leaf: 1, userId: BOB }, epoch: 5, digest: 'x' });
+        w.Groups.frame({ type: 'group', channel: G, seq: 7, epoch: 4, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('later'), createdAt: Date.now() });
+        await w.until(() => w.Groups.debug(G).cursor === 7, 'later commit');
+      }
+      const commits = w.of('mlsCommit').length;
+      w.Groups.frame({ type: 'channel', id: G, change: 'rolled-back', action: 'rollback', seq: 6, digest: sha('commit'), author: '', by: DEV2, signature: 'L'.repeat(86), ...variant.notice });
+      await Bun.sleep(150);
+      expect([what, joined, w.of('mlsCommit').length]).toEqual([what, 0, commits]);
+      if (variant.later) expect(w.of('mlsVerifyResolution')).toEqual([]); // forgotten as soon as the group moved past it
+    }
+  });
+
+  const tagCheck = () => ({ authenticated: true, signedContentInvalid: false, class: 'tag', author: { leaf: 1, userId: BOB, deviceId: BOB_DEV } });
+  const instanceKey = `tag-rollbacks-v1:${ME}-${DEV}-${'A'.repeat(12)}`;
+  test('7. a tag rollback names nobody but is counted; from the second in a day an admin may remove that device, explicitly', async () => {
+    const once = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { author: tagCheck });
+    expect(once.el('group-remove-author').hidden).toBe(true);
+    await once.el('group-rollback').onclick(); await once.settle();
+    expect(once.requests.find(request => request.path.endsWith('/resolve'))!.body).toMatchObject({ author: '', leafSignature: 'L'.repeat(86) });
+    expect(JSON.parse(once.storage.get(instanceKey)!)[BOB_DEV]).toHaveLength(1);
+    expect(once.of('mlsCommit')).toEqual([]);
+
+    const w = await frozenWorld(() => { throw coded('poison', `poison ${sha('bad commit')}: bad tag`); }, frozenEntry(), { author: tagCheck, before: storage => storage.set(instanceKey, JSON.stringify({ [BOB_DEV]: [Date.now() - 3600000, Date.now() - 60000] })) });
+    expect(w.el('group-remove-author').hidden).toBe(false);
+    expect(w.el('group-remove-author').textContent).toBe("Remove bob's device");
+    w.el('group-remove-author').onclick();
+    expect(w.el('group-remove-confirm').hidden).toBe(false);
+    expect(w.requests.filter(request => request.path.endsWith('/resolve'))).toEqual([]); // nothing until confirmed
+    w.el('group-remove-yes').onclick();
+    await w.until(() => w.of('mlsCommit').length > 0, 'removal');
+    expect(w.requests.find(request => request.path.endsWith('/resolve'))!.body).toMatchObject({ action: 'rollback', author: BOB_DEV });
+    expect(w.of('mlsSignResolution')[0]).toMatchObject({ author: BOB_DEV });
+    expect(w.of('mlsCommit')[0].removes).toEqual([{ userId: BOB, deviceId: BOB_DEV }]);
   });
 
   test('5. a changed code of someone met in a group pauses the group and is only accepted from an explicit review', async () => {

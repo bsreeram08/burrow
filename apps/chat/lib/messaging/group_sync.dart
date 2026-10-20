@@ -143,6 +143,7 @@ class GroupSync {
     required this.platform,
     required this.ensurePinned,
     this.verifiedOwnDevices,
+    this.companion = false,
     TagRollbackLog? tagLog,
     this.sendCursor,
     this.onDelivery,
@@ -178,6 +179,14 @@ class GroupSync {
   /// forward): the devices it names, and the ones a pinned list dropped. Null when it can't be verified; then
   /// no own leaf is removed and no channel is auto-joined (m5 §3, §4).
   final Future<OwnDeviceList?> Function()? verifiedOwnDevices;
+
+  /// A linked device (m5 §1): its MLS certificate came with the link grant, signed by the primary; it never
+  /// makes one itself.
+  final bool companion;
+
+  /// Names and topics of channels from a link bundle (m5 §3 step 3), used when this device first joins them;
+  /// later `meta` overrides them. ponytail: kept in memory, so a join after a restart shows no name until meta.
+  final Map<String, ({String name, String topic})> bundleNames = {};
 
   /// The random 0–3 s wait before acting on our own revoked leaves, so devices don't all commit at once.
   Duration Function() removalJitter = () => Duration(milliseconds: math.Random().nextInt(3000));
@@ -240,7 +249,7 @@ class GroupSync {
 
   Future<void> _setUp() async {
     final local = await device();
-    await crypto.initDevice(userId: me.id, deviceId: local.deviceId, platform: platform, issuedAt: _now());
+    if (!companion) await crypto.initDevice(userId: me.id, deviceId: local.deviceId, platform: platform, issuedAt: _now());
     await topUpKeyPackages();
   }
 
@@ -767,7 +776,11 @@ class GroupSync {
     _dropWelcome(event.id);
     _changed(event.channel);
     await _catchUpNow(event.channel);
-    if (info.kind == GroupKindName.dm) onDmJoined?.call(event.channel);
+    if (info.kind == GroupKindName.dm) {
+      // A linked device never sees the pointer: the checked DM group it was added to as our device is the proof.
+      if (companion && await checkDmNow(event.channel)) await store.updateGroup(event.channel, (g) => g.copyWith(movedAt: g.movedAt ?? _now()));
+      onDmJoined?.call(event.channel);
+    }
   });
 
   void _dropWelcome(String id) {
@@ -855,8 +868,9 @@ class GroupSync {
       final channel = await _channelInfo(groupId);
       final existing = await store.group(groupId);
       final seq = accepted['seq'] as int;
+      final named = bundleNames.remove(groupId);
       await store.putGroup(
-        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? '', peer: channel.peer))
+        (existing ?? GroupConversation(id: groupId, kind: channel.kind, createdAt: _now(), name: channel.name ?? named?.name ?? '', topic: named?.topic ?? '', peer: channel.peer))
             .copyWith(membership: Membership.active, cursor: seq, clearFrozen: true),
       );
       _reportCursor(groupId, seq);

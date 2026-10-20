@@ -32,7 +32,7 @@ class Person {
 
   Contact get contact => Contact(id: user.id, username: user.username, state: ContactState.mutual, online: true);
 
-  static Future<Person> start(FakeDs ds, String name, {required List<Contact> Function() contacts, String? userId}) async {
+  static Future<Person> start(FakeDs ds, String name, {required List<Contact> Function() contacts, String? userId, bool companion = false}) async {
     final user = User(id: userId ?? '${name}_${'x' * (21 - name.length)}', username: name.replaceAll(RegExp(r'\d'), ''));
     final device = await localDevice(MemoryDevicePrefs(), user.id);
     final api = ds.client(userId: user.id, username: user.username, deviceId: device.deviceId);
@@ -49,7 +49,11 @@ class Person {
       mutualContacts: contacts,
       ack: (_) {},
       viewing: () => person.viewing,
-    )..moveChats = false;
+    )
+      ..moveChats = false
+      ..companion = companion;
+    // A linked device's MLS certificate came with its link grant (modelled here by the fake's own).
+    if (companion) await mls.initDevice(userId: user.id, deviceId: device.deviceId, platform: 'macos', issuedAt: 1);
     final sync = GroupSync(
       api: api,
       crypto: mls,
@@ -59,6 +63,7 @@ class Person {
       platform: 'ios',
       ensurePinned: (ids, {force = false}) => person.groups.ensurePinned(ids, force: force),
       backoff: (_) => Duration.zero,
+      companion: companion,
     );
     final groups = GroupMessenger(api: api, sync: sync, chatCrypto: chat, store: store, me: user, contacts: contacts);
     messenger.groups = groups;
@@ -152,8 +157,13 @@ void main() {
     expect(ds.envelopes.length, afterPointer, reason: 'nothing more over the Double Ratchet');
 
     // Typing: live through the group only.
-    await bob.messenger.typingChanged(alice.contact, on: true);
-    await eventually(() async => alice.messenger.typing, (t) => t.contains(bob.user.id), 'typing via the group');
+    // Live-only: a hint sent while the channel's queue is busy is dropped by design, so the composer says it again.
+    await eventually(() async {
+      await bob.messenger.typingChanged(alice.contact, on: false);
+      await bob.messenger.typingChanged(alice.contact, on: true);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      return alice.messenger.typing;
+    }, (t) => t.contains(bob.user.id), 'typing via the group');
     expect(ds.envelopes.length, afterPointer);
   });
 
@@ -205,5 +215,26 @@ void main() {
     await alice.messenger.send(bob.contact, 'another from the phone');
     final seen = await eventually(() => laptop.chat(bob), (l) => has(l, 'to both', Direction.incoming) && has(l, 'another from the phone', Direction.outgoing));
     expect(seen.firstWhere((m) => m.text == 'another from the phone').status, MessageStatus.sent);
+  });
+
+  test('a linked device (no account keys) sends only once the chat moved, through the DM group', () async {
+    late Contact bobContact;
+    final laptop = await Person.start(ds, 'alice2', contacts: () => [bobContact], userId: alice.user.id, companion: true);
+    bobContact = bob.contact;
+    people.add(laptop);
+    expect(laptop.messenger.active, isFalse);
+    final before = ds.envelopes.length;
+    final early = await laptop.messenger.send(bob.contact, 'from the laptop, early');
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    expect((await laptop.store.get(laptop.messenger.conversationWith(bob.user.id), early.id))!.status, MessageStatus.queued, reason: 'waits for the move');
+    expect(ds.envelopes.length, before, reason: 'never over the Double Ratchet');
+
+    alice.messenger.moveChats = true;
+    await alice.messenger.send(bob.contact, 'moving');
+    final dm = await eventually(() => laptop.groups.dmChannelWith(bob.user.id), (c) => c != null, 'the laptop holds the checked DM group');
+    expect(dm, isNotNull);
+    await laptop.messenger.flush();
+    await eventually(() => bob.chat(alice), (l) => has(l, 'from the laptop, early', Direction.incoming), 'bob got the laptop message');
+    await eventually(() => alice.chat(bob), (l) => has(l, 'from the laptop, early', Direction.outgoing), 'the phone stores it as ours');
   });
 }

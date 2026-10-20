@@ -28,6 +28,9 @@ const typingHideMs = 6000;
 /// receiver waits this long for the pointer's group.
 const dmMoveRetryMs = 600000;
 
+/// Why a linked device can't send in a chat that is still on the Double Ratchet.
+const companionNotice = 'Messages in this chat go through your primary device until it moves to the new encryption.';
+
 /// The system line both sides show where a 1:1 chat moved.
 const dmMovedNote = 'Messages in this chat now use the new encryption.';
 
@@ -186,6 +189,11 @@ class Messenger {
   /// Compares the server's published identity with ours before uploading anything.
   /// Re-run on sign-in, on reconnect and on a `keys` event for our own id.
   Future<bool> checkActive() async {
+    if (companion) {
+      // A linked device never holds the account's keys: nothing to compare or upload.
+      _setActive(false);
+      return false;
+    }
     final count = await api.keyCount();
     final mine = await crypto.identity();
     final published = count.identity == null ? null : Identity.fromJson(count.identity!);
@@ -333,7 +341,7 @@ class Messenger {
     final list = view['list'] is Map ? (view['list'] as Map).cast<String, dynamic>() : null;
     final own = await crypto.identity();
     final served = view['identity'];
-    final holder = served is Map && served['sign'] == own.sign && served['dh'] == own.dh;
+    final holder = !companion && served is Map && served['sign'] == own.sign && served['dh'] == own.dh;
     final key = holder ? deviceMetaKey(await crypto.deviceMetaSignature(me.id)) : null;
     return [
       for (final row in (view['devices'] as List? ?? const []).cast<Map>())
@@ -558,13 +566,14 @@ class Messenger {
     return message;
   }
 
-  void _requireActive() {
-    if (!active || keysLocked) throw const CryptoException('Encrypted messaging for this account is active on another device or browser.');
+  /// A linked device sends only in chats that moved to MLS; the active device sends in all of them.
+  Future<void> _requireSendable(Contact contact) async {
+    if (keysLocked || (!active && await _dmChannel(contact.id!) == null)) throw CryptoException(companion ? companionNotice : 'Encrypted messaging for this account is active on another device or browser.');
   }
 
   /// Adds or removes our reaction: stored here at once, then sent. Reverted if it can't be sent.
   Future<void> react(Contact contact, ChatMessage target, String emoji, {required bool on}) async {
-    _requireActive();
+    await _requireSendable(contact);
     final conversationId = conversationWith(contact.id!);
     if (!await store.react(conversationId, target.id, who: 'me', emoji: emoji, on: on)) return;
     try {
@@ -577,7 +586,7 @@ class Messenger {
 
   /// Edits one of our sent text messages. Queued messages can't be edited yet (the peer doesn't have them).
   Future<void> edit(Contact contact, ChatMessage target, String text) async {
-    _requireActive();
+    await _requireSendable(contact);
     if (!target.outgoing || target.attachment != null || target.status == MessageStatus.queued) {
       throw const StoreException('Only your own sent text messages can be edited.');
     }
@@ -621,7 +630,7 @@ class Messenger {
     final conversationId = conversationWith(id);
     try {
       final changed = await store.markRead(conversationId, batch, direction: Direction.incoming);
-      if (changed.isNotEmpty && readReceipts() && active && !keysLocked) {
+      if (changed.isNotEmpty && readReceipts() && (active || await _dmChannel(id) != null) && !keysLocked) {
         await _sendToContact(contact, {'v': 1, 'type': 'read', 'id': const Uuid().v4(), 'ids': changed});
       }
     } catch (_) {
@@ -699,6 +708,10 @@ class Messenger {
   /// Off: 1:1 chats stay on the Double Ratchet (tests of the 1:1 protocol itself).
   bool moveChats = true;
 
+  /// A linked device (m5 §0): no account keys here, so no 1:1 sessions. It reads and sends only chats that
+  /// moved to MLS; the rest stay on the primary.
+  bool companion = false;
+
   Future<String?> _dmChannel(String contactId) async => await _groups?.dmChannelWith(contactId);
 
   /// Every payload to a contact: through the DM group once the chat moved, otherwise the 1:1 session.
@@ -766,7 +779,8 @@ class Messenger {
 
   /// Sends every queued message, oldest first, keeping each contact's order.
   Future<void> flush() async {
-    if (!active || keysLocked || _disposed) return; // Messages stay queued here until this device is usable.
+    // Messages stay queued here until this device is usable (a linked device: until the chat moves to MLS).
+    if ((!active && !companion) || keysLocked || _disposed) return;
     if (_flushing) {
       _flushAgain = true;
       return;
@@ -783,6 +797,7 @@ class Messenger {
         if (mine.isEmpty) continue;
         await _maybeMove(contact).catchError((_) {});
         final channel = await _dmChannel(contact.id!);
+        if (channel == null && !active) continue;
         var prepared = channel != null;
         for (final record in mine) {
           try {

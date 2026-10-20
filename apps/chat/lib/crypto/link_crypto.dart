@@ -75,8 +75,11 @@ abstract class LinkCrypto {
   Future<int> importPins(List<PinExport> pins);
 
   /// New device: installs the grant (the account's public identity and this device's certificate) and enters
-  /// companion mode.
-  Future<void> companionSetup({required String userId, required Identity identity, required String certJson});
+  /// companion mode. Returns what the installed certificate names.
+  Future<({String userId, String deviceId, String leafSigKey})> companionSetup({required String userId, required Identity identity, required String certJson});
+
+  /// The account a companion core is linked to; null on a primary (or a core not set up yet).
+  Future<({String userId, Identity identity})?> account();
 
   /// Succession (§5): the new primary mints its identity, then completes with the old primary's record.
   Future<Identity> successionStart();
@@ -173,8 +176,16 @@ class RustLinkCrypto implements LinkCrypto {
   ));
 
   @override
-  Future<void> companionSetup({required String userId, required Identity identity, required String certJson}) =>
-      _call(() => core.companionSetup(userId: userId, identity: core.Identity(dh: identity.dh, sign: identity.sign), certJson: certJson));
+  Future<({String userId, String deviceId, String leafSigKey})> companionSetup({required String userId, required Identity identity, required String certJson}) => _call(() async {
+    final cert = await core.companionSetup(userId: userId, identity: core.Identity(dh: identity.dh, sign: identity.sign), certJson: certJson);
+    return (userId: cert.userId, deviceId: cert.deviceId, leafSigKey: cert.leafSigKey);
+  });
+
+  @override
+  Future<({String userId, Identity identity})?> account() => _call(() async {
+    final a = await core.account();
+    return a == null ? null : (userId: a.userId, identity: Identity(dh: a.identity.dh, sign: a.identity.sign));
+  });
 
   @override
   Future<Identity> successionStart() => _call(() async {
@@ -303,8 +314,18 @@ class FakeLinkCrypto implements LinkCrypto {
   }
 
   @override
-  Future<void> companionSetup({required String userId, required Identity identity, required String certJson}) async =>
-      companion = (userId: userId, identity: identity, certJson: certJson);
+  Future<({String userId, String deviceId, String leafSigKey})> companionSetup({required String userId, required Identity identity, required String certJson}) async {
+    final cert = jsonDecode(certJson) as Map;
+    if (cert['aikSign'] != identity.sign || cert['userId'] != userId) throw const CryptoException('certificate does not verify', code: 'invalid');
+    companion = (userId: userId, identity: identity, certJson: certJson);
+    return (userId: cert['userId'] as String, deviceId: cert['deviceId'] as String, leafSigKey: cert['leafSigKey'] as String);
+  }
+
+  @override
+  Future<({String userId, Identity identity})?> account() async {
+    final c = companion;
+    return c == null ? null : (userId: c.userId, identity: c.identity);
+  }
 
   Identity? _minted;
 

@@ -265,6 +265,33 @@ class MessageStore {
     _changes.add(conversationId);
   }
 
+  /// History a linked device received in its bundle (m5 §2): records in the shape both clients store
+  /// (`exportRecord`), added where absent, within the device cap; anything malformed is skipped. Returns how many.
+  Future<int> importLinked(List<Object?> records) async {
+    Object? text(Object? value) => value == null ? null : jsonEncode(value);
+    var added = 0;
+    await _db.transaction((tx) async {
+      for (final r in records) {
+        if (r is! Map || await _count(tx) >= maxMessages) continue;
+        try {
+          final m = ChatMessage.fromRow({
+            'id': r['id'], 'conversation_id': r['conversationId'], 'direction': r['direction'], 'text': r['text'],
+            'created_at': r['createdAt'], 'status': r['status'] == 'queued' ? 'uncertain' : r['status'], 'expires_at': r['expiresAt'],
+            'reply_to': text(r['replyTo']), 'attachment': text(r['attachment']), 'link': text(r['link']),
+            'edited_text': r['editedText'], 'edited_at': r['editedAt'], 'reactions': text(r['reactions']),
+            'sender': r['from'], 'sender_name': r['fromName'], 'mentions': text(r['mentions']),
+          });
+          if (m.system || m.expired(_now())) continue;
+          added += await tx.insert('messages', m.toRow(), conflictAlgorithm: ConflictAlgorithm.ignore) > 0 ? 1 : 0;
+        } catch (_) {
+          // Not a record this store accepts: skipped.
+        }
+      }
+    });
+    if (added > 0) _changes.add(null);
+    return added;
+  }
+
   /// Adds or removes one person's reaction. Unknown targets are ignored (false); so is a no-op or a 21st distinct emoji.
   Future<bool> react(String conversationId, String target, {required String who, required String emoji, required bool on}) async {
     final group = conversationId.length == 22;

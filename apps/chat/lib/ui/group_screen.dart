@@ -12,6 +12,7 @@ import '../app/chat_settings.dart';
 import '../core/api.dart';
 import '../messaging/attachments.dart';
 import '../messaging/group_messenger.dart';
+import '../crypto/group_crypto.dart' show GroupMember;
 import '../messaging/group_sync.dart' show FrozenVerdict;
 import '../store/message.dart';
 import '../store/message_store.dart' show Frozen, GroupConversation, GroupKindName, Membership;
@@ -48,6 +49,7 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
   bool _focused = true, _dropping = false;
   Frozen? _verdictFor;
   FrozenVerdict? _verdict;
+  GroupMember? _escalation;
   final List<ChatMessage> _unreported = [];
 
   GroupMessenger? get _groups => _app.groups;
@@ -171,7 +173,12 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
         _verdictFor = frozen;
         _verdict = null;
         unawaited(_groups?.sync.checkFrozen(widget.groupId).then((check) {
-          if (mounted && _verdictFor == frozen) setState(() => _verdict = check.verdict);
+          if (mounted && _verdictFor == frozen) {
+            setState(() {
+              _verdict = check.verdict;
+              _escalation = check.escalation ? check.check?.author : null;
+            });
+          }
         }));
       }
       final verdict = _verdict;
@@ -185,6 +192,8 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
         key: const Key('frozen-banner'),
         actions: [
           if (verdict == FrozenVerdict.fails) TextButton(key: const Key('rollback'), onPressed: () => _resolve(rollback: true), child: const Text('Roll back')),
+          if (verdict == FrozenVerdict.fails && _escalation != null)
+            TextButton(key: const Key('rollback-remove'), onPressed: () => _removeRepeated(_escalation!), child: Text("Remove ${_nameOf(_escalation!.userId)}'s device")),
           if (verdict != null) TextButton(key: const Key('dismiss'), onPressed: () => _resolve(rollback: false), child: const Text('Dismiss')),
         ],
       );
@@ -197,6 +206,32 @@ class _GroupScreenState extends ConsumerState<GroupScreen> with AttachmentSendin
       );
     }
     return null;
+  }
+
+  /// A repeated tag-only failure by the same device: roll back and remove that device, only on an explicit,
+  /// confirmed choice that says the damage may not be theirs (m4-groups §7).
+  Future<void> _removeRepeated(GroupMember author) async {
+    final name = _nameOf(author.userId);
+    final count = (_groups?.sync.tagRollbacks(author.deviceId).length ?? 0) + 1;
+    final yes = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text("Roll back and remove $name's device?"),
+        content: Text(
+          "$name's changes to this conversation arrived damaged $count times in a day. That can be their device, but also the network or the server, so nothing was blamed on them. Roll this one back and remove that device? They can be added again.",
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
+          FilledButton(key: const Key('rollback-remove-confirm'), onPressed: () => Navigator.pop(context, true), child: const Text('Roll back and remove')),
+        ],
+      ),
+    );
+    if (yes != true) return;
+    try {
+      await _groups!.sync.resolve(widget.groupId, rollback: true, removeAuthor: true);
+    } catch (e) {
+      if (mounted) showSnack(context, e is ApiException ? e.message : (e is StoreException ? e.message : 'Could not resolve: $e'));
+    }
   }
 
   Future<void> _resolve({required bool rollback}) async {

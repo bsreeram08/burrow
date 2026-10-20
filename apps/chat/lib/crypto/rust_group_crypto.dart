@@ -117,6 +117,14 @@ class RustGroupCrypto implements GroupCrypto {
   });
 
   @override
+  Future<String> signResolution(String groupId, {required String action, required int seq, required String digest, required String author}) =>
+      _call(() => core.mlsSignResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author));
+
+  @override
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature}) =>
+      _call(() async => (await core.mlsVerifyResolution(groupId: groupId, action: action, seq: BigInt.from(seq), digest: digest, author: author, by: by, signature: signature)).userId);
+
+  @override
   Future<void> receiveCommit(String pendingId) => _call(() => core.mlsReceiveCommit(pendingId: pendingId));
 
   @override

@@ -112,6 +112,26 @@ class SharedRotationPrefs implements RotationPrefs {
   }
 }
 
+/// An admin device's tag-only rollbacks per author device, kept on this device (m4-groups §7).
+class SharedTagRollbackLog implements TagRollbackLog {
+  SharedTagRollbackLog(this._prefs, this._user);
+  final SharedPreferences _prefs;
+  final String _user;
+  String get _key => 'tag-rollbacks-v1:$_user';
+  @override
+  Map<String, List<int>> read() {
+    try {
+      final raw = jsonDecode(_prefs.getString(_key) ?? '{}');
+      return {for (final e in (raw as Map).entries) e.key as String: [for (final t in e.value as List) t as int]};
+    } catch (_) {
+      return {};
+    }
+  }
+
+  @override
+  void write(Map<String, List<int>> value) => _prefs.setString(_key, jsonEncode(value));
+}
+
 /// This install's device id and key per account, and contacts' pinned device lists (account.js `device-pins-v1`).
 final devicePrefsProvider = Provider<Future<DevicePrefs> Function()>((ref) => () async => SharedDevicePrefs(await SharedPreferences.getInstance()));
 
@@ -335,6 +355,7 @@ class AppController extends Notifier<AppState> {
       device: m.device,
       platform: _api.client,
       ensurePinned: (ids, {force = false}) async => await groups?.ensurePinned(ids, force: force) ?? const <String>[],
+      tagLog: SharedTagRollbackLog(await SharedPreferences.getInstance(), user.id),
       sendCursor: (channel, seq) => events.connected ? events.cursor(channel, seq) : unawaited(_api.setCursor(channel, seq).catchError((_) {})),
       ackWelcome: events.ack,
     );

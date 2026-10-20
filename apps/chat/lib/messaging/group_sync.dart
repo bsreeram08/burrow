@@ -60,13 +60,31 @@ class LogEntry {
   );
 }
 
+/// Where an admin device keeps its tag-only rollbacks per author device (timestamps, ms).
+abstract class TagRollbackLog {
+  Map<String, List<int>> read();
+  void write(Map<String, List<int>> value);
+}
+
+class MemoryTagRollbackLog implements TagRollbackLog {
+  Map<String, List<int>> _value = {};
+  @override
+  Map<String, List<int>> read() => {for (final e in _value.entries) e.key: List.of(e.value)};
+  @override
+  void write(Map<String, List<int>> value) => _value = value;
+}
+
 /// An admin device's own verdict on the commit a channel is frozen on.
 enum FrozenVerdict { fails, ok, unknown }
 
 /// [checkFrozen]'s result: the verdict, and the core's check of the commit (who signed it, which class of failure).
 class FrozenCheck {
-  const FrozenCheck(this.verdict, {this.check});
+  const FrozenCheck(this.verdict, {this.check, this.escalation = false});
   final FrozenVerdict verdict;
+
+  /// A failing `tag` commit by an authenticated author device whose changes this admin already rolled back at
+  /// least twice in 24 h: the admin may choose (never automatically) to roll it back *and* remove that device.
+  final bool escalation;
 
   /// The core's verdict on the commit (author and failure class), when it could be checked here.
   final CommitCheck? check;
@@ -116,13 +134,15 @@ class GroupSync {
     required this.device,
     required this.platform,
     required this.ensurePinned,
+    TagRollbackLog? tagLog,
     this.sendCursor,
     this.onDelivery,
     this.onMembership,
     this.ackWelcome,
     int Function()? now,
     Duration Function(int attempt)? backoff,
-  }) : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
+  }) : tagLog = tagLog ?? MemoryTagRollbackLog(),
+       _now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
        _backoff = backoff ?? commitBackoff;
 
   final Api api;
@@ -141,6 +161,9 @@ class GroupSync {
   /// The `cursor` frame on the events socket (falls back to `POST .../cursor`).
   final void Function(String channel, int seq)? sendCursor;
   final void Function(String welcomeId)? ackWelcome;
+
+  /// This admin device's record of tag-only rollbacks per author device (kept on the device).
+  final TagRollbackLog tagLog;
   DeliveryHandler? onDelivery;
   Future<void> Function(MembershipChange change)? onMembership;
   final int Function() _now;
@@ -263,7 +286,7 @@ class GroupSync {
       joiners: () => [for (final p in packages) p['deviceId'] as String],
       // A one-time KeyPackage is spent by the claim: a rebuild claims fresh ones.
       rebuild: claim,
-      redo: () => add(groupId, userIds),
+      redo: () async => redoAdd != null ? await redoAdd!(groupId, userIds) : await add(groupId, userIds),
     );
     return {...missing, ...userIds.where((u) => !packages.any((p) => p['userId'] == u))};
   });
@@ -284,7 +307,10 @@ class GroupSync {
   /// up on the log and rebuild; no answer → leave it pending and let the log decide.
   /// Our last sequenced commit per group, with how to make the same change again ([redo]) if an admin rolls it
   /// back (m4-groups §7: the author redoes it).
-  final Map<String, ({int seq, String digest, Future<void> Function()? redo})> _lastOwn = {};
+  final Map<String, ({int seq, String digest, int epoch, Future<void> Function()? redo})> _lastOwn = {};
+
+  /// Redoes a rolled-back add through the payload layer's normal add path (pins, fresh KeyPackages, `meta`).
+  Future<void> Function(String groupId, List<String> userIds)? redoAdd;
 
   Future<void> _commit(String groupId, Future<GroupCommit> Function() build, {List<String> Function()? joiners, Future<void> Function()? rebuild, Future<void> Function()? redo}) async {
     await _catchUpNow(groupId);
@@ -316,7 +342,7 @@ class GroupSync {
       final view = await crypto.mergeOwn(groupId);
       unawaited(_publishGroupInfo(groupId, view));
       final seq = accepted['seq'] as int?;
-      if (seq != null) _lastOwn[groupId] = (seq: seq, digest: accepted['digest'] as String? ?? messageDigest(out.commit), redo: redo);
+      if (seq != null) _lastOwn[groupId] = (seq: seq, digest: accepted['digest'] as String? ?? messageDigest(out.commit), epoch: out.epoch, redo: redo);
       await _advanceTo(groupId, seq, onlyIfNext: true);
       _changed(groupId);
       return;
@@ -586,6 +612,8 @@ class GroupSync {
         await crypto.receiveCommit(processed.pendingId);
       case ProcessedKind.commit || ProcessedKind.own:
         await crypto.receiveCommit(processed.pendingId);
+        // The group moved on past our last commit: a later rollback notice can't concern it any more.
+        if ((_lastOwn[group.id]?.seq ?? entry.seq) < entry.seq) _lastOwn.remove(group.id);
         final after = await crypto.members(group.id);
         final had = {for (final m in before) m.userId}, has = {for (final m in after) m.userId};
         _changed(group.id);
@@ -791,9 +819,11 @@ class GroupSync {
         if (event.seq != null && event.digest != null) await _markFrozen(event.id, {'seq': event.seq, 'digest': event.digest});
       case 'rolled-back':
         // Our commit was rolled back: our copy merged a commit the group no longer has. Rejoin, then make the
-        // same change again.
+        // same change again, but only on an admin's resolution that verifies against our own copy of the group,
+        // and only once the log confirms the commit is gone.
         final own = _lastOwn[event.id];
         if (own == null || own.seq != event.seq || own.digest != event.digest) return;
+        if (!await _verifiedRollback(event, own.seq, own.digest, own.epoch)) return;
         _lastOwn.remove(event.id);
         await _serial(event.id, () async {
           await crypto.forget(event.id);
@@ -802,7 +832,7 @@ class GroupSync {
         final redo = own.redo;
         if (redo != null) {
           await redo();
-          await store.note(event.id, 'A change you made was rolled back by an admin. It was made again.');
+          await store.note(event.id, 'Your change was undone and redone.');
         }
       case 'thawed':
         await store.updateGroup(event.id, (g) => g.copyWith(clearFrozen: true));
@@ -826,6 +856,39 @@ class GroupSync {
         }
         _changed(event.id);
     }
+  }
+
+  /// m4-groups §7: an admin of our own copy signed it with its leaf key, the channel is back at the commit's
+  /// pre-commit epoch, and the log holds no commit with that digest.
+  Future<bool> _verifiedRollback(ChannelEvent event, int seq, String digest, int epoch) async {
+    final by = event.by, signature = event.signature, author = event.author;
+    if (event.action != 'rollback' || by == null || signature == null || author == null) return false;
+    try {
+      await crypto.verifyResolution(event.id, action: 'rollback', seq: seq, digest: digest, author: author, by: by, signature: signature);
+    } catch (_) {
+      _notice('A rollback notice for a group could not be verified and was ignored.');
+      return false;
+    }
+    try {
+      if ((await api.channel(event.id))['epoch'] != epoch) return false;
+      final log = await api.groupLog(event.id, after: seq - 1);
+      return !(log['entries'] as List).cast<Map<String, dynamic>>().any((e) => e['kind'] == 'commit' && messageDigest(e['message'] as String) == digest);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // ---------- Repeated tag-only rollbacks (m4-groups §7) ----------
+  static const _tagWindow = 24 * 60 * 60 * 1000;
+
+  /// This admin device's tag-only rollbacks per author device in the last 24 h.
+  List<int> tagRollbacks(String deviceId) => [for (final at in tagLog.read()[deviceId] ?? const <int>[]) if (_now() - at < _tagWindow) at];
+
+  void _recordTagRollback(String deviceId) {
+    final all = tagLog.read();
+    final next = [...tagRollbacks(deviceId), _now()];
+    all[deviceId] = next.length > 20 ? next.sublist(next.length - 20) : next;
+    tagLog.write(all);
   }
 
   /// Whether this device's MLS state still has a leaf in the group.
@@ -896,13 +959,19 @@ class GroupSync {
     try {
       check = await crypto.commitAuthor(groupId, entry.message);
     } catch (_) {}
-    if (_reported.contains(frozen.digest)) return FrozenCheck(FrozenVerdict.fails, check: check);
+    FrozenCheck failing() {
+      final author = check?.author;
+      final escalation = check != null && check.authenticated && check.cls == 'tag' && author != null && tagRollbacks(author.deviceId).length >= 2;
+      return FrozenCheck(FrozenVerdict.fails, check: check, escalation: escalation);
+    }
+
+    if (_reported.contains(frozen.digest)) return failing();
     try {
       final trial = await crypto.receive(groupId, entry.message, expect: ProcessedKind.commit);
       await crypto.receiveAbort(trial.pendingId);
       return FrozenCheck(FrozenVerdict.ok, check: check);
     } on CryptoException catch (error) {
-      return FrozenCheck(error.code == 'poison' ? FrozenVerdict.fails : FrozenVerdict.unknown, check: check);
+      return error.code == 'poison' ? failing() : FrozenCheck(FrozenVerdict.unknown, check: check);
     } catch (_) {
       return FrozenCheck(FrozenVerdict.unknown, check: check);
     }
@@ -913,7 +982,9 @@ class GroupSync {
   /// author this device authenticated and then removes exactly that device (nobody if the server's answer names
   /// another); a `tag` rollback, and every dismissal, name nobody and remove nobody. After a rollback this device
   /// uploads the restored epoch's GroupInfo so devices can rejoin.
-  Future<void> resolve(String groupId, {required bool rollback}) async {
+  /// [removeAuthor]: the admin explicitly chose to remove the author of a repeated tag-only failure
+  /// ([FrozenCheck.escalation]); refused otherwise.
+  Future<void> resolve(String groupId, {required bool rollback, bool removeAuthor = false}) async {
     GroupMember? culprit;
     await _serial(groupId, () async {
       final group = await store.group(groupId);
@@ -923,10 +994,14 @@ class GroupSync {
       if (rollback && check.verdict != FrozenVerdict.fails) {
         throw const StoreException('This device could not confirm that change is bad, so it can only be dismissed.');
       }
-      final blamed = rollback ? check.check?.blame : null;
+      if (removeAuthor && (!rollback || !check.escalation)) throw const StoreException("Removing that device isn't offered for this change.");
+      final blamed = rollback ? (check.check?.blame ?? (removeAuthor ? check.check?.author : null)) : null;
       final author = blamed?.deviceId ?? '';
       final action = rollback ? 'rollback' : 'dismiss';
       final local = await device();
+      // A rollback is also signed with this device's MLS leaf key, so every member can check it came from an
+      // admin of its own copy of the group before acting on the server's `rolled-back`.
+      final leafSignature = rollback ? await crypto.signResolution(groupId, action: action, seq: frozen.seq, digest: frozen.digest, author: author) : null;
       final answer = await api.resolveChannel(
         groupId,
         action: action,
@@ -934,8 +1009,12 @@ class GroupSync {
         digest: frozen.digest,
         author: author,
         signature: local.sign(resolveBytes(groupId, action, frozen.seq, frozen.digest, author)),
+        leafSignature: leafSignature,
       );
+  
       await store.updateGroup(groupId, (g) => g.copyWith(clearFrozen: true));
+      final tagAuthor = check.check?.author;
+      if (rollback && blamed == null && check.check?.cls == 'tag' && check.check?.authenticated == true && tagAuthor != null) _recordTagRollback(tagAuthor.deviceId);
       if (rollback) {
         // This device never merged the rejected commit, so its view is the restored epoch.
         try {

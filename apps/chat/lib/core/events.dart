@@ -69,6 +69,10 @@ sealed class AccountEvent {
           digest: m['digest'] as String?,
           deviceId: m['deviceId'] as String?,
           oldest: m['oldest'] as int?,
+          action: m['action'] as String?,
+          author: m['author'] as String?,
+          by: m['by'] as String?,
+          signature: m['signature'] as String?,
         ),
         'keypackages' => KeyPackagesLow(m['remaining'] as int),
         'ephemeral' => GroupEphemeral(
@@ -200,13 +204,19 @@ class WelcomeEvent extends AccountEvent {
 
 /// A channel changed: joined, invited, updated, left, frozen (+seq, digest), thawed, remove-needed (+deviceId), gap (+oldest).
 class ChannelEvent extends AccountEvent {
-  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest});
+  const ChannelEvent({required this.id, required this.change, this.seq, this.digest, this.deviceId, this.oldest, this.action, this.author, this.by, this.signature});
   final String id;
   final String change;
   final int? seq;
   final String? digest;
   final String? deviceId;
   final int? oldest;
+
+  /// `rolled-back`: the admin's resolution as signed with its MLS leaf key (author may be ""), and its device.
+  final String? action;
+  final String? author;
+  final String? by;
+  final String? signature;
 }
 
 /// A live-only group message (typing): never logged, processed only when the channel is idle.

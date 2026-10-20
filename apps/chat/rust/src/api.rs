@@ -313,6 +313,17 @@ pub fn mls_commit_author(group_id: String, message: String) -> Result<MlsCommitC
     let check = core::mls_commit_author(group_id, message)?;
     Ok(MlsCommitCheck { authenticated: check.authenticated, signed_content_invalid: check.signed_content_invalid, class: check.class.to_string(), author: check.author.map(Into::into) })
 }
+/// Signs a frozen-channel resolution (`rollback` or `dismiss`) with this device's MLS leaf key over the
+/// `webrtc-bun-mlsresolve-leaf-v1` bytes; nothing else is ever signed this way.
+pub fn mls_sign_resolution(group_id: String, action: String, seq: u64, digest: String, author: String) -> Result<String> {
+    Ok(core::mls_sign_resolution(group_id, action, seq, digest, author)?)
+}
+/// Verifies a resolution signed by device `by`, which must be an admin device in this device's own tree.
+/// Returns the signer (`user_id`, `device_id`); `auth` for a bad signature, `invalid` otherwise.
+pub fn mls_verify_resolution(group_id: String, action: String, seq: u64, digest: String, author: String, by: String, signature: String) -> Result<MlsRemoval> {
+    let signer = core::mls_verify_resolution(group_id, action, seq, digest, author, by, signature)?;
+    Ok(MlsRemoval { user_id: signer.user_id, device_id: Some(signer.device_id) })
+}
 pub fn mls_receive_commit(pending_id: String) -> Result<()> { Ok(core::mls_receive_commit(pending_id)?) }
 pub fn mls_receive_abort(pending_id: String) -> Result<()> { Ok(core::mls_receive_abort(pending_id)?) }
 pub fn mls_members(group_id: String) -> Result<Vec<MlsMember>> { Ok(core::mls_members(group_id)?.into_iter().map(Into::into).collect()) }

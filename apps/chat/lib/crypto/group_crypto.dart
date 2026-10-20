@@ -165,6 +165,13 @@ abstract class GroupCrypto {
   /// (nothing changes): whether its author is authenticated, and whether the failure is in what the author
   /// signed (`signed-content`) or only in a tag outside the signature (`tag`).
   Future<CommitCheck> commitAuthor(String groupId, String message);
+
+  /// An admin's resolution of a frozen channel, signed with this device's MLS leaf key (m4-groups §7).
+  Future<String> signResolution(String groupId, {required String action, required int seq, required String digest, required String author});
+
+  /// Checks a resolution signed by device [by]: it must be an admin device in this device's own tree. Returns
+  /// the signer's user id; throws [CryptoException] (`auth` bad signature, `invalid` otherwise).
+  Future<String> verifyResolution(String groupId, {required String action, required int seq, required String digest, required String author, required String by, required String signature});
   Future<void> receiveAbort(String pendingId);
 
   Future<List<GroupMember>> members(String groupId);

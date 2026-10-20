@@ -72,6 +72,8 @@ class GroupMessenger {
        _now = now ?? (() => DateTime.now().millisecondsSinceEpoch) {
     sync.onDelivery = _deliver;
     sync.onMembership = _membership;
+    // A rolled-back add is made again through the normal path (pins, fresh KeyPackages, then meta).
+    sync.redoAdd = (groupId, userIds) => addMembers(groupId, userIds);
   }
 
   final Api api;

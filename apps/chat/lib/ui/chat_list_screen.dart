@@ -10,7 +10,11 @@ import '../app/app_controller.dart';
 import '../core/api.dart';
 import '../core/pair_id.dart';
 import '../store/message.dart';
+import '../theme/theme_prefs.dart';
+import 'command_palette.dart';
+import 'conversation_view.dart' show messagePreview;
 import 'security_settings.dart';
+import 'settings_sheet.dart';
 import 'theme_picker.dart';
 import 'widgets/common.dart';
 
@@ -122,11 +126,18 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
           ],
         ),
         actions: [
+          IconButton(
+            key: const Key('open-palette'),
+            tooltip: 'Search chats and actions (⌘K)',
+            onPressed: () => showCommandPalette(context, ref),
+            icon: const Icon(Icons.search_rounded),
+          ),
           PopupMenuButton<String>(
             icon: const Icon(Icons.more_horiz),
             onSelected: (value) => switch (value) {
               'invite' => _guard(_invite),
               'theme' => showThemePicker(context, ref),
+              'chats' => showChatSettings(context, ref),
               'security' => showSecuritySettings(context, ref),
               'signout' => app.signOut(),
               'signout-all' => app.signOut(everywhere: true),
@@ -135,6 +146,7 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
             itemBuilder: (_) => const [
               PopupMenuItem(value: 'invite', child: Text('Invite someone')),
               PopupMenuItem(value: 'theme', child: Text('Appearance')),
+              PopupMenuItem(value: 'chats', child: Text('Chat settings')),
               PopupMenuItem(value: 'security', child: Text('Security')),
               PopupMenuItem(value: 'signout', child: Text('Sign out')),
               PopupMenuItem(value: 'signout-all', child: Text('Sign out everywhere')),
@@ -176,15 +188,19 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
           if (state.contacts.isEmpty)
             Padding(
               padding: const EdgeInsets.all(32),
-              child: Text('No contacts yet. Add someone by username, or invite them.', textAlign: TextAlign.center, style: TextStyle(color: muted)),
+              child: Text(
+                'Your conversations will appear here. Add someone by their username above, or invite them with a link from the ⋯ menu.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: muted),
+              ),
             ),
-          for (final contact in state.contacts) _row(context, contact, me, state.unread),
+          for (final contact in state.contacts) _row(context, contact, me, state.unread, state.typing),
         ],
       ),
     );
   }
 
-  Widget _row(BuildContext context, Contact contact, User? me, Map<String, int> unread) {
+  Widget _row(BuildContext context, Contact contact, User? me, Map<String, int> unread, Set<String> typing) {
     final app = ref.read(appProvider.notifier);
     final muted = Theme.of(context).textTheme.bodySmall?.color;
     final scheme = Theme.of(context).colorScheme;
@@ -207,29 +223,56 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
     }
     final recent = _latest[pairId(me.id, contact.id!)];
     final count = unread[contact.id] ?? 0;
+    final display = ref.watch(themePrefsProvider.select((p) => p.display));
+    final tokens = ref.watch(themePrefsProvider).tokens(null, ref.watch(platformBrightnessProvider));
+    final isTyping = typing.contains(contact.id);
+    final preview = isTyping
+        ? 'typing…'
+        : recent != null
+        ? '${recent.outgoing ? 'You: ' : ''}${messagePreview(recent)}'
+        : (contact.online ? 'Online' : 'Say hello. Messages are end-to-end encrypted.');
+    final previewStyle = TextStyle(
+      color: isTyping ? scheme.primary : (count > 0 ? null : muted),
+      fontWeight: count > 0 ? FontWeight.w600 : null,
+      fontStyle: isTyping ? FontStyle.italic : null,
+    );
+    final time = recent != null ? Text(clock(recent.createdAt), style: TextStyle(fontSize: 12, color: count > 0 ? scheme.primary : muted)) : null;
+    final badge = count > 0 ? Badge(label: Text(count > 99 ? '99+' : '$count'), backgroundColor: scheme.primary, textColor: scheme.onPrimary) : null;
+    void open() => context.push('/chat/${contact.id}');
+    if (display.listStyle == ListStyle.compact) {
+      return InkWell(
+        key: ValueKey(contact.id),
+        onTap: open,
+        child: Padding(
+          padding: EdgeInsets.symmetric(horizontal: 16, vertical: 6 + display.rowPadding),
+          child: Row(
+            children: [
+              if (contact.online) ...[const Icon(Icons.circle, size: 8, color: Color(0xFF3CD07A)), const SizedBox(width: 6)],
+              Text(contact.username, style: TextStyle(fontWeight: FontWeight.w700, color: tokens.square ? null : tokens.nameColor(contact.id!))),
+              const SizedBox(width: 10),
+              Expanded(child: Text(preview, maxLines: 1, overflow: TextOverflow.ellipsis, style: previewStyle)),
+              if (time != null) ...[const SizedBox(width: 8), time],
+              if (badge != null) ...[const SizedBox(width: 8), badge],
+            ],
+          ),
+        ),
+      );
+    }
     return ListTile(
       key: ValueKey(contact.id),
-      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      leading: Avatar(name: contact.username, online: contact.online),
+      contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: display.rowPadding / 2),
+      leading: Avatar(name: contact.username, online: contact.online, square: tokens.square, color: tokens.square ? null : tokens.nameColor(contact.id!)),
       title: Text(contact.username, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 17)),
-      subtitle: Text(
-        recent != null ? '${recent.outgoing ? 'You: ' : ''}${recent.text}' : (contact.online ? 'Online' : 'Tap to chat'),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(color: count > 0 ? null : muted, fontWeight: count > 0 ? FontWeight.w600 : null),
-      ),
+      subtitle: Text(preview, maxLines: 1, overflow: TextOverflow.ellipsis, style: previewStyle),
       trailing: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          if (recent != null) Text(clock(recent.createdAt), style: TextStyle(fontSize: 12, color: count > 0 ? scheme.primary : muted)),
-          if (count > 0) ...[
-            const SizedBox(height: 4),
-            Badge(label: Text(count > 99 ? '99+' : '$count'), backgroundColor: scheme.primary, textColor: scheme.onPrimary),
-          ],
+          ?time,
+          if (badge != null) ...[const SizedBox(height: 4), badge],
         ],
       ),
-      onTap: () => context.push('/chat/${contact.id}'),
+      onTap: open,
     );
   }
 }

@@ -2,9 +2,9 @@ import type { Database } from 'bun:sqlite';
 import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { mkdirSync, writeFileSync, existsSync, rmSync } from 'node:fs';
-import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { requestLimiter } from './rate-limit';
+import { isPublicAddress } from './safe-fetch';
 
 // Custom emoji: a workspace pack of small images. They are shared assets, not secrets — messages stay end to
 // end encrypted and only ever carry the `:name:` text, which each recipient renders from this pack.
@@ -35,21 +35,8 @@ export function sniff(bytes: Uint8Array): { ext: Ext; animated: boolean } | null
     return null;
 }
 
-/** Private, loopback, link-local, CGNAT, multicast, unspecified and documentation ranges, v4 and v6. */
-export function isPrivateAddress(address: string): boolean {
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-    if (mapped) return isPrivateAddress(mapped[1]!);
-    if (isIP(address) === 4) {
-        const [a, b] = address.split('.').map(Number) as [number, number];
-        return a === 0 || a === 10 || a === 127 || a >= 224 || a === 100 && b >= 64 && b <= 127 || a === 169 && b === 254 ||
-            a === 172 && b >= 16 && b <= 31 || a === 192 && b === 168 || a === 192 && b === 0 || a === 198 && (b === 18 || b === 19) || a === 198 && b === 51 || a === 203 && b === 0;
-    }
-    if (isIP(address) === 6) {
-        const value = address.toLowerCase();
-        return value === '::' || value === '::1' || /^f[cd]/.test(value) || /^fe[89ab]/.test(value) || /^ff/.test(value) || value.startsWith('2001:db8') || value.startsWith('64:ff9b');
-    }
-    return true; // Anything that is not an IP literal is not something we connect to.
-}
+/** Anything that is not a public unicast address (see safe-fetch.ts), including IPv4-mapped forms in any notation. */
+export const isPrivateAddress = (address: string): boolean => !isPublicAddress(address);
 
 export function createEmoji(options: { db: Database; dataDir: string; origin: string; now: () => number; adminToken?: string; fetcher?: Fetcher; resolver?: Resolver; importHosts?: string[] }) {
     const { db, now } = options;

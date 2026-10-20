@@ -9,6 +9,7 @@
 // production. Steps are synchronised with the Dart side through files in a temp dir.
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -75,6 +76,81 @@ try {
     await log(page, 'hello from app');
     await waitFor('sent-2');
     step('web → app and app → web messages decrypt (signal.js ↔ Rust core), with encrypted receipts');
+
+    // Phase 1 payloads, both directions (docs/phase1-protocol.md §1–§3).
+    const records = (): Promise<any[]> => page.evaluate(async () => {
+        const w = window as any;
+        return (await w.ChatStore.list()).filter((r: any) => r.conversationId === w.App.conversationId);
+    });
+    async function webUntil(what: string, check: (list: any[]) => boolean, timeout = 45000) {
+        const end = Date.now() + timeout;
+        while (!check(await records())) {
+            if (Date.now() > end || failed) throw new Error(`web: ${what}\n${JSON.stringify((await records()).map(r => ({ d: r.direction, s: r.status, t: r.editedText ?? r.text, k: r.attachment?.kind, r: r.reactions })))}`);
+            await Bun.sleep(150);
+        }
+        return records();
+    }
+    // The first row with this text: later replies also contain it, in their quote.
+    const row = (text: string) => page.locator('#chat-log li[data-message-id]', { hasText: text }).first();
+    async function action(text: string, selector: string) { await row(text).hover(); await page.click(`#msg-actions ${selector}`); }
+    const sha = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
+    const webSha = (attachment: any): Promise<string> => page.evaluate(async (a: any) => {
+        const { blob } = await (window as any).Files.open(a);
+        const digest = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+        return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+    }, attachment);
+
+    await waitFor('read-sent');
+    await webUntil('read receipt from the app', list => list.some(r => r.text === 'hello from web' && r.status === 'read'));
+    step('read receipts both ways (✓✓ in accent)');
+
+    // Web → app: reply, react 👍 and 😂 then take 😂 back, edit, an image and a file, a link preview, typing.
+    await action('hello from app', '[data-action="reply"]');
+    await page.fill('#chat-input', 'web reply'); await page.click('#chat-send');
+    await action('hello from app', '[data-react="👍"]');
+    await action('hello from app', '[data-react="😂"]');
+    await webUntil('our reactions', list => list.some(r => r.text === 'hello from app' && (r.reactions?.me || []).length === 2));
+    await row('hello from app').locator('.reaction[data-emoji="😂"]').click();
+    await action('hello from web', '[data-action="edit"]');
+    await page.fill('#chat-input', 'hello from web, edited'); await page.click('#chat-send');
+    const png = readFileSync(join(root, 'packages/signaling/public/icon-192.png'));
+    const file = new Uint8Array(50000).map((_, i) => (i * 17 + 3) % 256);
+    await page.setInputFiles('#attach-input', [
+        { name: 'web.png', mimeType: 'image/png', buffer: png },
+        { name: 'web-notes.bin', mimeType: 'application/octet-stream', buffer: Buffer.from(file) },
+    ]);
+    await webUntil('both uploads sent', list => list.filter(r => r.attachment && r.status !== 'queued').length === 2, 90000);
+    await page.evaluate(async () => {
+        const w = window as any;
+        await w.ChatStore.put({
+            id: crypto.randomUUID(), conversationId: w.App.conversationId, direction: 'outgoing', text: 'see https://example.com/web',
+            createdAt: Date.now(), status: 'queued', expiresAt: null, link: { url: 'https://example.com/web', title: 'Web link', site: 'example.com' },
+        });
+        w.App.onQueued();
+    });
+    await page.fill('#chat-input', 'typing something');
+    signal('web-rich', JSON.stringify({ image: sha(png), file: sha(file) }));
+    await waitFor('web-rich-ok');
+    await page.fill('#chat-input', '');
+    step('web → app: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive in the app');
+
+    // App → web: the same set.
+    const fromApp = JSON.parse(await waitFor('app-rich'));
+    await page.waitForFunction(() => !document.getElementById('typing')!.hidden && document.getElementById('typing-text')!.textContent!.includes('appuser'), null, { timeout: 15000 });
+    const list = await webUntil('rich messages from the app', l =>
+        l.some(r => r.text === 'app reply' && r.replyTo?.id === fromApp.target) &&
+        l.some(r => r.id === fromApp.target && (r.reactions?.peer || []).join() === '❤️') &&
+        l.some(r => r.id === fromApp.ours && r.editedText === 'hello from app, edited' && r.editedAt) &&
+        l.some(r => r.direction === 'incoming' && r.attachment?.kind === 'image') && l.some(r => r.direction === 'incoming' && r.attachment?.kind === 'file') &&
+        l.some(r => r.link?.url === 'https://example.com/app' && r.link?.title === 'App link'));
+    for (const kind of ['image', 'file']) {
+        const got = await webSha(list.find(r => r.direction === 'incoming' && r.attachment?.kind === kind).attachment);
+        if (got !== fromApp[kind]) throw new Error(`${kind} from the app decrypted to different bytes on the web`);
+    }
+    // The app's photo decrypts and draws on the web.
+    await page.waitForFunction(() => [...document.querySelectorAll('#chat-log img.media-full')].some(i => (i as HTMLImageElement).alt === 'app.png' && (i as HTMLImageElement).naturalWidth === 64), null, { timeout: 20000 });
+    signal('app-rich-ok');
+    step('app → web: reply, reactions on/off, edit, image + file (byte-identical), link preview and typing arrive on the web');
 
     const appNumber = await waitFor('safety');
     await page.click('#conv-menu summary'); await page.click('#conv-safety');

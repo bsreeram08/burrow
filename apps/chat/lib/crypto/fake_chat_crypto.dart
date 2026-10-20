@@ -87,12 +87,14 @@ class FakeChatCrypto implements ChatCrypto {
     }
     final id = 'c${_random.nextInt(1 << 31)}';
     _pending[id] = contactId;
+    // Like the core: the claimed identity is reported only for a message that opens a session.
+    final opens = known == null || changed || !sessions.containsKey(contactId);
     return Decrypted(
       plaintextJson: outer['p'] as String,
       commitId: id,
       identityChanged: changed,
       firstContact: known == null,
-      identity: claimed,
+      identity: opens ? claimed : null,
     );
   }
 

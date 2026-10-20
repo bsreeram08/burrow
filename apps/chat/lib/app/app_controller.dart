@@ -15,9 +15,11 @@ import '../core/api.dart';
 import '../core/events.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
+import '../messaging/attachments.dart';
 import '../messaging/messenger.dart';
 import '../store/message_store.dart';
 import '../theme/theme_prefs.dart';
+import 'chat_settings.dart';
 
 /// Riverpod: providers make every dependency (API, crypto, storage, passkeys)
 /// overridable in tests without a DI framework, and Notifier state rebuilds
@@ -55,6 +57,9 @@ class SecureTokenStore implements TokenStore {
 }
 
 final apiProvider = Provider<Api>((ref) => Api());
+
+/// Encrypted file upload, download and the decrypted cache (one per app; it follows the signed-in token).
+final attachmentsProvider = Provider<AttachmentService>((ref) => AttachmentService(ref.read(apiProvider)));
 
 /// Off in tests and the screenshot demo (no OS permission prompts, no Firebase).
 final pushEnabledProvider = Provider<bool>((ref) => true);
@@ -128,6 +133,7 @@ class AppState {
     this.keyChanged = const {},
     this.inactiveDevice = false,
     this.keysLocked = false,
+    this.typing = const {},
   });
   final AuthPhase phase;
   final User? user;
@@ -146,6 +152,9 @@ class AppState {
   /// This device's key database can't be unlocked: messaging is stopped until the user recovers.
   final bool keysLocked;
 
+  /// Contacts typing to us right now.
+  final Set<String> typing;
+
   AppState copyWith({
     AuthPhase? phase,
     User? user,
@@ -160,6 +169,7 @@ class AppState {
     Set<String>? keyChanged,
     bool? inactiveDevice,
     bool? keysLocked,
+    Set<String>? typing,
   }) => AppState(
     phase: phase ?? this.phase,
     user: user ?? this.user,
@@ -171,6 +181,7 @@ class AppState {
     keyChanged: keyChanged ?? this.keyChanged,
     inactiveDevice: inactiveDevice ?? this.inactiveDevice,
     keysLocked: keysLocked ?? this.keysLocked,
+    typing: typing ?? this.typing,
   );
 }
 
@@ -226,6 +237,7 @@ class AppController extends Notifier<AppState> {
     _api.token = token;
     await ref.read(tokenStoreProvider).write(token);
     await ref.read(themePrefsProvider.notifier).load(user.id);
+    await ref.read(chatSettingsProvider.notifier).load(user.id);
     final dbStore = await ref.read(storeOpenerProvider)(user.id);
     store = dbStore;
     try {
@@ -249,6 +261,7 @@ class AppController extends Notifier<AppState> {
       ack: events.ack,
       viewing: () => viewingContact,
       rotation: await ref.read(rotationPrefsProvider)(user.id),
+      readReceipts: () => ref.read(chatSettingsProvider).readReceipts,
     );
     messenger = m;
     _subscriptions
@@ -257,7 +270,8 @@ class AppController extends Notifier<AppState> {
       ..add(m.unreadChanges.listen((unread) => state = state.copyWith(unread: unread)))
       ..add(m.identityChanges.listen((id) => state = state.copyWith(keyChanged: {...state.keyChanged, id})))
       ..add(m.activeChanges.listen((active) => state = state.copyWith(inactiveDevice: !active)))
-      ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)));
+      ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
+      ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
     state = state.copyWith(phase: AuthPhase.signedIn, user: user, clearNotice: true);
     unawaited(_checkActive());
     await loadContacts();
@@ -465,6 +479,7 @@ class AppController extends Notifier<AppState> {
       } catch (_) {}
     }
     await _teardown();
+    await ref.read(attachmentsProvider).clearDisk();
     await ref.read(tokenStoreProvider).write(null);
     _api.token = null;
     state = AppState(phase: AuthPhase.signedOut, notice: message ?? (everywhere ? 'Signed out on every device.' : 'Signed out.'));

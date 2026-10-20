@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'dart:io' show Platform;
 
@@ -144,8 +145,80 @@ class Api {
   Future<String> bundleJson(String username) async => jsonEncode(await call('/api/keys/$username'));
   Future<Map<String, dynamic>> publishedIdentity(String username) async =>
       (await call('/api/keys/$username/identity'))['identity'] as Map<String, dynamic>;
-  Future<void> postEnvelope(String username, String envelope) =>
-      call('/api/messages', method: 'POST', body: {'to': username, 'envelope': envelope});
+  /// [ephemeral]: delivered only to the recipient's open connections, never stored (typing).
+  Future<void> postEnvelope(String username, String envelope, {bool ephemeral = false}) =>
+      call('/api/messages', method: 'POST', body: {'to': username, 'envelope': envelope, if (ephemeral) 'ephemeral': true});
+
+  // ---- Encrypted blobs and link previews ----
+  Map<String, String> get _auth => {if (token != null) 'Authorization': 'Bearer $token'};
+
+  ApiException _blobError(int status, List<int> body) {
+    String? message;
+    try {
+      final decoded = jsonDecode(utf8.decode(body));
+      if (decoded is Map && decoded['error'] is String) message = decoded['error'] as String;
+    } catch (_) {}
+    return ApiException(
+      message ??
+          switch (status) {
+            404 => 'That file is no longer on the server. Files are kept for 30 days.',
+            413 => 'That file is too large. Files can be up to 25 MB.',
+            429 => 'Too many files at once. Wait a moment, then try again.',
+            _ => "Couldn't reach the server. Check your connection and try again.",
+          },
+      status,
+    );
+  }
+
+  /// Uploads ciphertext, reporting progress in bytes handed to the connection. Returns the blob id.
+  Future<String> uploadBlob(List<int> ciphertext, {void Function(int sent, int total)? onProgress}) async {
+    final request = http.StreamedRequest('POST', uri('/api/blobs'))
+      ..headers.addAll({..._auth, 'Content-Type': 'application/octet-stream', 'Accept': 'application/json'})
+      ..contentLength = ciphertext.length;
+    final response = _client.send(request).timeout(const Duration(minutes: 5));
+    response.ignore(); // Observed below; this only keeps an early failure from surfacing as unhandled.
+    const chunk = 64 * 1024;
+    for (var offset = 0; offset < ciphertext.length; offset += chunk) {
+      final end = offset + chunk < ciphertext.length ? offset + chunk : ciphertext.length;
+      request.sink.add(ciphertext.sublist(offset, end));
+      onProgress?.call(end, ciphertext.length);
+      await Future<void>.delayed(Duration.zero);
+    }
+    unawaited(request.sink.close());
+    final streamed = await response;
+    final body = await streamed.stream.toBytes();
+    if (streamed.statusCode < 200 || streamed.statusCode >= 300) throw _blobError(streamed.statusCode, body);
+    final decoded = jsonDecode(utf8.decode(body));
+    final id = decoded is Map ? decoded['id'] : null;
+    if (id is! String) throw ApiException('The server gave an unexpected answer.', streamed.statusCode);
+    return id;
+  }
+
+  /// Downloads up to [maxBytes] of a blob, reporting progress against Content-Length when known.
+  Future<Uint8List> downloadBlob(String id, {required int maxBytes, void Function(int received, int? total)? onProgress}) =>
+      _download(uri('/api/blobs/${Uri.encodeComponent(id)}'), maxBytes: maxBytes, onProgress: onProgress, timeout: const Duration(minutes: 5));
+
+  Future<Uint8List> _download(Uri url, {required int maxBytes, void Function(int, int?)? onProgress, required Duration timeout}) async {
+    final request = http.Request('GET', url)..headers.addAll(_auth);
+    final streamed = await _client.send(request).timeout(const Duration(seconds: 30));
+    if (streamed.statusCode != 200) throw _blobError(streamed.statusCode, await streamed.stream.toBytes());
+    final total = streamed.contentLength;
+    if (total != null && total > maxBytes) throw ApiException('That file is larger than expected.', 413);
+    final out = BytesBuilder(copy: false);
+    await for (final part in streamed.stream.timeout(timeout)) {
+      out.add(part);
+      if (out.length > maxBytes) throw ApiException('That file is larger than expected.', 413);
+      onProgress?.call(out.length, total);
+    }
+    return out.takeBytes();
+  }
+
+  /// The server fetches the page (sender side only): `{url, title?, description?, site?, image?}`.
+  Future<Map<String, dynamic>> unfurl(String url) => call('/api/unfurl?url=${Uri.encodeQueryComponent(url)}');
+
+  /// The preview image's bytes (image/* only, at most 2 MB), to downscale into a thumb here.
+  Future<Uint8List> unfurlImage(String url) =>
+      _download(uri('/api/unfurl/image?url=${Uri.encodeQueryComponent(url)}'), maxBytes: 2 * 1024 * 1024, timeout: const Duration(seconds: 15));
 
   // ---- Calls ----
   Future<({String roomId, String token})> session(String username, String kind) async {

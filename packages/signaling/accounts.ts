@@ -28,7 +28,7 @@ export type Calls = {
     /** Whether a live pair room is waiting for this user to join. */
     ringingFor?(userId: string, roomId: string): boolean;
 };
-const MAILBOX_TTL = 30 * 86400000, MAILBOX_MAX_COUNT = 1000, MAILBOX_MAX_BYTES = 50 * 1024 * 1024, SENDER_MAX_COUNT = 200, SENDER_MAX_BYTES = 10 * 1024 * 1024, ENVELOPE_MAX = 65536, MAX_PREKEYS = 200, INFLIGHT = 32;
+const MAILBOX_TTL = 30 * 86400000, MAILBOX_MAX_COUNT = 1000, MAILBOX_MAX_BYTES = 50 * 1024 * 1024, SENDER_MAX_COUNT = 200, SENDER_MAX_BYTES = 10 * 1024 * 1024, ENVELOPE_MAX = 65536, EPHEMERAL_MAX = 2048, MAX_PREKEYS = 200, INFLIGHT = 32;
 const KEY = /^[A-Za-z0-9_-]{43}$/, SIGNATURE = /^[A-Za-z0-9_-]{86}$/, MESSAGE_ID = /^[A-Za-z0-9_-]{22}$/, RESERVED = new Set(['count']);
 const DAY = 86400000, INVITE_LIFETIME = 7 * DAY, SESSION_LIFETIME = 30 * DAY, FLOW_LIFETIME = 5 * 60000, REQUEST_LIFETIME = 30 * DAY, MAX_PENDING_REQUESTS = 20;
 const USERNAME = /^[a-z0-9_]{3,20}$/, INVITE = /^[A-Za-z0-9_-]{22}$/, FLOW = /^[A-Za-z0-9_-]{22}$/, TOKEN = /^[A-Za-z0-9_-]{43}$/;
@@ -91,7 +91,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     const expectedOrigins = (client: string) => client === 'web' ? options.origin : [options.origin, ...(options.androidOrigins ?? [])];
     const listeners = new Map<string, Set<ServerWebSocket<EventsConnection>>>();
     const allowAuth = requestLimiter({ perSource: 10, global: 100 });
-    const allowSend = requestLimiter({ perSource: 20, global: 2000 }), allowBundle = requestLimiter({ perSource: 3, global: 500 });
+    const allowSend = requestLimiter({ perSource: 20, global: 2000 }), allowEphemeral = requestLimiter({ perSource: 10, global: 2000 }), allowBundle = requestLimiter({ perSource: 3, global: 500 });
     // Each registration pushes a nonce to the claimed device, so one account may not trigger many per second.
     const allowRegister = requestLimiter({ perSource: 5, global: 200 });
 
@@ -445,6 +445,17 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             const raw = body!.envelope;
             const envelope = typeof raw === 'string' && raw.length <= Math.ceil(ENVELOPE_MAX * 4 / 3) && /^[A-Za-z0-9_-]+$/.test(raw) ? Buffer.from(raw, 'base64url') : null;
             if (!envelope || envelope.length === 0 || envelope.length > ENVELOPE_MAX || envelope.toString('base64url') !== raw) return json({ error: 'Invalid envelope' }, 400);
+            // Ephemeral envelopes (typing) go only to streams open right now: never stored, pushed or acknowledged.
+            if (body!.ephemeral === true) {
+                if (envelope.length > EPHEMERAL_MAX) return json({ error: 'Ephemeral envelopes are at most 2 KB.' }, 413);
+                if (!allowEphemeral(user.id)) return json({ error: 'Rate limited' }, 429);
+                const frame = JSON.stringify({ type: 'envelope', id: random(16), from: { id: user.id, username: user.username }, envelope: raw, createdAt: now(), ephemeral: true });
+                let delivered = 0;
+                // A stream that is already backed up skips it rather than buffering more.
+                for (const socket of listeners.get(target.id) ?? []) if (socket.getBufferedAmount() <= 16384 && socket.send(frame) > 0) delivered++;
+                return json({ delivered: delivered > 0 }, 202);
+            }
+            if (body!.ephemeral !== undefined && body!.ephemeral !== false) return json({ error: 'Invalid envelope' }, 400);
             if (!allowSend(user.id)) return json({ error: 'Rate limited' }, 429);
             const pending = db.query<{ count: number; bytes: number }, [string]>('SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(envelope)), 0) AS bytes FROM mailbox WHERE recipient_id = ?').get(target.id)!;
             if (pending.count >= MAILBOX_MAX_COUNT || pending.bytes + envelope.length > MAILBOX_MAX_BYTES) return json({ error: `${target.username}'s mailbox is full. Try again once they have been online.` }, 507);

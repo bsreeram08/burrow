@@ -1,6 +1,6 @@
 'use strict';
-const CACHE = 'private-conversations-shell-v9';
-const ASSETS = ['/', '/app.js', '/account.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/vendor/simplewebauthn-browser.js', '/chat-store.js', '/signal.js', '/core.js', '/core-worker.js', '/verify.js', '/style.css', '/install.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
+const CACHE = 'private-conversations-shell-v10';
+const ASSETS = ['/', '/app.js', '/account.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/markdown.js', '/files.js', '/palette.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/vendor/simplewebauthn-browser.js', '/chat-store.js', '/signal.js', '/core.js', '/core-worker.js', '/verify.js', '/style.css', '/install.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'];
 // The WebAssembly core's files are content-hashed: cached as they are fetched (network first), not precached.
 const CORE = /^\/core\/(manifest\.json|chatcore(?:_bg)?\.[0-9a-f]{16}\.(?:js|wasm))$/;
 self.addEventListener('install', event => {

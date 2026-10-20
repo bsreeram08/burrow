@@ -27,6 +27,7 @@ function browser(options: { offlineDelete?: boolean } = {}) {
             append(...children: any[]) { this.children.push(...children); },
             add(child: any) { this.children.push(child); },
             play: () => Promise.resolve(),
+            closest: () => element(`${id}-parent`), querySelectorAll: () => [], style: { setProperty() {}, removeProperty() {} },
         });
         return elements.get(id);
     }
@@ -67,7 +68,7 @@ function browser(options: { offlineDelete?: boolean } = {}) {
         AbortSignal: { timeout: () => new AbortController().signal },
         location: { href: `http://localhost:3000/#${new URLSearchParams(invitation)}`, origin: 'http://localhost:3000', hash: `#${new URLSearchParams(invitation)}`, pathname: '/', protocol: 'http:', host: 'localhost:3000' },
         history: { replaceState(_state: unknown, _title: string, path: string) { history.push(path); } },
-        document: { getElementById: element, createElement: (tag: string) => element(tag), querySelector: element },
+        document: { getElementById: element, createElement: (tag: string) => element(tag), createElementNS: (_ns: string, tag: string) => element(tag), querySelector: element, addEventListener() {} },
         window: { ChatStore, isSecureContext: true, RTCPeerConnection: peer, addEventListener(type: string, callback: () => void) { events.set(type, callback); } },
         navigator: { mediaDevices: { getUserMedia() { mediaRequests++; return media; } } },
         fetch: async (url: string, init: RequestInit) => {

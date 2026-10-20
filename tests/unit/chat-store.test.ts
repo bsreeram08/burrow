@@ -7,13 +7,13 @@ const source = readFileSync(new URL('../../packages/signaling/public/chat-store.
 const PASSWORD = 'correct horse battery staple';
 const NOW = 1800000000000;
 const ROOM = 'r'.repeat(43);
-type Message = { id: string; conversationId: string; direction: 'incoming' | 'outgoing' | 'system'; text: string; createdAt: number; status: 'queued' | 'sent' | 'delivered' | 'uncertain'; expiresAt: number | null };
+type Message = { id: string; conversationId: string; direction: 'incoming' | 'outgoing' | 'system'; text: string; createdAt: number; status: 'queued' | 'sent' | 'delivered' | 'read' | 'uncertain'; expiresAt: number | null };
 type Store = { receive(conversationId: string, payload: unknown): Promise<string>; note(conversationId: string, id: string, text: string): Promise<boolean>; checkPayload(payload: unknown): string; inboundDisposition(error: any, attempts: number): { ack: boolean; notice: string | null }; put(message: unknown): Promise<Message>; list(): Promise<Message[]>; clear(): Promise<void>; removeConversation(conversationId: string): Promise<void>; setStatus(conversationId: string, id: string, status: string): Promise<boolean>; exportBackup(password: string): Promise<Blob>; importBackup(file: Blob, password: string): Promise<number> };
 function fixture() {
   let now = NOW;
   class Clock extends Date { static override now() { return now; } }
   const indexedDB = new IDBFactory();
-  const context: Record<string, any> = { indexedDB, IDBKeyRange, crypto, Blob, TextEncoder, TextDecoder, Uint8Array, Date: Clock, atob, btoa };
+  const context: Record<string, any> = { indexedDB, IDBKeyRange, crypto, Blob, TextEncoder, TextDecoder, Uint8Array, Date: Clock, atob, btoa, URL };
   context.window = context;
   runInNewContext(source, context);
   return { store: context.ChatStore as Store, indexedDB, advance(ms: number) { now += ms; } };
@@ -354,5 +354,174 @@ describe('actions, polls and votes', () => {
     const restored = await other.list() as any[];
     expect(restored.map(record => record.kind)).toEqual(['poll', 'action']);
     expect(restored[0].votes).toEqual({ me: 1 });
+  });
+});
+
+describe('phase 1 message content: replies, attachments, link previews, reactions, edits and read status', () => {
+  type Phase1 = Store & {
+    react(conversationId: string, target: string, who: string, emoji: string, on: boolean): Promise<boolean>;
+    edit(conversationId: string, target: string, who: string, text: string, editedAt: number): Promise<boolean>;
+    markRead(conversationId: string, ids: string[], direction: string): Promise<string[]>;
+  };
+  const store = () => fixture().store as Phase1;
+  const b64url = (bytes: number) => Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString('base64url');
+  const attachment = (values: Record<string, unknown> = {}) => ({ kind: 'image', blob: b64url(16), key: b64url(32), sha256: b64url(32), mime: 'image/jpeg', name: 'cat.jpg', size: 120000, width: 800, height: 600, thumb: 'data:image/jpeg;base64,/9j/4AAQ', ...values });
+  const payload = (values: Record<string, unknown> = {}): Record<string, any> & { id: string } => ({ v: 1, type: 'message', id: crypto.randomUUID(), text: 'hello', createdAt: NOW, expiresAt: null, ...values });
+
+  test('payload shapes: replies, one attachment and a link preview ride on any message; controls are exact', () => {
+    const { store: s } = fixture(), id = crypto.randomUUID(), target = crypto.randomUUID();
+    expect(s.checkPayload(payload({ replyTo: { id: target, text: 'earlier' } }))).toBe('message');
+    expect(s.checkPayload(payload({ text: '', attachment: attachment() }))).toBe('message');
+    expect(s.checkPayload(payload({ text: 'see https://example.com', link: { url: 'https://example.com' } }))).toBe('message');
+    expect(s.checkPayload(payload({ text: 'waves', kind: 'action', replyTo: { id: target, text: 'x' } }))).toBe('message');
+    expect(s.checkPayload({ v: 1, type: 'react', id, target, emoji: '👍', on: true })).toBe('react');
+    expect(s.checkPayload({ v: 1, type: 'react', id, target, emoji: ':party_parrot:', on: false })).toBe('react');
+    expect(s.checkPayload({ v: 1, type: 'edit', id, target, text: 'fixed', editedAt: NOW })).toBe('edit');
+    expect(s.checkPayload({ v: 1, type: 'read', id, ids: [target] })).toBe('read');
+    expect(s.checkPayload({ v: 1, type: 'typing', id, at: NOW, on: true })).toBe('typing');
+    for (const bad of [
+      payload({ reactions: { me: ['👍'] } }), // Local state never travels.
+      payload({ editedText: 'x', editedAt: NOW }),
+      payload({ attachment: attachment(), extra: 1 }),
+      payload({ text: 'x'.repeat(4000), attachment: attachment({ name: 'y'.repeat(120) }), link: { url: 'https://a.example', description: 'z'.repeat(300) }, replyTo: { id: target, text: 'q'.repeat(140) }, poll: undefined, padding: 'p'.repeat(12000) }),
+      { v: 1, type: 'react', id, target, emoji: 'ab', on: true },
+      { v: 1, type: 'react', id, target, emoji: '👍👍', on: true },
+      { v: 1, type: 'react', id, target, emoji: ':x:', on: true },
+      { v: 1, type: 'react', id, target: 'nope', emoji: '👍', on: true },
+      { v: 1, type: 'react', id, target, emoji: '👍', on: 1 },
+      { v: 1, type: 'edit', id, target, text: '🧪'.repeat(1025), editedAt: NOW },
+      { v: 1, type: 'edit', id, target, text: 'x', editedAt: -1 },
+      { v: 1, type: 'read', id, ids: [] },
+      { v: 1, type: 'read', id, ids: Array.from({ length: 101 }, () => crypto.randomUUID()) },
+      { v: 1, type: 'read', id, ids: ['nope'] },
+      { v: 1, type: 'typing', id, at: NOW, on: true, text: 'leak' },
+      { v: 1, type: 'typing', id, at: 'now', on: true },
+    ]) expect(() => s.checkPayload(bad)).toThrow();
+    // The whole encoded payload is at most 16 KB.
+    expect(() => s.checkPayload(payload({ text: 'x', replyTo: { id: target, text: 'y' }, attachment: attachment({ thumb: `data:image/jpeg;base64,${'A'.repeat(16400)}` }) }))).toThrow();
+  });
+
+  test('attachments, replies and link previews are validated with strict bounds and rejected deterministically', async () => {
+    const s = store();
+    expect(await s.receive(ROOM, payload({ text: '', attachment: attachment() }))).toBe('stored');
+    expect(await s.receive(ROOM, payload({ text: '', attachment: attachment({ kind: 'voice', mime: 'audio/webm;codecs=opus', name: 'Voice message.webm', width: undefined, height: undefined, thumb: undefined, duration: 4.2, waveform: [0, 31, 12] }) }))).toBe('stored');
+    expect(await s.receive(ROOM, payload({ replyTo: { id: crypto.randomUUID(), text: '' } }))).toBe('stored');
+    expect(await s.receive(ROOM, payload({ text: 'read https://example.com/a', link: { url: 'https://example.com/a', title: 'A', site: 'Example', thumb: 'data:image/jpeg;base64,AAAA' } }))).toBe('stored');
+    const invalid = [
+      payload({ text: '' }), // Empty text needs an attachment.
+      payload({ text: '   ', link: { url: 'https://example.com' } }),
+      payload({ attachment: attachment({ kind: 'sticker' }) }),
+      payload({ attachment: attachment({ key: b64url(16) }) }),
+      payload({ attachment: attachment({ sha256: 'not base64url!' + 'x'.repeat(29) }) }),
+      payload({ attachment: attachment({ blob: 'short' }) }),
+      payload({ attachment: attachment({ size: 25 * 1024 * 1024 + 1 }) }),
+      payload({ attachment: attachment({ name: 'n'.repeat(121) }) }),
+      payload({ attachment: attachment({ mime: 'text/html<script>' }) }),
+      payload({ attachment: attachment({ thumb: 'data:image/png;base64,AAAA' }) }),
+      payload({ attachment: attachment({ thumb: `data:image/jpeg;base64,${'A'.repeat(5468)}` }) }),
+      payload({ attachment: attachment({ kind: 'file', width: undefined, height: undefined, thumb: undefined, waveform: [1] }) }),
+      payload({ attachment: attachment({ kind: 'voice', thumb: undefined, width: undefined, height: undefined, waveform: Array(65).fill(1) }) }),
+      payload({ attachment: attachment({ kind: 'voice', thumb: undefined, width: undefined, height: undefined, waveform: [32] }) }),
+      payload({ attachment: attachment({ kind: 'file', width: undefined, height: undefined, thumb: undefined, duration: 3 }) }),
+      payload({ attachment: attachment({ password: 'leak' }) }),
+      payload({ replyTo: { id: crypto.randomUUID(), text: 'q'.repeat(141) } }),
+      payload({ replyTo: { id: 'nope', text: 'q' } }),
+      payload({ replyTo: { id: crypto.randomUUID(), text: 'q', author: 'mallory' } }),
+      payload({ text: 'see http://example.com', link: { url: 'http://example.com' } }),
+      payload({ text: 'no url here', link: { url: 'https://example.com' } }),
+      payload({ text: 'https://example.com', link: { url: 'https://example.com', title: 't'.repeat(201) } }),
+      payload({ text: 'https://example.com', link: { url: 'https://example.com', description: 'd'.repeat(301) } }),
+      payload({ text: 'https://example.com', link: { url: 'https://example.com', site: 's'.repeat(61) } }),
+      payload({ text: 'https://example.com', link: { url: 'https://example.com', image: 'https://tracker.example/pixel' } }),
+      payload({ kind: 'poll', poll: { question: 'Q', options: ['a', 'b'] }, attachment: attachment() }),
+    ];
+    for (const bad of invalid) await expect(s.receive(ROOM, bad)).rejects.toMatchObject({ code: 'invalid' });
+    // A redelivered message is a duplicate; the same id with a different attachment is a conflict.
+    const original = payload({ text: '', attachment: attachment() });
+    await s.receive(ROOM, original);
+    expect(await s.receive(ROOM, original)).toBe('duplicate');
+    await expect(s.receive(ROOM, { ...original, attachment: attachment() })).rejects.toMatchObject({ code: 'conflict' });
+    await expect(s.receive(ROOM, { ...original, replyTo: { id: crypto.randomUUID(), text: 'x' } })).rejects.toMatchObject({ code: 'conflict' });
+  });
+
+  test('attachment names lose bidi, isolate and zero-width characters, so an extension cannot be disguised', async () => {
+    const s = store(), disguised = payload({ text: '', attachment: attachment({ kind: 'file', mime: 'application/octet-stream', width: undefined, height: undefined, thumb: undefined, name: 'report‮fdp.exe' }) });
+    expect(await s.receive(ROOM, disguised)).toBe('stored');
+    for (const name of ['a‎b‏c؜.txt', 'x⁦y⁩​﻿.txt', '‪‫‬‭']) await s.receive(ROOM, payload({ text: '', attachment: attachment({ name }) }));
+    const names = ((await s.list()) as any[]).map(record => record.attachment.name);
+    expect(names.sort()).toEqual(['abc.txt', 'file', 'reportfdp.exe', 'xy.txt']);
+    expect(await s.receive(ROOM, disguised)).toBe('duplicate'); // Redelivery still matches the cleaned record.
+  });
+  test('reactions: a set per person, toggled in place, at most 20 distinct emoji, unknown targets ignored', async () => {
+    const s = store(), incoming = payload();
+    await s.receive(ROOM, incoming);
+    expect(await s.react(ROOM, incoming.id, 'peer', '👍', true)).toBe(true);
+    expect(await s.react(ROOM, incoming.id, 'peer', '👍', true)).toBe(true); // Idempotent.
+    expect(await s.react(ROOM, incoming.id, 'me', '👍', true)).toBe(true);
+    expect(await s.react(ROOM, incoming.id, 'me', ':party_parrot:', true)).toBe(true);
+    expect(((await s.list()) as any[])[0].reactions).toEqual({ me: ['👍', ':party_parrot:'], peer: ['👍'] });
+    expect(await s.react(ROOM, incoming.id, 'me', '👍', false)).toBe(true);
+    expect(await s.react(ROOM, incoming.id, 'peer', '👍', false)).toBe(true);
+    expect(((await s.list()) as any[])[0].reactions).toEqual({ me: [':party_parrot:'] });
+    expect(await s.react(ROOM, crypto.randomUUID(), 'peer', '👍', true)).toBe(false);
+    await expect(s.react(ROOM, incoming.id, 'mallory', '👍', true)).rejects.toMatchObject({ code: 'invalid' });
+    await expect(s.react(ROOM, incoming.id, 'peer', 'not emoji', true)).rejects.toMatchObject({ code: 'invalid' });
+    const many = ['😀', '😃', '😄', '😁', '😆', '😅', '🤣', '😂', '🙂', '🙃', '🫠', '😉', '😊', '😇', '🥰', '😍', '🤩', '😘', '😗', '☺️', '😚'];
+    for (const emoji of many) await s.react(ROOM, incoming.id, 'peer', emoji, true);
+    const stored = ((await s.list()) as any[])[0].reactions;
+    expect(new Set([...stored.me, ...stored.peer]).size).toBe(20);
+    // A redelivered message keeps its reactions.
+    expect(await s.receive(ROOM, incoming)).toBe('duplicate');
+    expect(new Set([...((await s.list()) as any[])[0].reactions.peer]).size).toBe(19);
+  });
+
+  test('edits: author only, last editedAt wins, the original text stays for deduplication, polls are not editable', async () => {
+    const s = store(), incoming = payload({ text: 'helo' }), poll = payload({ text: '📊 Q', kind: 'poll', poll: { question: 'Q', options: ['a', 'b'] }, createdAt: NOW + 1 });
+    await s.receive(ROOM, incoming); await s.receive(ROOM, poll);
+    const mine = message({ text: 'mine', createdAt: NOW + 2 }); await s.put(mine);
+    expect(await s.edit(ROOM, incoming.id, 'me', 'hijack', NOW + 5)).toBe(false); // Not my message.
+    expect(await s.edit(ROOM, mine.id, 'peer', 'hijack', NOW + 5)).toBe(false); // Not theirs.
+    expect(await s.edit(ROOM, poll.id, 'peer', 'changed', NOW + 5)).toBe(false);
+    expect(await s.edit(ROOM, incoming.id, 'peer', 'hello', NOW + 10)).toBe(true);
+    expect(await s.edit(ROOM, incoming.id, 'peer', 'older', NOW + 9)).toBe(false); // Reordered: ignored.
+    expect(await s.edit(ROOM, incoming.id, 'peer', 'hello', NOW + 10)).toBe(true); // Repeated: harmless.
+    expect(await s.edit(ROOM, incoming.id, 'peer', '   ', NOW + 11)).toBe(false);
+    expect(await s.edit(ROOM, crypto.randomUUID(), 'peer', 'x', NOW + 11)).toBe(false);
+    expect(await s.edit(ROOM, mine.id, 'me', 'mine, edited', NOW + 12)).toBe(true);
+    const list = (await s.list()) as any[];
+    expect(list.find(value => value.id === incoming.id)).toMatchObject({ text: 'helo', editedText: 'hello', editedAt: NOW + 10 });
+    expect(list.find(value => value.id === mine.id)).toMatchObject({ text: 'mine', editedText: 'mine, edited' });
+    expect(await s.receive(ROOM, incoming)).toBe('duplicate'); // Redelivery after an edit is not a conflict.
+    await expect(s.edit(ROOM, incoming.id, 'peer', '🧪'.repeat(1025), NOW + 20)).rejects.toMatchObject({ code: 'invalid' });
+    // Stored records cannot carry half an edit.
+    await expect(s.put({ ...message(), editedText: 'x' })).rejects.toThrow();
+  });
+
+  test('read status: only moves forward, read beats delivered, and each side marks only its own direction', async () => {
+    const s = store(), sent = message({ status: 'sent' }), incoming = payload({ createdAt: NOW + 1 });
+    await s.put(sent); await s.receive(ROOM, incoming);
+    expect(await s.markRead(ROOM, [sent.id, incoming.id, crypto.randomUUID()], 'outgoing')).toEqual([sent.id]);
+    expect(await s.markRead(ROOM, [sent.id], 'outgoing')).toEqual([]);
+    expect(await s.setStatus(ROOM, sent.id, 'delivered')).toBe(true); // A late delivery receipt.
+    expect(await s.setStatus(ROOM, sent.id, 'sent')).toBe(true);
+    expect((await s.list()).find(value => value.id === sent.id)!.status).toBe('read');
+    expect(await s.markRead(ROOM, [incoming.id], 'incoming')).toEqual([incoming.id]);
+    const queued = message({ createdAt: NOW + 2 }); await s.put(queued);
+    expect(await s.markRead(ROOM, [queued.id], 'outgoing')).toEqual([]); // Never read before it was sent.
+    await expect(s.markRead(ROOM, Array.from({ length: 101 }, () => crypto.randomUUID()), 'outgoing')).rejects.toMatchObject({ code: 'invalid' });
+    await expect(s.markRead(ROOM, [sent.id], 'system')).rejects.toMatchObject({ code: 'invalid' });
+  });
+
+  test('new fields survive an encrypted backup round trip and restored read messages are not re-queued', async () => {
+    const s = store(), incoming = payload({ text: '', attachment: attachment(), replyTo: { id: crypto.randomUUID(), text: 'q' } });
+    await s.receive(ROOM, incoming);
+    await s.react(ROOM, incoming.id, 'me', '❤️', true);
+    const mine = message({ text: 'typo', createdAt: NOW + 3, status: 'sent' }); await s.put(mine);
+    await s.edit(ROOM, mine.id, 'me', 'fixed', NOW + 4); await s.markRead(ROOM, [mine.id], 'outgoing');
+    const other = store();
+    expect(await other.importBackup(await s.exportBackup(PASSWORD), PASSWORD)).toBe(2);
+    const restored = (await other.list()) as any[];
+    expect(restored[0]).toMatchObject({ attachment: incoming.attachment, replyTo: incoming.replyTo, reactions: { me: ['❤️'] } });
+    expect(restored[1]).toMatchObject({ text: 'typo', editedText: 'fixed', status: 'read' });
   });
 });

@@ -107,10 +107,10 @@
     },
     { name: 'shrug', args: '[text]', description: 'Append ¯\\_(ツ)_/¯', available: inChat, run: (context, args, rest) => context.send({ text: `${rest ? `${rest} ` : ''}¯\\_(ツ)_/¯` }) },
     {
-      name: 'theme', args: '[name]', description: 'Theme for this chat (midnight, fsociety, daylight, amoled, dusk, ocean, default)', available: inChat,
+      name: 'theme', args: '[name]', description: 'Theme for this chat (classic, forest, ocean, rose, paper, mono, midnight, fsociety, default…)', available: inChat,
       run(context, args) {
         if (!args.length) return context.press('conv-theme');
-        if (!context.setTheme(args.join(' '))) return { error: 'Unknown theme. Try midnight, fsociety, daylight, amoled, dusk, ocean or default.' };
+        if (!context.setTheme(args.join(' '))) return { error: 'Unknown theme. Try classic, forest, ocean, dusk, rose, paper, mono, midnight, fsociety, daylight, amoled or default; add -light or -dark to a family, like forest-light.' };
         context.notice(`Chat theme set to ${args.join(' ')} on this device.`);
       },
     },

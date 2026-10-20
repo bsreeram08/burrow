@@ -10,11 +10,17 @@ use std::collections::{HashMap, HashSet};
 use openmls::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::cert::{canonical_id, verify_credential, verify_standing, DeviceCert, Directory, Standing};
+use super::cert::{canonical_id, UNPINNED, verify_credential, verify_standing, DeviceCert, Directory, Standing};
 use super::{limits, ROLES_EXT};
 use crate::error::{ChatError, Result};
 
 fn policy(message: impl Into<String>) -> ChatError { ChatError::coded("invalid", &message.into()) }
+
+/// A leaf a commit introduces or changes: if its user is unpinned here the author is still to blame (they put it in),
+/// so the error is a plain `invalid`. Only a leaf the group already held may be `unpinned` (this device's gap).
+fn blame_author(result: Result<DeviceCert>) -> Result<DeviceCert> {
+    result.map_err(|error| if error.code.as_deref() == Some(UNPINNED) { ChatError::coded("invalid", &error.message) } else { error })
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -125,8 +131,8 @@ pub fn validate_group_state(extensions: &Extensions<GroupContext>, members: impl
     let roles = validate_context(extensions)?;
     let mut certs = Vec::new();
     for member in members {
-        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key)?;
-        let allowed = match (standing, stale) { (Standing::Current, _) | (_, Stale::Any) => true, (_, Stale::Own(user)) => cert.user_id == user, (_, Stale::Reject) => false };
+        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key, matches!(stale, Stale::Any))?;
+        let allowed = match (standing, stale) { (Standing::Current | Standing::Previous, _) | (_, Stale::Any) => true, (_, Stale::Own(user)) => cert.user_id == user, (_, Stale::Reject) => false };
         if !allowed { return Err(policy("device certificate: not signed by the pinned account key")); }
         if let Some(users) = &roles.dm {
             if !users.contains(&cert.user_id) { return Err(policy("a DM holds a device of a third user")); }
@@ -158,12 +164,24 @@ pub fn validate_staged(
     // in this very commit never authorizes the other proposals bundled with it.
     let roles = validate_context(extensions)?;
     let mut tree: HashMap<LeafNodeIndex, DeviceCert> = HashMap::new();
+    let mut members_by_leaf: HashMap<LeafNodeIndex, Member> = HashMap::new();
     let mut stale_leaves: HashSet<LeafNodeIndex> = HashSet::new();
+    let mut previous_leaves: HashSet<LeafNodeIndex> = HashSet::new();
     for member in members {
-        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key)?;
+        let (cert, standing) = verify_standing(directory, &member.credential, &member.signature_key, true)?;
         if standing == Standing::Stale { stale_leaves.insert(member.index); }
+        if standing == Standing::Previous { previous_leaves.insert(member.index); }
         tree.insert(member.index, cert);
+        members_by_leaf.insert(member.index, member);
     }
+    // A leaf that keeps its credential and signature key was checked above (a predecessor's certificate is honoured
+    // there); anything new must chain to the current key.
+    let renewed = |directory: &mut dyn Directory, leaf: &LeafNode, index: &LeafNodeIndex| -> Result<DeviceCert> {
+        match members_by_leaf.get(index) {
+            Some(old) if old.credential == *leaf.credential() && old.signature_key == leaf.signature_key().as_slice() => Ok(tree[index].clone()),
+            _ => blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())),
+        }
+    };
     let users: HashSet<String> = tree.values().map(|c| c.user_id.clone()).collect();
 
     let (committer, external) = match sender {
@@ -173,7 +191,7 @@ pub fn validate_staged(
         }
         Sender::NewMemberCommit => {
             let leaf = staged.update_path_leaf_node().ok_or_else(|| policy("external commit without a path"))?;
-            (verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?, true)
+            (blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice()))?, true)
         }
         _ => return Err(policy("commits are only accepted from members or external joiners")),
     };
@@ -188,8 +206,8 @@ pub fn validate_staged(
     }
 
     // The committer's new leaf (UpdatePath) must stay the same user and device.
-    if let Some(leaf) = staged.update_path_leaf_node() {
-        let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+    if let (Some(leaf), Sender::Member(index)) = (staged.update_path_leaf_node(), sender) {
+        let cert = renewed(directory, leaf, index)?;
         if cert.user_id != committer.user_id || cert.device_id != committer.device_id {
             return Err(policy("an update path may not change the leaf's user or device"));
         }
@@ -211,7 +229,7 @@ pub fn validate_staged(
             Proposal::Add(add) => {
                 adds += 1;
                 let leaf = add.key_package().leaf_node();
-                let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+                let cert = blame_author(verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice()))?;
                 introduced.push(cert.clone());
                 match roles.kind {
                     Kind::Dm => {
@@ -236,7 +254,7 @@ pub fn validate_staged(
                 let Sender::Member(index) = queued.sender() else { return Err(policy("update from a non-member")) };
                 let old = tree.get(index).ok_or_else(|| policy("update for an empty leaf"))?;
                 let leaf = update.leaf_node();
-                let cert = verify_credential(directory, leaf.credential(), leaf.signature_key().as_slice())?;
+                let cert = renewed(directory, leaf, index)?;
                 if cert.user_id != old.user_id || cert.device_id != old.device_id { return Err(policy("an update may not change the leaf's user or device")); }
             }
             Proposal::GroupContextExtensions(change) => {
@@ -252,6 +270,7 @@ pub fn validate_staged(
     if !introduced.iter().all(|cert| taken.insert(cert.device_id.as_str())) { return Err(policy("a device id in this group is already taken")); }
     // Welcomes must be entirely current (see Stale::Reject): whoever adds people first removes the devices of identities their users left.
     if adds > 0 && stale_leaves.iter().any(|leaf| !removed_leaves.contains(leaf)) { return Err(policy("remove devices of an identity their user left before adding people")); }
+    if adds > 0 && previous_leaves.iter().any(|leaf| !removed_leaves.contains(leaf)) { return Err(policy("devices on a previous account key must recertify or go before adding people")); }
     let after = tree.len() + adds + usize::from(external);
     if after.saturating_sub(removes) > limits::MAX_LEAVES { return Err(policy("the group would exceed the leaf limit")); }
     Ok(())

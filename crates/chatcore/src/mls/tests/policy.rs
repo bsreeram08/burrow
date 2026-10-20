@@ -897,3 +897,25 @@ fn a_device_id_names_one_leaf_of_a_group() {
     f.b2.join_external(&mut f.server, &g, &info).unwrap();
     assert_eq!(f.a1.members(&g).len(), 5);
 }
+
+#[test]
+fn a_missing_pin_is_blamed_on_the_author_only_for_a_leaf_the_commit_introduces() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let gid = group_id(&g).unwrap();
+    // The commit adds a device of a user nobody pinned: the author put that leaf in, so the author is blamed.
+    let mallory = Account::new();
+    let mut m1 = Dev::new(&mallory, "web", &[&mallory]);
+    let kp = m1.kp(1);
+    let out = f.a1.groups.commit_unchecked(&mut f.a1.store, &gid, &kp, &[], None, false).unwrap();
+    let check = f.c1.groups.commit_author(&mut f.c1.store, &gid, &out.commit).unwrap();
+    assert!(check.authenticated && check.signed_content_invalid, "{check:?}");
+    assert_eq!(check.author.as_ref().map(|a| a.device_id.as_str()), Some(f.a1.device.as_str()));
+    f.a1.groups.clear_own(&mut f.a1.store, &gid).unwrap();
+
+    // A leaf the group already held whose user this device has no pin for is this device's gap: the load gate fails
+    // closed with a typed `unpinned` error and nobody is blamed.
+    let out = f.a1.groups.commit(&mut f.a1.store, &gid, &[], &[], None, true).unwrap();
+    f.c1.store.delete(&format!("peer:{}", f.bob.id)).unwrap();
+    assert_eq!(f.c1.groups.commit_author(&mut f.c1.store, &gid, &out.commit).unwrap_err().code(), Some("unpinned"));
+}

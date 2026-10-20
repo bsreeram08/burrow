@@ -107,14 +107,36 @@ fn a_signed_succession_keeps_the_old_devices_working_for_certificates_issued_bef
     let err = f.a1.commit(&mut f.server, &g, &late.kp(1), &[], None, false).unwrap_err();
     assert!(err.message.contains("not signed by the pinned account key"), "{err}");
 
-    // The new key is current; its devices work as soon as they are added.
+    // The old key cannot mint a backdated certificate for a new leaf either: issued_at is the signer's word.
+    let mut backdated = Dev::issued(&f.bob, "linux", &[&f.alice, &bob, &f.carol], AT - 1);
+    let err = f.a1.commit(&mut f.server, &g, &backdated.kp(1), &[], None, false).unwrap_err();
+    assert!(err.message.contains("not signed by the pinned account key"), "{err}");
+
+    // Nobody is added while leaves on the previous key remain (a Welcome would refuse them): they go (or recertify) first.
     let mut b3 = Dev::new(&bob, "ios", &[&f.alice, &bob, &f.carol]);
-    // The new primary remembers the key it succeeded (becomePrimary does this), so the account's older devices stay current.
+    // The new primary remembers the key it succeeded (succession_complete does this).
     b3.store.put("own-previous", json!([{ "sign": f.bob.pin(), "until": AT }])).unwrap();
+    let err = f.a1.commit(&mut f.server, &g, &b3.kp(1), &[], None, false).unwrap_err();
+    assert!(err.message.contains("previous account key"), "{err}");
+    f.a1.accepted(&mut f.server, &g, &[], &[(f.bob.id.clone(), None)], None, false);
     let out = f.a1.accepted(&mut f.server, &g, &b3.kp(1), &[], None, false);
     b3.join(&mut f.server, &out.welcome.unwrap(), &g);
     b3.send(&mut f.server, &g, "from the new primary");
     assert!(f.c1.texts(&f.server, &g).contains(&"from the new primary".to_string()));
+}
+
+#[test]
+fn a_device_takes_its_own_account_key_from_the_core_and_its_certificates_key_is_a_predecessor() {
+    let mut f = Fixture::new(JoinPolicy::Invite);
+    let g = f.group.clone();
+    let bob = f.bob.rekeyed();
+    // After a succession the core's account row holds the new key; this device's certificate still names the old one.
+    f.b1.store.put("account", json!({ "userId": f.bob.id, "identity": { "sign": bob.pin(), "dh": b64(&[7u8; 32]) } })).unwrap();
+    f.b1.restart();
+    assert!(f.b1.members(&g).iter().any(|m| m.stale), "an unrecorded old key is stale, not trusted from our own certificate");
+    f.b1.store.put("own-previous", json!([{ "sign": f.bob.pin(), "until": AT }])).unwrap();
+    f.b1.restart();
+    assert!(f.b1.members(&g).iter().all(|m| !m.stale), "recorded as a predecessor, the certificate still counts");
 }
 
 #[test]

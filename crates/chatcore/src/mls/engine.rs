@@ -198,8 +198,9 @@ fn check_commit(provider: &Provider, group: &MlsGroup, protocol: ProtocolMessage
             let author = view(&sender, staged.update_path_leaf_node());
             let mut directory = Groups::client_directory(store, cert);
             let policy = validate_staged(group.extensions(), group.members(), &sender, &staged, &mut directory);
-            // A missing pin is this device's problem, not something the author signed: never blame them for it.
-            let blamed = policy.as_ref().is_err_and(|error| !error.message.starts_with("no pinned account key"));
+            // A missing pin for a leaf the group already held is this device's problem, not something the author signed.
+            // A leaf the commit itself introduces or changes is the author's (policy turns that into plain `invalid`).
+            let blamed = policy.as_ref().is_err_and(|error| error.code.as_deref() != Some(super::cert::UNPINNED));
             Ok(CommitCheck::new(true, blamed, author))
         }
         // Staging happens after the signature has been checked: the author signed content that does not stage.
@@ -406,8 +407,18 @@ impl Groups {
         let public = key32(&cert.leaf_sig_key).ok_or_else(|| ChatError::storage("malformed device record"))?;
         Ok(CredentialWithKey { credential: BasicCredential::new(cert.encode()).into(), signature_key: public.to_vec().into() })
     }
+    /// Our own account key is the core's current one (the identity on a primary, the `account` row on a companion),
+    /// not the one in this device's certificate: after a succession the certificate's key is a predecessor
+    /// (`own-previous`) until `mls_recertify` has run. A store without either row (the web's, whose key lives in
+    /// WebCrypto) has only the certificate to go by.
     fn client_directory<'a>(store: &'a mut dyn Store, own: &DeviceCert) -> StoreDirectory<'a> {
-        StoreDirectory { store, prefix: "peer:", own: key32(&own.aik_sign).map(|aik| (own.user_id.clone(), aik)) }
+        let current = match (store.get("identity"), store.get("account")) {
+            (Err(_), _) | (_, Err(_)) => None,
+            (Ok(Some(row)), _) => row.pointer("/pub/sign").and_then(Value::as_str).and_then(key32),
+            (Ok(None), Ok(Some(row))) => row.pointer("/identity/sign").and_then(Value::as_str).and_then(key32),
+            (Ok(None), Ok(None)) => key32(&own.aik_sign),
+        };
+        StoreDirectory { store, prefix: "peer:", own: current.map(|aik| (own.user_id.clone(), aik)) }
     }
     /// The load gate, once per group per process (and again after a restore): the stored group must still pass
     /// whole-group validation under today's pins, and this device's own leaf must still be this device. A group
@@ -493,7 +504,7 @@ impl Groups {
         let public = ds_bootstrap(&scratch, &info, &tree, &mut directory, Stale::Any)?;
         let roles = validate_context(public.group_context().extensions())?;
         Ok(public.members().filter_map(|m| {
-            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key, false), Ok((_, Standing::Stale)));
             cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
         }).collect())
     }
@@ -510,7 +521,7 @@ impl Groups {
         if roles.kind != Kind::Dm || roles.dm.as_ref() != Some(&users) { return Err(invalid("that is not the DM of these two people")); }
         let mut directory = Self::client_directory(store, &cert);
         for member in mls_group.members() {
-            let (leaf, standing) = verify_standing(&mut directory, &member.credential, &member.signature_key)?;
+            let (leaf, standing) = verify_standing(&mut directory, &member.credential, &member.signature_key, true)?;
             if standing != Standing::Current || !users.contains(&leaf.user_id) { return Err(invalid("that DM holds a device that does not chain to these two accounts")); }
         }
         Ok(())
@@ -701,7 +712,7 @@ impl Groups {
         let cert = Self::device(store)?;
         let mut directory = Self::client_directory(store, &cert);
         Ok(mls_group.members().filter_map(|m| {
-            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key, true), Ok((_, Standing::Stale)));
             cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
         }).collect())
     }
@@ -933,7 +944,7 @@ impl Groups {
                     // A device of an identity its user left may no longer speak for them (it may be the reason they left).
                     let leaf = sender_index.and_then(|index| mls_group.member_at(index)).ok_or_else(|| ChatError::coded("auth", "unknown sender"))?;
                     let mut directory = Self::client_directory(store, &cert);
-                    if verify_standing(&mut directory, &leaf.credential, &leaf.signature_key)?.1 == Standing::Stale { return Err(ChatError::coded("stale", "This device belongs to an identity its user left")); }
+                    if verify_standing(&mut directory, &leaf.credential, &leaf.signature_key, true)?.1 == Standing::Stale { return Err(ChatError::coded("stale", "This device belongs to an identity its user left")); }
                     let text = String::from_utf8(app.into_bytes()).map_err(|_| ChatError::coded("invalid", "payload is not UTF-8"))?;
                     Ok((Processed { pending_id: String::new(), kind: "application".into(), plaintext: Some(text), sender, epoch: current, digest: None }, Vec::new()))
                 }
@@ -1192,7 +1203,7 @@ impl Ds {
         let roles = validate_context(public.group_context().extensions())?;
         let mut directory = Groups::ds_directory(store);
         let members = public.members().filter_map(|m| {
-            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key), Ok((_, Standing::Stale)));
+            let stale = matches!(verify_standing(&mut directory, &m.credential, &m.signature_key, true), Ok((_, Standing::Stale)));
             cert_of(&m.credential).map(|c| MemberView { leaf: m.index.u32(), admin: roles.is_admin(&c.user_id), user_id: c.user_id, device_id: c.device_id, platform: c.platform, stale })
         }).collect();
         Ok(GroupMembers { epoch: public.group_context().epoch().as_u64(), roles, members })

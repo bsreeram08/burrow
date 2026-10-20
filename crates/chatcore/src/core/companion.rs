@@ -341,6 +341,16 @@ impl Core {
         let mut state = self.link_state(link_id, now)?;
         let mode = state.code_mode.clone().filter(|_| state.role == "n" && state.k_out.is_none()).ok_or_else(|| invalid("This link is not waiting to be opened"))?;
         unb64_32(eph_p)?;
+        // One-shot: once our key and nonce are shown, a different primary key would let a man in the middle grind the
+        // 6-digit code. An identical repeat is harmless; anything else burns the link.
+        match state.eph_p.as_deref() {
+            Some(prev) if prev == eph_p => return Ok((state.eph_n.clone(), mode.nonce.expect("set at commit"))),
+            Some(_) => {
+                self.store.delete("link:state")?;
+                return Err(ChatError::coded("auth", "The primary's key changed after this device revealed its own"));
+            }
+            None => {}
+        }
         // The primary's key is fixed before ours is shown: remember it so `link_complete_code` cannot be handed another.
         state.eph_p = Some(eph_p.to_string());
         self.store.put("link:state", to_value(&state))?;

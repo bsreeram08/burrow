@@ -83,6 +83,14 @@ pub fn session_info(contact_id: String) -> Result<Option<SessionInfo>> {
 pub fn prove_identity(user_id: String, device_id: String, challenge: String) -> Result<String> { with(|core| core.prove_identity(&user_id, &device_id, &challenge)) }
 pub fn reset_identity() -> Result<()> { with(|core| core.reset_identity()) }
 
+/// Signs the account's next DeviceList (JSON, devices.js shape) and its device certificates; see
+/// `Core::sign_device_list`. `published_sign` is the account's identity signing key as the server publishes it.
+pub fn sign_device_list(user_id: String, published_sign: String, list_json: String) -> Result<crate::devicelist::SignedList> {
+    with(|core| core.sign_device_list(&user_id, &published_sign, &list_json))
+}
+/// The device-meta seed (base64url signature); see `Core::device_meta_signature`.
+pub fn device_meta_signature(user_id: String) -> Result<String> { with(|core| core.device_meta_signature(&user_id)) }
+
 /// Chat key rotation schedule: the shorter non-off interval of the two sides wins (0 = off).
 pub fn rotation_interval(mine: u64, theirs: u64) -> u64 { crate::core::rotation_interval(mine, theirs) }
 

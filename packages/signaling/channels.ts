@@ -323,7 +323,13 @@ export function createChannels(deps: Deps) {
         const mine = db.query<Member, [string, string]>('SELECT * FROM channel_members WHERE channel_id = ? AND user_id = ? ORDER BY device_id').all(channel.id, user.id);
         const device = deps.sessionDevice(user.session);
         const here = mine.find(row => row.device_id === device);
-        return { id: channel.id, kind: channel.kind, name: channel.name, epoch: channel.epoch, seq: channel.seq, frozen: channel.frozen_seq !== null, member: Boolean(here), cursor: here?.cursor ?? null, admin: mine.some(row => row.admin) };
+        const base = { id: channel.id, kind: channel.kind, name: channel.name, epoch: channel.epoch, seq: channel.seq, frozen: channel.frozen_seq !== null, member: Boolean(here), cursor: here?.cursor ?? null, admin: mine.some(row => row.admin) };
+        if (channel.kind !== 'dm') return base;
+        // A DM names the other person, so a client can tie it to the 1:1 conversation it replaces (docs/m5-linking.md §8).
+        const pair = db.query<{ user_a: string; user_b: string }, [string]>('SELECT user_a, user_b FROM dm_pairs WHERE channel_id = ?').get(channel.id);
+        const peerId = pair ? (pair.user_a === user.id ? pair.user_b : pair.user_a) : null;
+        const peer = peerId ? db.query<{ id: string; username: string }, [string]>('SELECT id, username FROM users WHERE id = ?').get(peerId) : null;
+        return { ...base, peer: peer ? { id: peer.id, username: peer.username } : null };
     }
     function list(user: Caller): Response {
         if (!allowRead(user.id)) return json({ error: 'Rate limited' }, 429);
@@ -360,6 +366,31 @@ export function createChannels(deps: Deps) {
         if (body.epoch !== channel.epoch) return json({ error: 'The group is at another epoch.', epoch: channel.epoch }, 409);
         db.query('UPDATE channels SET group_info = ?, group_info_epoch = ? WHERE id = ?').run(body.groupInfo, body.epoch, channelId);
         return json({ epoch: body.epoch });
+    }
+
+    // ---------- M5: capability, revoked devices (docs/m5-linking.md §4, §8) ----------
+
+    /** Whether a contact can take part in MLS DMs: how many of their listed devices hold KeyPackages, and the DM that exists. */
+    function capability(user: Caller, username: string): Response {
+        const target = deps.userByName(username);
+        if (!target || (target.id !== user.id && !deps.mutual(user.id, target.id))) return json({ error: 'You can only reach accepted contacts.' }, 403);
+        if (!allowRead(user.id)) return json({ error: 'Rate limited' }, 429);
+        const seconds = Math.floor(now() / 1000);
+        const holders = db.query<{ device_id: string }, [string, number]>('SELECT DISTINCT device_id FROM mls_key_packages WHERE user_id = ? AND expires_at > ?').all(target.id, seconds).filter(row => deps.eligible(target.id, row.device_id));
+        const [a, b] = [user.id, target.id].sort();
+        const pair = db.query<{ channel_id: string }, [string, string]>('SELECT channel_id FROM dm_pairs WHERE user_a = ? AND user_b = ?').get(a!, b!);
+        return json({ userId: target.id, devices: holders.length, channel: pair?.channel_id ?? null });
+    }
+
+    /** A device was revoked: it leaves every fan-out and its other devices are told to remove its leaves. */
+    function devicesRevoked(userId: string, ids: string[]) {
+        for (const deviceId of ids) {
+            const where = db.query<{ channel_id: string }, [string]>('SELECT channel_id FROM channel_members WHERE device_id = ?').all(deviceId);
+            db.query('DELETE FROM channel_members WHERE device_id = ?').run(deviceId);
+            db.query('DELETE FROM mls_welcomes WHERE device_id = ?').run(deviceId);
+            db.query('DELETE FROM mls_key_packages WHERE device_id = ?').run(deviceId);
+            for (const { channel_id } of where) { deps.notify(userId, { type: 'channel', id: channel_id, change: 'remove-device', deviceId }); trim(channel_id); }
+        }
     }
 
     // ---------- M4: directory, identities, ephemeral messages (docs/m4-groups.md §8) ----------
@@ -654,6 +685,8 @@ export function createChannels(deps: Deps) {
         if (welcomeMatch && (method === 'GET' || method === 'DELETE')) return welcome(user, welcomeMatch[1]!, method === 'DELETE');
         if (path === '/api/channels' && method === 'GET') return list(user);
         if (path === '/api/channels/directory' && method === 'GET') return directory(user);
+        const capabilityMatch = /^\/api\/mls\/capability\/([a-z0-9_]{3,20})$/.exec(path);
+        if (capabilityMatch && method === 'GET') return capability(user, capabilityMatch[1]!);
         const userMatch = /^\/api\/users\/([A-Za-z0-9_-]{22})\/identity$/.exec(path);
         if (userMatch && method === 'GET') return identity(user, userMatch[1]!);
         if (path === '/api/channels' && method === 'POST') return create(request, user);
@@ -676,6 +709,6 @@ export function createChannels(deps: Deps) {
         return json({ error: 'Not found' }, 404);
     }
 
-    return { handle, pump, cursorFrame, ackWelcome, sweep };
+    return { handle, pump, cursorFrame, ackWelcome, sweep, devicesRevoked };
 }
 export type Channels = ReturnType<typeof createChannels>;

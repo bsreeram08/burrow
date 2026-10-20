@@ -104,6 +104,26 @@ const MIGRATIONS: ((db: Database) => void)[] = [
             CREATE INDEX mls_welcomes_channel ON mls_welcomes (channel_id, seq);
         `);
     },
+    // 4 (M5): device linking (a blind relay between a new device and the primary), succession records.
+    db => {
+        db.exec(`
+            -- One linking session. The server never sees the link secret, the code or what the devices exchange.
+            -- state: waiting (new device started), offered (primary answered), granted (list published, bundle sent),
+            -- claimed (the new device took its session). mode: 'qr' or 'code' (short-code rendezvous).
+            CREATE TABLE link_requests (id TEXT PRIMARY KEY, purpose TEXT NOT NULL CHECK (purpose IN ('link', 'transfer')), mode TEXT NOT NULL CHECK (mode IN ('qr', 'code')),
+                device_id TEXT NOT NULL, device_key TEXT NOT NULL, platform TEXT NOT NULL, claim_hash TEXT NOT NULL,
+                expect_user TEXT, code_hash TEXT UNIQUE, commit_hash TEXT, reveal TEXT, user_id TEXT REFERENCES users(id) ON DELETE CASCADE, offer_device_id TEXT, eph TEXT,
+                state TEXT NOT NULL CHECK (state IN ('waiting', 'offered', 'granted', 'claimed')), strikes INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
+            CREATE INDEX link_requests_expiry ON link_requests (expires_at);
+            CREATE TABLE link_messages (link_id TEXT NOT NULL REFERENCES link_requests(id) ON DELETE CASCADE, dir TEXT NOT NULL CHECK (dir IN ('n2p', 'p2n')),
+                seq INTEGER NOT NULL, data TEXT NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (link_id, dir, seq));
+            -- Signed hand-overs from one account identity key to the next (docs/m5-linking.md §5), oldest first.
+            CREATE TABLE identity_succession (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, seq INTEGER NOT NULL,
+                old_sign TEXT NOT NULL, new_sign TEXT NOT NULL, new_dh TEXT NOT NULL, at INTEGER NOT NULL, signature TEXT NOT NULL, created_at INTEGER NOT NULL,
+                PRIMARY KEY (user_id, seq));
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

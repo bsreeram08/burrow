@@ -362,10 +362,8 @@ describe('messaging device and per-device delivery', () => {
         const receipt = await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(48).toString('base64url') }));
         expect((await phoneStream.next('envelope')).id).toBe(receipt.body.id);
         laptopStream.socket.send(JSON.stringify({ type: 'ack', id: receipt.body.id }));
-        // Typing is ephemeral: every open stream of every device of the recipient gets it, and nothing is stored.
-        expect((await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(32).toString('base64url'), ephemeral: true }))).status).toBe(202);
-        expect((await laptopStream.next('envelope')).ephemeral).toBe(true);
-        expect((await phoneStream.next('envelope')).ephemeral).toBe(true);
+        // Typing no longer travels as a 1:1 envelope (it goes over MLS): refused, and nothing is stored or delivered.
+        expect((await read(await request('/api/messages', 'POST', bob.cookie, { to: 'alice', envelope: randomBytes(32).toString('base64url'), ephemeral: true }))).status).toBe(410);
         await Bun.sleep(50);
         const after = new Database(join(dataDir, 'accounts.sqlite'), { readonly: true });
         expect((after.query('SELECT device_id FROM device_inbox ORDER BY created_at').all() as any[]).map(row => row.device_id)).toEqual([phone, phone]);

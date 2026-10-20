@@ -91,12 +91,23 @@ type Caller = { id: string; session: string };
 const json = (value: unknown, status = 200) => Response.json(value, { status, headers: { 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer' } });
 
 /** Pins the account keys the registry holds for `userIds`, so the validator can check certificates against them. */
-export function pinAccounts(deps: Pick<Deps, 'aikOf'>, call: Call, userIds: Iterable<string>) {
+export function pinAccounts(deps: Pick<Deps, 'aikOf'> & { successions?(userId: string): object[] }, call: Call, userIds: Iterable<string>) {
     for (const userId of new Set(userIds)) {
         const aik = deps.aikOf(userId);
         if (!aik) throw new Abort(409, 'A member has not published an identity key.');
         try { call({ cmd: 'dsPin', userId, aik }); }
-        catch (error) { if (error instanceof DsError) throw new Abort(409, 'A member\'s identity changed; their old devices are no longer valid here.'); throw error; }
+        catch (error) {
+            if (!(error instanceof DsError)) throw error;
+            // The registry's key moved. Follow the signed succession records from the pinned key if they lead to it
+            // (older devices stay valid for what they were certified before); otherwise the user recovered under a
+            // new key and their old devices are stale (removable, unable to act). Either way the group carries on.
+            const records = deps.successions?.(userId) ?? [];
+            let followed = false;
+            if (records.length) { try { call({ cmd: 'dsSucceed', userId, records }); followed = true; } catch (inner) { if (!(inner instanceof DsError)) throw inner; } }
+            try { call({ cmd: 'dsPin', userId, aik }); }
+            catch (inner) { if (!(inner instanceof DsError)) throw inner; call({ cmd: 'dsRepin', userId, aik }); }
+            void followed;
+        }
     }
 }
 

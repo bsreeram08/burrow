@@ -74,7 +74,7 @@ P to N, `grant`:
   "identity": { "dh": "<43>", "sign": "<43>" },          // the account's public AIK
   "deviceId": "<22>", "cert": "<DeviceCert JSON text>",    // MLS device certificate (§1.5)
   "listVersion": n, "listHash": "<43>",                    // the list that names N
-  "metaKey": "<43 base64url, 32 bytes>",                   // device-label sealing key (devices.md)
+  "metaKey": "<43 base64url, 32 bytes>",                   // the derived device-label key (devices.md: HKDF of the AIK's meta signature, 32 zero bytes salt, info "webrtc-bun-devicemeta-v1"), not the seed
   "chunks": n }                                            // number of bundle messages that follow
 ```
 
@@ -83,6 +83,8 @@ P to N, `bundle` (0..16 chunks, in order): `{ "v": 1, "type": "bundle", "i": k, 
 ### 1.5 The new device's MLS certificate
 
 A chatcore `DeviceCert` (`webrtc-bun-devcert-v1`, [API.md](../crates/chatcore/API.md)): `userId`, `deviceId`, `platform`, `leafSigKey` (from the hello), `aikSign` (the AIK), `issuedAt` (ms), signature by the AIK. P's core builds the bytes itself and signs only for a `deviceId` in the **last list this core signed** (it remembers the ids with `devlist:last`), a known platform, a canonical key, and an `issuedAt` within 10 minutes of now.
+
+On the web the AIK is a non-extractable WebCrypto key that chatcore does not hold: a web primary signs the same bytes itself (`devices.js` `mlsCertBytes`, the list bytes, `successionBytes`) and enforces "only for a device in the list it just signed" in the client. Chatcore's `signDeviceCert` / `signSuccession` / `signDeviceList` are the same signatures for a primary whose AIK is in chatcore (the app).
 
 ## 2. What the bundle carries (and what it does not)
 
@@ -107,6 +109,19 @@ bundle = { "v": 1,
 4. The user sees "Linked to <username>. Safety number <n>" and can leave at once (`DELETE /api/devices/<id>` revokes itself).
 
 The account identity N pins comes from the QR-authenticated primary, not from the server. A hostile server that substitutes P's ephemeral key cannot derive the keys (it lacks the link secret) and the codes would differ.
+
+### 1.7 Linking without a camera: the short code
+
+Scanning is not always possible (laptop to laptop). A new device may instead start the link in `mode: 'code'`: it shows an 8-character code (31 unambiguous letters and digits, about 39.6 bits, 5 minutes, single use) and the account's name field is required so only that account's primary can complete it. There is no QR and so **no link secret**: the 6-digit confirmation code is the only thing that authenticates the key exchange against whoever relays it (the server). A bare "post the key under the code" would let a relay grind keys until both screens show one number (a million trials, seconds of CPU), so the new device **commits before it reveals**:
+
+1. N: `POST /api/link/start { purpose: 'link', mode: 'code', username, deviceId, deviceKey, platform, signature }` -> `{ linkId, claim, code, expiresAt }`.
+2. N: `linkCommit { linkId, deviceId }` (chatcore) makes its ephemeral key and a nonce and returns `commit = base64url(SHA-256("webrtc-bun-link-commit-v1" ‖ linkId(16) ‖ text16(deviceN) ‖ ephN(32) ‖ nonce(16)))`; `POST /api/link/:id/commit { commit }`.
+3. P's user types the code: `POST /api/link/lookup { code }` (the account's primary session only) -> `{ linkId, deviceId, platform, commit, expiresAt }`. The code stops existing. P: `linkLookup { linkId, deviceN, commit, deviceP }` -> `{ eph }`; `POST /api/link/:id/offer { eph }` (creates N's pending device as in §1.1).
+4. N polls `GET /api/link/:id` -> `eph`, `offerDeviceId`. Only now: `linkReveal { linkId, eph }` -> `{ eph, nonce }` (its committed key and nonce); `POST /api/link/:id/reveal { eph, nonce }`.
+5. P polls (`GET /api/link/:id` -> `reveal`, or the `link` frame `reveal`): `linkOpenCommitment { linkId, eph, nonce }` checks the commitment (a mismatch burns the link, error `auth`) and derives the keys and the code. N: `linkCompleteCode { linkId, eph (the primary's), deviceP }` derives the same.
+6. The keys and code are `derive_code_mode`: `salt = SHA-256("webrtc-bun-link-v2" ‖ linkId ‖ ephN ‖ ephP ‖ text16(deviceN) ‖ text16(deviceP))`, `ikm = dh`, infos `"webrtc-bun-link-v2 n2p|p2n|code"`; the code commits to **both ephemeral keys and both device ids**. From here the link is exactly §1.1 steps 5-9 (sealed hello, list, certificate, grant, claim).
+
+Why this holds: the relay sees the commitment, then the primary's key, and only then the reveal. It cannot choose its key for the new device after seeing the new device's (still hidden) key, and it cannot change the key it gave the primary after the fact, so both screens agree only by luck: one chance in a million per attempt, and every attempt is a visible failed link. The user must still compare the two codes and tap **Link** only if they match; there is no other check in this mode. Guards: three wrong or rejected codes block that account's lookups for five minutes; lookups answer the same for a wrong, used, expired, uncommitted or other account's code; a `DELETE` by the primary on a looked-up link counts as a strike; the code never reaches anyone but a session of the named account's primary device.
 
 ## 3. The new device joins its groups
 
@@ -145,9 +160,9 @@ JSON: `{ v, userId, oldSign, newSign, newDh, at, signature }` (keys base64url). 
 ### 5.2 Flow (same relay as linking, `purpose: 'transfer'`)
 
 1. N (a listed companion, with a session) wants to become primary: `POST /api/link/start { purpose: 'transfer', deviceId (its own), … }` (session required, N must be listed), shows the QR (`linkQr`), P0 (the current primary) scans and offers (only the primary may offer a transfer), the code is confirmed on both screens exactly as in §1.
-2. N: `becomePrimary` (chatcore: leaves companion mode, mints a fresh identity; it is **not** published yet) and sends sealed `succession-request { "v":1, "type":"succession-request", "newSign", "newDh", "leafSigKey" }`.
+2. N: `successionStart` (chatcore: mints the fresh identity it will hold, kept aside, **not** active or published yet; N stays a companion) and sends sealed `succession-request { "v":1, "type":"succession-request", "newSign", "newDh", "leafSigKey" }`.
 3. P0 shows "Make <label> your primary device?" with the code. On confirm: `signSuccession { userId, newSign, newDh, at }` (chatcore; signs only the record bytes; requires P0 to hold the published AIK) and sends sealed `succession { record, signature }`.
-4. N publishes: `PUT /api/devices/succession { record, signature }` (server verifies under the current AIK, §5.3), then `PUT /api/keys` with the new identity (the server accepts the identity change **as a succession** because a matching record is stored), then publishes **DeviceList version 1 under the new AIK** naming all current devices (including P0), with the usual per-device certs, and signs fresh MLS certificates for itself (`mlsInitDevice`).
+4. N publishes: `PUT /api/devices/succession { record, signature }` (server verifies under the current AIK, §5.3), then `PUT /api/keys` with the new identity (the server accepts the identity change **as a succession** because a matching record is stored), then `successionComplete { record, signature }` (chatcore: verifies the record against the pinned account and the identity it minted, then holds that identity, remembers the old key as a predecessor until the record's time, leaves companion mode), then publishes **DeviceList version 1 under the new AIK** naming all current devices (including P0), with the usual per-device certs, and signs fresh MLS certificates for itself (`mlsInitDevice`).
 5. P0 receives a final sealed `demote { "v":1, "type":"demote", "identity": {dh, sign}, "cert"?: … }`, `retireIdentity` (chatcore: deletes its AIK secret, enters companion mode with the new account identity pinned, **keeps** its device key and MLS leaf), and asks N for a new MLS cert for its leaf with the same relay (`signDeviceCert` flow of §1.5, optional: its old certificate stays valid through the succession, §7). The 1:1 inbox moves to N (existing claim rules).
 6. Other companions: on the `devices` frame they fetch the new list, verify it under the new AIK via the succession chain (§5.3) and `companionSetup` again with the new pinned identity (no user action).
 
@@ -179,6 +194,7 @@ Today a member's identity change makes **every** commit in their channels fail (
 - **Stale leaves can be removed.** A commit may Remove stale leaves; allowed to an admin or to a Current/Predecessor device of the **same user** (the existing own-device rule). This is what makes a recovered or revoked identity's old devices removable.
 - **Joining.** A stale user's *new* device may external-join: the user is still "in the group". The validator counts stale leaves' users as members.
 - Everything else is unchanged: adds, updates and external joins of new leaves still need a Current/Predecessor certificate.
+- **A device id names one leaf.** Two leaves of a group may never share a device id (one account's, or two accounts'): the whole-group validation and every commit that adds or joins a leaf refuse it. Clients find leaves by device id (removal, resolutions); resolutions are verified with the signer's user id too.
 - `mlsMembers` reports `stale: bool` per leaf; clients show "Old device" and offer/do removal of own stale leaves after a succession/recovery.
 - **DS pins.** The delivery service pins each user's registry key. When the registry's identity changes: with a stored succession chain from the pinned key, `dsSucceed` moves the pin and records the predecessor; otherwise (recovery/takeover) `dsRepin` replaces it. Old leaves become stale and removable; nothing blocks the channel (this is the gap the server returned `409 identity changed` for).
 - Client pins: `acceptSuccession` (contacts, §5.3) writes the `previous` list that chatcore's directory reads; a plain accepted code change (`acceptChange`) gives no predecessor, so old leaves are stale.
@@ -224,42 +240,53 @@ Duplicate pointers (both sides migrating at once) are ignored once `migrated`. S
 
 ### 10.1 chatcore (JSON command / Rust `api`)
 
-| Command | Meaning |
+Every command takes optional `now` (ms) where it says so; results are the `ok` value. Errors keep chatcore's codes (`companion`, `unknown-link`, `expired`, `replay`, `auth`, `stale`, `invalid`).
+
+| Command | Result / meaning |
 | --- | --- |
-| `linkQr { linkId }` | N: ephemeral key + link secret, stores link state; `{ qr }`. |
-| `linkAccept { qr }` | P: parse/validate the QR, ephemeral key, derive keys; `{ linkId, eph, code }`. |
-| `linkComplete { linkId, eph }` | N: derive keys from P's ephemeral; `{ code }`. |
-| `linkSeal { linkId, plaintext }` / `linkOpen { linkId, data }` | AEAD of §1.2 (`dir` is implied by the core's role); counters kept in the store. |
-| `linkEnd { linkId }` | Deletes the state. |
-| `signDeviceCert { userId, deviceId, platform, leafSigKey, issuedAt }` | P: MLS certificate JSON for a device in the last signed list (§1.5). |
-| `exportPins` / `importPins { pins }` | §2. |
-| `companionSetup { userId, identity, cert }` | N: pins the account identity, installs the cert, enters companion mode. |
-| `becomePrimary` / `retireIdentity { identity }` | §5.2 steps 2 and 5. |
-| `signSuccession { userId, newSign, newDh, at }` | P0: signs the record of §5.1 (only if it holds the published AIK). |
-| `acceptSuccession { contact, records }` | §5.3: verifies the chain from the pin, moves the pin, keeps `verified`. |
-| `mlsMembers` | now includes `stale`. |
+| `linkQr { linkId, now }` | N: `{ qr }`; ephemeral key + link secret stored (one link per core at a time). |
+| `linkAccept { qr, now }` | P: `{ linkId, eph, code }`. Any core that is not a companion (an identity-less web MLS store is fine). |
+| `linkComplete { linkId, eph, now }` | N: `{ code }`. |
+| `linkSeal { linkId, plaintext, now }` / `linkOpen { linkId, data, now }` | the sealed string / the plaintext string (AEAD of §1.2; direction follows the core's role in this link; counters in the store). |
+| `linkEnd { linkId }` | `null`. |
+| `linkCommit { linkId, deviceId, now }` / `linkReveal { linkId, eph, now }` / `linkLookup { linkId, deviceN, commit, deviceP, now }` / `linkOpenCommitment { linkId, eph, nonce, now }` / `linkCompleteCode { linkId, eph, deviceP, now }` | §1.7: `{ commit }`, `{ eph, nonce }`, `{ eph }`, `{ code }`, `{ code }`. |
+| `signDeviceList { userId, published, list, head? }` | `{ signature, certs }` (devices.md "App list signing"; `head` is `{ list, signature }`). |
+| `signDeviceCert { userId, deviceId, platform, leafSigKey, issuedAt, now }` | The MLS certificate JSON text for a device in the last list this core signed (§1.5). Primary only. |
+| `exportPins` / `importPins { pins }` | `[ { contact, identity, verified, previous? } ]` / the number created (§2). |
+| `companionSetup { userId, identity, cert }` | `DeviceCert`. Installs the cert and pins the account identity; re-runnable (a new identity and a cert under it replace the old). |
+| `successionStart` / `successionComplete { record, signature }` | N: the identity minted for taking over / the identity now held (§5.2). |
+| `signSuccession { userId, published, newSign, newDh, at }` | P0: the signed record (JSON with `signature`); signs only the record bytes. |
+| `retireIdentity { userId, identity, at }` | P0 steps down to a companion of `identity`. |
+| `acceptSuccession { contact, records }` | The moved `PeerRecord` (call it **before** noting the served identity; refused for a pin awaiting review). |
+| `mlsRecertify { platform, issuedAt }` | A new primary re-signs its own device certificate under its identity. |
+| `mlsMembers` | members now include `stale`. |
 | `mlsCheckDm { group, peer }` | §8.3 step 3. |
-| `mlsInspectGroup { groupInfo, tree }` | §3 step 1: the members `{ userId, deviceId, stale }` of a served GroupInfo/tree after the whole-group validation of a join; changes nothing. |
-| `dsRepin { userId, aik }` / `dsSucceed { userId, record, signature }` | §7, DS side. |
+| `mlsInspectGroup { groupInfo, tree }` | `[ { leaf, userId, deviceId, platform, admin, stale } ]` after the whole-group validation of a join; changes nothing (§3). |
+| `mlsVerifyResolution { …, by, byUser, signature }` | needs the signer's user id; a device id names one leaf (duplicates are refused in a group). |
+| `dsRepin { userId, aik }` / `dsSucceed { userId, records }` | DS side of §7. |
+
+Rust `chatcore::api` mirrors these as functions (`link_qr`, `link_accept`, …, `sign_device_cert`, `companion_setup`, `succession_*`, `accept_succession`, `mls_inspect_group`, `mls_check_dm`).
 
 ### 10.2 Server
 
 | Endpoint | Behaviour |
 | --- | --- |
-| `POST /api/link/start` | §1.1 step 1. No session for `purpose: 'link'`; a listed device's session for `'transfer'`. Rate limited per source (5/min) and globally (1,000 open links). |
-| `POST /api/link/:id/offer { eph }` | The primary's session. For `link` creates N's pending device; for `transfer` the offerer must be the primary. |
-| `GET /api/link/:id` | N (header `X-Link-Claim`) or the offering session: `{ state: 'waiting'\|'offered'\|'granted'\|'expired', eph?, purpose, platform }`. |
-| `POST /api/link/:id/messages { dir, data }` · `GET /api/link/:id/messages?dir=&after=` | The sealed relay (≤ 64 messages per direction, ≤ 64 KiB each). `n2p` needs the claim, `p2n` the offering session. |
-| `POST /api/link/:id/grant` | P, after publishing the list naming N. |
-| `POST /api/link/:id/claim { claim, signature, client? }` | N. Issues the session; once. |
-| `DELETE /api/link/:id` | Either side; drops it. |
-| `POST /api/devices/:id/revoke` | §4. |
-| `PUT /api/devices/succession { record, signature }` · `GET /api/devices/:username` (`succession`) | §5. |
-| `GET /api/mls/capability/:username` | §8.1. |
+| `POST /api/link/start` | §1.1 step 1 / §1.7. `{ purpose: 'link'\|'transfer', mode?: 'qr'\|'code', username? (code mode), deviceId, deviceKey, platform, signature }` -> 201 `{ linkId, claim, expiresAt, code? }`. No session for `link`; a listed device's own session for `transfer`. Rate limited: 5 per minute per source, 1,000 open links; the device id must be new. |
+| `POST /api/link/:id/commit { commit }` · `POST /api/link/:id/reveal { eph, nonce }` | Code mode (§1.7); the claim in `X-Link-Claim`. |
+| `POST /api/link/lookup { code }` | The account's primary session. -> `{ linkId, deviceId, platform, commit, expiresAt }`; 404 for anything else; three strikes block for 5 minutes (429). |
+| `POST /api/link/:id/offer { eph }` | The primary's session. 201 `{ deviceId, platform, purpose, mode }`; for `link` it creates N's pending device (the registered key); for `transfer` the offerer must be the primary. |
+| `GET /api/link/:id` | N (`X-Link-Claim`) or the offering session. `{ state: 'waiting'\|'offered'\|'granted'\|'claimed', purpose, mode, platform, expiresAt }` plus for N `eph`, `offerDeviceId` once offered; for P `deviceId`, `commit?`, `reveal?: { eph, nonce }`. A non-party gets the same 404 as an unknown link. |
+| `POST /api/link/:id/messages { data }` · `GET /api/link/:id/messages?after=<seq>` | The sealed relay. `seq` starts at 1; `after` is exclusive; each side posts its own direction and reads the other's (`dir`, if sent, must match). `{ seq }` / `{ messages: [ { seq, data } ] }`. At most 64 per direction, 64 KiB each. |
+| `POST /api/link/:id/grant` | P, after publishing the list naming N and sending the grant (409 before). |
+| `POST /api/link/:id/claim { claim, signature }` | N, no session: the claim secret and the device key's signature over the claim bytes. Web: 200 `Set-Cookie` + `{ user: { id, username } }`; native: 200 `{ user, session: { token, expiresAt } }`. Once; the session is bound to the device. |
+| `DELETE /api/link/:id` | Either side; drops the link and the unlisted device it created. |
+| `POST /api/devices/:id/revoke` | §4: 200 `{ revoked: [id] }`; 409 for the primary, 404 for an unknown or revoked id. |
+| `PUT /api/devices/succession { record, signature }` · `GET /api/devices/:username` (`succession`) | §5.3. 201 `{ seq }`. |
+| `GET /api/mls/capability/:username` | §8.1: `{ userId, devices, channel }`. |
 | `GET /api/channels` (+`peer`) | DM channels carry `peer: { id, username }`. |
 | `POST /api/messages` | `ephemeral: true` is 410; envelopes to a pair whose DM channel is over 60 days old are 410. |
 
-Frames: `link { id, event: 'hello'\|'offer'\|'grant'\|'message' }` to the offering account's streams; `devices { id, needsList }`; `channel { change: 'remove-device', deviceId }`.
+Frames: `link { id, event: 'message'\|'reveal'\|'claimed', dir?, seq? }` to the offering account's streams; `devices { id, needsList?, revoked? }`; `channel { id, change: 'remove-device', deviceId }`. The DS follows an identity change by itself: with signed succession records from the pinned key it moves the pin and keeps the old key as a predecessor, otherwise it replaces the pin (old devices stale); it no longer answers 409 for the whole channel.
 
 ## 11. Who builds what
 

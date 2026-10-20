@@ -2,6 +2,7 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { fileURLToPath } from 'node:url';
 import { verifyCore } from './core-manifest';
 import { createChannels, type Channels } from './channels';
+import { createLink, type LinkRelay } from './link';
 import { createDsCore, createKeyPackages } from './mls-ds';
 import type { ServerWebSocket } from 'bun';
 import { packetBudget } from '../stun-server/native/server';
@@ -136,6 +137,7 @@ export function startSignaling(options: SignalingOptions) {
         for (const room of rooms.values()) if (room.expiresAt <= now()) remove(room);
         accounts?.sweep();
         blobs?.sweep();
+        link?.sweep();
     }
     function issue(participant: Participant) { const next = token(); participant.digest = digest(next); return next; }
     let accounts: Accounts | undefined;
@@ -182,10 +184,15 @@ export function startSignaling(options: SignalingOptions) {
     let channels: Channels | undefined;
     if (db && accounts && options.dataDir) {
         const ds = createDsCore({ db, dir: dsDir });
-        const directory = { db, now, ds, eligible: accounts.devices.eligible, sessionDevice: accounts.devices.sessionDevice, aikOf: accounts.devices.aikOf, mutual: accounts.mutual, notify: accounts.notify };
+        const directory = { db, now, ds, eligible: accounts.devices.eligible, sessionDevice: accounts.devices.sessionDevice, aikOf: accounts.devices.aikOf, successions: accounts.devices.successions, mutual: accounts.mutual, notify: accounts.notify };
         channels = createChannels({ ...directory, origin: options.origin, keyPackages: createKeyPackages(directory), sigKey: accounts.devices.sigKey, userByName: accounts.userByName, streams: accounts.streams as any, pumpUser: accounts.pumpUser });
         accounts.attach(channels);
     }
+    // Device linking (docs/m5-linking.md): a blind relay between a new device and the account's primary.
+    const link: LinkRelay | undefined = db && accounts ? createLink({
+        db, now, origin: options.origin, sessionUser: request => accounts!.sessionUser(request), sessionDevice: accounts.devices.sessionDevice, notify: accounts.notify,
+        issueSession: accounts.issueSession, eligible: accounts.devices.eligible, sigKey: accounts.devices.sigKey,
+    }) : undefined;
     const unfurl = createUnfurl({ resolver: options.unfurlResolver, transport: options.unfurlTransport });
     const server = Bun.serve({
         hostname: options.hostname ?? '127.0.0.1', port: options.port ?? 3000,
@@ -237,6 +244,7 @@ export function startSignaling(options: SignalingOptions) {
             if (!allowRequest(source)) return json({ error: 'Rate limited' }, 429);
             if (emoji && accounts && /^\/api\/emoji(\/|$)/.test(url.pathname)) return emoji.handle(request, url, accounts.sessionUser(request), source);
             if (blobs && accounts && /^\/api\/blobs(\/|$)/.test(url.pathname)) return blobs.handle(request, url, accounts.sessionUser(request));
+            if (link && /^\/api\/link(\/|$)/.test(url.pathname)) return link.handle(request, url, source);
             if (channels && accounts && /^\/api\/(mls|channels|users)(\/|$)/.test(url.pathname)) return channels.handle(request, url, accounts.sessionUser(request));
             if (accounts && /^\/api\/unfurl(\/|$)/.test(url.pathname)) return unfurl.handle(request, url, accounts.sessionUser(request));
             if (url.pathname.startsWith('/api/')) return accounts ? accounts.handle(request, url, server, source) : json({ error: 'Not found' }, 404);

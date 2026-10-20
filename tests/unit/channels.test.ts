@@ -683,9 +683,9 @@ suite('signed-content removal (a faulty DS sequences what the validator would re
         let notice: any;
         do { notice = await watch.next('channel'); } while (notice.change !== 'rolled-back');
         expect(notice).toMatchObject({ action: 'rollback', seq, digest, author, by: w.a2.deviceId });
-        expect(w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: notice.action, seq: notice.seq, digest: notice.digest, author: notice.author, by: notice.by, signature: notice.signature })).toMatchObject({ userId: w.alice.id, deviceId: w.a2.deviceId });
-        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author: '', by: notice.by, signature: notice.signature })).toThrow(); // not what was signed
-        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author, by: w.b2.deviceId, signature: w.b2.client.call({ cmd: 'mlsSignResolution', group: w.channel, action: 'rollback', seq, digest, author }) })).toThrow(); // not an admin
+        expect(w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: notice.action, seq: notice.seq, digest: notice.digest, author: notice.author, by: notice.by, byUser: notice.byUser, signature: notice.signature })).toMatchObject({ userId: w.alice.id, deviceId: w.a2.deviceId });
+        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author: '', by: notice.by, byUser: notice.byUser, signature: notice.signature })).toThrow(); // not what was signed
+        expect(() => w.c1.client.call({ cmd: 'mlsVerifyResolution', group: w.channel, action: 'rollback', seq, digest, author, by: w.b2.deviceId, byUser: w.bob.id, signature: w.b2.client.call({ cmd: 'mlsSignResolution', group: w.channel, action: 'rollback', seq, digest, author }) })).toThrow(); // not an admin
 
         // The admin removes bob's device from the tree; the group goes on without it.
         const removal = await w.a2.commit(w.channel, { removes: [{ userId: w.bob.id, deviceId: author }] });
@@ -1023,5 +1023,45 @@ suite('M4 client additions (docs/m4-groups.md §8)', () => {
         const bytes = resolveBytes('C'.repeat(22), 'rollback', 7, 'd'.repeat(64), 'a'.repeat(22));
         expect(createHash('sha256').update(bytes).digest('hex')).toBe('15911786d65cec6da7b01ae0de4df45929815e2d0073cad52665c981f5710bd3');
         expect(bytes.toString()).toBe(`webrtc-bun-mlsresolve-v2\n${'C'.repeat(22)}\nrollback\n7\n${'d'.repeat(64)}\n${'a'.repeat(22)}`);
+    });
+});
+
+suite('identity change in a channel (docs/m5-linking.md §7)', () => {
+    test('a member recovering under a new key no longer wedges the channel: the DS follows the registry, their old devices go stale and can be removed', async () => {
+        const w = await populated();
+        const fresh = new Client(Core).call({ cmd: 'identity' });
+        run('UPDATE identity_keys SET sign = ?, dh = ? WHERE user_id = ?', fresh.sign, fresh.dh, w.bob.id);
+        // Before M5 this was a 409 "identity changed" for every commit in every channel Bob is in.
+        const update = await w.a1.commit(w.channel, { update: true });
+        expect(update.status).toBe(201);
+        // Alice's devices review Bob's new code; his old devices are stale for them, and cannot be added to anything.
+        for (const dev of [w.a1, w.a2, w.c1]) dev.client.call({ cmd: 'notePeer', contact: w.bob.id, identity: fresh });
+        for (const dev of [w.a1, w.a2, w.c1]) dev.client.call({ cmd: 'acceptChange', contact: w.bob.id });
+        const stale = w.a1.client.call({ cmd: 'mlsMembers', group: w.channel }).filter((m: any) => m.stale).map((m: any) => m.deviceId).sort();
+        expect(stale).toEqual([w.b1.deviceId, w.b2.deviceId].sort());
+        const cleanup = await w.a1.commit(w.channel, { removes: [{ userId: w.bob.id, deviceId: w.b1.deviceId }, { userId: w.bob.id, deviceId: w.b2.deviceId }] });
+        expect(cleanup.status).toBe(201);
+        for (const dev of [w.a2, w.c1]) await dev.sync(w.channel);
+        expect(w.a2.client.call({ cmd: 'mlsMembers', group: w.channel }).some((m: any) => m.stale)).toBe(false);
+    });
+
+    test('a signed succession keeps the old devices current for what they were certified before it', async () => {
+        const w = await populated();
+        const fresh = new Client(Core).call({ cmd: 'identity' });
+        const oldIdentity = w.b1.client.call({ cmd: 'identity' });
+        const signed = w.b1.client.call({ cmd: 'signSuccession', userId: w.bob.id, published: oldIdentity.sign, newSign: fresh.sign, newDh: fresh.dh, at: clock + 60_000 }); // after every certificate issued so far
+        const { signature, ...record } = signed;
+        expect((await w.b1.api('PUT', '/api/devices/succession', { record, signature })).status).toBe(201);
+        run('UPDATE identity_keys SET sign = ?, dh = ? WHERE user_id = ?', fresh.sign, fresh.dh, w.bob.id);
+        expect((await w.a1.commit(w.channel, { update: true })).status).toBe(201);
+        // Alice's devices follow the chain the server serves for Bob (his pin moves, verification kept) and see no stale device.
+        const view = await w.a1.must('GET', '/api/devices/bob');
+        for (const dev of [w.a1, w.a2, w.c1]) dev.client.call({ cmd: 'acceptSuccession', contact: w.bob.id, records: view.succession });
+        expect(w.a1.client.call({ cmd: 'mlsMembers', group: w.channel }).some((m: any) => m.stale)).toBe(false);
+        for (const dev of [w.a2, w.c1, w.b1, w.b2]) { try { await dev.sync(w.channel); } catch {} }
+        // Bob's old device still writes, and Alice's devices still read it.
+        w.b1.client.call({ cmd: 'notePeer', contact: w.bob.id, identity: oldIdentity });
+        await w.a2.sync(w.channel);
+        expect((await w.a2.sync(w.channel))).toEqual([]);
     });
 });

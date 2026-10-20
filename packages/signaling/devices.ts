@@ -14,7 +14,8 @@ type Format = {
     bindBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
     claimBytes(userId: string, deviceId: string, challenge: string): Uint8Array;
 };
-const Format = (globalThis as any).DeviceFormat as Format;
+const Format = (globalThis as any).DeviceFormat as Format & { successionBytes(record: object): Uint8Array; startBytes(deviceId: string, platform: string, deviceKey: string): Uint8Array; linkClaimBytes(linkId: string, deviceId: string, claim: string): Uint8Array };
+export { Format };
 export const MAX_DEVICES = Format.MAX_DEVICES;
 const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/, KEY = /^[A-Za-z0-9_-]{43}$/;
 /** A bind challenge is single use, for one session, and short lived. */
@@ -34,10 +35,12 @@ type Deps = {
     sessionsEnded(userId: string, sessions: string[]): void;
     /** A session was bound or an inbox moved: deliver what now waits for the user's open streams. */
     inboxChanged(userId: string): void;
+    /** Devices were revoked (by the account, or dropped by a new list): group memberships and the like go with them. */
+    devicesRevoked?(userId: string, ids: string[]): void;
 };
 
 /** Ed25519 verification of a base64url signature under a base64url public key (the AIK or a device key). */
-function ed25519Verify(aikSign: string, bytes: Uint8Array, signature: unknown) {
+export function ed25519Verify(aikSign: string, bytes: Uint8Array, signature: unknown) {
     if (typeof signature !== 'string' || !SIG.test(signature)) return false;
     try { return verify(null, bytes, createPublicKey({ key: { kty: 'OKP', crv: 'Ed25519', x: aikSign }, format: 'jwk' }), Buffer.from(signature, 'base64url')); }
     catch { return false; }
@@ -85,6 +88,7 @@ export function createDevices(deps: Deps) {
             }
         })();
         deps.sessionsEnded(userId, ended);
+        deps.devicesRevoked?.(userId, ids);
     }
     function announceChange(userId: string) {
         deps.notify(userId, { type: 'devices', id: userId });
@@ -265,15 +269,60 @@ export function createDevices(deps: Deps) {
         return [200, { deviceId, state: row.state, primary: Boolean(row.is_primary) }];
     }
 
+    /**
+     * Any signed-in session of the account may revoke one of its other devices at once (docs/m5-linking.md §4): its
+     * sessions end, its keys and mail go, it leaves every fan-out. The signed list still names a listed device until
+     * the primary publishes the next version, which the primary is told to do. The primary itself is handed over,
+     * never revoked.
+     */
+    function revokeAny(user: Caller, deviceId: string): [number, object] {
+        const row = DEVICE_ID.test(deviceId) ? db.query<DeviceRow, [string, string]>("SELECT * FROM devices WHERE id = ? AND user_id = ? AND state != 'revoked'").get(deviceId, user.id) : null;
+        if (!row) return [404, { error: 'No such device.' }];
+        if (row.state === 'placeholder' || row.is_primary) return [409, { error: 'The primary device cannot be revoked. Hand the account to another device first.' }];
+        revoke(user.id, [deviceId]);
+        deps.notify(user.id, { type: 'devices', id: user.id, needsList: row.state === 'listed', revoked: deviceId });
+        announceChange(user.id);
+        return [200, { revoked: [deviceId] }];
+    }
+
+    // ---------- Succession (docs/m5-linking.md §5) ----------
+    const SUCCESSION_MAX = 8;
+    type SuccessionRow = { old_sign: string; new_sign: string; new_dh: string; at: number; signature: string };
+    /** The account's records, oldest first, as served and as the delivery service's pin follows them. */
+    function successions(userId: string) {
+        return db.query<SuccessionRow, [string]>('SELECT old_sign, new_sign, new_dh, at, signature FROM identity_succession WHERE user_id = ? ORDER BY seq').all(userId)
+            .map(row => ({ v: 1, userId, oldSign: row.old_sign, newSign: row.new_sign, newDh: row.new_dh, at: row.at, signature: row.signature }));
+    }
+    /** The old identity key hands the account to a new one. Self-authenticating: only its signature counts. */
+    function putSuccession(user: Caller, body: Record<string, any> | null): [number, object] {
+        const record = body?.record, signature = body?.signature;
+        const current = aikOf(user.id);
+        if (!current) return [409, { error: 'Publish encryption keys first.' }];
+        let bytes: Uint8Array;
+        try { bytes = Format.successionBytes(record); } catch { return [400, { error: 'Invalid succession record' }]; }
+        if (record.userId !== user.id || record.oldSign !== current || record.newSign === record.oldSign) return [403, { error: 'The record is not from this account\'s current identity key.' }];
+        if (!ed25519Verify(current, bytes, signature)) return [403, { error: 'The record is not signed by the current identity key.' }];
+        if (Math.abs(record.at - now()) > 10 * 60 * 1000) return [400, { error: 'The record\'s time is not now.' }];
+        const count = db.query<{ n: number; max: number | null }, [string]>('SELECT COUNT(*) AS n, MAX(seq) AS max FROM identity_succession WHERE user_id = ?').get(user.id)!;
+        db.transaction(() => {
+            // The chain keeps its newest records; older ones fall off (contacts that old review the code instead).
+            if (count.n >= SUCCESSION_MAX) db.query('DELETE FROM identity_succession WHERE user_id = ? AND seq = (SELECT MIN(seq) FROM identity_succession WHERE user_id = ?)').run(user.id, user.id);
+            db.query('INSERT INTO identity_succession (user_id, seq, old_sign, new_sign, new_dh, at, signature, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+                .run(user.id, (count.max ?? 0) + 1, record.oldSign, record.newSign, record.newDh, record.at, signature, now());
+        })();
+        return [201, { seq: (count.max ?? 0) + 1 }];
+    }
+
     /** The served view of an account's devices. Contacts see only the signed list; the owner also sees pending devices and when each was last seen. */
     function view(owner: { id: string }, viewer: Caller) {
         const stored = db.query<{ list: string; signature: string; certs: string }, [string]>('SELECT list, signature, certs FROM device_lists WHERE user_id = ?').get(owner.id);
         const signed = stored ? { list: JSON.parse(stored.list), signature: stored.signature, certs: JSON.parse(stored.certs) } : { list: null, signature: null, certs: {} };
         const identity = db.query<{ dh: string; sign: string }, [string]>('SELECT dh, sign FROM identity_keys WHERE user_id = ?').get(owner.id) ?? null;
-        if (owner.id !== viewer.id) return { userId: owner.id, identity, ...signed };
+        const succession = successions(owner.id);
+        if (owner.id !== viewer.id) return { userId: owner.id, identity, ...signed, ...(succession.length ? { succession } : {}) };
         const mine = sessionDevice(viewer.session);
         const devices = live(owner.id).filter(row => row.state !== 'placeholder').map(row => ({ id: row.id, platform: row.platform, state: row.state, primary: Boolean(row.is_primary), createdAt: row.created_at, lastSeenAt: row.last_seen_at, current: row.id === mine }));
-        return { userId: owner.id, identity, ...signed, devices, currentDevice: mine };
+        return { userId: owner.id, identity, ...signed, ...(succession.length ? { succession } : {}), devices, currentDevice: mine };
     }
 
     /** Removes one of the owner's devices. A listed device also needs the new signed list without it. */
@@ -321,6 +370,6 @@ export function createDevices(deps: Deps) {
 
     function touch(session: string) { const id = sessionDevice(session); if (id) db.query('UPDATE devices SET last_seen_at = ? WHERE id = ?').run(now(), id); }
 
-    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, identityChanged, touch, sessionDevice, eligible, sigKey, aikOf };
+    return { primary, inboxFor, publish, challenge, announce, keysUploaded, view, remove, revokeAny, putSuccession, successions, identityChanged, touch, sessionDevice, eligible, sigKey, aikOf };
 }
 export type Devices = ReturnType<typeof createDevices>;

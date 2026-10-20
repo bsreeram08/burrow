@@ -185,6 +185,10 @@
     for (const device of view.list.devices) devices.push({ ...device, described: metaKey ? await openMeta(metaKey, userId, device.deviceId, device.meta).catch(() => null) : null });
     return { pin: check.pin, devices };
   }
+  /** A transfer's new-chain marker (m5 §5.2) counts only for the key it was made for, and only before that key's list has a pin. */
+  function chainMarker(marker, ownSign, pin) {
+    return marker && typeof marker.aik === 'string' && marker.aik === ownSign && !pin && Array.isArray(marker.keep) ? marker : null;
+  }
   /** m5 §5.2.2: the platform to certify for `deviceId`, from our signed list's sealed label; null for this device or one the list doesn't name. */
   function recertPlatform(owned, deviceId, selfId) {
     if (!owned || deviceId === selfId) return null;
@@ -321,5 +325,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, chainMarker, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

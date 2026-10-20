@@ -14,20 +14,26 @@
     stopScan();
     for (const id of ['link-qr-box', 'link-entry', 'link-confirm', 'link-scan-box']) $(id).hidden = true;
     $('link-qr').replaceChildren(); $('link-code').textContent = ''; $('link-status').textContent = ''; $('link-code-input').value = '';
-    $('link-cancel').textContent = 'Cancel';
+    $('link-cancel').textContent = 'Cancel'; $('link-alt').hidden = true;
+    $('link-code-label').textContent = 'Code from your other device'; $('link-code-input').placeholder = '1234 5678 9012'; $('link-code-submit').textContent = 'Link';
   }
   /**
    * Opens the dialog. `qr`: text to show as a QR code (with `code`, the same thing to type instead). `entry`: let the
    * user type (or scan) the other device's code; `onEntry(text)` gets it and may throw to show an error.
+   * Without `qr`, `code` alone is shown (the short code, §1.7). `entry` may be `{ label, placeholder, submit }` to ask
+   * for something else (a username). `alt`: `{ label, run }`, a second way to do this (e.g. a code instead of a QR).
    * Returns a handle for the next steps; `onCancel` runs if the user closes it.
    */
-  function open({ title, hint, qr, code, entry, onEntry, onCancel }) {
+  function open({ title, hint, qr, code, entry, onEntry, onCancel, alt }) {
     close();
     reset();
     active = { onCancel };
     $('link-title').textContent = title; $('link-hint').textContent = hint || '';
-    if (qr) { $('link-qr').append(window.QR.svg(qr, `${title}: QR code`)); $('link-code').textContent = code ? spaced(code) : ''; $('link-qr-box').hidden = false; }
+    if (qr) { $('link-qr').append(window.QR.svg(qr, `${title}: QR code`)); $('link-code').textContent = code ? spaced(code) : ''; $('link-code-note').textContent = 'Or type this code on the other device:'; $('link-qr-box').hidden = false; }
+    else if (code) { $('link-code').textContent = spaced(code); $('link-code-note').textContent = 'Type this code on your primary device:'; $('link-qr-box').hidden = false; }
+    if (alt) { $('link-alt').textContent = alt.label; $('link-alt').hidden = false; $('link-alt').onclick = () => { const { run } = alt; close(); run(); }; }
     if (entry) {
+      if (typeof entry === 'object') { $('link-code-label').textContent = entry.label; $('link-code-input').placeholder = entry.placeholder || ''; $('link-code-submit').textContent = entry.submit || 'Next'; }
       $('link-entry').hidden = false;
       const submit = async text => {
         $('link-code-submit').disabled = true; $('link-status').textContent = 'Checking…';
@@ -49,17 +55,17 @@
     $('link-dialog').hidden = false;
     (entry ? $('link-code-input') : $('link-cancel')).focus();
     return {
-      status: text => { if (active) $('link-status').textContent = text; },
+      status: text => { if (active) { $('link-status').textContent = text; $('link-alt').hidden = true; } }, // Under way: no switching now.
       /** Both screens show the 6-digit code (shown "123 456", docs/m5-linking.md §1.2): does it match? Resolves true or false. */
       compare(numbers) {
-        stopScan();
+        stopScan(); $('link-alt').hidden = true;
         for (const id of ['link-qr-box', 'link-entry', 'link-scan-box']) $(id).hidden = true;
         const digits = String(numbers).replace(/\s+/g, '');
         $('link-sas').textContent = /^\d{6}$/.test(digits) ? `${digits.slice(0, 3)} ${digits.slice(3)}` : digits; $('link-confirm').hidden = false; $('link-match').focus();
         return new Promise(resolve => { $('link-match').onclick = () => { $('link-confirm').hidden = true; resolve(true); }; $('link-mismatch').onclick = () => { $('link-confirm').hidden = true; resolve(false); }; });
       },
-      done(text) { stopScan(); for (const id of ['link-qr-box', 'link-entry', 'link-confirm', 'link-scan-box']) $(id).hidden = true; $('link-status').textContent = text; $('link-cancel').textContent = 'Done'; if (active) active.onCancel = null; },
-      fail(text) { stopScan(); $('link-status').textContent = text; $('link-cancel').textContent = 'Close'; },
+      done(text) { stopScan(); $('link-alt').hidden = true; for (const id of ['link-qr-box', 'link-entry', 'link-confirm', 'link-scan-box']) $(id).hidden = true; $('link-status').textContent = text; $('link-cancel').textContent = 'Done'; if (active) active.onCancel = null; },
+      fail(text) { stopScan(); $('link-alt').hidden = true; $('link-status').textContent = text; $('link-cancel').textContent = 'Close'; },
       close,
     };
   }

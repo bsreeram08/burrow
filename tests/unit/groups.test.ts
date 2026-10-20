@@ -81,7 +81,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
   const ctx = { me: { id: ME, username: 'me' }, backend: 'signal', box: { identity: async () => ({ pub: { sign: 'A'.repeat(43) } }), peer: async () => dm.peer, notePeer: async () => {} }, signWithIdentity: async () => 'sig',
     contacts: () => options.contact ? [{ id: BOB, username: 'bob', state: 'mutual' }] : [], render() {}, notice() {}, viewing: () => false, looking: () => false, socket: () => null, openGroup() {},
     // Our devices as a verified signed list proves them (account.js); null: nothing verifiable.
-    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping(_peer: string, _payload?: unknown) {},
+    pairIdOf: async () => PAIR, dmChanged() {}, dmIncoming() {}, dmTyping(_peer: string, _payload?: unknown) {}, followOwnSuccession: async () => false,
     verifiedOwnDevices: async () => { const own = options.own === undefined ? { listed: [DEV], dropped: [] } : options.own; return own && { listed: new Set(own.listed), dropped: new Set(own.dropped) }; } };
   const el = (id: string) => document.getElementById(id);
   const until = async (check: () => boolean, what: string) => { for (let i = 0; i < 400; i++) { if (check()) return; await Bun.sleep(5); } throw new Error(`timed out: ${what}`); };
@@ -491,6 +491,33 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(typed).toEqual([BOB]);
     expect(await w.Groups.acceptDm(G, BOB)).toBe(true);
     expect(w.Groups.dmChannelWith(BOB)).toBe(G);
+  });
+
+  test('13. a commit from our own account under its new key follows the account\'s succession first and is not reported (m5 §5)', async () => {
+    const w = world();
+    let followed = 0, received = 0;
+    w.ctx.followOwnSuccession = async () => { followed++; return true; };
+    await w.start();
+    w.handlers.mlsReceive = () => {
+      if (received++ === 0) throw coded('poison', `poison ${sha('recert')}: device certificate: not signed by the pinned account key`);
+      return { pendingId: 'p1', kind: 'commit', sender: { leaf: 0, userId: ME, deviceId: DEV2 }, epoch: 4, digest: sha('recert') };
+    };
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV2 }, message: b64('recert'), createdAt: Date.now() });
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    expect(followed).toBe(1);
+    expect(w.requests.filter(request => request.path.endsWith('/poison'))).toEqual([]);
+  });
+
+  test('14. a primary handing the account over reads nothing more until it has stepped down', async () => {
+    const w = world();
+    await w.start();
+    w.Groups.hold();
+    w.calls.length = 0;
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV2 }, message: b64('recert'), createdAt: Date.now() });
+    w.Groups.frame(live);
+    await Bun.sleep(150);
+    expect(w.of('mlsReceive')).toEqual([]);
+    expect(w.Groups.debug(G).cursor).toBe(0);
   });
 
   test('3e. a report refused because the commit was rolled back meanwhile reads on; it never rejoins (or retries a 429 report)', async () => {

@@ -77,11 +77,16 @@ List<({String deviceId, int addedAt, Map<String, String>? described})>? verified
 /// signed before the user compares the codes and confirms; this device deletes its account key only once the
 /// server serves the new one and the new primary sent `demote` (its certificate under the new key).
 class HandOver {
-  HandOver._(this._ctx, this._groups, this._inbox, {required this.linkId, required this.deviceId, required this.platform, required this.code});
+  HandOver._(this._ctx, this._groups, this._inbox, this._hold, {required this.linkId, required this.deviceId, required this.platform, required this.code});
 
   final LinkContext _ctx;
   final GroupCrypto _groups;
   final _Inbox _inbox;
+
+  /// Stops (true) or resumes (false) group processing here: from sending `succession` until this device has
+  /// stepped down, the new primary's recertify commits are under a key this core doesn't pin yet, and would be
+  /// rejected as poison.
+  final Future<void> Function(bool held)? _hold;
   final String linkId;
 
   /// The device taking over, as the server registered it.
@@ -90,12 +95,12 @@ class HandOver {
   final String code;
   ({Identity identity, String leafSigKey})? request;
 
-  static Future<HandOver> fromQr(LinkContext ctx, GroupCrypto groups, String qr) async {
+  static Future<HandOver> fromQr(LinkContext ctx, GroupCrypto groups, String qr, {Future<void> Function(bool held)? hold}) async {
     final accepted = await ctx.link.accept(qr.replaceAll(RegExp(r'\s'), ''));
     try {
       final offered = await ctx.api.linkOffer(accepted.linkId, accepted.eph);
       if (offered['purpose'] != 'transfer') throw const StoreException('That code is for linking a new device. Use "Link a device" instead.');
-      return HandOver._(ctx, groups, _Inbox(ctx.api, ctx.link, accepted.linkId, wait: ctx.wait),
+      return HandOver._(ctx, groups, _Inbox(ctx.api, ctx.link, accepted.linkId, wait: ctx.wait), hold,
           linkId: accepted.linkId, deviceId: offered['deviceId'] as String, platform: offered['platform'] as String, code: accepted.code);
     } catch (_) {
       await ctx.link.end(accepted.linkId);
@@ -118,6 +123,17 @@ class HandOver {
     final me = _ctx.messenger.me, own = await _ctx.crypto.identity();
     final signed = (jsonDecode(await _ctx.link.signSuccession(userId: me.id, publishedSign: own.sign, newIdentity: r.identity, at: _ctx.now())) as Map).cast<String, Object?>();
     final signature = signed.remove('signature')! as String;
+    await _hold?.call(true);
+    try {
+      return await _stepDown(r, signed, signature, timeout);
+    } catch (_) {
+      await _hold?.call(false); // Still the primary: carry on with the groups.
+      rethrow;
+    }
+  }
+
+  Future<String> _stepDown(({Identity identity, String leafSigKey}) r, Map<String, Object?> signed, String signature, Duration timeout) async {
+    final me = _ctx.messenger.me;
     await _ctx.api.linkSend(linkId, await _ctx.link.seal(linkId, jsonEncode({'v': 1, 'type': 'succession', 'record': signed, 'signature': signature, 'leafSigKey': await _groups.deviceLeaf()})));
     final demote = await _inbox.next('demote', const {'v', 'type', 'identity', 'cert', 'metaKey'}, timeout: timeout);
     final identity = demote['identity'];
@@ -373,6 +389,7 @@ class OwnSuccession {
     this.chat,
     this.devices,
     this.device,
+    this.certKey,
     int Function()? now,
   })
     : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
@@ -391,6 +408,10 @@ class OwnSuccession {
   final ChatCrypto? chat;
   final DevicePrefs? devices;
   final Future<LocalDevice> Function()? device;
+
+  /// The account key this linked device's MLS certificate is under (persisted): it asks for a certificate again
+  /// until that is the account's current key (a first request is refused while the new list isn't up yet).
+  final ({Future<String?> Function() read, Future<void> Function(String sign) write})? certKey;
   final int Function() _now;
 
   /// Linked device: the served account key moved on from our pin. Follows a valid chain (never the server's word
@@ -401,7 +422,12 @@ class OwnSuccession {
     if (account == null) return false;
     final view = await api.devices(me.username);
     final served = view['identity'];
-    if (served is! Map || (served['sign'] == account.identity.sign && served['dh'] == account.identity.dh)) return false;
+    if (served is! Map || (served['sign'] == account.identity.sign && served['dh'] == account.identity.dh)) {
+      // Already following the current key; a certificate still under an older one is asked for again.
+      final under = await certKey?.read();
+      if (under != null && under != account.identity.sign) await api.askRecert(platform: platform, leafSigKey: await groups.deviceLeaf());
+      return false;
+    }
     final all = [for (final r in (view['succession'] as List? ?? const [])) (r as Map).cast<String, dynamic>()];
     final from = all.indexWhere((r) => r['oldSign'] == account.identity.sign);
     final path = from < 0 ? const <Map<String, dynamic>>[] : all.sublist(from);
@@ -430,6 +456,7 @@ class OwnSuccession {
     }
     if (cert == null) return false;
     await link.companionSetup(userId: me.id, identity: account.identity, certJson: cert);
+    await certKey?.write(account.identity.sign);
     for (final g in await store.groups()) {
       if (g.active) await updateLeaf(g.id).catchError((_) {});
     }

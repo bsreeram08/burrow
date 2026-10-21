@@ -156,7 +156,15 @@ class Api {
     );
   }
 
-  Future<void> uploadKeys(Map<String, dynamic> upload) => call('/api/keys', method: 'PUT', body: upload);
+  /// [proof]: on an account with a backup, a new identity outside a succession or a waited reset needs the
+  /// passphrase's proof (docs/m6-account-key.md §6.5).
+  Future<void> uploadKeys(Map<String, dynamic> upload, {String? proof}) => call('/api/keys', method: 'PUT', body: {...upload, 'proof': ?proof});
+
+  /// The delayed reset of the account key (M6 §6.5): `{requestedBy: {deviceId, platform}, at, executeAfter}`.
+  Future<Map<String, dynamic>> requestKeyReset() async => ((await call('/api/keys/reset', method: 'POST', body: const {}))['reset'] as Map).cast<String, dynamic>();
+  Future<void> cancelKeyReset() async {
+    await call('/api/keys/reset', method: 'DELETE');
+  }
 
   // ---- Devices (docs/devices.md) ----
   /// A single-use challenge for this session, to sign with the device key in [announceDevice].
@@ -261,11 +269,14 @@ class Api {
   }
 
   /// Cuts one of the account's devices off at once (any session of the account; not the primary).
-  Future<List<String>> revokeDevice(String deviceId) async =>
-      ((await call('/api/devices/$deviceId/revoke', method: 'POST', body: const {}))['revoked'] as List? ?? const []).cast<String>();
+  /// [proof]: on an account with a backup, removing another device needs the passphrase's proof (M6 §6.3).
+  Future<List<String>> revokeDevice(String deviceId, {String? proof}) async =>
+      ((await call('/api/devices/$deviceId/revoke', method: 'POST', body: {'proof': ?proof}))['revoked'] as List? ?? const []).cast<String>();
 
-  Future<void> publishSuccession(Map<String, dynamic> record, String signature) async {
-    await call('/api/devices/succession', method: 'PUT', body: {'record': record, 'signature': signature});
+  /// [proof]: when the account has a backup, a rotation needs the current passphrase's or recovery key's proof
+  /// (docs/m6-account-key.md §6.2).
+  Future<void> publishSuccession(Map<String, dynamic> record, String signature, {String? proof}) async {
+    await call('/api/devices/succession', method: 'PUT', body: {'record': record, 'signature': signature, 'proof': ?proof});
   }
 
   // Companion certificates under a new primary's key (m5 §5.2.2).
@@ -287,6 +298,53 @@ class Api {
 
   Future<void> dropRecert() async {
     await call('/api/devices/recert', method: 'DELETE');
+  }
+
+  // The encrypted account key backup (docs/m6-account-key.md §3.5).
+  /// The account's backup record (without the proof hashes), or null when it has none.
+  Future<Map<String, dynamic>?> backup() async {
+    try {
+      return await call('/api/backup');
+    } on ApiException catch (error) {
+      if (error.status == 404) return null;
+      rethrow;
+    }
+  }
+
+  /// Uploads the next record: [record] signed, [proof] of the current passphrase or recovery key (none for the
+  /// first record or a re-seal right after a rotation), and the new proofs when they change.
+  Future<void> putBackup(Map<String, Object?> record, {String? proof, String? passProof, String? recoveryProof}) async {
+    await call('/api/backup', method: 'PUT', body: {...record, 'proof': ?proof, 'passProof': ?passProof, 'recoveryProof': ?recoveryProof});
+  }
+
+  Future<void> deleteBackup(String proof) async {
+    await call('/api/backup', method: 'DELETE', body: {'proof': proof});
+  }
+
+  // Rekey: a device without the account key asks a device with it (docs/m6-account-key.md §5).
+  Future<void> askRekey({required String platform, required String eph, required String leafSigKey, required String signature}) async {
+    await call('/api/devices/rekey', method: 'PUT', body: {'platform': platform, 'eph': eph, 'leafSigKey': leafSigKey, 'signature': signature});
+  }
+
+  /// Requests still waiting: `[{deviceId, platform, eph, leafSigKey, signature}]`. Proof of nothing by themselves.
+  Future<List<Map<String, dynamic>>> rekeyRequests() async => ((await call('/api/devices/rekey'))['requests'] as List? ?? const []).cast<Map<String, dynamic>>();
+
+  Future<void> answerRekey(String deviceId, String box) async {
+    await call('/api/devices/rekey/$deviceId', method: 'PUT', body: {'box': box});
+  }
+
+  /// This device's answer (null until answered); a 404 means it has no request.
+  Future<({bool asked, String? box})> myRekey() async {
+    try {
+      return (asked: true, box: (await call('/api/devices/rekey/mine'))['box'] as String?);
+    } on ApiException catch (error) {
+      if (error.status == 404) return (asked: false, box: null);
+      rethrow;
+    }
+  }
+
+  Future<void> dropRekey() async {
+    await call('/api/devices/rekey', method: 'DELETE');
   }
 
   /// `{userId, devices, channel}`: the contact's MLS-capable devices and our DM channel with them, if any.

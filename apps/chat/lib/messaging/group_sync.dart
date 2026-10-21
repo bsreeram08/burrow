@@ -1097,6 +1097,11 @@ class GroupSync {
         final known = await store.group(id);
         if (known?.membership == Membership.left) continue;
         try {
+          // The inspection validates every member's certificate under its pinned account key: a device that starts
+          // with no pins (a restore, M6 §4) pins the members first, contacts as usual, others on first use.
+          try {
+            await ensurePinned({for (final m in await api.channelMembers(id)) m['userId'] as String}.where((u) => u != me.id));
+          } catch (_) {}
           // One join-info, inspected and then joined as is (409 "between epochs" is retried, not "not ours").
           final info = await _joinInfo(id);
           final inspected = await crypto.inspectGroup(info['groupInfo'] as String, info['tree'] as String);

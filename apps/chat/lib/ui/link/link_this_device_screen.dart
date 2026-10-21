@@ -12,8 +12,9 @@ import '../../store/message.dart' show StoreException;
 import 'qr.dart';
 
 /// Welcome → "Link to my account" (docs/m5-linking.md §1, §1.7): this install becomes a linked device. It shows
-/// a code for the primary to scan (or, without a camera there, an 8-character code for one account), then the
-/// 6 digits to compare, and signs in once the primary taps Link.
+/// a code for another device of the account to scan (or, without a camera there, an 8-character code for one
+/// account), then the 6 digits to compare, and signs in once that device taps Link. A QR link brings the account key
+/// with it; a short-code link doesn't (docs/m6-account-key.md §2).
 Future<void> showLinkThisDevice(BuildContext context) => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LinkThisDeviceScreen()));
 
 class LinkThisDeviceScreen extends ConsumerStatefulWidget {
@@ -88,11 +89,11 @@ class _LinkThisDeviceScreenState extends ConsumerState<LinkThisDeviceScreen> {
             _Step.start => Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                const Text('Use this device with your account. Your primary device (where you first signed in) approves it, and stays where 1:1 chats live until they move to the new encryption.'),
+                const Text('Use this device with your account. A device you already use approves it.'),
                 const SizedBox(height: 20),
                 FilledButton.icon(key: const Key('link-show-qr'), onPressed: () => _start(), icon: const Icon(Icons.qr_code_2), label: const Text('Show a code to scan')),
                 const SizedBox(height: 28),
-                Text("Your primary can't scan? Get a short code to type there instead.", style: TextStyle(color: muted)),
+                Text("Your other device can't scan? Get a short code to type there instead.", style: TextStyle(color: muted)),
                 const SizedBox(height: 8),
                 TextField(key: const Key('link-username'), controller: _username, autocorrect: false, decoration: const InputDecoration(labelText: 'Your username')),
                 const SizedBox(height: 8),
@@ -109,14 +110,16 @@ class _LinkThisDeviceScreenState extends ConsumerState<LinkThisDeviceScreen> {
             _Step.waiting => Column(
               children: [
                 if (link?.qr case final qr?) ...[
-                  const Text('On your primary device, open Settings → Devices → Link a device, and scan this.', textAlign: TextAlign.center),
+                  const Text('On a device you already use, open Settings → Devices → Link a device, and scan this.', textAlign: TextAlign.center),
                   const SizedBox(height: 16),
                   LinkQr(data: qr),
                   const SizedBox(height: 12),
                   SelectableText(qr, key: const Key('link-qr-text'), textAlign: TextAlign.center, style: TextStyle(color: muted, fontSize: 12)),
                   TextButton.icon(onPressed: () => Clipboard.setData(ClipboardData(text: qr)), icon: const Icon(Icons.copy, size: 16), label: const Text('Copy the text instead')),
                 ] else if (link?.shortCode case final code?) ...[
-                  const Text('On your primary device, open Settings → Devices → Link a device, and type this code.', textAlign: TextAlign.center),
+                  const Text('On a device you already use, open Settings → Devices → Link a device, and type this code.', textAlign: TextAlign.center),
+                  const SizedBox(height: 8),
+                  const Text('To unlock everything on this device, enter your passphrase afterwards.', key: Key('link-short-passphrase'), textAlign: TextAlign.center),
                   const SizedBox(height: 16),
                   SelectableText(code, key: const Key('link-short'), style: Theme.of(context).textTheme.displaySmall?.copyWith(letterSpacing: 6, fontWeight: FontWeight.w700)),
                 ],
@@ -124,7 +127,7 @@ class _LinkThisDeviceScreenState extends ConsumerState<LinkThisDeviceScreen> {
             ),
             _Step.compare => Column(
               children: [
-                const Text('Check that your primary device shows the same code, then tap Link there.', textAlign: TextAlign.center),
+                const Text('Check that your other device shows the same code, then tap Link there.', textAlign: TextAlign.center),
                 const SizedBox(height: 16),
                 ConfirmationCode(code: link?.code ?? ''),
                 const SizedBox(height: 16),

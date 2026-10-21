@@ -194,6 +194,31 @@ void main() {
     expect((await bob.list(id)).any((m) => m.text == 'live'), isFalse);
   });
 
+  test("a non-contact's key moved by a signed chain is followed without a review", () async {
+    await team();
+    final before = (await bob.chat.peer(carol.user.id))!.identity;
+    ds.identityOverride[carol.user.id] = {'dh': 'new-dh', 'sign': 'new-sign'};
+    ds.succession[carol.user.id] = [
+      {'oldSign': before.sign, 'newSign': 'new-sign', 'newDh': 'new-dh', 'at': 1, 'signature': 'sig'},
+    ];
+    final moved = <(String, Identity)>[];
+    bob.messenger.onKeyMoved = (id, now) => moved.add((id, now));
+    expect(await bob.messenger.ensurePinned([carol.user.id], force: true), isEmpty);
+    expect(bob.messenger.followed, {carol.user.id});
+    expect(moved, [(carol.user.id, const Identity(dh: 'new-dh', sign: 'new-sign'))]);
+    expect(bob.messenger.pinChanges, isNot(contains(carol.user.id)));
+    final now = (await bob.chat.peer(carol.user.id))!;
+    expect((now.identity, now.blocked, now.changed), (const Identity(dh: 'new-dh', sign: 'new-sign'), false, false));
+    // A chain that doesn't start at the pinned key is still a change to review.
+    ds.identityOverride[carol.user.id] = {'dh': 'other-dh', 'sign': 'other-sign'};
+    ds.succession[carol.user.id] = [
+      {'oldSign': 'someone-else', 'newSign': 'other-sign', 'newDh': 'other-dh', 'at': 2, 'signature': 'sig'},
+    ];
+    expect(await bob.messenger.ensurePinned([carol.user.id], force: true), [carol.user.id]);
+    expect((await bob.chat.peer(carol.user.id))!.blocked, isTrue);
+    expect(moved, hasLength(1));
+  });
+
   test("a non-contact's changed code is recorded for review, pauses, and is never accepted silently", () async {
     final id = await team();
     // carol isn't bob's contact: pinned on first use. Now the server publishes a different key for her.

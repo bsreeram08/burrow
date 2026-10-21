@@ -128,6 +128,12 @@ class GroupMessenger {
   /// before and what is published now (m4-groups §3). The core's pin already holds the new key, blocked.
   final Map<String, ({Identity before, Identity after})> pinChanges = {};
 
+  /// Users whose pin [ensurePinned] moved along a signed succession chain, until [GroupSync.followIdentity] asks.
+  final Set<String> followed = {};
+
+  /// A pin moved along a signed chain here (the 1:1 side tells a contact's move to the user).
+  void Function(String userId, Identity now)? onKeyMoved;
+
   /// §3: contacts are pinned through their 1:1 identity (their published identity on first contact; a change
   /// goes through the 1:1 review). Anyone else is pinned on first use from `GET /api/users/:id/identity`; with
   /// [force] their published key is checked again and a different one is recorded as a change awaiting review,
@@ -155,6 +161,11 @@ class GroupMessenger {
         }
         if (published != null) {
           final identity = Identity.fromJson(published);
+          if (pinned != null && pinned.identity != identity && await _followChain(id, contact?.username ?? names[id], pinned, identity)) {
+            followed.add(id);
+            onKeyMoved?.call(id, identity);
+            continue;
+          }
           if (pinned != null && pinned.identity != identity && contact == null) {
             pinChanges[id] = (before: pinChanges[id]?.before ?? pinned.identity, after: identity);
           }
@@ -168,6 +179,21 @@ class GroupMessenger {
       }
     }
     return problems;
+  }
+
+  /// Someone's key moved by a signed record (m6 §6.2, m5 §5.3): follow the served chain from the pinned key, whatever
+  /// order the frames came in, so a group-only member's rotation needs no review. Only from a code that was accepted;
+  /// the core checks every signature. True when the pin now names [served].
+  Future<bool> _followChain(String id, String? username, PinnedPeer pinned, Identity served) async {
+    if (username == null || pinned.changed || pinned.blocked) return false;
+    final records = (await api.devices(username))['succession'];
+    if (records is! List || records.isEmpty) return false;
+    try {
+      final moved = await chatCrypto.acceptSuccession(id, [for (final r in records) (r as Map).cast<String, dynamic>()]);
+      return moved.identity == served;
+    } on CryptoException {
+      return false;
+    }
   }
 
   /// The user reviewed a group member's changed code: accept exactly [shown] (and optionally mark it

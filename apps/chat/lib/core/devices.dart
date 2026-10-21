@@ -166,14 +166,20 @@ String listHash(Uint8List bytes) => b64(hash.sha256.convert(bytes).bytes);
 /// The highest verified list of one account: version, hash, the devices it names, and every device a
 /// pinned list later dropped (tombstones: they never come back under this key).
 class DevicePin {
-  const DevicePin({required this.aik, required this.version, required this.hash, required this.devices, required this.revoked});
+  const DevicePin({required this.aik, required this.version, required this.hash, required this.devices, required this.revoked, this.labels = const {}});
   final String aik;
   final int version;
   final String hash;
   final List<String> devices;
   final List<String> revoked;
 
-  Map<String, dynamic> toJson() => {'aik': aik, 'version': version, 'hash': hash, 'devices': devices, 'revoked': revoked};
+  /// Our own account's pin only: the labels this device could read in its lists (device id → label), so it can name a
+  /// device a later list dropped (M6 §6.2).
+  final Map<String, String> labels;
+
+  DevicePin withLabels(Map<String, String> next) => DevicePin(aik: aik, version: version, hash: hash, devices: devices, revoked: revoked, labels: next);
+
+  Map<String, dynamic> toJson() => {'aik': aik, 'version': version, 'hash': hash, 'devices': devices, 'revoked': revoked, if (labels.isNotEmpty) 'labels': labels};
   static DevicePin? fromJson(Object? json) {
     if (json is! Map) return null;
     try {
@@ -183,6 +189,7 @@ class DevicePin {
         hash: json['hash'] as String,
         devices: (json['devices'] as List? ?? const []).cast<String>(),
         revoked: (json['revoked'] as List? ?? const []).cast<String>(),
+        labels: (json['labels'] as Map? ?? const {}).cast<String, String>(),
       );
     } catch (_) {
       return null;
@@ -348,10 +355,12 @@ Uint8List _metaAad(String userId, String deviceId) => (_Writer()
 
 /// Seals `{label, platform}` for one list entry (12-byte IV ‖ ciphertext ‖ tag, base64url); the AAD binds it
 /// to that account and device.
-String sealMeta(Uint8List key, String userId, String deviceId, {required String label, required String platform, Uint8List? iv}) {
+/// [via]: `'code'` for a device linked by short code (docs/m6-account-key.md §5), sealed with its label.
+String sealMeta(Uint8List key, String userId, String deviceId, {required String label, required String platform, String? via, Uint8List? iv}) {
   if (!devicePlatforms.contains(platform)) _fail('Invalid device platform');
+  if (via != null && via != 'code') _fail('Invalid device meta');
   final short = label.length > _metaMaxLabel ? label.substring(0, _metaMaxLabel) : label;
-  final plain = Uint8List.fromList(utf8.encode(jsonEncode({'label': short, 'platform': platform})));
+  final plain = Uint8List.fromList(utf8.encode(jsonEncode({'label': short, 'platform': platform, 'via': ?via})));
   final nonce = iv ?? Uint8List.fromList(List<int>.generate(12, (_) => Random.secure().nextInt(256)));
   final gcm = GCMBlockCipher(AESEngine())..init(true, AEADParameters(KeyParameter(key), 128, nonce, _metaAad(userId, deviceId)));
   return b64([...nonce, ...gcm.process(plain)]);
@@ -364,8 +373,9 @@ Map<String, String>? openMeta(Uint8List key, String userId, String deviceId, Str
     final bytes = unb64(meta);
     final gcm = GCMBlockCipher(AESEngine())..init(false, AEADParameters(KeyParameter(key), 128, Uint8List.sublistView(bytes, 0, 12), _metaAad(userId, deviceId)));
     final value = jsonDecode(utf8.decode(gcm.process(Uint8List.sublistView(bytes, 12))));
-    if (value is Map && value.length == 2 && value['label'] is String && devicePlatforms.contains(value['platform'])) {
-      return {'label': value['label'] as String, 'platform': value['platform'] as String};
+    final via = value is Map ? value['via'] : null;
+    if (value is Map && value.length == (via == null ? 2 : 3) && (via == null || via == 'code') && value['label'] is String && devicePlatforms.contains(value['platform'])) {
+      return {'label': value['label'] as String, 'platform': value['platform'] as String, 'via': ?via as String?};
     }
   } catch (_) {}
   return null;
@@ -427,4 +437,38 @@ bool verifySuccessionChain(String userId, String pinnedSign, String servedSign, 
     return false;
   }
   return key == servedSign;
+}
+
+// ---------- The account key backup record (docs/m6-account-key.md §3.3) ----------
+const _backupKeysLabel = 'webrtc-bun-backup-keys-v2';
+
+/// The bytes the account key signs for a backup record: everything in it except the boxes.
+Uint8List backupKeysBytes(Map<String, Object?> record) {
+  final kdf = record['kdf'];
+  if (kdf is! Map || record['userId'] is! String || record['epoch'] is! int) _fail('Invalid backup record');
+  final out = _Writer()
+    ..text16(_backupKeysLabel)
+    ..text16(record['userId']! as String)
+    ..bytes8(unb64(record['aikSign']! as String))
+    ..u32(record['epoch']! as int)
+    ..bytes8(unb64(kdf['salt']! as String))
+    ..u32(kdf['m']! as int)
+    ..u32(kdf['t']! as int)
+    ..u32(kdf['p']! as int);
+  for (final field in ['passHash', 'recoveryHash', 'passProofHash', 'recoveryProofHash']) {
+    out.bytes8(unb64(record[field]! as String));
+  }
+  return out.done();
+}
+
+/// What the server keeps of a passphrase or recovery proof: SHA-256 of its raw bytes (§3.5).
+String proofHash(String proof) => b64(hash.sha256.convert(unb64(proof)).bytes);
+
+/// A served backup record is usable only if the account's current key signed it (§3.3, §4 step 1).
+bool verifyBackupRecord(Map<String, Object?> record, {required String userId, required String aikSign}) {
+  try {
+    return record['v'] == 1 && record['userId'] == userId && record['aikSign'] == aikSign && verifyBytes(aikSign, backupKeysBytes(record), record['signature']);
+  } catch (_) {
+    return false;
+  }
 }

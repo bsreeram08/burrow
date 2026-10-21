@@ -309,7 +309,12 @@ try {
         }
         await Bun.sleep(300);
     }
-    step('the app links a fresh browser as a device of its account: QR text across, the same 6 digits on both, list + MLS certificate + sealed grant; the browser joins the channel by itself');
+    // M6 §2: the QR grant carried the account key, so the browser can unlock the account by itself.
+    await laptop.click('#account-menu summary'); await laptop.click('#account-settings');
+    await laptop.waitForFunction(() => [...document.querySelectorAll('#device-list .device-row')].some(row => row.textContent!.includes('This browser') && row.textContent!.includes('Can unlock your account')), null, { timeout: 60000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nlaptop devices: ${await laptop.textContent('#device-list')}`); });
+    await laptop.click('#account-menu summary').catch(() => {});
+    step('the app links a fresh browser as a device of its account: QR text across, the same 6 digits on both, list + MLS certificate + sealed grant carrying the account key (the browser can unlock the account); the browser joins the channel by itself');
     signal('laptop-ready');
     await waitFor('app-sent-laptop', 120000);
     const laptopRecords = (): Promise<any[]> => laptop.evaluate(async (id: string) => (await (window as any).ChatStore.list()).filter((r: any) => r.conversationId === id), appGroupId);
@@ -361,35 +366,60 @@ try {
     if (webSas !== appSas.replace(/\s+/g, '')) throw new Error(`the codes differ: web ${webSas}, app ${appSas}`);
     await page.click('#link-match');
     await page.waitForFunction(() => document.getElementById('link-status')!.textContent!.startsWith('Linked'), null, { timeout: 90000 });
-    step('the web links the app as a device of its account: QR text across, the same 6 digits, list + MLS certificate + sealed grant; the app checks it and its Rust core becomes a companion');
+    step('the web links the app as a device of its account: QR text across, the same 6 digits, list + MLS certificate + sealed grant carrying the account key; the app checks it and its Rust core holds the key');
     await waitFor('app-linked-sent', 180000);
     await page.click('#link-cancel').catch(() => {});
     await page.waitForFunction(() => (window as any).ChatStore.list().then((all: any[]) => all.some(r => r.text === 'from the linked app' && r.direction === 'outgoing')), null, { timeout: 90000 });
     signal('linked-seen');
-    step('without the account keys, the linked app joins the web account\'s channels by itself (named from the bundle) and sends in the moved DM through its group; the web stores it as its own');
+    step('not the inbox device, the linked app joins the web account\'s channels by itself (named from the bundle) and sends in the moved DM through its group; the web stores it as its own');
 
-    // Primary transfer: the linked app takes the web account over; the web confirms and steps down.
-    const takeQr = await waitFor('app-take-qr', 120000);
-    if (!await page.locator('#device-list').isVisible()) { await page.click('#account-menu summary'); await page.click('#account-settings'); }
-    await page.locator('#device-list .device-promote').first().click({ timeout: 60000 });
-    await page.fill('#link-code-input', takeQr); await page.click('#link-code-submit');
-    await page.waitForSelector('#link-match', { state: 'visible', timeout: 90000 })
-        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb transfer status: ${await page.textContent('#link-status')}`); });
-    const takeSas = await waitFor('app-take-sas', 120000);
-    if ((await page.textContent('#link-sas'))!.replace(/\s+/g, '') !== takeSas.replace(/\s+/g, '')) throw new Error(`the transfer codes differ: web ${await page.textContent('#link-sas')}, app ${takeSas}`);
-    await page.click('#link-match');
-    const newSign = await waitFor('app-took-over', 180000);
-    for (const end = Date.now() + 60000; (testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign !== newSign;) {
-        if (Date.now() > end || failed) throw new Error('the server never served the new account key');
-        await Bun.sleep(300);
+    // M6 §3-§4: the web turns on account backup; the app, signed in on a new device of that account, restores it.
+    const webKey = (testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign;
+    if (!await page.locator('#backup-on').isVisible()) { await page.click('#account-menu summary'); await page.click('#account-settings'); }
+    await page.click('#backup-on', { timeout: 60000 });
+    await page.click('#backup-own');
+    const passphrase = 'cross client backup passphrase';
+    await page.fill('#backup-pass1', passphrase); await page.fill('#backup-pass2', passphrase);
+    await page.click('#backup-next');
+    await page.waitForFunction(() => document.querySelectorAll('#backup-words li').length === 24, null, { timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#backup-status')}`); });
+    const words: string[] = await page.$$eval('#backup-words li', items => items.map(item => item.textContent!.trim()));
+    await page.click('#backup-next');
+    const asked: string[] = await page.$$eval('#backup-check input', inputs => inputs.map(input => input.id));
+    for (const id of asked) await page.fill(`#${id}`, words[Number(id.split('-').pop())]!);
+    await page.click('#backup-next');
+    await page.waitForFunction(() => document.getElementById('backup')!.hidden && document.getElementById('backup-state')!.textContent!.startsWith('On.'), null, { timeout: 90000 })
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#backup-status')}`); });
+    step('the web turns on account backup: its own passphrase, 24 recovery words shown once, three typed back');
+    signal('web-backup-on', JSON.stringify({ passphrase, token: testing.bearer(webUser.id, 'macos') }));
+    const restoredDevice = await waitFor('app-restored', 180000);
+    const restoredRow = testing.db.query('SELECT state FROM devices WHERE id = ? AND user_id = ?').get(restoredDevice, webUser.id) as any;
+    if (restoredRow?.state !== 'listed') throw new Error(`the restored app is not a listed device of the web account: ${JSON.stringify(restoredRow)}`);
+    if ((testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign !== webKey) throw new Error('the account key changed: contacts would have to re-verify');
+    step('the app restores the web\'s backup on a new device: a wrong passphrase opens nothing, the right one gives it the same account key, and it lists itself');
+    signal('restore-seen');
+
+    // M6 §6.2-§6.3: the restored app removes the other app device (with the backup proof) and changes the account key;
+    // the web follows the signed chain and gets the new key from the app (rekey).
+    const rotatedSign = await waitFor('app-rotated', 300000);
+    if ((testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign !== rotatedSign) throw new Error('the server does not serve the rotated key');
+    if (rotatedSign === webKey) throw new Error('the account key did not change');
+    const rekeyed = () => page.evaluate(() => [...document.querySelectorAll('#device-list .device-row')].some(row => row.textContent!.includes('This browser') && row.textContent!.includes('Can unlock your account'))).catch(() => false);
+    for (const end = Date.now() + 150000; !await rekeyed();) {
+        if (Date.now() > end || failed) {
+            const seen = await page.evaluate(async (name: string) => {
+                const view = await (await fetch(`/api/devices/${name}`, { cache: 'no-store' })).json();
+                const pins = JSON.parse(localStorage.getItem(Object.keys(localStorage).find(key => key.startsWith('device-pins-v1:')) || '') || 'null');
+                return { identity: view.identity?.sign, listVersion: view.list?.version, listed: view.list?.devices.map((d: any) => d.deviceId), rows: view.devices?.map((r: any) => `${r.id}:${r.state}${r.primary ? '*' : ''}${r.current ? '(me)' : ''}`), succession: view.succession?.length, pinned: pins };
+            }, 'webuser').catch(error => String(error));
+            throw new Error(`the web was never rekeyed: ${await page.textContent('#device-list').catch(() => '')} / ${await page.textContent('#devices-status').catch(() => '')}\nweb sees: ${JSON.stringify(seen)}`);
+        }
+        if (!await page.locator('#device-list').isVisible().catch(() => false)) { await page.click('#account-menu summary').catch(() => {}); await page.click('#account-settings').catch(() => {}); }
+        await Bun.sleep(1000);
     }
-    // The web reloads as a linked device of the new key and still reads the channel.
-    for (const end = Date.now() + 120000; !(await groupRecords().catch(() => [])).some(r => r.text === 'from the new primary');) {
-        if (Date.now() > end || failed) throw new Error(`the old primary never read the new primary's message: ${JSON.stringify((await groupRecords().catch(() => [])).map(r => r.text))}`);
-        await Bun.sleep(500);
-    }
-    step('primary transfer: the linked app takes the account over (same 6 digits, signed record, new key, list v1, the old primary\'s leaf certified); the web steps down and still reads the channel');
-    signal('takeover-seen');
+    signal('web-rekeyed');
+    await waitFor('removed-checked', 120000);
+    step('removing a device that holds the key changes it: the app proves the passphrase, revokes it and rotates (list v1 without it, backup re-sealed); the web follows the chain and the app rekeys it; the removed device can publish nothing');
     await waitFor('done');
     step('the app adds thirduser (who reads from then on) and removes them; the web sees both');
     code = await dartDone;

@@ -6,9 +6,11 @@ import '../core/api.dart';
 import '../core/devices.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart';
+import '../crypto/account_crypto.dart';
 import '../crypto/link_crypto.dart';
 import '../store/message.dart';
 import '../store/message_store.dart';
+import 'backup.dart';
 import 'group_sync.dart';
 import 'linking.dart';
 import 'messenger.dart';
@@ -248,7 +250,7 @@ class TakeOver {
       'primary': {'deviceId': p0.deviceId, 'platform': platformOf(p0), 'leafSigKey': primaryLeaf},
       'keep': [
         for (final d in owned)
-          if (d.deviceId != self && listed(d.deviceId)) {'deviceId': d.deviceId, 'addedAt': d.addedAt, 'label': d.described?['label'] ?? platformLabel(platformOf(d)), 'platform': platformOf(d)},
+          if (d.deviceId != self && listed(d.deviceId)) {'deviceId': d.deviceId, 'addedAt': d.addedAt, 'label': d.described?['label'] ?? platformLabel(platformOf(d)), 'platform': platformOf(d), 'via': ?d.described?['via']},
       ],
       'step': 'publish',
     };
@@ -324,7 +326,8 @@ class TakeOver {
         final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
         await messenger.publishNewChain([
           for (final d in (marker['keep'] as List? ?? const []).cast<Map>())
-            {'deviceId': d['deviceId'], 'addedAt': d['addedAt'], 'meta': sealMeta(metaKey, me.id, d['deviceId'] as String, label: d['label'] as String, platform: d['platform'] as String)},
+            // A code-linked device stays marked under the new key: it unlocks with the passphrase, never by rekey (§5).
+            {'deviceId': d['deviceId'], 'addedAt': d['addedAt'], 'meta': sealMeta(metaKey, me.id, d['deviceId'] as String, label: d['label'] as String, platform: d['platform'] as String, via: d['via'] as String?)},
         ]);
       }
     }
@@ -419,20 +422,28 @@ class OwnSuccession {
   /// without a valid chain.
   Future<bool> follow() async {
     final account = await link.account();
-    if (account == null) return false;
+    // A device with the key follows a rotation another device made (M6 §6.2 step 3); it pins its own key.
+    final chat = this.chat;
+    final pinned = account?.identity ?? (chat == null ? null : await chat.identity());
+    if (pinned == null) return false;
     final view = await api.devices(me.username);
     final served = view['identity'];
-    if (served is! Map || (served['sign'] == account.identity.sign && served['dh'] == account.identity.dh)) {
+    if (served is! Map || (served['sign'] == pinned.sign && served['dh'] == pinned.dh)) {
       // Already following the current key; a certificate still under an older one is asked for again.
       final under = await certKey?.read();
-      if (under != null && under != account.identity.sign) await api.askRecert(platform: platform, leafSigKey: await groups.deviceLeaf());
+      if (account != null && under != null && under != pinned.sign) await api.askRecert(platform: platform, leafSigKey: await groups.deviceLeaf());
       return false;
     }
     final all = [for (final r in (view['succession'] as List? ?? const [])) (r as Map).cast<String, dynamic>()];
-    final from = all.indexWhere((r) => r['oldSign'] == account.identity.sign);
+    final from = all.indexWhere((r) => r['oldSign'] == pinned.sign);
     final path = from < 0 ? const <Map<String, dynamic>>[] : all.sublist(from);
-    if (path.isEmpty || path.last['newDh'] != served['dh'] || !verifySuccessionChain(me.id, account.identity.sign, served['sign'] as String, path)) {
-      throw const StoreException('Your account key changed without a record from your previous primary. Link this device again.');
+    if (path.isEmpty || path.last['newDh'] != served['dh'] || !verifySuccessionChain(me.id, pinned.sign, served['sign'] as String, path)) {
+      throw const StoreException('Your account key changed without a record from your previous device. Link this device again.');
+    }
+    notice = null;
+    if (account == null) {
+      final adopt = await _checkAdoption(view, served['sign'] as String);
+      if (!adopt) return false; // The new key's list isn't up yet: the next devices event tries again.
     }
     for (final r in path) {
       final record = Map<String, Object?>.of(r)..remove('signature');
@@ -441,6 +452,30 @@ class OwnSuccession {
     await api.askRecert(platform: platform, leafSigKey: await groups.deviceLeaf());
     return true;
   }
+
+  /// After a [follow] that adopted a key change which removed devices: the notice to show until dismissed.
+  String? notice;
+
+  /// §6.2 step 3: a device holding the key adopts another device's key change whenever the new key's list still names
+  /// it. The server can't say whether a removal was the user's own (revoked rows aren't served), so the check is
+  /// against this device's own last verified list: if the new list drops any device that named, it follows but sets
+  /// [notice] (who changed the key, what it removed). A change that drops this device is refused, with the same words.
+  /// Returns false while the new key's list isn't up yet.
+  Future<bool> _checkAdoption(Map<String, dynamic> view, String newSign) async {
+    final self = (await device?.call())?.deviceId, rows = (view['devices'] as List? ?? const []).cast<Map>();
+    final check = verifyView(userId: me.id, aikSign: newSign, list: view['list'], signature: view['signature'], certs: view['certs']);
+    final newIds = check.pin?.devices;
+    if (!check.ok || newIds == null) return false;
+    final pin = devices?.pin(me.id, me.id);
+    final rotator = rows.where((r) => r['primary'] == true).firstOrNull;
+    final from = platformLabel(rotator?['platform'] as String? ?? 'web');
+    String name(String id) => pin?.labels[id] ?? 'a device';
+    if (self == null || !newIds.contains(self)) throw RotationRefused(from, ['this device', for (final id in pin?.devices ?? const <String>[]) if (id != self && !newIds.contains(id)) name(id)]);
+    final dropped = [for (final id in pin?.devices ?? const <String>[]) if (id != self && !newIds.contains(id)) name(id)];
+    if (dropped.isNotEmpty) notice = RotationRefused(from, dropped).message;
+    return true;
+  }
+
 
   /// Linked device: installs the new primary's answer, if there is one yet, and commits the new leaf in every
   /// group so it stops being Previous.
@@ -495,3 +530,210 @@ class OwnSuccession {
     return answered;
   }
 }
+
+/// A full device replaces the account key itself (docs/m6-account-key.md §6.2): every holder of the key can sign
+/// anything, so removing a device that holds it means a new key. The M5 succession, run by this device on itself:
+/// record (with the backup proof when there is a backup), the new key held, keys uploaded (the inbox moves here),
+/// list v1 naming every live device of our verified list except [removed], our leaf re-signed, and the backup
+/// re-sealed to the backup keys held here.
+class AccountRotation {
+  AccountRotation({required this.api, required this.account, required this.groups, required this.messenger, required this.platform, this.backup, int Function()? now})
+    : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
+
+  final Api api;
+  final AccountCrypto account;
+  final GroupCrypto groups;
+  final Messenger messenger;
+  final String platform;
+  final AccountBackup? backup;
+  final int Function() _now;
+
+  /// [proven]: the proof (and the record it was checked against) when the caller already has it.
+  Future<void> rotate({Set<String> removed = const {}, Unlock? unlock, ({String proof, Map<String, Object?> record})? proven}) async {
+    final me = messenger.me;
+    // Asked first: without the passphrase (when there is a backup) nothing changes.
+    final checked = proven ?? await backup?.proveForRotation(unlock);
+    final view = await api.devices(me.username);
+    final live = await _live(view, removed);
+    // The new key and the record signed by the old one, kept in the core; nothing changes until the server took it.
+    final rotated = await account.prepareRotation(me.id, at: _now());
+    try {
+      await api.publishSuccession(rotated.record, rotated.signature, proof: checked?.proof);
+    } on ApiException catch (error) {
+      // Refused (a wrong proof, or another device rotated first): the prepared key goes; a lost connection keeps it
+      // for [resume].
+      if (error.status >= 400 && error.status < 500) await account.rotationDrop();
+      rethrow;
+    }
+    await _complete(view, live, record: checked?.record);
+  }
+
+  /// On start: a rotation this core prepared before a crash. If the server took its record, it is finished (the key
+  /// held, keys, list v1, our leaf, the re-seal, each only if still missing); otherwise it is dropped. Returns whether
+  /// one was finished.
+  Future<bool> resume() async {
+    final pending = await account.rotationPending();
+    if (pending == null) return false;
+    final view = await api.devices(messenger.me.username);
+    final served = view['identity'], rotation = view['rotation'];
+    // The server's word on its newest record (our own view's `rotation`): finish only a key it publishes, or a record
+    // of ours that still authorizes its key upload ('open'). Anything else never landed or was superseded.
+    final accepted = (served is Map && served['sign'] == pending.identity.sign) ||
+        (rotation is Map && rotation['newSign'] == pending.identity.sign && rotation['state'] == 'open');
+    if (!accepted) {
+      await account.rotationDrop();
+      return false;
+    }
+    // List v1 may have gone out before the crash; otherwise the removed devices were revoked before the record went
+    // out, so the live ones are the listed ones.
+    final done = verifyView(userId: messenger.me.id, aikSign: pending.identity.sign, list: view['list'], signature: view['signature'], certs: view['certs']).ok;
+    await _complete(view, done ? const [] : await _live(view, const {}));
+    return true;
+  }
+
+  /// Our verified devices (under the key held now) that stay: listed on the server, not removed, not this one.
+  Future<List<({String deviceId, int addedAt, Map<String, String>? described})>> _live(Map<String, dynamic> view, Set<String> removed) async {
+    final me = messenger.me, own = await messenger.crypto.identity();
+    final rows = (view['devices'] as List? ?? const []).cast<Map>();
+    final owned = verifiedOwnList(view, userId: me.id, aikSign: own.sign, pin: messenger.devices.pin(me.id, me.id), metaKey: deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id)));
+    if (owned == null) throw const StoreException("The device list on the server isn't one your account signed. Nothing changed.");
+    final self = (await messenger.device()).deviceId;
+    return [
+      for (final d in owned)
+        if (d.deviceId != self && !removed.contains(d.deviceId) && rows.any((r) => r['id'] == d.deviceId && r['state'] == 'listed')) d,
+    ];
+  }
+
+  Future<void> _complete(Map<String, dynamic> view, List<({String deviceId, int addedAt, Map<String, String>? described})> live, {Map<String, Object?>? record}) async {
+    final me = messenger.me;
+    final rows = (view['devices'] as List? ?? const []).cast<Map>();
+    final next = await account.commitRotation(me.id);
+    await messenger.takeOver(); // Keys under the new key (the server takes them after the succession).
+    final served = await api.devices(me.username);
+    final listed = verifyView(userId: me.id, aikSign: next.sign, list: served['list'], signature: served['signature'], certs: served['certs']);
+    if (!listed.ok) {
+      final metaKey = deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id));
+      await messenger.publishNewChain([
+        for (final d in live)
+          () {
+            final platformOf = d.described?['platform'] ?? rows.where((r) => r['id'] == d.deviceId).firstOrNull?['platform'] as String? ?? 'web';
+            // A code-linked device stays marked under the new key: it unlocks with the passphrase, never by rekey (§5).
+            return <String, Object?>{
+              'deviceId': d.deviceId,
+              'addedAt': d.addedAt,
+              'meta': sealMeta(metaKey, me.id, d.deviceId, label: d.described?['label'] ?? platformLabel(platformOf), platform: platformOf, via: d.described?['via']),
+            };
+          }(),
+      ]);
+    } else if (listed.pin case final pin?) {
+      messenger.devices.setPin(me.id, me.id, pin); // List v1 went out before the crash: keep it.
+    }
+    await groups.recertify(platform: platform, issuedAt: _now());
+    await backup?.resealAfterRotation(record);
+  }
+}
+
+/// Rekey (docs/m6-account-key.md §5): a listed device without the account key (after following a rotation, or a
+/// pre-M6 linked device) asks; a device with the key answers only for a device of its verified list that wasn't
+/// linked by code, with the platform from that device's sealed label, and only if the core finds the request signed
+/// by a leaf one of its groups holds. The server relays and proves nothing.
+class Rekey {
+  Rekey({required this.api, required this.account, required this.link, required this.store, required this.me, required this.platform, required this.device, required this.messenger, required this.updateLeaf, int Function()? now})
+    : _now = now ?? (() => DateTime.now().millisecondsSinceEpoch);
+
+  final Api api;
+  final AccountCrypto account;
+  final LinkCrypto link;
+  final MessageStore store;
+  final User me;
+  final String platform;
+  final Future<LocalDevice> Function() device;
+  final Messenger messenger;
+  final Future<void> Function(String groupId) updateLeaf;
+  final int Function() _now;
+
+  /// Why requests were last left unanswered (device id → reason), for diagnostics.
+  final Map<String, String> skipped = {};
+
+  /// Without the key: ask (once per start; a new request replaces the old one on the server).
+  Future<void> ask() async {
+    if (await link.account() == null) return; // Already full.
+    final id = (await device()).deviceId;
+    final r = await account.rekeyRequest(me.id, id, platform);
+    await api.askRekey(platform: platform, eph: r.eph, leafSigKey: r.leafSigKey, signature: r.signature);
+  }
+
+  /// Without the key: installs the answer if there is one. Returns whether this device is now full.
+  Future<bool> take() async {
+    if (await link.account() == null) return false;
+    final mine = await api.myRekey();
+    final box = mine.box;
+    if (box == null) return false;
+    await account.rekeyOpen(me.id, deviceId: (await device()).deviceId, platform: platform, box: box);
+    for (final g in await store.groups()) {
+      if (g.active) await updateLeaf(g.id).catchError((_) {});
+    }
+    await api.dropRekey();
+    return true;
+  }
+
+  /// With the key: answers every waiting request that passes. Returns how many.
+  Future<int> answer() async {
+    final requests = await api.rekeyRequests();
+    if (requests.isEmpty) return 0;
+    final own = await messenger.crypto.identity(), self = (await device()).deviceId;
+    final owned = verifiedOwnList(
+      await api.devices(me.username),
+      userId: me.id,
+      aikSign: own.sign,
+      pin: messenger.devices.pin(me.id, me.id),
+      metaKey: deviceMetaKey(await messenger.crypto.deviceMetaSignature(me.id)),
+    );
+    if (owned == null) return 0;
+    final channels = [for (final g in await store.groups()) if (g.active) g.id];
+    var answered = 0;
+    for (final r in requests) {
+      final deviceId = r['deviceId'] as String;
+      final described = owned.where((d) => d.deviceId == deviceId && deviceId != self).firstOrNull?.described;
+      final platform = described?['platform'];
+      // Not ours, this device, unreadable, or linked by code (that one unlocks with the passphrase): no answer.
+      if (platform == null || described?['via'] == 'code') {
+        skipped[deviceId] = platform == null ? 'not in our list (or unreadable)' : 'linked by code';
+        continue;
+      }
+      try {
+        final box = await account.rekeyAnswer(
+          me.id,
+          deviceId: deviceId,
+          platform: platform,
+          request: (eph: r['eph'] as String, leafSigKey: r['leafSigKey'] as String, signature: r['signature'] as String),
+          groups: channels,
+          now: _now(),
+        );
+        await api.answerRekey(deviceId, box);
+        answered++;
+      } on CryptoException catch (error) {
+        // Not signed by a leaf our groups hold (or not for our key): it asks again later.
+        skipped[deviceId] = error.message;
+      }
+    }
+    return answered;
+  }
+}
+
+/// Another device changed the account key in a way this device won't adopt silently (M6 §6.2 step 3).
+class RotationRefused implements Exception {
+  const RotationRefused(this.label, [this.removed = const []]);
+  final String label;
+
+  /// What the change removed: device labels, "this device" first when it was this one.
+  final List<String> removed;
+
+  String get message => removed.isEmpty
+      ? 'Your account key was changed from $label. If this wasn’t you, take your account back.'
+      : 'Your account key was changed from $label, which removed ${_and(removed)}. If this wasn’t you, take your account back.';
+  @override
+  String toString() => message;
+}
+
+String _and(List<String> items) => items.length == 1 ? items.single : '${items.sublist(0, items.length - 1).join(', ')} and ${items.last}';

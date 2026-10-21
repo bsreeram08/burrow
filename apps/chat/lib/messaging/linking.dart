@@ -4,6 +4,7 @@ import 'dart:math' as math;
 
 import '../core/api.dart';
 import '../core/devices.dart';
+import '../crypto/account_crypto.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart' show GroupCrypto;
 import '../crypto/link_crypto.dart';
@@ -41,7 +42,11 @@ class LinkHello {
 /// its short code, both screens show the same 6 digits, and only after the user taps Link does it sign
 /// anything: the next device list naming the device, its MLS certificate, the grant and the bundle.
 class PrimaryLink {
-  PrimaryLink._(this._ctx, {required this.linkId, required this.deviceId, required this.platform, required this.code});
+  PrimaryLink._(this._ctx, {required this.linkId, required this.deviceId, required this.platform, required this.code, this.viaCode = false});
+
+  /// Linked by the 8-character code: the 6 digits alone authenticate the exchange, so the account key is not
+  /// handed over (docs/m6-account-key.md §2); the device unlocks with the passphrase later.
+  final bool viaCode;
 
   final LinkContext _ctx;
   final String linkId;
@@ -82,7 +87,7 @@ class PrimaryLink {
         final reveal = state['reveal'];
         if (reveal is Map) {
           final code = await ctx.link.openCommitment(linkId, eph: reveal['eph'] as String, nonce: reveal['nonce'] as String);
-          return PrimaryLink._(ctx, linkId: linkId, deviceId: offered['deviceId'] as String, platform: offered['platform'] as String, code: code);
+          return PrimaryLink._(ctx, linkId: linkId, deviceId: offered['deviceId'] as String, platform: offered['platform'] as String, code: code, viaCode: true);
         }
         if (DateTime.now().isAfter(end)) throw const StoreException('The other device did not answer. Start again on it.');
         await ctx.wait(const Duration(milliseconds: 600));
@@ -121,12 +126,17 @@ class PrimaryLink {
     final me = _ctx.messenger.me;
     final metaKey = deviceMetaKey(await _ctx.crypto.deviceMetaSignature(me.id));
     final now = _ctx.now();
-    final entry = <String, Object?>{'deviceId': h.deviceId, 'addedAt': now, 'meta': sealMeta(metaKey, me.id, h.deviceId, label: h.label.isEmpty ? platformLabel(h.platform) : h.label, platform: h.platform)};
+    // A short-code link says so in the sealed meta (M6 §5): no rekey for it; it unlocks with the passphrase.
+    final entry = <String, Object?>{
+      'deviceId': h.deviceId,
+      'addedAt': now,
+      'meta': sealMeta(metaKey, me.id, h.deviceId, label: h.label.isEmpty ? platformLabel(h.platform) : h.label, platform: h.platform, via: viaCode ? 'code' : null),
+    };
     final published = await _ctx.messenger.publishNextList(add: entry);
     final cert = await _ctx.link.signDeviceCert(userId: me.id, deviceId: h.deviceId, platform: h.platform, leafSigKey: h.leafSigKey, issuedAt: now);
     final identity = await _ctx.crypto.identity();
     final chunks = _chunks(jsonEncode(await _ctx.bundle(wantsHistory: h.wantsHistory)));
-    final grant = {
+    final grant = <String, Object?>{
       'v': 1,
       'type': 'grant',
       'userId': me.id,
@@ -139,6 +149,12 @@ class PrimaryLink {
       'metaKey': b64(metaKey),
       'chunks': chunks.length,
     };
+    // A QR link hands the account key over, sealed, after both screens showed the same digits (M6 §2).
+    final account = _ctx.account;
+    if (!viaCode && account != null) {
+      grant['accountKey'] = await account.exportAccountKey(me.id);
+      grant['backupKeys'] = (await _ctx.backupKeys?.call())?.toJson();
+    }
     await _ctx.api.linkSend(linkId, await _ctx.link.seal(linkId, jsonEncode(grant)));
     for (var i = 0; i < chunks.length; i++) {
       await _ctx.api.linkSend(linkId, await _ctx.link.seal(linkId, jsonEncode({'v': 1, 'type': 'bundle', 'i': i, 'of': chunks.length, 'data': b64(utf8.encode(chunks[i]))})));
@@ -168,7 +184,13 @@ class PrimaryLink {
 
 /// What a new device learned from a checked grant (§1.6): its session, the account, and what to install.
 class LinkedSetup {
-  const LinkedSetup({required this.user, required this.token, required this.identity, required this.pin, required this.metaKey, required this.bundle});
+  const LinkedSetup({required this.user, required this.token, required this.identity, required this.pin, required this.metaKey, required this.bundle, this.full = false, this.backupKeys});
+
+  /// The grant carried the account key and this device now holds it (QR links, M6 §2).
+  final bool full;
+
+  /// The backup keys the grant carried, to keep.
+  final BackupKeys? backupKeys;
   final User user;
   final String token;
 
@@ -189,7 +211,9 @@ class LinkedSetup {
 /// 8-character code for one account), both screens show the same 6 digits, the primary signs it in, and it
 /// checks the grant before trusting any of it. Its core must be fresh (no identity of its own).
 class NewDeviceLink {
-  NewDeviceLink._(this._api, this._link, this._groups, this._device, this._wait, {required this.linkId, required this.claim, required this.platform, required this.label, this.qr, this.shortCode});
+  NewDeviceLink._(this._api, this._link, this._groups, this._device, this._wait, this._account, {required this.linkId, required this.claim, required this.platform, required this.label, this.qr, this.shortCode});
+
+  final AccountCrypto? _account;
 
   final Api _api;
   final LinkCrypto _link;
@@ -219,6 +243,7 @@ class NewDeviceLink {
     required String platform,
     required String label,
     String? username,
+    AccountCrypto? account,
     Future<void> Function(Duration)? wait,
   }) async {
     final started = await api.linkStart(
@@ -238,7 +263,7 @@ class NewDeviceLink {
       } else {
         await api.linkCommit(linkId, await link.commit(linkId, device.deviceId), claim: claim);
       }
-      return NewDeviceLink._(api, link, groups, device, wait ?? ((d) => Future<void>.delayed(d)),
+      return NewDeviceLink._(api, link, groups, device, wait ?? ((d) => Future<void>.delayed(d)), account,
           linkId: linkId, claim: claim, platform: platform, label: label, qr: qr, shortCode: username == null ? null : started['code'] as String?);
     } catch (_) {
       await link.end(linkId).catchError((_) {});
@@ -336,8 +361,16 @@ class NewDeviceLink {
       }
     }
     if (pins.isNotEmpty) await _link.importPins(pins).catchError((_) => 0);
+    // A QR grant carries the account key (M6 §2): this device becomes full, checked against the identity it pinned.
+    BackupKeys? backupKeys;
+    final accountKey = grant['accountKey'];
+    if (accountKey is String && shortCode == null) {
+      final account = _account ?? (throw wrong);
+      if (await account.importAccountKey(user.id, accountKey) != identity) throw wrong;
+      backupKeys = BackupKeys.fromJson(grant['backupKeys']);
+    }
     await _link.end(linkId).catchError((_) {});
-    return LinkedSetup(user: user, token: claimed.token, identity: identity, pin: pin, metaKey: grant['metaKey'] as String, bundle: bundle);
+    return LinkedSetup(user: user, token: claimed.token, identity: identity, pin: pin, metaKey: grant['metaKey'] as String, bundle: bundle, full: accountKey is String && shortCode == null, backupKeys: backupKeys);
   }
 
   /// The user left the link screen before it finished: nothing was installed.
@@ -379,6 +412,8 @@ class LinkContext {
     required this.messenger,
     required this.store,
     required this.contacts,
+    this.account,
+    this.backupKeys,
     int Function()? now,
     Future<void> Function(Duration)? wait,
   }) : now = now ?? (() => DateTime.now().millisecondsSinceEpoch),
@@ -390,6 +425,10 @@ class LinkContext {
   final Messenger messenger;
   final MessageStore store;
   final List<Contact> Function() contacts;
+
+  /// The account key export and the backup keys held here, for a QR grant (M6 §2).
+  final AccountCrypto? account;
+  final Future<BackupKeys?> Function()? backupKeys;
   final int Function() now;
   final Future<void> Function(Duration) wait;
 

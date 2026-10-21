@@ -256,7 +256,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
         body: _messages == null
             ? const SizedBox.shrink()
             : _onPrimaryNotice(
-                show: state.companion && !state.movedChats.contains(widget.contactId),
+                show: (state.companion || state.inactiveDevice) && !state.movedChats.contains(widget.contactId),
                 color: tokens.muted,
                 child: _dropTarget(
                 accent: tokens.accent,
@@ -289,7 +289,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
     );
   }
 
-  /// A linked device sends here only once the chat moved to MLS (m5 §8); until then it is on the primary.
+  /// A device other than the inbox device sends here only once the chat moved to MLS (m5 §8, M6 §0).
   Widget _onPrimaryNotice({required bool show, required Color color, required Widget child}) => !show
       ? child
       : Column(

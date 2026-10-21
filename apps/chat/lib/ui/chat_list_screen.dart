@@ -7,6 +7,9 @@ import 'package:go_router/go_router.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../app/app_controller.dart';
+import 'account/backup_screen.dart';
+import 'account/copy.dart' show resetBanner;
+import '../messaging/linking.dart' show platformLabel;
 import '../app/chat_settings.dart';
 import '../core/api.dart';
 import '../core/pair_id.dart';
@@ -211,6 +214,43 @@ class _ChatListScreenState extends ConsumerState<ChatListScreen> {
               ],
             ),
           ),
+          // Another device changed the account key and removed devices: until dismissed (M6 §6.2).
+          if (state.keyChangeNotice case final text?)
+            MaterialBanner(
+              key: const Key('key-change-notice'),
+              content: Text(text),
+              actions: [TextButton(onPressed: () => _guard(app.dismissKeyChangeNotice), child: const Text('Dismiss'))],
+            ),
+          // Someone asked to reset the account key: any of the user's devices can stop it (M6 §6.5).
+          if (state.keyReset case final reset? when !reset.mine)
+            MaterialBanner(
+              key: const Key('reset-banner'),
+              content: Text(resetBanner(platformLabel(reset.platform), reset.at)),
+              actions: [
+                TextButton(
+                  key: const Key('reset-cancel'),
+                  onPressed: () => _guard(app.cancelKeyReset),
+                  child: const Text('Cancel it'),
+                ),
+              ],
+            ),
+          // Offered once after sign-in when the account has no backup (M6 §3.4).
+          if (state.offerBackup)
+            MaterialBanner(
+              key: const Key('offer-backup'),
+              content: const Text("Turn on account backup so you can sign in on a new device without your other devices, and a lost device can't lock you out."),
+              actions: [
+                TextButton(onPressed: app.dismissBackupOffer, child: const Text('Not now')),
+                TextButton(
+                  key: const Key('offer-backup-yes'),
+                  onPressed: () {
+                    app.dismissBackupOffer();
+                    showAccountBackup(context);
+                  },
+                  child: const Text('Turn on'),
+                ),
+              ],
+            ),
           if (state.groupsUnavailable != null)
             Padding(
               padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),

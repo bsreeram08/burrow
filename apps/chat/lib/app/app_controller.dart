@@ -15,12 +15,14 @@ import '../calls/call_controller.dart';
 import '../core/api.dart';
 import '../core/devices.dart';
 import '../core/events.dart';
+import '../crypto/account_crypto.dart';
 import '../crypto/chat_crypto.dart';
 import '../crypto/group_crypto.dart';
 import '../crypto/link_crypto.dart';
 import '../crypto/rust_chat_crypto.dart';
 import '../crypto/rust_group_crypto.dart';
 import '../messaging/attachments.dart';
+import '../messaging/backup.dart';
 import '../messaging/group_messenger.dart';
 import '../messaging/group_sync.dart';
 import '../messaging/linking.dart';
@@ -85,6 +87,9 @@ final linkCryptoProvider = Provider<LinkCrypto>((ref) => const RustLinkCrypto())
 
 /// Groups over MLS: the same Rust core (its group engine). Tests and the demo override this with FakeGroupCrypto.
 final groupCryptoProvider = Provider<GroupCrypto>((ref) => const RustGroupCrypto());
+
+/// The account key export/import and its encrypted backup (docs/m6-account-key.md).
+final accountCryptoProvider = Provider<AccountCrypto>((ref) => const RustAccountCrypto());
 
 /// Rotation settings for an account on this device (account.js `rotation-*` keys in localStorage).
 final rotationPrefsProvider = Provider<Future<RotationPrefs> Function(String userId)>((ref) => (userId) async {
@@ -173,6 +178,9 @@ final storeOpenerProvider = Provider<Future<MessageStore> Function(String userId
 
 enum AuthPhase { loading, signedOut, signedIn }
 
+/// An open reset of the account key (docs/m6-account-key.md §6.5).
+typedef KeyReset = ({String platform, int at, int executeAfter, bool mine});
+
 @immutable
 class IncomingCall {
   const IncomingCall({required this.contact, required this.kind, required this.roomId, required this.token});
@@ -202,6 +210,15 @@ class AppState {
     this.groupsUnavailable,
     this.companion = false,
     this.movedChats = const {},
+    this.needsRestore = false,
+    this.hasBackup,
+    this.backupUpdatedAt,
+    this.fullDevice = false,
+    this.offerBackup = false,
+    this.removedListed,
+    this.restoredSafety,
+    this.keyReset,
+    this.keyChangeNotice,
   });
   final AuthPhase phase;
   final User? user;
@@ -241,6 +258,36 @@ class AppState {
   /// Contacts whose 1:1 chat moved to MLS here (m5 §8).
   final Set<String> movedChats;
 
+  /// Signed in on a device the account doesn't list yet (docs/m6-account-key.md §4): show "Use your account here".
+  final bool needsRestore;
+
+  /// Whether the account has an encrypted key backup (null: not known yet).
+  final bool? hasBackup;
+
+  /// When the backup last changed (its `updatedAt`).
+  final int? backupUpdatedAt;
+
+  /// This device holds the account key ("Can unlock your account").
+  final bool fullDevice;
+
+  /// Offer to turn the backup on, once after sign-in, when the account has none.
+  final bool offerBackup;
+
+  /// A device our signed list still names that the server says was revoked (another device cut it off): ask the
+  /// user to change the account key (§6.2). Its id and label.
+  final ({String id, String label})? removedListed;
+
+  /// Just restored from the backup: the account's safety number, shown once with "your contacts don't need to
+  /// re-verify you" (§4).
+  final String? restoredSafety;
+
+  /// An open request to reset the account key (M6 §6.5): from which platform, when, when it may run, and whether this
+  /// device asked for it.
+  final KeyReset? keyReset;
+
+  /// Another device changed the account key and removed devices (or this one): shown until dismissed.
+  final String? keyChangeNotice;
+
   AppState copyWith({
     AuthPhase? phase,
     User? user,
@@ -263,6 +310,19 @@ class AppState {
     bool clearGroupsUnavailable = false,
     bool? companion,
     Set<String>? movedChats,
+    bool? needsRestore,
+    bool? hasBackup,
+    int? backupUpdatedAt,
+    bool? fullDevice,
+    bool? offerBackup,
+    ({String id, String label})? removedListed,
+    bool clearRemovedListed = false,
+    String? restoredSafety,
+    bool clearRestoredSafety = false,
+    KeyReset? keyReset,
+    bool clearKeyReset = false,
+    String? keyChangeNotice,
+    bool clearKeyChangeNotice = false,
   }) => AppState(
     phase: phase ?? this.phase,
     user: user ?? this.user,
@@ -281,6 +341,15 @@ class AppState {
     groupsUnavailable: clearGroupsUnavailable ? null : groupsUnavailable ?? this.groupsUnavailable,
     companion: companion ?? this.companion,
     movedChats: movedChats ?? this.movedChats,
+    needsRestore: needsRestore ?? this.needsRestore,
+    hasBackup: hasBackup ?? this.hasBackup,
+    backupUpdatedAt: backupUpdatedAt ?? this.backupUpdatedAt,
+    fullDevice: fullDevice ?? this.fullDevice,
+    offerBackup: offerBackup ?? this.offerBackup,
+    removedListed: clearRemovedListed ? null : removedListed ?? this.removedListed,
+    restoredSafety: clearRestoredSafety ? null : restoredSafety ?? this.restoredSafety,
+    keyReset: clearKeyReset ? null : keyReset ?? this.keyReset,
+    keyChangeNotice: clearKeyChangeNotice ? null : keyChangeNotice ?? this.keyChangeNotice,
   );
 }
 
@@ -355,6 +424,7 @@ class AppController extends Notifier<AppState> {
       platform: _api.client,
       label: platformLabel(_api.client),
       username: username?.trim().toLowerCase(),
+      account: ref.read(accountCryptoProvider),
     );
   }
 
@@ -370,6 +440,10 @@ class AppController extends Notifier<AppState> {
     await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:${setup.user.id}', setup.metaKey);
     await (await _certKey(setup.user.id)).write(setup.identity.sign); // The grant's certificate is under this key.
     await (await SharedPreferences.getInstance()).setString('linked-core-v1:${setup.user.id}', 'keys-link-${link.deviceId}');
+    // A short-code link carries no key and is never rekeyed: it unlocks with the passphrase (M6 §2, §5).
+    await (await SharedPreferences.getInstance()).setBool('linked-by-code-v1:${setup.user.id}', link.shortCode != null && !setup.full);
+    final keys = setup.backupKeys;
+    if (keys != null) await ref.read(accountCryptoProvider).keepBackupKeys(keys); // In the core, like every full device's.
     await _signedIn(setup.user, setup.token, linked: setup.bundle);
   }
 
@@ -436,6 +510,10 @@ class AppController extends Notifier<AppState> {
     // Moved 1:1 chats travel through their DM groups (m5 §8).
     m.groups = g;
     sync.followIdentity = _followAuthor;
+    g.onKeyMoved = (id, now) {
+      final contact = contactById(id);
+      if (contact != null) m.keyMoved(contact, now);
+    };
     _certKeyCached = await _certKey(user.id);
     _subscriptions
       ..add(sync.notices.listen((text) => state = state.copyWith(notice: text)))
@@ -453,15 +531,26 @@ class AppController extends Notifier<AppState> {
       ..add(m.lockedChanges.listen((locked) => state = state.copyWith(keysLocked: locked)))
       ..add(m.typingChanges.listen((typing) => state = state.copyWith(typing: typing)));
     if (linked != null) await installLinkBundle(linked, dbStore);
-    state = state.copyWith(phase: AuthPhase.signedIn, user: user, companion: companion, clearNotice: true);
+    state = state.copyWith(
+      phase: AuthPhase.signedIn,
+      user: user,
+      companion: companion,
+      needsRestore: false,
+      keyChangeNotice: (await SharedPreferences.getInstance()).getString('key-change-notice-v1:${user.id}'),
+      clearNotice: true,
+    );
     await _loadGroups();
-    unawaited(_checkActive());
+    final checked = _checkActive();
     await loadContacts();
     unawaited(events.connect());
-    // Pin each contact's signed device list now, so a later rollback or injected device is caught.
-    for (final contact in state.contacts.where((c) => c.state == ContactState.mutual && c.id != null)) {
-      unawaited(m.verifyContactDevices(contact).catchError((_) => null));
-    }
+    // Pin each contact's signed device list now, so a later rollback or injected device is caught. Not on a device
+    // waiting to restore: its key database must stay empty until the account key is imported (§4).
+    unawaited(checked.then((_) {
+      if (state.needsRestore) return;
+      for (final contact in state.contacts.where((c) => c.state == ContactState.mutual && c.id != null)) {
+        unawaited(m.verifyContactDevices(contact).catchError((_) => null));
+      }
+    }));
   }
 
   Future<void> _loadGroups() async {
@@ -506,47 +595,7 @@ class AppController extends Notifier<AppState> {
     await _signedIn(user, token);
   }
 
-  /// This primary takes the QR text of the device taking over.
-  Future<HandOver> handOver(String qr) async {
-    final ctx = linkContext() ?? (throw StateError('Not signed in'));
-    return HandOver.fromQr(ctx, ref.read(groupCryptoProvider), qr, hold: (held) async {
-      final sync = groups?.sync;
-      if (sync == null) return;
-      held ? sync.held = true : await sync.release();
-    });
-  }
-
-  /// The user confirmed on this primary: sign the account over, then continue here as a linked device.
-  Future<void> finishHandOver(HandOver h) async {
-    final userId = state.user?.id;
-    final metaKey = await h.approve();
-    if (userId != null) {
-      await (await SharedPreferences.getInstance()).setString('device-meta-key-v1:$userId', metaKey);
-      final under = h.request?.identity.sign; // The demote's certificate is under the new key.
-      if (under != null) await (await _certKey(userId)).write(under);
-    }
-    await _reopen();
-    await _recommitLeaves();
-  }
-
-  /// This linked device asks to become the primary: it shows a code for the primary to scan.
-  Future<TakeOver> startTakeOver() async {
-    final m = messenger ?? (throw StateError('Not signed in'));
-    return TakeOver.start(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), device: await m.device(), platform: _api.client);
-  }
-
-  /// The primary confirmed: take the account over, then continue here as its primary.
-  Future<void> finishTakeOver(TakeOver t) async {
-    final m = messenger ?? (throw StateError('Not signed in'));
-    final prefs = await SharedPreferences.getInstance(), key = 'device-meta-key-v1:${m.me.id}';
-    final old = prefs.getString(key);
-    await t.run(m, platform: _api.client, markers: await _takeOverMarkers(m.me.id), oldMetaKey: old == null ? null : unb64(old));
-    await prefs.remove(key); // A primary derives its own label key.
-    await _reopen();
-    await _recommitLeaves();
-    unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
-  }
-
+  // M6 devices don't transfer (docs/m6-account-key.md §2): a take-over begun under M5 still finishes on start.
   Future<TakeOverMarkers> _takeOverMarkers(String userId) async {
     final prefs = await SharedPreferences.getInstance(), key = 'takeover-v1:$userId';
     return (read: () async => prefs.getString(key), write: (String? v) async => v == null ? await prefs.remove(key) : await prefs.setString(key, v));
@@ -558,7 +607,7 @@ class AppController extends Notifier<AppState> {
     if (m == null) return false;
     try {
       final done = await TakeOver.resume(api: _api, link: ref.read(linkCryptoProvider), groups: ref.read(groupCryptoProvider), messenger: m, platform: _api.client, markers: await _takeOverMarkers(m.me.id));
-      if (done) state = state.copyWith(notice: 'This device finished becoming your primary.');
+      if (done) state = state.copyWith(notice: 'This device finished taking over your account.');
       return done;
     } on StoreException catch (error) {
       state = state.copyWith(notice: error.message);
@@ -612,27 +661,50 @@ class AppController extends Notifier<AppState> {
     if (userId == state.user?.id) return messenger?.companion ?? false ? await _ownSuccession()?.follow() ?? false : false;
     final before = (await _crypto.peer(userId))?.identity;
     await _checkIdentity(userId);
-    return (await _crypto.peer(userId))?.identity != before;
+    // Someone met only in groups: the group pins follow their chain (a forced pass may already have moved it).
+    if (contactById(userId) == null) await groups?.ensurePinned([userId], force: true);
+    return (groups?.followed.remove(userId) ?? false) || (await _crypto.peer(userId))?.identity != before;
   }
 
-  Future<void> _followSuccession() async {
+  /// Follows the account to a new key along its signed chain. Returns whether it moved.
+  Future<bool> _followSuccession() async {
     final own = _ownSuccession();
-    if (own == null) return;
+    if (own == null) return false;
     try {
-      if (await own.follow()) state = state.copyWith(notice: 'Your account moved to a new primary device.');
+      final moved = await own.follow();
+      final notice = own.notice;
+      if (notice != null) {
+        await _keepKeyChangeNotice(notice);
+      } else if (moved) {
+        state = state.copyWith(notice: 'Your account has a new key. Your contacts keep their verification.');
+      }
       await own.takeRecert();
+      return moved;
     } on StoreException catch (error) {
       state = state.copyWith(notice: error.message);
+    } on RotationRefused catch (refused) {
+      // This device was removed by someone else's key change: not followed; restore takes the account back (§6.4).
+      await _keepKeyChangeNotice(refused.message);
     } catch (_) {
       // Offline: tried again on the next devices event or start.
     }
+    return false;
   }
 
   /// What linking a device needs (this device as the primary).
   LinkContext? linkContext() {
     final m = messenger, s = store;
     if (m == null || s == null) return null;
-    return LinkContext(api: _api, crypto: _crypto, link: ref.read(linkCryptoProvider), messenger: m, store: s, contacts: () => state.contacts);
+    return LinkContext(
+      api: _api,
+      crypto: _crypto,
+      link: ref.read(linkCryptoProvider),
+      messenger: m,
+      store: s,
+      contacts: () => state.contacts,
+      account: ref.read(accountCryptoProvider),
+      backupKeys: ref.read(accountCryptoProvider).heldBackupKeys,
+    );
   }
 
   void openGroup(String id) {
@@ -694,6 +766,26 @@ class AppController extends Notifier<AppState> {
         }
       case EnvelopeEvent():
         unawaited(messenger?.receive(event));
+      case BackupEvent(:final read, :final deviceId):
+        if (read) {
+          _backupOpenedElsewhere(deviceId);
+        } else {
+          unawaited(backupChanged());
+        }
+      case ResetEvent(:final cancelled, :final deviceId, :final platform, :final at, :final executeAfter):
+        if (cancelled || at == null || executeAfter == null) {
+          state = state.copyWith(clearKeyReset: true);
+        } else {
+          unawaited(messenger?.device().then((d) {
+            state = state.copyWith(keyReset: (platform: platform ?? 'web', at: at, executeAfter: executeAfter, mine: d.deviceId == deviceId));
+          }));
+        }
+      case RekeyEvent(:final answered):
+        if (answered) {
+          unawaited(_takeRekey());
+        } else if (messenger?.full ?? false) {
+          unawaited(_rekey()?.answer().catchError((_) => 0));
+        }
       case RecertEvent():
         // A linked device's certificate under the new key was answered, or (on the primary) one is waiting.
         if (messenger?.companion ?? false) {
@@ -725,21 +817,43 @@ class AppController extends Notifier<AppState> {
       return;
     }
     if (messenger?.companion ?? false) {
-      // A linked device: groups (and moved chats) only; the account's keys are on the primary.
+      // Without the account key: groups (and moved chats) only. It asks a device with the key for it (M6 §5),
+      // unless it was linked by code (that one unlocks with the passphrase).
       if (!(groups?.ready ?? true)) await _startGroups();
       await _followSuccession();
+      if (!await _linkedByCode()) {
+        if (!await _takeRekey()) unawaited(_rekey()?.ask().catchError((_) {}));
+      }
+      return;
+    }
+    if (await _needsRestore()) return;
+    // A key change this device prepared before a crash (M6 §6.2): finished if the server took it, else dropped. First,
+    // before the key comparison below would take the new published key for someone else's.
+    if (await _resumeRotation()) {
+      await _reopen();
+      await _recommitLeaves();
       return;
     }
     try {
-      final active = await messenger?.checkActive();
-      if (active != null) state = state.copyWith(inactiveDevice: !active);
-      if (active == true) {
+      final m = messenger;
+      final active = await m?.checkActive();
+      if (active != null) state = state.copyWith(inactiveDevice: !active, fullDevice: m?.full ?? false);
+      // The key this device holds is no longer the published one: another device rotated it (M6 §6.2). Follow it
+      // (if it passes the adoption check) and ask for the new key.
+      if (active == false && !(m?.full ?? true) && await _followSuccession()) {
+        await _reopen();
+        return;
+      }
+      if (active == true || (m?.full ?? false)) {
         // Groups need this device in the account's signed device list (docs/m4-groups.md §2).
         try {
           await messenger?.syncDevices();
         } catch (_) {}
         if (!(groups?.ready ?? true)) await _startGroups();
         unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
+        unawaited(_checkBackup());
+        unawaited(checkRemovedDevices());
+        unawaited(_rekey()?.answer().catchError((_) => 0));
       }
     } catch (e) {
       state = state.copyWith(notice: 'Could not check encryption keys: $e');
@@ -771,6 +885,252 @@ class AppController extends Notifier<AppState> {
     await messenger?.takeOver();
   }
 
+  // ---------- The account key and its backup (docs/m6-account-key.md) ----------
+  /// The backup service for this account, once signed in.
+  Future<AccountBackup?> accountBackup() async {
+    final user = state.user;
+    if (user == null) return null;
+    return AccountBackup(api: _api, crypto: ref.read(accountCryptoProvider), me: user);
+  }
+
+  /// §4: signed in on a device the account doesn't list, while it has a published key: the restore screen, and
+  /// nothing that would mint or upload a key of this device's own.
+  Future<bool> _needsRestore() async {
+    final m = messenger, user = state.user;
+    if (m == null || user == null || m.companion) return false;
+    try {
+      final published = (await _api.keyCount()).identity;
+      if (published == null) return false; // A new account: this device makes the key.
+      final id = (await m.device()).deviceId;
+      final rows = ((await _api.devices(user.username))['devices'] as List? ?? const []).cast<Map>();
+      final listed = rows.any((r) => r['id'] == id && r['state'] == 'listed');
+      if (listed) return false;
+      final backup = await _backupState();
+      await m.bindSession(); // A pending device of the account, so it may list itself after the restore.
+      state = state.copyWith(needsRestore: true, hasBackup: backup.has);
+      // Its own reset has waited its week: this same session may now replace the account key (§6.5).
+      final reset = state.keyReset;
+      if (reset != null && reset.mine && DateTime.now().millisecondsSinceEpoch >= reset.executeAfter) {
+        unawaited(_startOverNow().catchError((Object e) => state = state.copyWith(notice: 'Couldn’t reset the account key: $e')));
+      }
+      return true;
+    } catch (_) {
+      return false; // Offline: the next reconnect checks again.
+    }
+  }
+
+  /// "Enter your passphrase" / "Use your recovery key" on the restore screen (§4): open the backup, hold the account
+  /// key, publish the list naming this device, then start as a full device. Returns the account's safety number.
+  Future<String> restoreFromBackup(Unlock unlock) async {
+    final m = messenger, backup = await accountBackup();
+    if (m == null || backup == null) throw StateError('Not signed in');
+    final published = (await _api.keyCount()).identity;
+    if (published == null) throw const StoreException("Your account has no key yet. Nothing to restore.");
+    final identity = await backup.restore(unlock, published: Identity.fromJson(published));
+    await m.publishNextList();
+    final safety = identityFingerprint(identity);
+    state = state.copyWith(needsRestore: false, restoredSafety: safety);
+    await _reopen();
+    return safety;
+  }
+
+  void dismissRestored() => state = state.copyWith(clearRestoredSafety: true);
+
+  /// "I can't do any of these" (M5 §6, after its warning): new keys here; contacts see the code change. With a
+  /// backup the server waits a week first, so any of the user's devices can cancel it (§6.5).
+  Future<void> startOver() async {
+    if (state.hasBackup ?? false) {
+      final reset = await _api.requestKeyReset();
+      state = state.copyWith(keyReset: (platform: _api.client, at: reset['at'] as int, executeAfter: reset['executeAfter'] as int, mine: true));
+      return;
+    }
+    await _startOverNow();
+  }
+
+  Future<void> _startOverNow() async {
+    state = state.copyWith(needsRestore: false, clearKeyReset: true);
+    await useThisDevice();
+  }
+
+  /// A code-linked device unlocks itself with the passphrase (§2): the same backup, against its pinned account.
+  Future<void> unlockWithBackup(Unlock unlock) async {
+    final user = state.user, backup = await accountBackup();
+    if (user == null || backup == null) return;
+    final account = await ref.read(linkCryptoProvider).account();
+    if (account == null) return; // Already full.
+    await backup.restore(unlock, published: account.identity);
+    await messenger?.publishNextList(); // Its own first list: its meta no longer says "linked by code".
+    await (await SharedPreferences.getInstance()).remove('linked-by-code-v1:${user.id}');
+    await _reopen();
+  }
+
+  Rekey? _rekey() {
+    final m = messenger, s = store, g = groups, user = state.user;
+    if (m == null || s == null || g == null || user == null) return null;
+    return Rekey(
+      api: _api,
+      account: ref.read(accountCryptoProvider),
+      link: ref.read(linkCryptoProvider),
+      store: s,
+      me: user,
+      platform: _api.client,
+      device: m.device,
+      messenger: m,
+      updateLeaf: g.sync.updateLeaf,
+    );
+  }
+
+  /// A rekey answer is in: this device holds the account key now; reopen as a full device.
+  Future<bool> _takeRekey() async {
+    try {
+      if (await _rekey()?.take() ?? false) {
+        await _reopen();
+        return true;
+      }
+    } catch (_) {
+      // Not yet, or not for us: it asks again on the next start.
+    }
+    return false;
+  }
+
+  Future<bool> _linkedByCode() async {
+    final user = state.user;
+    return user != null && ((await SharedPreferences.getInstance()).getBool('linked-by-code-v1:${user.id}') ?? false);
+  }
+
+  /// Whether the account has a backup; offered once after sign-in on a full device when it has none.
+  Future<void> _checkBackup() async {
+    final user = state.user;
+    if (user == null) return;
+    try {
+      final backup = await _backupState();
+      final prefs = await SharedPreferences.getInstance(), key = 'backup-offered-v1:${user.id}';
+      final offer = !backup.has && !(prefs.getBool(key) ?? false);
+      if (offer) await prefs.setBool(key, true);
+      state = state.copyWith(hasBackup: backup.has, offerBackup: offer, backupUpdatedAt: backup.updatedAt);
+    } catch (_) {}
+  }
+
+  void dismissBackupOffer() => state = state.copyWith(offerBackup: false);
+
+  /// A backup read (§3.5): our own devices read it to change it; a device our verified list didn't name at the time
+  /// of the read is signing in. Judged from the frame and the list this device had pinned, never a later lookup.
+  void _backupOpenedElsewhere(String? deviceId) {
+    final m = messenger, user = state.user;
+    if (m == null || user == null) return;
+    final known = m.devices.pin(user.id, user.id)?.devices ?? const <String>[];
+    if (deviceId != null && known.contains(deviceId)) return;
+    state = state.copyWith(notice: 'Your backup was opened on a new device');
+  }
+
+  /// Refreshes [AppState.hasBackup] after a change on the backup screens.
+  Future<void> backupChanged() async {
+    try {
+      final backup = await _backupState();
+      state = state.copyWith(hasBackup: backup.has, backupUpdatedAt: backup.updatedAt);
+    } catch (_) {}
+  }
+
+  /// Whether the account has a backup, from our own device view (`backup: {epoch, updatedAt} | null`): never the
+  /// rate-limited, logged `GET /api/backup`, which only a restore or a change reads.
+  Future<({bool has, int? updatedAt})> _backupState() async {
+    final user = state.user ?? (throw StateError('Not signed in'));
+    final view = await _api.devices(user.username);
+    final backup = view['backup'], reset = view['reset'];
+    final self = (await messenger?.device())?.deviceId;
+    state = reset is Map && reset['requestedBy'] is Map
+        ? state.copyWith(
+            keyReset: (
+              platform: (reset['requestedBy'] as Map)['platform'] as String? ?? 'web',
+              at: reset['at'] as int,
+              executeAfter: reset['executeAfter'] as int,
+              mine: (reset['requestedBy'] as Map)['deviceId'] == self,
+            ),
+          )
+        : state.copyWith(clearKeyReset: true);
+    return backup is Map ? (has: true, updatedAt: backup['updatedAt'] as int?) : (has: false, updatedAt: null);
+  }
+
+  /// A listed device cancels someone's reset of the account key (M6 §6.5).
+  Future<void> cancelKeyReset() async {
+    await _api.cancelKeyReset();
+    state = state.copyWith(clearKeyReset: true);
+  }
+
+  /// §6.2: a device our newest signed list names that the server says was revoked (cut off from a device that
+  /// couldn't rotate): the user is asked to change the account key. The server can't make us rotate by itself.
+  Future<void> checkRemovedDevices() async {
+    final m = messenger, user = state.user;
+    if (m == null || user == null || !m.full) return;
+    try {
+      final view = await _api.devices(user.username);
+      final own = await _crypto.identity();
+      final owned = verifiedOwnList(view, userId: user.id, aikSign: own.sign, pin: m.devices.pin(user.id, user.id), metaKey: deviceMetaKey(await _crypto.deviceMetaSignature(user.id)));
+      final rows = (view['devices'] as List? ?? const []).cast<Map>();
+      final gone = owned?.where((d) => rows.any((r) => r['id'] == d.deviceId && r['state'] == 'revoked')).firstOrNull;
+      state = gone == null
+          ? state.copyWith(clearRemovedListed: true)
+          : state.copyWith(removedListed: (id: gone.deviceId, label: gone.described?['label'] ?? platformLabel(gone.described?['platform'] ?? 'web')));
+    } catch (_) {}
+  }
+
+  /// Revoke from a full device (§6.2): "Remove <label> and change your account key?". Revokes, then replaces the
+  /// account key (with the backup proof when there is a backup) so the removed device's copy is worthless.
+  Future<void> removeAndRotate(String deviceId, {Unlock? unlock, bool alreadyRemoved = false}) async {
+    final m = messenger, g = groups;
+    if (m == null || g == null) throw StateError('Not signed in');
+    // With a backup, removing a device needs the passphrase's proof (§6.3), checked here before anything changes.
+    final backup = (state.hasBackup ?? false) ? await accountBackup() : null;
+    final proven = await backup?.proveForRotation(unlock);
+    if (!m.full) {
+      // Not holding the key: only cut the device off; a device with the key finishes the job (§6.2).
+      await _api.revokeDevice(deviceId, proof: proven?.proof);
+      return;
+    }
+    if (!alreadyRemoved) {
+      try {
+        await _api.revokeDevice(deviceId, proof: proven?.proof);
+      } on ApiException catch (error) {
+        if (error.status != 404) rethrow; // Already revoked: finish the rotation.
+      }
+    }
+    await AccountRotation(api: _api, account: ref.read(accountCryptoProvider), groups: ref.read(groupCryptoProvider), messenger: m, platform: _api.client, backup: backup)
+        .rotate(removed: {deviceId}, proven: proven);
+    state = state.copyWith(clearRemovedListed: true);
+    await _reopen();
+    await _recommitLeaves();
+  }
+
+  /// "Your account key was changed from …, which removed …" stays until the user dismisses it (M6 §6.2 step 3).
+  Future<void> _keepKeyChangeNotice(String text) async {
+    final user = state.user;
+    if (user != null) await (await SharedPreferences.getInstance()).setString('key-change-notice-v1:${user.id}', text);
+    state = state.copyWith(keyChangeNotice: text);
+  }
+
+  Future<void> dismissKeyChangeNotice() async {
+    final user = state.user;
+    if (user != null) await (await SharedPreferences.getInstance()).remove('key-change-notice-v1:${user.id}');
+    state = state.copyWith(clearKeyChangeNotice: true);
+  }
+
+  Future<bool> _resumeRotation() async {
+    final m = messenger;
+    if (m == null || m.companion) return false;
+    try {
+      return await AccountRotation(
+        api: _api,
+        account: ref.read(accountCryptoProvider),
+        groups: ref.read(groupCryptoProvider),
+        messenger: m,
+        platform: _api.client,
+        backup: await accountBackup(),
+      ).resume();
+    } catch (_) {
+      return false; // Offline: tried again on the next start.
+    }
+  }
+
   /// "Use this device instead" (recovery without a primary, m5 §6): only ever from the user's confirmed tap. This
   /// device's key becomes the account's (contacts see the code change) and the first list under it names only
   /// this device: no device of the old key is trusted again.
@@ -785,7 +1145,7 @@ class AppController extends Notifier<AppState> {
 
   Future<void> _checkIdentity(String contactId) async {
     final contact = contactById(contactId);
-    if (contact == null) return;
+    if (contact == null || state.needsRestore) return;
     try {
       // The devices view also serves any succession chain, so a moved account keeps its verification.
       final view = await _api.devices(contact.username);

@@ -25,6 +25,16 @@ sealed class AccountEvent {
         'keys' => KeysChanged(m['id'] as String),
         'devices' => DevicesChanged(m['id'] as String, needsList: m['needsList'] == true),
         'link' => LinkEvent(m['id'] as String, m['event'] as String),
+        'reset' => ResetEvent(
+          m['id'] as String,
+          cancelled: m['cancelled'] == true,
+          deviceId: (m['requestedBy'] as Map?)?['deviceId'] as String?,
+          platform: (m['requestedBy'] as Map?)?['platform'] as String?,
+          at: m['at'] as int?,
+          executeAfter: m['executeAfter'] as int?,
+        ),
+        'rekey' => RekeyEvent(m['id'] as String, deviceId: m['deviceId'] as String?, answered: m['answered'] == true),
+        'backup' => BackupEvent(m['id'] as String, epoch: m['epoch'] as int?, read: m['read'] == true, deviceId: m['deviceId'] as String?),
         'recert' => RecertEvent(m['id'] as String, deviceId: m['deviceId'] as String?, answered: m['answered'] == true),
         'ended' => Ended(m['roomId'] as String),
         'incoming' => Incoming(
@@ -105,6 +115,34 @@ class DevicesChanged extends AccountEvent {
 
   /// To the primary after a revocation: publish the next list without the revoked device.
   final bool needsList;
+}
+
+/// Someone asked to reset the account key (M6 §6.5), or the request was cancelled.
+class ResetEvent extends AccountEvent {
+  const ResetEvent(this.id, {this.cancelled = false, this.deviceId, this.platform, this.at, this.executeAfter});
+  final String id;
+  final bool cancelled;
+  final String? deviceId;
+  final String? platform;
+  final int? at;
+  final int? executeAfter;
+}
+
+/// A device without the account key asked for it (to full devices), or its answer is in ([answered]), M6 §5.
+class RekeyEvent extends AccountEvent {
+  const RekeyEvent(this.id, {this.deviceId, this.answered = false});
+  final String id;
+  final String? deviceId;
+  final bool answered;
+}
+
+/// The account's key backup changed (`epoch`), or was opened (`read`) by a device signing in (M6 §3.5).
+class BackupEvent extends AccountEvent {
+  const BackupEvent(this.id, {this.epoch, this.read = false, this.deviceId});
+  final String id;
+  final int? epoch;
+  final bool read;
+  final String? deviceId;
 }
 
 /// A companion certificate request (to the primary) or its answer (to the companion, [answered]), m5 §5.2.2.

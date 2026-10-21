@@ -63,6 +63,10 @@ void main() {
       expect(openMeta(key, 'user_1', 'a' * 22, sealed), {'label': 'Mac app', 'platform': 'macos'});
       expect(openMeta(key, 'user_1', 'b' * 22, sealed), isNull, reason: 'bound to its entry');
       expect(openMeta(key, 'user_2', 'a' * 22, sealed), isNull, reason: 'bound to its account');
+      // M6 §5: a short-code link says so inside the sealed meta; nothing else may.
+      final code = sealMeta(key, 'user_1', 'a' * 22, label: 'Mac app', platform: 'macos', via: 'code');
+      expect(openMeta(key, 'user_1', 'a' * 22, code), {'label': 'Mac app', 'platform': 'macos', 'via': 'code'});
+      expect(() => sealMeta(key, 'user_1', 'a' * 22, label: 'Mac app', platform: 'macos', via: 'qr'), throwsA(anything));
       expect(() => sealMeta(key, 'user_1', 'a' * 22, label: 'x', platform: 'toaster'), throwsA(anything));
     });
 

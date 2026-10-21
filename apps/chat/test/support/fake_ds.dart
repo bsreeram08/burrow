@@ -23,6 +23,9 @@ class FakeDs {
   /// Tests: a different identity than the account's real one, as if its keys changed.
   final Map<String, Map<String, String>> identityOverride = {};
 
+  /// Succession records served in a user's devices view (user id → records).
+  final Map<String, List<Map<String, dynamic>>> succession = {};
+
   /// Tests: replace the admin's leaf signature in `rolled-back` (a server forging the notice).
   String? forgeRollback;
 
@@ -168,6 +171,13 @@ class FakeDs {
       final user = devices.values.where((d) => d.userId == identity[1]).firstOrNull;
       if (user == null) return _error('No such user.', 404);
       return _json({'userId': user.userId, 'username': user.username, 'identity': identityOverride[user.userId] ?? {'dh': 'dh-${user.userId}', 'sign': 'sign-${user.userId}'}});
+    }
+    final view = RegExp(r'^/api/devices/([a-z0-9_]+)$').firstMatch(path);
+    if (view != null && method == 'GET') {
+      final user = devices.values.where((d) => d.username == view[1]).firstOrNull;
+      if (user == null) return _error('No such user.', 404);
+      final chain = succession[user.userId];
+      return _json({'userId': user.userId, 'identity': _identity(user.userId), 'list': null, 'signature': null, 'certs': const {}, 'succession': ?chain});
     }
     final published = RegExp(r'^/api/keys/([a-z0-9_]+)/identity$').firstMatch(path);
     if (published != null) {

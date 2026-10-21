@@ -464,3 +464,83 @@ pub fn mls_recertify(platform: String, issued_at_ms: u64) -> Result<MlsDeviceCer
 }
 /// A DM pointer's group passes only if it is the DM of this account and `peer` and every leaf chains to the pins.
 pub fn mls_check_dm(group_id: String, peer_user_id: String) -> Result<()> { Ok(core::mls_check_dm(group_id, peer_user_id)?) }
+
+// ---------- The account key on every device and its backup (docs/m6-account-key.md §8.1) ----------
+// Records and backup keys travel as the contract's JSON text, so a field change needs no codegen.
+
+/// `backupCreate` / `backupReseal`: the unsigned record, the backup keys to keep, and what to show once.
+pub struct BackupResult {
+    pub record_json: String,
+    pub backup_keys_json: String,
+    pub words: Option<String>,
+    pub pass_proof: Option<String>,
+    pub recovery_proof: Option<String>,
+}
+fn backup_result(r: core::BackupResult) -> BackupResult {
+    BackupResult { record_json: r.record_json, backup_keys_json: r.backup_keys_json, words: r.words, pass_proof: r.pass_proof, recovery_proof: r.recovery_proof }
+}
+/// `backupOpen`: the AccountKey and the backup keys inside the box.
+pub struct BackupOpened {
+    pub account_key: String,
+    pub backup_keys_json: String,
+}
+/// `rekeyRequest`: what a companion sends to ask for the account key.
+pub struct RekeyRequest {
+    pub eph: String,
+    pub leaf_sig_key: String,
+    pub signature: String,
+}
+/// `rekeyOpen` / `rotateIdentity`: an identity and a JSON text beside it.
+pub struct IdentityWith {
+    pub identity: Identity,
+    pub json: Option<String>,
+}
+
+pub fn export_account_key(user_id: String) -> Result<String> { Ok(core::export_account_key(user_id)?) }
+pub fn import_account_key(user_id: String, key: String, published: Option<Identity>) -> Result<Identity> {
+    Ok(core::import_account_key(user_id, key, published.map(Into::into))?.into())
+}
+pub fn passphrase_generate() -> String { core::passphrase_generate() }
+pub fn backup_create(user_id: String, passphrase: String, account_key: Option<String>) -> Result<BackupResult> {
+    Ok(backup_result(core::backup_create(user_id, passphrase, account_key)?))
+}
+pub fn backup_sign_keys(user_id: String, record_json: String) -> Result<String> { Ok(core::backup_sign_keys(user_id, record_json)?) }
+pub fn backup_prove(record_json: String, passphrase: Option<String>, words: Option<String>) -> Result<String> { Ok(core::backup_prove(record_json, passphrase, words)?) }
+pub fn backup_reseal(user_id: String, record_json: String, account_key: Option<String>, passphrase: Option<String>, new_recovery: bool) -> Result<BackupResult> {
+    Ok(backup_result(core::backup_reseal(user_id, record_json, account_key, passphrase, new_recovery)?))
+}
+pub fn backup_open(user_id: String, record_json: String, passphrase: Option<String>, words: Option<String>, published: Option<Identity>) -> Result<BackupOpened> {
+    let o = core::backup_open(user_id, record_json, passphrase, words, published.map(Into::into))?;
+    Ok(BackupOpened { account_key: o.account_key, backup_keys_json: o.backup_keys_json })
+}
+pub fn backup_keys() -> Result<Option<String>> { Ok(core::backup_keys()?) }
+pub fn backup_keys_set(backup_keys_json: String) -> Result<String> { Ok(core::backup_keys_set(backup_keys_json)?) }
+pub fn rekey_request(user_id: String, device_id: String, platform: String) -> Result<RekeyRequest> {
+    let r = core::rekey_request(user_id, device_id, platform)?;
+    Ok(RekeyRequest { eph: r.eph, leaf_sig_key: r.leaf_sig_key, signature: r.signature })
+}
+#[allow(clippy::too_many_arguments)]
+pub fn rekey_answer(user_id: String, device_id: String, platform: String, eph: String, leaf_sig_key: String, signature: String, groups: Vec<String>, now_ms: u64) -> Result<String> {
+    Ok(core::rekey_answer(user_id, device_id, platform, eph, leaf_sig_key, signature, groups, now_ms)?)
+}
+pub fn rekey_open(user_id: String, device_id: String, platform: String, boxed: String) -> Result<IdentityWith> {
+    let (identity, keys) = core::rekey_open(user_id, device_id, platform, boxed)?;
+    Ok(IdentityWith { identity: identity.into(), json: keys })
+}
+/// A full core replaces its own key in two steps: `commit = false` mints it and signs the record (nothing changes);
+/// after the server took the record, the same `key`, `record_json` and `signature` with `commit = true` swap it.
+pub struct Rotation {
+    pub identity: Identity,
+    pub record_json: String,
+    pub key: String,
+}
+pub fn rotate_identity(user_id: String, key: Option<String>, record_json: Option<String>, signature: Option<String>, at: u64, commit: bool) -> Result<Rotation> {
+    let r = core::rotate_identity(user_id, key, record_json, signature, at, commit)?;
+    Ok(Rotation { identity: r.identity.into(), record_json: r.record_json, key: r.key })
+}
+/// A rotation prepared (and stored in the core) but not committed: its new identity and the signed record (JSON).
+pub fn rotation_pending() -> Result<Option<IdentityWith>> {
+    Ok(core::rotation_pending()?.map(|p| IdentityWith { identity: p.identity.into(), json: Some(p.record_json) }))
+}
+/// Forgets a prepared rotation (the server still publishes the old key).
+pub fn rotation_drop() -> Result<()> { Ok(core::rotation_drop()?) }

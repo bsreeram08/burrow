@@ -114,6 +114,8 @@ struct Pending {
     fresh: Option<(u64, Handshake)>,
 }
 
+#[cfg(feature = "mls")]
+mod account;
 mod companion;
 pub use companion::{Account, LinkAccepted, PinExport};
 

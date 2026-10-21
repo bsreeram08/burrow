@@ -21,6 +21,9 @@ base64 = "=0.22.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.140", features = ["preserve_order"] }
 zeroize = { version = "=1.9.1", features = ["derive"] }
+# The account-key backup (docs/m6-account-key.md §3): Argon2id and NFKC normalization of the passphrase.
+argon2 = { version = "=0.5.3", default-features = false, features = ["alloc"], optional = true }
+unicode-normalization = { version = "=0.1.24", default-features = false, optional = true }
 rusqlite = { version = "=0.32.1", features = ["bundled"], optional = true }
 # WebAssembly (crates/chatcore-wasm): browser randomness and clock.
 getrandom = { version = "=0.2.17", features = ["js"], optional = true }
@@ -36,7 +39,7 @@ getrandom04 = { package = "getrandom", version = "=0.4.3", features = ["wasm_js"
 [features]
 default = ["native", "mls", "ds"]
 # Groups over MLS: the client engine (create, join, commit, receive, encrypt, KeyPackages, payloads).
-mls = ["dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_traits", "dep:openmls_basic_credential"]
+mls = ["dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_traits", "dep:openmls_basic_credential", "dep:argon2", "dep:unicode-normalization"]
 # The delivery service's commit validator over public group state (the same validator `mls` runs).
 # Build with `--no-default-features --features ds,wasm` for the Bun/Node delivery service.
 ds = ["dep:openmls", "dep:openmls_rust_crypto", "dep:openmls_traits", "dep:openmls_basic_credential"]
@@ -55,3 +58,9 @@ required-features = ["native"]
 
 [profile.release]
 lto = true
+
+# Argon2id at 64 MiB is far too slow unoptimized; tests and debug builds still need it to finish in seconds.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3

@@ -43,7 +43,7 @@ fn ok<T: serde::Serialize>(value: T) -> Result<Value> { Ok(serde_json::to_value(
 /// `None`: not an MLS command.
 pub fn run(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>> {
     #[cfg(feature = "mls")]
-    if cmd.starts_with("mls") || matches!(cmd, "companionSetup" | "signDeviceCert" | "adoptSuccession") { return run_mls(core, cmd, command); }
+    if cmd.starts_with("mls") || matches!(cmd, "companionSetup" | "signDeviceCert" | "adoptSuccession" | "rotateIdentity" | "rotationPending" | "rotationDrop" | "rekeyRequest" | "rekeyAnswer" | "rekeyOpen") { return run_mls(core, cmd, command); }
     #[cfg(feature = "ds")]
     if cmd.starts_with("ds") { return run_ds(core, cmd, command); }
     let _ = (core, cmd, command);
@@ -87,6 +87,33 @@ fn run_mls(core: &mut Core, cmd: &str, command: &Value) -> Option<Result<Value>>
             "companionSetup" => {
                 let identity: crate::protocol::IdentityPub = serde_json::from_value(command.get("identity").cloned().unwrap_or(Value::Null)).map_err(|_| ChatError::coded("invalid", "Invalid identity"))?;
                 return ok(core.companion_setup(&text(command, "userId")?, &identity, &text(command, "cert")?)?);
+            }
+            // The account key to a companion (docs/m6-account-key.md §5).
+            "rekeyRequest" => return ok(core.rekey_request(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "platform")?)?),
+            "rekeyAnswer" => {
+                let listed = command.get("groups").and_then(Value::as_array).ok_or_else(|| ChatError::coded("invalid", "groups must be a list"))?;
+                if listed.len() > 1000 { return Err(ChatError::coded("invalid", "too many groups")); }
+                let ids = listed.iter().map(|g| g.as_str().ok_or_else(|| ChatError::coded("invalid", "group ids are strings")).and_then(group_id)).collect::<Result<Vec<_>>>()?;
+                let keys = match command.get("backupKeys") { None | Some(Value::Null) => None, Some(value) => Some(crate::account_key::BackupKeys::parse(value)?) };
+                return ok(core.rekey_answer(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "platform")?, &text(command, "eph")?, &text(command, "leafSigKey")?, &text(command, "signature")?, &ids, command.get("now").and_then(Value::as_u64).unwrap_or(0), keys.as_ref())?);
+            }
+            "rekeyOpen" => {
+                let (identity, backup_keys) = core.rekey_open(&text(command, "userId")?, &text(command, "deviceId")?, &text(command, "platform")?, &text(command, "box")?)?;
+                return ok(serde_json::json!({ "identity": identity, "backupKeys": backup_keys }));
+            }
+            // A prepared rotation survives a restart (docs/m6-account-key.md §6.2): look at it, or drop it.
+            "rotationPending" => return ok(core.rotation_pending()?.map(|(identity, record)| serde_json::json!({ "identity": identity, "record": record }))),
+            "rotationDrop" => { core.rotation_drop()?; return Ok(Value::Null); }
+            // A full core replaces its own account identity (docs/m6-account-key.md §6.2).
+            "rotateIdentity" => {
+                let external = match (command.get("record"), command.get("signature").and_then(Value::as_str)) {
+                    (Some(record), Some(signature)) => Some((record, signature)),
+                    (None, None) => None,
+                    _ => return Err(ChatError::coded("invalid", "give both the record and its signature, or neither")),
+                };
+                let commit = command.get("commit").and_then(Value::as_bool).unwrap_or(true);
+                let (identity, record, key) = core.rotate_identity(&text(command, "userId")?, command.get("key").and_then(Value::as_str), external, command.get("at").and_then(Value::as_u64).unwrap_or(0), commit)?;
+                return ok(serde_json::json!({ "identity": identity, "record": record, "key": key }));
             }
             "adoptSuccession" => {
                 let record = command.get("record").ok_or_else(|| ChatError::coded("invalid", "record is required"))?;

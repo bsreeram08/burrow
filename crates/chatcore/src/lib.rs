@@ -4,6 +4,8 @@
 
 #[cfg(feature = "native")]
 pub mod api;
+#[cfg(feature = "mls")]
+pub mod account_key;
 pub mod commands;
 pub mod core;
 pub mod devicelist;

@@ -149,6 +149,135 @@ pub fn adopt_succession(user_id: String, record_json: String, signature: String,
     let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed succession record"))?;
     with(|core| core.adopt_succession(&user_id, &record, &signature, cert_json.as_deref()))
 }
+
+// ---------- The account key on every device and its backup (docs/m6-account-key.md) ----------
+
+/// A backup record (JSON, unsigned), the backup keys (JSON) to keep after the server accepts it, and, for what was
+/// made or changed, the recovery words (show once) and the proofs the server checks against the record's hashes.
+#[cfg(feature = "mls")]
+pub struct BackupResult {
+    pub record_json: String,
+    pub backup_keys_json: String,
+    pub words: Option<String>,
+    pub pass_proof: Option<String>,
+    pub recovery_proof: Option<String>,
+}
+
+/// An opened backup: the AccountKey and the backup keys (JSON) to store.
+#[cfg(feature = "mls")]
+pub struct BackupOpened {
+    pub account_key: String,
+    pub backup_keys_json: String,
+}
+
+/// The AccountKey (§1) of this full core, base64url. `companion` on a core without the account key.
+#[cfg(feature = "mls")]
+pub fn export_account_key(user_id: String) -> Result<String> { with(|core| core.export_account_key(&user_id)) }
+/// Makes this core full: a companion's (checked against the identity it pins), or a restore's (checked against `published`).
+#[cfg(feature = "mls")]
+pub fn import_account_key(user_id: String, key: String, published: Option<IdentityPub>) -> Result<IdentityPub> { with(|core| core.import_account_key(&user_id, &key, published.as_ref())) }
+/// Six words: the passphrase offered by default.
+#[cfg(feature = "mls")]
+pub fn passphrase_generate() -> String { Core::generate_passphrase() }
+/// A first backup (epoch 1) sealed to the passphrase and a fresh recovery key. `account_key` only for a core that does not hold the key.
+#[cfg(feature = "mls")]
+pub fn backup_create(user_id: String, passphrase: String, account_key: Option<String>) -> Result<BackupResult> {
+    with(|core| {
+        let out = core.backup_create(&user_id, &passphrase, account_key.as_deref())?;
+        Ok(BackupResult { record_json: out.record.to_string(), backup_keys_json: out.backup_keys.to_string(), words: Some(out.words), pass_proof: Some(out.pass_proof), recovery_proof: Some(out.recovery_proof) })
+    })
+}
+/// The AIK's signature over the record's keys bytes (full core).
+#[cfg(feature = "mls")]
+pub fn backup_sign_keys(user_id: String, record_json: String) -> Result<String> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed backup"))?;
+    with(|core| core.backup_sign_keys(&user_id, &record))
+}
+/// The proof of knowing the passphrase or the recovery words (exactly one), for a change, a delete or a rotation. `auth` if wrong.
+#[cfg(feature = "mls")]
+pub fn backup_prove(record_json: String, passphrase: Option<String>, words: Option<String>) -> Result<String> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed backup"))?;
+    with(|core| core.backup_prove(&record, passphrase.as_deref(), words.as_deref()))
+}
+/// The record again at epoch + 1, sealed to the backup keys this core holds: after a rotation, a new passphrase, or a new recovery key.
+#[cfg(feature = "mls")]
+pub fn backup_reseal(user_id: String, record_json: String, account_key: Option<String>, passphrase: Option<String>, new_recovery: bool) -> Result<BackupResult> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed backup"))?;
+    with(|core| {
+        let held = core.backup_keys()?.ok_or_else(|| ChatError::coded("invalid", "this device holds no backup keys"))?;
+        let out = core.backup_reseal(&user_id, &record, &held, account_key.as_deref(), passphrase.as_deref(), new_recovery)?;
+        Ok(BackupResult { record_json: out.record.to_string(), backup_keys_json: out.backup_keys.to_string(), words: out.words, pass_proof: out.pass_proof, recovery_proof: out.recovery_proof })
+    })
+}
+/// The AccountKey and backup keys from a signed backup, with the passphrase or the 24 words (exactly one). `auth` for a wrong one.
+#[cfg(feature = "mls")]
+pub fn backup_open(user_id: String, record_json: String, passphrase: Option<String>, words: Option<String>, published: Option<IdentityPub>) -> Result<BackupOpened> {
+    let record = serde_json::from_str(&record_json).map_err(|_| ChatError::coded("invalid", "malformed backup"))?;
+    with(|core| { let (account_key, keys) = core.backup_open(&user_id, &record, passphrase.as_deref(), words.as_deref(), published.as_ref())?; Ok(BackupOpened { account_key, backup_keys_json: keys.to_string() }) })
+}
+/// The backup keys (JSON) this core holds, if any; remember new ones (never lowering the epoch) after the server accepted them.
+#[cfg(feature = "mls")]
+pub fn backup_keys() -> Result<Option<String>> { with(|core| Ok(core.backup_keys()?.map(|k| k.json().to_string()))) }
+#[cfg(feature = "mls")]
+pub fn backup_keys_set(backup_keys_json: String) -> Result<String> {
+    let keys = crate::account_key::BackupKeys::parse(&serde_json::from_str(&backup_keys_json).map_err(|_| ChatError::coded("invalid", "malformed backup keys"))?)?;
+    with(|core| Ok(core.set_backup_keys(&keys)?.json().to_string()))
+}
+/// What a companion's rekey request carries (§5).
+#[cfg(feature = "mls")]
+pub struct RekeyRequest {
+    pub eph: String,
+    pub leaf_sig_key: String,
+    pub signature: String,
+}
+/// A companion asks for the account key; repeating returns the same request.
+#[cfg(feature = "mls")]
+pub fn rekey_request(user_id: String, device_id: String, platform: String) -> Result<RekeyRequest> {
+    let value = with(|core| core.rekey_request(&user_id, &device_id, &platform))?;
+    let text = |key: &str| value[key].as_str().unwrap_or_default().to_string();
+    Ok(RekeyRequest { eph: text("eph"), leaf_sig_key: text("leafSigKey"), signature: text("signature") })
+}
+/// A full device answers a request: the box for the companion. `groups` are the channels this device is in.
+#[cfg(feature = "mls")]
+pub fn rekey_answer(user_id: String, device_id: String, platform: String, eph: String, leaf_sig_key: String, signature: String, groups: Vec<String>, now_ms: u64) -> Result<String> {
+    let ids = groups.iter().map(|g| crate::mls::engine::group_id(g)).collect::<Result<Vec<_>>>()?;
+    with(|core| core.rekey_answer(&user_id, &device_id, &platform, &eph, &leaf_sig_key, &signature, &ids, now_ms, None))
+}
+/// The companion opens the answer; it is full afterwards. Returns the identity and the backup keys (JSON) it holds, if any.
+#[cfg(feature = "mls")]
+pub fn rekey_open(user_id: String, device_id: String, platform: String, boxed: String) -> Result<(IdentityPub, Option<String>)> {
+    with(|core| { let (identity, keys) = core.rekey_open(&user_id, &device_id, &platform, &boxed)?; Ok((identity, keys.map(|k| k.to_string()))) })
+}
+
+/// A full core replaces its own account identity: with `key` (an AccountKey) or a fresh one. Returns the new identity and the signed
+/// succession record (JSON) for the server and the new AccountKey. With `record_json` and `signature` the record was signed elsewhere
+/// (it is checked). With `commit = false` nothing changes: send the record to the server first, then call again with the returned
+/// `key`, record and signature and `commit = true`.
+#[cfg(feature = "mls")]
+pub struct RotateResult {
+    pub identity: IdentityPub,
+    pub record_json: String,
+    pub key: String,
+}
+/// The rotation prepared (`commit = false`) and not yet committed, if any: it survives a restart. On start: when the server publishes that
+/// identity, call `rotate_identity` with no key, record or signature and `commit = true` to finish; when it still publishes the old key, `rotation_drop`.
+#[cfg(feature = "mls")]
+pub fn rotation_pending() -> Result<Option<RotationPending>> {
+    with(|core| Ok(core.rotation_pending()?.map(|(identity, record)| RotationPending { identity, record_json: record.to_string() })))
+}
+#[cfg(feature = "mls")]
+pub struct RotationPending {
+    pub identity: IdentityPub,
+    pub record_json: String,
+}
+#[cfg(feature = "mls")]
+pub fn rotation_drop() -> Result<()> { with(|core| core.rotation_drop()) }
+#[cfg(feature = "mls")]
+pub fn rotate_identity(user_id: String, key: Option<String>, record_json: Option<String>, signature: Option<String>, at: u64, commit: bool) -> Result<RotateResult> {
+    let record: Option<serde_json::Value> = record_json.map(|text| serde_json::from_str(&text).map_err(|_| ChatError::coded("invalid", "malformed succession record"))).transpose()?;
+    let external = match (&record, &signature) { (Some(record), Some(signature)) => Some((record, signature.as_str())), (None, None) => None, _ => return Err(ChatError::coded("invalid", "give both the record and its signature, or neither")) };
+    with(|core| { let (identity, signed, key) = core.rotate_identity(&user_id, key.as_deref(), external, at, commit)?; Ok(RotateResult { identity, record_json: signed.to_string(), key }) })
+}
 /// Old primary: the signed record (JSON, `signature` included) for the new identity.
 pub fn sign_succession(user_id: String, published_sign: String, new_sign: String, new_dh: String, at: u64) -> Result<String> {
     with(|core| Ok(core.sign_succession(&user_id, &published_sign, &new_sign, &new_dh, at)?.to_string()))

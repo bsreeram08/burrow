@@ -523,6 +523,19 @@ impl Groups {
         Ok(GroupInspection { group_id: group_text(public.group_id()), members })
     }
 
+    /// This device's installed certificate.
+    pub fn own_cert(&mut self, store: &mut dyn Store) -> Result<DeviceCert> { Self::device(store) }
+
+    /// Signs `data` with this device's MLS leaf signature key (made on first use); returns `(leafSigKey, signature)`
+    /// in base64url. Only for the fixed byte strings `core::account` builds (docs/m6-account-key.md §5).
+    pub fn leaf_sign(&mut self, store: &mut dyn Store, data: &[u8]) -> Result<(String, String)> {
+        let leaf = self.device_leaf(store)?;
+        let public = key32(&leaf).ok_or_else(|| ChatError::storage("malformed leaf key"))?;
+        let signer = SignatureKeyPair::read(self.provider.storage(), &public, SignatureScheme::ED25519).ok_or_else(|| ChatError::storage("device signature key missing"))?;
+        let signature = openmls_traits::signatures::Signer::sign(&signer, data).map_err(|_| ChatError::storage("signing failed"))?;
+        Ok((leaf, b64(&signature)))
+    }
+
     /// Whether one of this account's devices (`device_id`) holds exactly `leaf_sig_key` as a current leaf in any of
     /// `groups` (groups that fail their load gate prove nothing). A new primary asks this before it certifies a
     /// companion's leaf under the new account key: a key the server or the device merely claims is not enough, only

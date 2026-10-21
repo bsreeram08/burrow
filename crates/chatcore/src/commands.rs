@@ -31,6 +31,14 @@ pub fn respond(core: &mut Core, command: &Value) -> Value {
     }
 }
 
+#[cfg(feature = "mls")]
+fn shown_identity_at(command: &Value, key: &str) -> crate::error::Result<Option<IdentityPub>> {
+    match command.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone()).map(Some).map_err(|_| ChatError::coded("invalid", "malformed identity")),
+    }
+}
+
 fn now(command: &Value) -> u64 { command.get("now").and_then(Value::as_u64).unwrap_or(0) }
 
 fn text(command: &Value, key: &str) -> Result<String, ChatError> {
@@ -120,6 +128,38 @@ pub fn run(core: &mut Core, command: &Value) -> Result<Value, ChatError> {
             };
             Ok(json!(core.sign_device_list(&text(command, "userId")?, &text(command, "published")?, &list, head.as_ref())?))
         }
+        // The account key on every device and its backup (docs/m6-account-key.md).
+        #[cfg(feature = "mls")]
+        "exportAccountKey" => Ok(json!(core.export_account_key(&text(command, "userId")?)?)),
+        #[cfg(feature = "mls")]
+        "importAccountKey" => Ok(json!(core.import_account_key(&text(command, "userId")?, &text(command, "key")?, shown_identity_at(command, "published")?.as_ref())?)),
+        #[cfg(feature = "mls")]
+        "passphraseGenerate" => Ok(json!(Core::generate_passphrase())),
+        #[cfg(feature = "mls")]
+        "backupCreate" => {
+            let out = core.backup_create(&text(command, "userId")?, &text(command, "passphrase")?, command.get("accountKey").and_then(Value::as_str))?;
+            Ok(json!({ "record": out.record, "words": out.words, "backupKeys": out.backup_keys, "passProof": out.pass_proof, "recoveryProof": out.recovery_proof }))
+        }
+        #[cfg(feature = "mls")]
+        "backupSignKeys" => Ok(json!(core.backup_sign_keys(&text(command, "userId")?, command.get("record").unwrap_or(&Value::Null))?)),
+        #[cfg(feature = "mls")]
+        "backupProve" => Ok(json!({ "proof": core.backup_prove(command.get("record").unwrap_or(&Value::Null), command.get("passphrase").and_then(Value::as_str), command.get("words").and_then(Value::as_str))? })),
+        #[cfg(feature = "mls")]
+        "backupReseal" => {
+            let held = match command.get("backupKeys") { None | Some(Value::Null) => core.backup_keys()?, Some(value) => Some(crate::account_key::BackupKeys::parse(value)?) }
+                .ok_or_else(|| ChatError::coded("invalid", "this device holds no backup keys"))?;
+            let out = core.backup_reseal(&text(command, "userId")?, command.get("record").unwrap_or(&Value::Null), &held, command.get("accountKey").and_then(Value::as_str), command.get("passphrase").and_then(Value::as_str), command.get("newRecovery").and_then(Value::as_bool).unwrap_or(false))?;
+            Ok(json!({ "record": out.record, "backupKeys": out.backup_keys, "words": out.words, "passProof": out.pass_proof, "recoveryProof": out.recovery_proof }))
+        }
+        #[cfg(feature = "mls")]
+        "backupOpen" => {
+            let (account_key, backup_keys) = core.backup_open(&text(command, "userId")?, command.get("record").unwrap_or(&Value::Null), command.get("passphrase").and_then(Value::as_str), command.get("words").and_then(Value::as_str), shown_identity_at(command, "published")?.as_ref())?;
+            Ok(json!({ "accountKey": account_key, "backupKeys": backup_keys }))
+        }
+        #[cfg(feature = "mls")]
+        "backupKeys" => Ok(json!(core.backup_keys()?.map(|k| k.json()))),
+        #[cfg(feature = "mls")]
+        "backupKeysSet" => Ok(json!(core.set_backup_keys(&crate::account_key::BackupKeys::parse(command.get("backupKeys").unwrap_or(&Value::Null))?)?.json())),
         "linkQr" => Ok(json!({ "qr": core.link_qr(&text(command, "linkId")?, now(command))? })),
         "linkAccept" => Ok(json!(core.link_accept(&text(command, "qr")?, now(command))?)),
         "linkComplete" => Ok(json!({ "code": core.link_complete(&text(command, "linkId")?, &text(command, "eph")?, now(command))? })),

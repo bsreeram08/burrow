@@ -381,9 +381,8 @@ fn a_companion_with_its_key_outside_the_core_adopts_a_signed_succession_and_inst
     let (record, signature) = record_of(&signed);
     let new_cert = String::from_utf8(DeviceCert::issue(&next_key, &w.user, &device, "web", &URL_SAFE_NO_PAD.decode(&leaf).unwrap().try_into().unwrap(), 9_001).unwrap().encode()).unwrap();
 
-    // A primary holds the key itself and uses succession_complete; a record that does not continue from the pin, a
-    // tampered one, another account's, or a certificate under another key changes nothing.
-    assert!(w.primary.adopt_succession(&w.user, &record, &signature, None).is_err());
+    // A record that does not continue from the pin, a tampered one, another account's, or a certificate under another key
+    // changes nothing. (A full core follows a rotation too, since M6: see tests/account_key.rs.)
     let mut tampered = record.clone();
     tampered["at"] = json!(9_001);
     assert_eq!(code_of(w.new.adopt_succession(&w.user, &tampered, &signature, None)).as_deref(), Some("auth"));

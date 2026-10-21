@@ -92,23 +92,20 @@
     if (context.backend === 'wasm') { reason = 'Groups and channels need the standard encryption core on this device (Settings → Advanced).'; ctx.render(); return; }
     if (!navigator.locks || !window.Core?.supported()) { reason = 'This browser is too old for groups and channels.'; ctx.render(); return; }
     reason = 'Getting groups ready…';
+    // A restart in this tab (e.g. after following a key change, m6 §6.2) already holds the account's lock: it never ends.
+    if (lockedFor === me.id) { starting = setup(mine); return; }
     navigator.locks.request(`groups:${me.id}`, { ifAvailable: true }, lock => {
       if (mine !== generation) return;
-      if (lock) { starting = setup(mine); return new Promise(() => {}); }
+      if (lock) { lockedFor = me.id; starting = setup(mine); return new Promise(() => {}); }
       reason = 'Your groups are open in another tab of this browser. Use that tab, or close it to use them here.';
       ctx.render();
       // Take over when that tab goes away.
-      navigator.locks.request(`groups:${me.id}`, () => { if (mine !== generation) return; starting = setup(mine); return new Promise(() => {}); });
+      const id = me.id;
+      navigator.locks.request(`groups:${id}`, () => { lockedFor = id; if (mine !== generation) return; starting = setup(mine); return new Promise(() => {}); });
     });
   }
-  /**
-   * A primary handing the account over (m5 §5.2) reads nothing more until it has stepped down and reloaded: the new
-   * primary's recertifying commits are under a key this store doesn't hold yet, and must not be reported as bad.
-   */
-  let held = false;
-  const hold = () => { held = true; };
+  let lockedFor = null;
   function stop() {
-    held = false;
     generation++; enabled = false; ctx = null; run = null; me = null; currentId = null; channels = new Map(); queues.clear(); pinned.clear();
     for (const timer of cursorTimers.values()) clearTimeout(timer);
     cursorTimers.clear(); typingFrom.clear();
@@ -126,6 +123,8 @@
       instance = linked?.instance || (kept?.aik === aik && kept.instance) || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
       run = window.Core.groupStore(me.id, instance);
       load();
+      // This device replaced the account key (m6 §6.2): every group gets a self-update with the new certificate.
+      if (localStorage.getItem(`mls-recertify-v1:${instance}`)) { for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true; persist(); localStorage.removeItem(`mls-recertify-v1:${instance}`); }
       if (linked) await ctx.followOwnSuccession?.().catch(() => {}); // Our account moved to a new primary meanwhile (m5 §5.2 step 6).
       const certified = `mls-cert-v1:${instance}`;
       if (!linked && localStorage.getItem(certified) !== '1') {
@@ -143,10 +142,10 @@
       await refreshChannels();
       await welcomes();
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
-      for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id);
       flushAll();
       ctx.render();
-      removeOwnStale().catch(() => {});
+      // Leaves of removed devices go first: a group holding a device the new key's list dropped refuses other commits.
+      removeOwnStale().catch(() => {}).finally(() => { for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id); });
       ctx.recerts?.(); // Certificates under a new account key: asked for, answered or installed (m5 §5.2.2).
     } catch (error) {
       if (mine !== generation) return;
@@ -184,6 +183,14 @@
     for (const [id, ch] of channels) if (!['left', 'removed'].includes(ch.status)) { ch.recertify = true; if (usable(ch)) recertify(id); }
     persist();
   }
+  /** A certificate under the account key arrived with the key (m6 §5 rekey): every group gets a self-update carrying it. */
+  function recertifyAll(aik) {
+    certUnder(aik);
+    for (const [id, ch] of channels) if (!['left', 'removed'].includes(ch.status)) { ch.recertify = true; if (usable(ch)) recertify(id); }
+    persist();
+  }
+  /** m6 §5 step 2: seals the account key for a waiting device; the core checks its leaf signature and that our groups hold that leaf. */
+  const rekeyAnswer = request => run({ cmd: 'rekeyAnswer', userId: me.id, deviceId: request.deviceId, platform: request.platform, eph: request.eph, leafSigKey: request.leafSigKey, signature: request.signature, groups: [...channels].filter(([, ch]) => usable(ch)).map(([id]) => id), now: Date.now(), ...(request.backupKeys ? { backupKeys: request.backupKeys } : {}) });
   /** Is exactly this (device, leaf key) of our account already a leaf in a group this device holds? (m5 §5.2.2) */
   const leafKnown = (target, leafSigKey) => run({ cmd: 'mlsLeafKnown', deviceId: target, leafSigKey, groups: [...channels].filter(([, ch]) => usable(ch)).map(([id]) => id) });
   /** When this device joins the signed list (or anything about our devices changes), try again. */
@@ -225,24 +232,46 @@
         if (found.status === 200) { published = found.body.identity; remember(userId, found.body.username); }
       }
       if (theirs) {
-        // The 1:1 pin is the authority. A newer published key goes through its review, never around it.
-        if (published && !same(published, theirs.identity) && !theirs.blocked) await ctx.box.notePeer(userId, published).catch(() => {});
+        // The 1:1 pin is the authority. A newer published key goes through account.js, which follows a signed record (and
+        // posts the one "updated their security key" notice) or else records it for review, never around it.
+        if (published && !same(published, theirs.identity) && !theirs.blocked) {
+          if (ctx.followContact) await ctx.followContact(userId).catch(() => false);
+          else await ctx.box.notePeer(userId, published).catch(() => {});
+        }
         const current = published && !same(published, theirs.identity) ? await ctx.box.peer(userId) : theirs;
         if (current.blocked) { problems.push(userId); continue; }
         // First sight is trust on first use; a different key than the group store knew is a change, and a change
         // waits for an explicit review (the group sheet, or accepting it in the 1:1 safety sheet). Never silent.
+        if (mine && !same(mine.identity, current.identity) && await followChain(userId, mine.identity, current.identity)) { mine = await run({ cmd: 'peer', contact: userId }); changed = true; }
         if (mine && !same(mine.identity, current.identity)) rememberChange(userId, mine.identity, current.identity);
         if (!same(mine?.identity, current.identity)) { mine = await run({ cmd: 'notePeer', contact: userId, identity: current.identity }); changed = true; }
         if (mine.blocked) { problems.push(userId); continue; }
         pinned.add(userId); continue;
       }
       if (!mine && !published) { problems.push(userId); continue; }
+      if (mine && published && !same(mine.identity, published) && await followChain(userId, mine.identity, published)) { mine = await run({ cmd: 'peer', contact: userId }); changed = true; }
       if (mine && published && !same(mine.identity, published)) rememberChange(userId, mine.identity, published);
       if (!mine || (published && !same(mine.identity, published))) { mine = await run({ cmd: 'notePeer', contact: userId, identity: published }); changed = true; }
       if (mine.blocked) { problems.push(userId); continue; }
       pinned.add(userId);
     }
     return { problems, changed };
+  }
+  /**
+   * Someone's key moved by a signed record (m6 §6.2, m5 §5.3): the group store follows the chain from the key it pins,
+   * whatever order the frames came in (a commit under the new key may arrive before the 1:1 pin moved), so no review
+   * is asked for. Resolves true when the pin moved. Anything else stays a change to review.
+   */
+  async function followChain(userId, from, to) {
+    const username = names[userId] || ctx.contacts().find(contact => contact.id === userId)?.username;
+    if (!username) return false;
+    const view = await call(`/api/devices/${encodeURIComponent(username)}`);
+    // The same check the 1:1 side uses (Devices.successionFrom): only from a pin that was accepted, each record signed by
+    // the key before it, the first by the pinned key, the last naming the served one; the core checks the chain again.
+    const pinned = await run({ cmd: 'peer', contact: userId }).catch(() => null);
+    const path = view.status === 200 && view.body.succession?.length && same(pinned?.identity, from) ? await window.DeviceFormat.successionFrom(userId, pinned, to, view.body.succession) : null;
+    if (!path) return false;
+    try { await run({ cmd: 'acceptSuccession', contact: userId, records: path }); return true; } catch { return false; }
   }
   // A changed code of someone met in a group: what it was and what it is now, kept until the user decides (§3).
   const changesKey = () => `pin-changes-v1:${instance}`;
@@ -389,7 +418,8 @@
     if (!own) return false;
     try {
       // The served tree, validated like a join (read-only): it must be this channel's group, holding a leaf of ours.
-      const view = await run({ cmd: 'mlsInspectGroup', groupInfo: info.groupInfo, tree: info.tree });
+      // Members this device hasn't pinned yet (a fresh device) are pinned first, as for any join.
+      const view = await withPins(id, () => run({ cmd: 'mlsInspectGroup', groupInfo: info.groupInfo, tree: info.tree }));
       return view?.groupId === id && Array.isArray(view.members) && view.members.some(member => member.userId === me.id && !member.stale && member.deviceId !== deviceId && own.listed.has(member.deviceId));
     } catch { return false; }
   }
@@ -530,7 +560,6 @@
   // ---------- Receiving (§6) ----------
   /** Frames from account.js's event stream. */
   function frame(message) {
-    if (held) return;
     if (!enabled) { if (message.type === 'devices') devicesChanged(); return; }
     if (message.type === 'group') onGroup(message);
     else if (message.type === 'welcome') enqueue('welcome', () => takeWelcome(message.id, message)).catch(() => {});
@@ -563,7 +592,6 @@
     return true;
   }
   async function syncInner(id) {
-    if (held) return;
     const ch = channels.get(id);
     for (let pages = 0; pages < 400 && usable(ch); pages++) {
       const result = await call(`/api/channels/${id}/log?after=${ch.cursor}`);
@@ -1450,7 +1478,7 @@
     dmChannelWith: peerId => [...channels].find(([, ch]) => ch.kind === 'dm' && ch.peer === peerId && ch.dmChecked === peerId && usable(ch))?.[0] || null,
     /** The link commands of this device's group store (docs/m5-linking.md §1.2): the primary's end of a link. */
     /** For a primary transfer (m5 §5): this store's name, its leaf key, its pins, and adopting the new account key. */
-    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown, certAik, hold,
+    instance: () => instance, leafKey: () => run({ cmd: 'mlsDeviceLeaf' }), exportPins: () => run({ cmd: 'exportPins' }), importPins: pins => run({ cmd: 'importPins', pins }), adoptSuccession, installCert, leafKnown, certAik, recertifyAll, rekeyAnswer,
     linkCore: command => enabled && /^link[A-Z]/.test(command?.cmd || '') ? run({ ...command, now: Date.now() }) : Promise.reject(new Error(reason || 'Groups are not ready on this device.')),
     /** Names and topics for a linked device's bundle (§2): private names exist only on devices. */
     bundleChannels: () => [...channels].filter(([, ch]) => ['active', 'frozen', 'paused'].includes(ch.status) && ch.kind !== 'dm').map(([id, ch]) => ({ id, kind: ch.kind, name: ch.meta?.name || ch.serverName || null, topic: ch.meta?.topic || null })), sections, open, close, info, nameOf, receiptInfo, openNew, openBrowser, openInfo,

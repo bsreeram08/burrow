@@ -128,6 +128,37 @@
   // ---------- Linking and succession (docs/m5-linking.md §1.3, §5.1) ----------
   const PLATFORM_OK = value => typeof value === 'string' && PLATFORMS.includes(value);
   const key32 = value => { const bytes = typeof value === 'string' && KEY.test(value) ? unb64(value) : null; if (!bytes || bytes.length !== 32) fail('Invalid key'); return bytes; };
+  // ---------- M6 (docs/m6-account-key.md) ----------
+  const ACCOUNT_KEY = 'webrtc-bun-account-key-v1';
+  /** §1: the AccountKey bytes, the only form in which the account key leaves a device. */
+  function accountKeyBytes(userId, signSeed, dhSecret) {
+    if (typeof userId !== 'string' || !USER_ID.test(userId) || signSeed?.length !== 32 || dhSecret?.length !== 32) fail('Invalid account key');
+    return writer().text16(ACCOUNT_KEY).text16(userId).bytes8(signSeed).bytes8(dhSecret).done();
+  }
+  /** Reads AccountKey bytes for `userId` (anything else, or trailing bytes: refused). The caller zeroes the result. */
+  function parseAccountKey(bytes, userId) {
+    const label = encoder.encode(ACCOUNT_KEY), id = encoder.encode(userId);
+    const want = 2 + label.length + 2 + id.length + 1 + 32 + 1 + 32;
+    if (!(bytes instanceof Uint8Array) || bytes.length !== want) fail('Invalid account key');
+    const expected = writer().text16(ACCOUNT_KEY).text16(userId).done();
+    if (expected.some((byte, at) => bytes[at] !== byte) || bytes[expected.length] !== 32 || bytes[expected.length + 33] !== 32) fail('Invalid account key');
+    return { signSeed: bytes.slice(expected.length + 1, expected.length + 33), dhSecret: bytes.slice(expected.length + 34) };
+  }
+  /** §3.3: the backup record's keys bytes, which the account key signs. */
+  function backupKeysBytes(record) {
+    const kdf = record?.kdf;
+    if (!record || record.v !== 1 || typeof record.userId !== 'string' || !USER_ID.test(record.userId) || !Number.isSafeInteger(record.epoch) || record.epoch < 1 || record.epoch > 0xffffffff
+      || kdf?.alg !== 'argon2id' || ![kdf.m, kdf.t, kdf.p].every(value => Number.isSafeInteger(value) && value > 0 && value <= 0xffffffff)) fail('Invalid backup record');
+    const salt = unb64(kdf.salt);
+    if (salt.length !== 16) fail('Invalid backup record');
+    return writer().text16('webrtc-bun-backup-keys-v2').text16(record.userId).bytes8(key32(record.aikSign)).u32(record.epoch).bytes8(salt).u32(kdf.m).u32(kdf.t).u32(kdf.p)
+      .bytes8(key32(record.passHash)).bytes8(key32(record.recoveryHash)).bytes8(key32(record.passProofHash)).bytes8(key32(record.recoveryProofHash)).done();
+  }
+  /** §5: what a companion's MLS leaf key signs to ask for the account key. */
+  function rekeyBytes(userId, deviceId, platform, eph, leafSigKey, aikSign) {
+    if (typeof userId !== 'string' || !USER_ID.test(userId) || typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || !PLATFORM_OK(platform)) fail('Invalid rekey request');
+    return writer().text16('webrtc-bun-rekey-v1').text16(userId).text16(deviceId).text16(platform).bytes8(key32(eph)).bytes8(key32(leafSigKey)).bytes8(key32(aikSign)).done();
+  }
   /** What a new device's key signs to open a link: its id, platform and public device key. */
   function startBytes(deviceId, platform, deviceKey) {
     if (typeof deviceId !== 'string' || !DEVICE_ID.test(deviceId) || !PLATFORM_OK(platform)) fail('Invalid link start');
@@ -257,22 +288,24 @@
   const metaKeyFromBytes = bytes => crypto.subtle.importKey('raw', bytes, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
   const metaAad = (userId, deviceId) => writer().text16(META_LABEL).text16(userId).text16(deviceId).done();
   /** Seals { label, platform } for one list entry; the AAD binds it to that account and device. */
-  async function sealMeta(key, userId, deviceId, { label, platform }) {
-    if (!PLATFORMS.includes(platform)) fail('Invalid device platform');
-    const plain = encoder.encode(JSON.stringify({ label: String(label || '').slice(0, META_MAX_LABEL), platform }));
+  // m6 §5: `via: 'code'` marks a device linked by short code (it unlocks with the passphrase, never by rekey).
+  async function sealMeta(key, userId, deviceId, { label, platform, via }) {
+    if (!PLATFORMS.includes(platform) || (via !== undefined && via !== 'code')) fail('Invalid device platform');
+    const plain = encoder.encode(JSON.stringify({ label: String(label || '').slice(0, META_MAX_LABEL), platform, ...(via ? { via } : {}) }));
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: metaAad(userId, deviceId) }, key, plain));
     const out = new Uint8Array(12 + sealed.length); out.set(iv); out.set(sealed, 12);
     return b64(out);
   }
-  /** The entry's { label, platform }, or null if it is empty, not ours, or tampered with. */
+  /** The entry's { label, platform, via? }, or null if it is empty, not ours, or tampered with. */
   async function openMeta(key, userId, deviceId, meta) {
     if (!meta) return null;
     try {
       const bytes = unb64(meta);
       const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.subarray(0, 12), additionalData: metaAad(userId, deviceId) }, key, bytes.subarray(12));
       const value = JSON.parse(new TextDecoder().decode(plain));
-      return exact(value, ['label', 'platform']) && typeof value.label === 'string' && PLATFORMS.includes(value.platform) ? value : null;
+      const fields = 'via' in (value || {}) ? ['label', 'platform', 'via'] : ['label', 'platform'];
+      return exact(value, fields) && typeof value.label === 'string' && PLATFORMS.includes(value.platform) && (value.via === undefined || value.via === 'code') ? value : null;
     } catch { return null; }
   }
   // ---------- Browser-only: this browser's device key ----------
@@ -325,5 +358,5 @@
     return `${browserName} on ${os}`;
   }
 
-  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, chainMarker, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
+  root.DeviceFormat = Object.freeze({ PLATFORMS, MAX_DEVICES, validateList, listBytes, validateCert, certBytes, certFor, hash, verifyBytes, verifyView, newDeviceId, bindBytes, claimBytes, startBytes, linkClaimBytes, successionBytes, verifySuccession, successionFrom, ownDevices, recertPlatform, chainMarker, accountKeyBytes, parseAccountKey, backupKeysBytes, rekeyBytes, mlsCertBytes, mlsCertJson, deviceKey, adoptDeviceKey, deviceMetaKey, deviceMetaKeyBytes, metaKeyFromBytes, sealMeta, openMeta, describeThisDevice, b64, unb64 });
 })();

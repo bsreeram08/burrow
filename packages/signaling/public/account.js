@@ -62,16 +62,22 @@
     try { unread = JSON.parse(localStorage.getItem(`unread-v1:${me.id}`) || '{}') || {}; } catch { unread = {}; }
     ready = setupKeys(user);
     // Groups and channels (groups.js) start once this device's keys and device list are in place.
-    ready.then(ok => { if (ok && me?.id === user.id && !inactive) window.Groups?.start(groupContext()); if (ok && me?.id === user.id) window.DeviceLink?.attach(linkContext()); });
+    ready.then(ok => {
+      if (ok && me?.id === user.id && !inactive) window.Groups?.start(groupContext());
+      if (ok && me?.id === user.id) window.DeviceLink?.attach(linkContext());
+      // A device waiting for the account key asks (again) on every start, not only on frames (m6 §5).
+      if (ok && me?.id === user.id && linked && !keyBox) followOwnSuccession().catch(() => false).then(() => takeRekey()).catch(() => {});
+    });
     window.Theme?.setAccount(user.id); App.accountId = user.id; App.myName = user.username; App.rescheduleReminders?.(); loadEmoji();
     $('rotation-every').value = String(myRotation());
-    loadContacts(); connectEvents(); window.Alerts?.signedIn();
+    loadContacts(); connectEvents(); window.Alerts?.signedIn(); showKeyChange();
   }
   function signedOut(message = '') {
-    window.Groups?.stop(); window.DeviceLink?.attach(null); delete body.dataset.kind; linked = null;
+    window.Groups?.stop(); window.DeviceLink?.attach(null); delete body.dataset.kind; linked = null; keyBox = null;
+    unfinished = []; backupExists = false; coreKeyed = null;
     me = null; contacts = []; current = null; pairs.clear(); box = null; deviceView = null; announced = ''; metaKey = null; deviceWarning = ''; deviceNotice = ''; ready = Promise.resolve(false); flagged = new Set(); mismatched.clear();
     clearTimeout(retryTimer); clearTimeout(flushTimer); const previous = events; events = null; previous?.close();
-    if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true;
+    if (App.active) App.end(); App.closeConversation(); $('key-banner').hidden = true; $('keychange-notice').hidden = true;
     body.dataset.auth = 'out'; body.dataset.screen = ''; say('account-status', message);
     hideRing(); stopCalling(); window.Alerts?.signedOut(); window.Theme?.setAccount(null); App.accountId = null; App.myName = null; App.rescheduleReminders?.();
   }
@@ -89,11 +95,15 @@
       say('chats-status', 'This browser is too old for encrypted messaging. Update it to send and receive messages; calls still work.');
       return false;
     }
+    // A key change this browser started before it was closed (m6 §6.2) is finished, or dropped, first.
+    await resumeRotation(user.id).catch(error => say('chats-status', `Couldn’t finish changing your account key: ${error.message}`));
     // A linked device (docs/m5-linking.md §1) holds no account identity key: no 1:1 keys here, ever (publishing
-    // some would take messaging away from the primary). Groups, channels and moved DMs run in its group store.
+    // some would take messaging away from the inbox device). Groups, channels and moved DMs run in its group store.
     linked = linkedStore(user.id);
     if (linked) {
       backendName = 'linked'; box = null; keysLost = false; setInactive(false); showBackend();
+      // m6 §2, §4: a linked browser that holds the account key keeps it in its key store, for signing only.
+      keyBox = linked.full ? window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${user.id}`)) : null;
       $('identity-reset').hidden = true;
       return true;
     }
@@ -130,9 +140,7 @@
   let inactive = false, keysLost = false;
   function setInactive(value) {
     inactive = value; $('device-banner').hidden = !value;
-    say('device-banner-text', keysLost
-      ? 'This browser lost your encryption keys since you last used it here. That happens in private tabs and in apps’ built-in browsers (Instagram, WhatsApp, Telegram…). Open calls.sreerams.in in Safari or Chrome itself, or from the Home Screen app, and use that one.'
-      : 'Encrypted messaging for this account is active on your primary device. Link this browser from your primary device to use it here; messages are not sent or received here until then.');
+    if (keysLost) say('device-banner-text', 'This browser lost your encryption keys since you last used it here. That happens in private tabs and in apps’ built-in browsers. Open this site in your browser itself, or from the Home Screen app, or unlock your account here again.');
     if (value) { say('chats-status', ''); if (current) App.chatStatus('Messaging is active on another device. Use this device from the chat list to send here.'); }
   }
   async function publishKeys(takeover = false) {
@@ -140,7 +148,13 @@
     const keys = await box.prekeys(), count = await api('/api/keys/count');
     const mine = count.identity, here = keys.identity;
     const other = Boolean(mine && (mine.dh !== here.dh || mine.sign !== here.sign));
-    if (other && !takeover) { setInactive(true); announceDevice(null).catch(() => {}); return; }
+    if (other && !takeover) {
+      // The account key was replaced on another device while this one was away (m6 §6.2): follow it if it checks out.
+      if (await followOwnSuccession().catch(() => false)) { setInactive(false); return; } // Now a device waiting for the new key.
+      setInactive(true); announceDevice(null).catch(() => {});
+      api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); // Whether a backup can unlock it here.
+      return;
+    }
     setInactive(false); keysLost = false;
     // Holding the published identity: this device takes the messaging inbox (unless a signed list names another primary).
     if (!other) await announceDevice(mine ? here : null).catch(() => {}); // Before the first upload there is nothing to prove: the upload claims.
@@ -164,16 +178,19 @@
   // Highest verified list per account (own and contacts): a list may only move forward, never back or sideways.
   const readPins = () => { try { return JSON.parse(localStorage.getItem(`device-pins-v1:${me.id}`) || '{}') || {}; } catch { return {}; } };
   const writePins = pins => { try { localStorage.setItem(`device-pins-v1:${me.id}`, JSON.stringify(pins)); } catch {} };
-  async function rawSign(bytes, from = box) {
-    const identity = await from.identity();
-    if (!identity?.sign?.privateKey) throw new Error('this encryption core cannot sign device lists yet');
-    return new Uint8Array(await crypto.subtle.sign('Ed25519', identity.sign.privateKey, bytes));
+  // m6: the account key may be on any listed device. The inbox device's box holds it (and runs 1:1); a linked browser
+  // holding it keeps it in the same store, for signing only (it publishes no prekeys from there).
+  const signer = () => linked ? keyBox : inactive ? null : box;
+  const holdsKey = () => Boolean(signer());
+  async function rawSign(bytes, from = signer()) {
+    if (!from?.sign) throw new Error('this encryption core cannot sign device lists yet');
+    return from.sign(bytes);
   }
   const signWithIdentity = async bytes => Devices.b64(await rawSign(bytes));
   // The key that seals device labels and platforms inside the list: derived from the identity key, per account.
   let metaKey = null;
   async function deviceMetaKey() {
-    const aik = (await box.identity()).pub.sign;
+    const aik = (await signer().identity()).pub.sign;
     if (metaKey?.aik !== aik) metaKey = { aik, key: Devices.deviceMetaKey(me.id, rawSign) };
     return metaKey.key;
   }
@@ -198,13 +215,15 @@
     if (!view?.list) return null;
     const check = await Devices.verifyView({ userId: me.id, aikSign, list: view.list, signature: view.signature, certs: view.certs, pin });
     if (!check.ok) return null;
-    pins[me.id] = check.pin; writePins(pins);
-    return { listed: new Set(check.pin.devices), dropped: new Set(check.pin.revoked) };
+    pins[me.id] = check.pin; writePins(pins); rememberLabels(view.list).catch(() => {});
+    // A key change starts a new list chain, so devices it dropped aren't tombstones there: they are remembered apart.
+    const removed = readJson(`removed-devices-v1:${me.id}`, []).filter(id => !check.pin.devices.includes(id));
+    return { listed: new Set(check.pin.devices), dropped: new Set([...check.pin.revoked, ...removed]) };
   }
   async function pinOwn(signed) {
-    const pins = readPins(), own = (await box.prekeys()).identity;
+    const pins = readPins(), own = (await signer().identity()).pub;
     const after = await Devices.verifyView({ userId: me.id, aikSign: own.sign, ...signed, pin: pins[me.id] });
-    if (after.ok) { pins[me.id] = after.pin; writePins(pins); }
+    if (after.ok) { pins[me.id] = after.pin; writePins(pins); await rememberLabels(signed.list).catch(() => {}); }
   }
   /**
    * Binds this browser's session to its device id. A browser that does not hold the keys shows up as pending in
@@ -230,8 +249,9 @@
   let syncing = Promise.resolve();
   function syncDevices() { const run = syncing.then(syncDevicesNow); syncing = run.catch(() => {}); return run; }
   async function syncDevicesNow() {
-    if (!me || !box || inactive || !Devices || backendName === 'wasm') return; // The WebAssembly core cannot sign with the identity key yet (M2).
-    const id = (await localDevice()).deviceId, own = (await box.prekeys()).identity;
+    const holder = signer();
+    if (!me || !holder || !Devices || backendName === 'wasm') return; // The WebAssembly core cannot sign with the identity key yet (M2).
+    const id = (await localDevice()).deviceId, own = (await holder.identity()).pub;
     const view = await api(`/api/devices/${me.username}`);
     if (!view.identity || view.identity.sign !== own.sign || view.identity.dh !== own.dh) return; // Not the key holder: publishKeys decides.
     const pins = readPins(), pin = pins[me.id];
@@ -243,15 +263,18 @@
       // A new account key here (recovery or a primary transfer, m5 §5-§6): the old key's list ends; version 1 starts.
       if (!check.ok && newChain && check.reason === 'signature') base = null;
       else if (!check.ok) { deviceWarning = `The device list on the server is not one this device signed (${check.reason}). It was not changed.`; deviceView = view; renderDevices(); return; }
-      else { pins[me.id] = check.pin; writePins(pins); base = { list: view.list, hash: check.hash }; }
-      const mine = view.devices.find(row => row.id === id);
-      if (base && view.currentDevice === id && mine?.primary && view.list.devices.some(device => device.deviceId === id)) { deviceWarning = ''; deviceView = view; renderDevices(); return; }
+      else { pins[me.id] = check.pin; writePins(pins); base = { list: view.list, hash: check.hash }; await rememberLabels(view.list).catch(() => {}); }
+      // Listed already (and, once it holds the key, no longer marked as short-code linked, m6 §5): nothing to sign.
+      if (base && view.list.devices.some(device => device.deviceId === id) && (await ownMeta(view))?.via !== 'code') { deviceWarning = ''; deviceView = view; renderDevices(); return; }
     }
     // Next version: this device plus every listed device the server still has, chained to the current list. A new
     // chain keeps only the devices the transfer brought along (none after a recovery).
     const stillListed = device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && ['listed', 'pending'].includes(row.state));
     const keep = base ? base.list.devices.filter(device => device.deviceId !== id && view.devices.some(row => row.id === device.deviceId && row.state === 'listed')) : (newChain?.keep || []).filter(stillListed);
-    const self = base?.list.devices.find(device => device.deviceId === id) || { deviceId: id, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, id, { label: Devices.describeThisDevice(), platform: 'web' }) };
+    const listed = base?.list.devices.find(device => device.deviceId === id);
+    // Our own entry, re-sealed without `via` once this browser holds the key itself (m6 §5).
+    const label = (listed && (await ownMeta(view))?.label) || Devices.describeThisDevice();
+    const self = { deviceId: id, addedAt: listed?.addedAt || Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, id, { label, platform: 'web' }) };
     const list = { v: 1, userId: me.id, version: (base?.list.version || 0) + 1, prevHash: base?.hash || '', devices: [...keep, self].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
     const signed = await signList(list);
     await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
@@ -266,16 +289,17 @@
    * Linking (docs/m5-linking.md §1.1 step 7): the next signed list, with the new device. The current list must be
    * one we signed (verified against our pin); every device it names that the server still lists stays.
    */
-  async function addToList(newId, { label, platform }) {
-    const id = (await localDevice()).deviceId, own = (await box.prekeys()).identity;
+  async function addToList(newId, { label, platform }, viaCode = false) {
+    const id = (await localDevice()).deviceId, own = (await signer().identity()).pub;
     const view = await api(`/api/devices/${me.username}`);
     if (!view.list) throw new Error('Your device list isn’t published yet. Try again in a moment.');
     const pins = readPins();
     const check = await Devices.verifyView({ userId: me.id, aikSign: own.sign, list: view.list, signature: view.signature, certs: view.certs, pin: pins[me.id] });
     if (!check.ok) throw new Error(`The device list on the server isn’t one this device signed (${check.reason}). Nothing was linked.`);
-    pins[me.id] = check.pin; writePins(pins);
+    pins[me.id] = check.pin; writePins(pins); await rememberLabels(view.list).catch(() => {});
     const keep = view.list.devices.filter(device => device.deviceId !== newId && view.devices.some(row => row.id === device.deviceId && row.state === 'listed'));
-    const added = { deviceId: newId, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, newId, { label, platform }) };
+    // m6 §5: a short-code link is marked, so no device ever hands it the account key by rekey (it unlocks with the passphrase).
+    const added = { deviceId: newId, addedAt: Date.now(), meta: await Devices.sealMeta(await deviceMetaKey(), me.id, newId, { label, platform, ...(viaCode ? { via: 'code' } : {}) }) };
     const list = { v: 1, userId: me.id, version: view.list.version + 1, prevHash: check.hash, devices: [...keep, added].sort((a, b) => a.deviceId < b.deviceId ? -1 : 1) };
     const signed = await signList(list);
     await api('/api/devices/list', 'PUT', { ...signed, deviceId: id });
@@ -285,15 +309,15 @@
   function linkContext() {
     return {
       me: () => me, notice: text => say('chats-status', text), platformName, addToList, signWithIdentity, contacts: () => contacts, recover,
-      linked: () => Boolean(linked), mintSuccessor, takeOver, signSuccession, stepDown,
-      async isPrimary() {
-        if (!box || linked || inactive) return false;
-        const view = await api(`/api/devices/${me.username}`).catch(() => null);
-        return Boolean(view?.devices?.some(row => row.current && row.primary));
-      },
-      aikSign: async () => { const identity = (await box.prekeys()).identity; return { dh: identity.dh, sign: identity.sign }; },
+      holdsKey, accountKey: accountKeyB64, backupKeys: () => readJson(`backup-keys-v1:${me.id}`, null),
+      // Unlocking with the backup (§4): offered where it can help, on a browser without the key while a backup exists.
+      ...(backupExists && !holdsKey() ? { restorePass: () => restoreWith('pass').catch(error => say('chats-status', error.message)), restoreWords: () => restoreWith('words').catch(error => say('chats-status', error.message)) } : {}),
+      aikSign: async () => { const { pub } = await signer().identity(); return { dh: pub.dh, sign: pub.sign }; },
       metaKeyBytes: () => Devices.deviceMetaKeyBytes(me.id, rawSign),
-      peer: contactId => box.peer(contactId),
+      // The bundle's pins: the inbox device's 1:1 pins, or (elsewhere) the group store's.
+      exportPins: async () => box ? (await Promise.all(contacts.filter(contact => contact.state === 'mutual').map(async contact => [contact.id, await box.peer(contact.id).catch(() => null)])))
+        .filter(([, peer]) => peer && !peer.changed && !peer.blocked).map(([contact, peer]) => ({ contact, identity: { dh: peer.identity.dh, sign: peer.identity.sign }, verified: Boolean(peer.verified) }))
+        : window.Groups?.exportPins().catch(() => []) ?? [],
       async peerOfConversation(id) { for (const contact of contacts) if (contact.state === 'mutual' && await pairId(contact.id) === id) return contact.id; return null; },
       devicesChanged: () => api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}),
     };
@@ -307,7 +331,20 @@
    */
   async function recover() {
     if (!box || linked) return;
-    if (!await window.Linking.confirmRecovery()) return;
+    // m6 §6.5: with a backup, starting over without the passphrase waits a week, so the account's devices can cancel it.
+    const view = await api(`/api/devices/${me.username}`).catch(() => deviceView);
+    if (view?.backup) {
+      const reset = view.reset;
+      if (!reset) {
+        if (!await window.Linking.confirmRecovery()) return;
+        await api('/api/keys/reset', 'POST', {});
+        say('chats-status', 'Your account key will be reset in 7 days unless one of your devices cancels it.');
+        deviceView = await api(`/api/devices/${me.username}`); renderDevices();
+        return;
+      }
+      if (Date.now() < reset.executeAfter) { say('chats-status', `Your account key will be reset on ${new Date(reset.executeAfter).toLocaleString()} unless one of your devices cancels it.`); return; }
+      // The week is up: this session may start over now (the server deletes the backup, which holds the old key).
+    } else if (!await window.Linking.confirmRecovery()) return;
     try {
       // Nothing from the server's list is carried over: the new key's list names only this browser.
       newChain = { keep: [] }; try { localStorage.removeItem(`new-chain-v1:${me.id}`); } catch {}
@@ -318,154 +355,157 @@
       setTimeout(() => location.reload(), 1500);
     } catch (error) { newChain = null; say('chats-status', `Couldn’t start over: ${error.message}`); }
   }
-  // ---------- Primary transfer (m5 §5) ----------
-  // N, a linked browser taking over: the account key it will hold, minted in its own key store and published only
-  // after the old primary signed the account over to it.
-  let successor = null;
-  async function mintSuccessor() {
-    if (!linked) throw new Error('Only a linked browser can take over as primary.');
-    const next = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${me.id}`), { identityChanged: contactId => identityChanged(contactId) });
-    await next.resetIdentity(); // A fresh key for every attempt, never one left in this browser from an earlier time.
-    const { pub } = await next.identity();
-    successor = { box: next, identity: { dh: pub.dh, sign: pub.sign } };
-    return successor.identity;
-  }
   /**
-   * N: the old primary signed the account over (`record`, `signature`). Publishes the record, moves the group store to
-   * the new key, takes messaging over and signs list version 1 naming every live device (labels resealed under the new
-   * key). Returns the `demote` for the old primary (`primary`: its device id and MLS leaf key): its certificate under
-   * the new key and the new label key.
+   * Our account moved to a new key: another device replaced it (m6 §6.2). Followed only along signed records from the
+   * key this device holds or pinned, and only if the new key's list still names this device and drops nothing but
+   * devices the server shows revoked; otherwise the user is told and nothing is adopted. A device that held the old
+   * key drops it and asks for the new one (rekey, §5). Resolves true when followed.
    */
-  async function takeOver({ record, signature, primary }) {
-    const next = successor, pinned = linked?.identity;
-    if (!next || !pinned) throw new Error('Start again on both devices.');
-    if (record?.userId !== me.id || record.oldSign !== pinned.sign || record.newSign !== next.identity.sign || record.newDh !== next.identity.dh
-      || !await Devices.verifySuccession(me.id, pinned, next.identity, [{ ...record, signature }])) throw new Error('Your primary device sent something unexpected. Nothing changed.');
-    const sign = async bytes => Devices.b64(await rawSign(bytes, next.box));
-    const view = await api(`/api/devices/${me.username}`);
-    const oldKey = await Devices.metaKeyFromBytes(Devices.unb64(localStorage.getItem(`device-meta-key-v1:${me.id}`) || '')).catch(() => null);
-    const newKey = await Devices.deviceMetaKey(me.id, bytes => rawSign(bytes, next.box));
-    // Only devices our own signed list names (verified from our pin) are carried into the new key's list: a device the
-    // server merely shows would otherwise be signed in by us.
-    const owned = await Devices.ownDevices({ userId: me.id, aikSign: pinned.sign, view, pin: readPins()[me.id], metaKey: oldKey });
-    if (!owned) throw new Error('The device list on the server isn’t one your primary signed. Nothing changed.');
-    const keep = [];
-    for (const device of owned.devices) {
-      const row = view.devices.find(value => value.id === device.deviceId);
-      if (row?.state !== 'listed') continue;
-      const platform = device.described?.platform || row.platform;
-      keep.push({ deviceId: device.deviceId, addedAt: device.addedAt, meta: await Devices.sealMeta(newKey, me.id, device.deviceId, { label: device.described?.label || platformName(platform), platform }) });
-    }
-    const old = view.devices.find(row => row.id === primary.deviceId);
-    if (!keep.some(device => device.deviceId === primary.deviceId) || !old) throw new Error('Your primary device isn’t in your device list. Nothing changed.');
-    // The device id the server says offered, with the leaf key the sealed message gave: a pair our groups must already
-    // hold, or the certificate for the old primary could be bound to another device.
-    if (window.Groups.sections().rows.length + contacts.filter(contact => window.Groups.dmChannelWith(contact.id)).length
-      && !await window.Groups.leafKnown(primary.deviceId, primary.leafSigKey).catch(() => false)) throw new Error('Your primary device doesn’t match the one in your groups. Nothing changed.');
-    await api('/api/devices/succession', 'PUT', { record, signature });
-    const self = (await localDevice()).deviceId, leaf = await window.Groups.leafKey(), issuedAt = Date.now();
-    const cert = Devices.mlsCertJson(me.id, self, 'web', leaf, record.newSign, issuedAt, await sign(Devices.mlsCertBytes(me.id, self, 'web', leaf, record.newSign, issuedAt)));
-    await window.Groups.adoptSuccession({ record, signature, cert });
-    // From here this browser is the primary: its group store stays (under the new key) and 1:1 keys live here.
-    writeJson(`group-instance-v1:${me.id}`, { aik: record.newSign, instance: linked.instance });
-    writeJson(`new-chain-v1:${me.id}`, { aik: record.newSign, keep });
-    try {
-      // Moved 1:1 chats: a linked device went by its checked DM groups; a primary goes by its record of moves.
-      for (const contact of contacts) { const channel = window.Groups.dmChannelWith(contact.id); if (channel) await markMoved(contact, channel); }
-      for (const pin of await window.Groups.exportPins().catch(() => [])) {
-        await next.box.notePeer(pin.contact, pin.identity);
-        if (pin.verified) await next.box.setVerified(pin.contact, true);
-      }
-      const before = linked;
-      linked = null; box = next.box; backendName = 'signal'; successor = null; newChain = { aik: record.newSign, keep };
-      try { await publishKeys(true); } catch (error) { linked = before; box = null; backendName = 'linked'; throw error; }
-      // Published: from here this browser holds the account.
-      try { localStorage.removeItem(`linked-store-v1:${me.id}`); localStorage.removeItem(`device-meta-key-v1:${me.id}`); } catch {}
-      window.Core?.setBackend(me.id, 'signal');
-    } catch (error) {
-      // The new key isn't published: nothing may later start a chain from this marker.
-      const served = await api('/api/keys/count').then(count => count.identity?.sign, () => null);
-      if (served !== record.newSign) { newChain = null; try { localStorage.removeItem(`new-chain-v1:${me.id}`); localStorage.removeItem(`group-instance-v1:${me.id}`); } catch {} }
-      throw error;
-    }
-    const after = await api(`/api/devices/${me.username}`);
-    if (after.identity?.sign !== record.newSign || !after.list?.devices.some(device => device.deviceId === primary.deviceId)) throw new Error(deviceWarning || 'Your new device list wasn’t published. Reload and check Settings → Devices.');
-    const at = Date.now();
-    const p0 = owned.devices.find(device => device.deviceId === primary.deviceId)?.described?.platform || old.platform;
-    const demoted = Devices.mlsCertJson(me.id, primary.deviceId, p0, primary.leafSigKey, record.newSign, at, await sign(Devices.mlsCertBytes(me.id, primary.deviceId, p0, primary.leafSigKey, record.newSign, at)));
-    return { identity: next.identity, cert: demoted, metaKey: Devices.b64(await Devices.deviceMetaKeyBytes(me.id, rawSign)) };
-  }
-  /** P0: signs the account over to the key N minted (m5 §5.1). Nothing changes here until N has taken over. */
-  async function signSuccession({ newSign, newDh }) {
-    const own = (await box.prekeys()).identity;
-    const record = { v: 1, userId: me.id, oldSign: own.sign, newSign, newDh, at: Date.now() };
-    return { record, signature: await signWithIdentity(Devices.successionBytes(record)) };
-  }
-  /**
-   * P0: N took over and sent `demote`. This browser keeps its device key, MLS leaf and groups, becomes a linked device
-   * of the new key, and deletes the old account key: only once the server serves the new one.
-   */
-  async function stepDown({ record, signature, demote }) {
-    if (demote?.identity?.sign !== record.newSign || demote.identity.dh !== record.newDh || typeof demote.cert !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(demote.metaKey || '')) throw new Error('The new primary sent something unexpected.');
-    const served = (await api('/api/keys/count')).identity;
-    if (served?.sign !== record.newSign || served.dh !== record.newDh) throw new Error('The new primary hasn’t taken over yet. Nothing changed here.');
-    const own = (await box.prekeys()).identity, self = (await localDevice()).deviceId, leaf = await window.Groups.leafKey();
-    // The core enters companion mode under the old key first, so that key is kept as a predecessor of the new one.
-    const before = { identity: { dh: own.dh, sign: own.sign }, cert: Devices.mlsCertJson(me.id, self, 'web', leaf, own.sign, record.at, await signWithIdentity(Devices.mlsCertBytes(me.id, self, 'web', leaf, own.sign, record.at))) };
-    const pins = [];
-    for (const contact of contacts.filter(value => value.state === 'mutual')) {
-      const peer = await box.peer(contact.id).catch(() => null);
-      if (peer && !peer.changed && !peer.blocked) pins.push({ contact: contact.id, identity: { dh: peer.identity.dh, sign: peer.identity.sign }, verified: Boolean(peer.verified) });
-    }
-    await window.Groups.importPins(pins).catch(() => 0);
-    const instance = window.Groups.instance();
-    await window.Groups.adoptSuccession({ record, signature, cert: demote.cert, before });
-    writeJson(`linked-store-v1:${me.id}`, { deviceId: self, instance, identity: demote.identity });
-    try { localStorage.setItem(`device-meta-key-v1:${me.id}`, demote.metaKey); localStorage.removeItem(`keys-held-v1:${me.id}`); } catch {}
-    const all = readPins(); delete all[me.id]; writePins(all); // The new key's list starts a new chain.
-    await box.resetIdentity();
-  }
-  /**
-   * A linked browser whose account moved to a new primary while it was elsewhere (m5 §5.2 step 6): it follows the
-   * signed chain from the key pinned at link time, never the server's word. It has no certificate under the new key
-   * until the new primary signs one, so its leaf stays Previous.
-   */
-  /** Resolves true when the account moved here. */
   async function followOwnSuccession() {
-    if (!linked || !me) return false;
-    const view = await api(`/api/devices/${me.username}`), served = view.identity, pinned = linked.identity;
+    if (!me) return false;
+    const holder = linked ? keyBox : box, pinned = linked ? linked.identity : holder ? (await holder.identity()).pub : null;
+    if (!pinned) return false;
+    const view = await api(`/api/devices/${me.username}`), served = view.identity;
     if (!served || (served.sign === pinned.sign && served.dh === pinned.dh)) return false;
     const path = view.succession?.length ? await Devices.verifySuccession(me.id, pinned, served, view.succession) : null;
-    if (!path) { deviceWarning = 'Your account key changed without a record from your previous primary. Link this browser again.'; renderDevices(); return false; }
-    for (const { signature, ...record } of path) await window.Groups.adoptSuccession({ record, signature });
-    linked = { ...linked, identity: { dh: served.dh, sign: served.sign } };
+    if (!path) { if (linked) { deviceWarning = 'Your account key changed without a record from your devices. Unlock this browser with your passphrase, or link it again.'; renderDevices(); } return false; }
+    const self = (await localDevice()).deviceId;
+    const fresh = view.list ? await Devices.verifyView({ userId: me.id, aikSign: served.sign, list: view.list, signature: view.signature, certs: view.certs, pin: undefined }) : null;
+    if (!fresh?.ok) return false; // The new key's list isn't up yet: the next 'devices' frame tries again.
+    // m6 §6.2 step 3: whether a removal was the user's own can't be told from the server (the rotation revokes what it
+    // drops, and revoked rows aren't served), so it is compared with this device's own last verified list: anything
+    // dropped from it is always shown, until dismissed; a list that drops this device is not followed.
+    const before = readPins()[me.id]?.devices || [], dropped = before.filter(id => id !== self && !view.list.devices.some(device => device.deviceId === id));
+    const kept = view.list.devices.some(device => device.deviceId === self);
+    if (dropped.length || !kept) {
+      const from = view.devices.find(row => row.primary), removed = [...(kept ? [] : ['this device']), ...await oldLabels(dropped)];
+      showKeyChange(`Your account key was changed from ${platformName(from?.platform)}, which removed ${joinLabels(removed)}. If this wasn’t you, take your account back.`);
+      if (!kept) { if (backupExists) window.DeviceLink?.attach(linkContext()); return false; } // Restore is offered (§6.4).
+    }
+    if (dropped.length) writeJson(`removed-devices-v1:${me.id}`, [...new Set([...readJson(`removed-devices-v1:${me.id}`, []), ...dropped])]);
+    const instance = groupInstance(self, pinned.sign), run = keysCore(instance);
+    // The inbox device's group store holds neither the key nor an account row: it takes the old key first, so it can
+    // adopt the record (it then keeps the old key as a predecessor, like any device that held it).
+    if (!linked && holder) {
+      const secrets = await holder.exportIdentity();
+      if (secrets) {
+        try { await run({ cmd: 'importAccountKey', userId: me.id, key: Devices.b64(Devices.accountKeyBytes(me.id, secrets.signSeed, secrets.dhSecret)), published: pinned }); }
+        finally { secrets.signSeed.fill(0); secrets.dhSecret.fill(0); }
+      } else {
+        // A legacy key can't move: a certificate under it, made here, enters the store as a companion of that key.
+        const leaf = await run({ cmd: 'mlsDeviceLeaf' }), at = path[0].at;
+        const cert = Devices.mlsCertJson(me.id, self, 'web', leaf, pinned.sign, at, Devices.b64(await holder.sign(Devices.mlsCertBytes(me.id, self, 'web', leaf, pinned.sign, at))));
+        await run({ cmd: 'companionSetup', userId: me.id, identity: { dh: pinned.dh, sign: pinned.sign }, cert });
+      }
+    }
+    for (const { signature, ...record } of path) await run({ cmd: 'adoptSuccession', userId: me.id, record, signature });
+    // The old key is a predecessor now: it goes from here (the new one arrives by rekey).
+    await holder?.resetIdentity().catch(() => {});
+    linked = { deviceId: self, instance, identity: { dh: served.dh, sign: served.sign }, full: false };
+    keyBox = null; box = null;
     writeJson(`linked-store-v1:${me.id}`, linked);
-    const all = readPins(); delete all[me.id]; writePins(all);
-    deviceNotice = 'Your account moved to a new primary device.'; renderDevices();
-    await askRecert().catch(() => {}); // Refused while the new key's list isn't up yet: asked again on the next 'devices'.
+    const pins = readPins(); pins[me.id] = fresh.pin; writePins(pins);
+    deviceNotice = 'Your account key was changed on another device. This one gets the new key in a moment.'; renderDevices();
+    await askRekey().catch(() => {}); // Refused while the new key's list isn't up yet: asked again on the next 'devices'.
     return true;
   }
-  // §5.2.2: a companion that followed the chain asks the new primary to certify its leaf under the new key.
-  const askRecert = async () => api('/api/devices/recert', 'PUT', { platform: 'web', leafSigKey: await window.Groups.leafKey() });
-  /** Companion whose certificate is under an older account key: installs the answer, if there is one yet (a request the server lost is asked again). */
-  async function takeRecert() {
-    const under = window.Groups?.certAik();
-    if (!linked || !under || under === linked.identity.sign) return;
+  /**
+   * The labels of our own devices, kept from every verified list we pinned (opened with the label key this device holds
+   * or derives); kept for a device a later list dropped, so a key change can still name what it removed (§6.2 step 3).
+   */
+  async function rememberLabels(list) {
+    const holder = linked ? keyBox : inactive ? null : box, stored = localStorage.getItem(`device-meta-key-v1:${me.id}`);
+    const key = holder ? await Devices.deviceMetaKey(me.id, bytes => holder.sign(bytes)).catch(() => null) : stored ? await Devices.metaKeyFromBytes(Devices.unb64(stored)).catch(() => null) : null;
+    if (!key || !list) return;
+    const labels = readJson(`device-labels-v1:${me.id}`, {});
+    for (const device of list.devices) { const described = await Devices.openMeta(key, me.id, device.deviceId, device.meta); if (described?.label) labels[device.deviceId] = described.label; }
+    writeJson(`device-labels-v1:${me.id}`, labels);
+  }
+  const oldLabels = async ids => { const labels = readJson(`device-labels-v1:${me.id}`, {}); return ids.map(id => labels[id] || 'a device'); };
+  /** "A", "A and B", "A, B and C". */
+  const joinLabels = items => items.length < 2 ? items.join('') : `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
+  /** The key-change notice (§6.2 step 3) stays until the user dismisses it, across reloads. */
+  function showKeyChange(text) {
+    if (text) writeJson(`keychange-notice-v1:${me.id}`, text);
+    const shown = readJson(`keychange-notice-v1:${me.id}`, null);
+    $('keychange-notice').hidden = !shown; say('keychange-notice-text', shown || '');
+  }
+  $('keychange-notice-dismiss').onclick = () => { try { localStorage.removeItem(`keychange-notice-v1:${me.id}`); } catch {} showKeyChange(); };
+  /**
+   * The inbox device follows a key change made elsewhere without a reload: once followed it runs as a device waiting
+   * for the key (groups restart on the same store, which now pins the new key), and its rekey request is out.
+   */
+  let following = null;
+  function followLive() {
+    following ||= (async () => {
+      if (linked) return false;
+      if (!await followOwnSuccession()) return false;
+      setInactive(false); keysLost = false; backendName = 'linked'; showBackend();
+      window.Groups?.start(groupContext());
+      window.DeviceLink?.attach(linkContext());
+      await takeRekey().catch(() => {});
+      return true;
+    })().finally(() => { following = null; });
+    return following;
+  }
+  // ---------- Rekey (m6 §5): a device without the account key asks a device that has it ----------
+  async function askRekey() {
+    if (!linked || keyBox || !me) return;
+    const view = await api(`/api/devices/${me.username}`);
+    if (view.identity?.sign !== linked.identity.sign) return; // Follow the account's chain first.
+    if ((await ownMeta(view))?.via === 'code') return; // Unlocks with the passphrase (§2).
+    const request = await keysCore(linked.instance)({ cmd: 'rekeyRequest', userId: me.id, deviceId: linked.deviceId, platform: 'web' });
+    await api('/api/devices/rekey', 'PUT', { platform: 'web', eph: request.eph, leafSigKey: request.leafSigKey, signature: request.signature });
+  }
+  /** The answer, if there is one yet (a request the server lost is asked again): this browser then holds the key. */
+  async function takeRekey() {
+    if (!linked || keyBox || !me) return;
     let mine;
-    try { mine = await api('/api/devices/recert/mine'); } catch (error) { if (error.status === 404) await askRecert(); return; }
-    if (!mine.cert) return;
-    await window.Groups.installCert(linked.identity, mine.cert);
-    await api('/api/devices/recert', 'DELETE');
+    try { mine = await api('/api/devices/rekey/mine'); } catch (error) { if (error.status === 404) await askRekey(); return; }
+    if (!mine.box) return;
+    const run = keysCore(linked.instance);
+    const opened = await run({ cmd: 'rekeyOpen', userId: me.id, deviceId: linked.deviceId, platform: 'web', box: mine.box });
+    const accountKey = await run({ cmd: 'exportAccountKey', userId: me.id }), secrets = Devices.parseAccountKey(Devices.unb64(accountKey), me.id);
+    const held = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${me.id}`));
+    try { await held.adoptIdentity(secrets, linked.identity); } finally { secrets.signSeed.fill(0); secrets.dhSecret.fill(0); }
+    if (opened?.backupKeys && opened.backupKeys.epoch >= (readJson(`backup-keys-v1:${me.id}`, null)?.epoch || 0)) writeJson(`backup-keys-v1:${me.id}`, opened.backupKeys);
+    linked = { ...linked, full: true }; keyBox = held;
+    writeJson(`linked-store-v1:${me.id}`, linked);
+    await window.Groups.recertifyAll(linked.identity.sign); // The certificate in the answer reaches every group.
+    await api('/api/devices/rekey', 'DELETE');
+    deviceNotice = 'This browser can unlock your account again.'; renderDevices();
   }
   /**
-   * New primary: certifies each waiting companion's leaf under our key, but only a (device, leaf key) a group we hold
+   * A device holding the key answers waiting devices (§5 step 2), only for a device our verified signed list names,
+   * not linked by short code, not revoked and not this one; the core then checks the request's leaf signature and
+   * that a group we hold already contains exactly that leaf.
+   */
+  async function answerRekeys() {
+    const holder = signer();
+    if (!holder || !me || !window.Groups?.enabled()) return;
+    const { requests } = await api('/api/devices/rekey');
+    if (!requests.length || !await holder.exportable()) return; // A legacy key answers once it has been updated.
+    await coreHoldsKey();
+    const own = (await holder.identity()).pub, self = (await localDevice()).deviceId, view = await api(`/api/devices/${me.username}`);
+    const owned = await Devices.ownDevices({ userId: me.id, aikSign: own.sign, view, pin: readPins()[me.id], metaKey: await deviceMetaKey() });
+    for (const request of requests) {
+      const entry = owned?.devices.find(device => device.deviceId === request.deviceId), platform = Devices.recertPlatform(owned, request.deviceId, self);
+      if (!platform || entry.described?.via === 'code' || view.devices.find(row => row.id === request.deviceId)?.state !== 'listed') continue;
+      const sealed = await window.Groups.rekeyAnswer({ ...request, platform, backupKeys: readJson(`backup-keys-v1:${me.id}`, null) }).catch(() => null); // 'auth': not proven; it asks again later.
+      if (sealed) await api(`/api/devices/rekey/${request.deviceId}`, 'PUT', { box: sealed });
+    }
+  }
+  /**
+   * Pre-M6 companions (m6 §7) still ask for a certificate after a rotation (m5 §5.2.2): a device holding the key
+   * certifies each waiting one's leaf under our key, but only a (device, leaf key) a group we hold
    * already contains (mlsLeafKnown): the server's word about which key is whose counts for nothing.
    */
   async function answerRecerts() {
-    if (linked || !box || inactive || !window.Groups?.enabled()) return;
+    const holder = signer();
+    if (!holder || !window.Groups?.enabled()) return;
     const { requests } = await api('/api/devices/recert');
     if (!requests.length) return;
-    const own = (await box.prekeys()).identity, self = (await localDevice()).deviceId;
+    const own = (await holder.identity()).pub, self = (await localDevice()).deviceId;
     // Only a device our verified signed list still names (a dropped one may keep a leaf until it is removed), never
     // this one, with the platform its sealed label gives (not the server's request).
     const owned = await Devices.ownDevices({ userId: me.id, aikSign: own.sign, view: await api(`/api/devices/${me.username}`), pin: readPins()[me.id], metaKey: await deviceMetaKey() });
@@ -477,17 +517,157 @@
     }
   }
   const platformName = platform => ({ web: 'Web browser', ios: 'iPhone app', android: 'Android app', macos: 'Mac app', windows: 'Windows app', linux: 'Linux app' })[platform] || 'Device';
+  // ---------- The account key and its backup (docs/m6-account-key.md §1, §3, §4) ----------
+  /** The account key as AccountKey bytes (base64url), exported from this browser's key store. */
+  async function accountKeyB64() {
+    if (signer() && !await signer().exportable()) {
+      if (!await upgradeKey()) throw new Error('This browser’s key needs updating before it can move to another device.');
+    }
+    const holder = signer(), secrets = holder && await holder.exportIdentity();
+    if (!secrets) throw new Error('This device can’t unlock your account.');
+    try { return Devices.b64(Devices.accountKeyBytes(me.id, secrets.signSeed, secrets.dhSecret)); } finally { secrets.signSeed.fill(0); secrets.dhSecret.fill(0); }
+  }
+  // The chatcore store the account-key commands run in: this browser's group store (a pending browser makes it now).
+  const groupInstance = (deviceId, aikSign) => {
+    const kept = readJson(`group-instance-v1:${me.id}`, null); // Kept across a rotation by this device (groups.js reads the same).
+    return linked?.instance || window.Groups?.instance?.() || (kept?.aik === aikSign && kept.instance) || `${me.id}-${deviceId}-${aikSign.slice(0, 12)}`;
+  };
+  const keysCore = instance => window.Core.groupStore(me.id, instance);
+  /** The account's safety-number fingerprint (as group reviews show it): 12 groups of 5 digits of SHA-256(dh|sign). */
+  async function fingerprint(identity) {
+    const bytes = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${identity.dh}|${identity.sign}`)));
+    return Array.from({ length: 12 }, (_, at) => String(bytes[2 * at] * 256 + bytes[2 * at + 1]).padStart(5, '0')).join(' ');
+  }
+  /** The served backup record, only if the account's published key signed it (§4 step 1). Never the server's word. */
+  // Reads are rate-limited and each one notifies the account's devices: the last record read here is kept (it is no
+  // secret: the server holds it) and used again, checked again, while the owner view still names its epoch.
+  async function verifiedRecord(published) {
+    const fresh = await api(`/api/devices/${me.username}`).catch(() => null), kept = readJson(`backup-record-v1:${me.id}`, null);
+    const record = kept && fresh?.backup?.epoch === kept.epoch ? kept : await api('/api/backup');
+    if (record?.aikSign !== published.sign || !await Devices.verifyBytes(published.sign, Devices.backupKeysBytes(record), record.signature)) throw new Error('The backup on the server isn’t signed by your account. Nothing was changed.');
+    const seen = readJson(`backup-keys-v1:${me.id}`, null)?.epoch || 0;
+    if (record.epoch < seen) throw new Error('The backup on the server is older than one this device has seen. Nothing was changed.');
+    writeJson(`backup-record-v1:${me.id}`, record);
+    return record;
+  }
+  let backupExists = false;
+  /** Unlocks this browser with the passphrase or the recovery words (§4): a pending browser, or a code-linked one (§2). */
+  async function restoreWith(kind) {
+    const view = await api(`/api/devices/${me.username}`), published = view.identity;
+    if (!published) throw new Error('Your account has no published key yet.');
+    const device = await localDevice(), instance = groupInstance(device.deviceId, published.sign);
+    let record = null;
+    const done = await window.Linking.restore(kind, async secret => {
+      record ||= await verifiedRecord(published);
+      let opened;
+      try { opened = await keysCore(instance)({ cmd: 'backupOpen', userId: me.id, record, published, ...(kind === 'words' ? { words: secret } : { passphrase: secret }) }); }
+      catch (error) {
+        if (error.code === 'auth') throw new Error(kind === 'words' ? 'Those words don’t open your backup.' : 'That passphrase doesn’t open your backup.');
+        if (error.code === 'invalid' && kind === 'words') throw new Error('Check the words: one isn’t a recovery word, or one is missing.');
+        throw error;
+      }
+      await becomeFull({ ...opened, published, instance, device });
+      return fingerprint(published);
+    });
+    if (done) location.reload();
+  }
+  /**
+   * This browser now holds the account key (a restore, or a code-linked browser unlocking): kept in its key store
+   * (signing only: the 1:1 inbox stays where it is, §2) and in its group store; a browser new to the account certifies
+   * its own MLS leaf and publishes the next list naming itself.
+   */
+  async function becomeFull({ accountKey, backupKeys, published, instance, device }) {
+    const run = keysCore(instance), secrets = Devices.parseAccountKey(Devices.unb64(accountKey), me.id);
+    box = null; // A pending browser's own unpublished keys: never published now.
+    const held = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${me.id}`));
+    try { await held.adoptIdentity(secrets, published); } finally { secrets.signSeed.fill(0); secrets.dhSecret.fill(0); }
+    await run({ cmd: 'importAccountKey', userId: me.id, key: accountKey, published });
+    if (backupKeys && backupKeys.epoch >= (readJson(`backup-keys-v1:${me.id}`, null)?.epoch || 0)) writeJson(`backup-keys-v1:${me.id}`, backupKeys);
+    if (!linked) {
+      const leaf = await run({ cmd: 'mlsDeviceLeaf' }), issuedAt = Date.now(), bytes = Devices.mlsCertBytes(me.id, device.deviceId, 'web', leaf, published.sign, issuedAt);
+      await run({ cmd: 'mlsSetDeviceCert', cert: Devices.mlsCertJson(me.id, device.deviceId, 'web', leaf, published.sign, issuedAt, Devices.b64(await held.sign(bytes))), aik: published.sign });
+      try { localStorage.setItem(`mls-cert-v1:${instance}`, '1'); localStorage.setItem(`mls-cert-aik-v1:${instance}`, published.sign); } catch {}
+    }
+    linked = { deviceId: device.deviceId, instance, identity: { dh: published.dh, sign: published.sign }, full: true }; keyBox = held; inactive = false;
+    writeJson(`linked-store-v1:${me.id}`, linked);
+    await syncDevicesNow(); // The next list names this browser (and, for a code-linked one, no longer as such).
+  }
+  /** Settings → Devices → Account backup: what exists and what this device may do. */
+  function renderBackup() {
+    const full = holdsKey(), state = deviceView?.backup ?? null, changed = backupExists !== Boolean(state);
+    backupExists = Boolean(state);
+    say('backup-state', !deviceView ? 'Checking…' : state ? `On. Last changed ${new Date(state.updatedAt).toLocaleString()}.` : 'Off. Turn on account backup so a lost device can’t lock you out.');
+    $('backup-on').hidden = !full || Boolean(state);
+    for (const id of ['backup-change-pass', 'backup-new-words', 'backup-off']) $(id).hidden = !full || !state;
+    $('device-banner-nobackup').hidden = backupExists;
+    // §6.5: a reset asked for without the passphrase waits a week; the account's listed devices may cancel it.
+    const reset = deviceView?.reset, listedHere = deviceView?.devices?.find(row => row.current)?.state === 'listed';
+    $('reset-cancel').hidden = !reset || !listedHere;
+    if (reset && listedHere) deviceWarning = `Someone asked to reset your account key from ${platformName(reset.requestedBy?.platform)} on ${new Date(reset.at).toLocaleString()}. If this wasn’t you, cancel it.`;
+    else if (reset && !holdsKey()) say('chats-status', Date.now() < reset.executeAfter ? `Your account key will be reset on ${new Date(reset.executeAfter).toLocaleString()} unless one of your devices cancels it.` : 'The week is up: choose “I can’t do any of these” again to start over here.');
+    if (changed && me) window.DeviceLink?.attach(linkContext()); // The restore buttons follow whether a backup exists.
+  }
+  /** Turning the backup on, or changing it (§3.4): every change needs the current passphrase or recovery key. */
+  async function changeBackup(mode) {
+    const own = (await signer().identity()).pub, device = await localDevice(), run = keysCore(groupInstance(device.deviceId, own.sign));
+    const local = readJson(`backup-keys-v1:${me.id}`, null);
+    const prove = async (record, current) => (await run({ cmd: 'backupProve', record, ...(current.trim().split(/\s+/).length === 24 ? { words: current } : { passphrase: current }) })).proof;
+    const done = await window.Linking.backupFlow(mode, {
+      generate: () => run({ cmd: 'passphraseGenerate' }),
+      async prepare({ passphrase, current }) {
+        const accountKey = mode === 'off' ? null : await accountKeyB64();
+        let out, proof, record;
+        if (mode === 'on') out = await run({ cmd: 'backupCreate', userId: me.id, passphrase, accountKey, now: Date.now() });
+        else {
+          record = await verifiedRecord(own);
+          proof = await prove(record, current).catch(error => { throw error.code === 'auth' || error.code === 'invalid' ? new Error('That isn’t your current passphrase or recovery key.') : error; });
+          if (mode === 'off') return { publish: async () => { await api('/api/backup', 'DELETE', { proof }); localStorage.removeItem(`backup-keys-v1:${me.id}`); } };
+          if (!local) throw new Error('This device doesn’t have your backup keys yet. Unlock it with your passphrase first.');
+          out = await run({ cmd: 'backupReseal', userId: me.id, record, backupKeys: local, accountKey, ...(mode === 'pass' ? { passphrase } : { newRecovery: true }) });
+        }
+        return {
+          words: out.words,
+          async publish() {
+            const signed = { ...out.record, signature: await signWithIdentity(Devices.backupKeysBytes(out.record)) };
+            await api('/api/backup', 'PUT', { ...signed, ...(proof ? { proof } : {}), ...(out.passProof ? { passProof: out.passProof } : {}), ...(out.recoveryProof ? { recoveryProof: out.recoveryProof } : {}) });
+            writeJson(`backup-keys-v1:${me.id}`, out.backupKeys);
+          },
+        };
+      },
+    });
+    if (!done) return;
+    deviceNotice = { on: 'Account backup is on. You can now use your account on a new device with your passphrase or recovery key.', pass: 'Your passphrase was changed.', words: 'Your new recovery key is saved. The old one no longer works.', off: 'Account backup is off.' }[mode];
+    deviceView = await api(`/api/devices/${me.username}`); renderDevices();
+  }
+  $('backup-on').onclick = () => changeBackup('on').catch(error => { deviceWarning = error.message; renderDevices(); });
+  $('backup-change-pass').onclick = () => changeBackup('pass').catch(error => { deviceWarning = error.message; renderDevices(); });
+  $('backup-new-words').onclick = () => changeBackup('words').catch(error => { deviceWarning = error.message; renderDevices(); });
+  $('device-finish').onclick = async () => {
+    try { if (await finishRemoval(unfinished.map(value => value.id), { title: `${unfinished.map(deviceLabel).join(', ')} was removed. Change your account key now?` })) location.reload(); }
+    catch (error) { deviceWarning = error.message; renderDevices(); }
+  };
+  $('reset-cancel').onclick = () => api('/api/keys/reset', 'DELETE').then(async () => { deviceWarning = ''; deviceNotice = 'The reset was cancelled.'; deviceView = await api(`/api/devices/${me.username}`); renderDevices(); }, error => { deviceWarning = error.message; renderDevices(); });
+  $('backup-off').onclick = () => changeBackup('off').catch(error => { deviceWarning = error.message; renderDevices(); });
+
+  /** This browser's own sealed list entry ({ label, platform, via? }), with the label key it holds or derives. */
+  async function ownMeta(view) {
+    const id = (await localDevice()).deviceId, entry = view?.list?.devices.find(device => device.deviceId === id);
+    const stored = localStorage.getItem(`device-meta-key-v1:${me.id}`);
+    const key = holdsKey() ? await deviceMetaKey().catch(() => null) : stored ? await Devices.metaKeyFromBytes(Devices.unb64(stored)).catch(() => null) : null;
+    return key && entry ? Devices.openMeta(key, me.id, id, entry.meta) : null;
+  }
   async function renderDevices() {
     const list = $('device-list');
     if (!list || !me) return;
     say('devices-status', deviceWarning || deviceNotice);
     // A snapshot: sign-out (or a refresh) may replace deviceView while this awaits keys.
-    const view = deviceView, account = me;
+    const view = deviceView, account = me, full = holdsKey();
+    renderBackup();
+    $('device-finish').hidden = !full || !unfinished.length;
     if (!view?.devices) { list.replaceChildren(); return; }
-    const amPrimary = view.devices.some(row => row.current && row.primary);
-    // Only the identity-key holder can open the sealed labels; other browsers show the kind of client.
+    // The labels are sealed under a key derived from the account key: a device holding it derives it, a linked one got it.
     const linkedKey = linked ? localStorage.getItem(`device-meta-key-v1:${me.id}`) : null;
-    const key = amPrimary && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : linkedKey ? await Devices.metaKeyFromBytes(Devices.unb64(linkedKey)).catch(() => null) : null;
+    const key = full && backendName !== 'wasm' ? await deviceMetaKey().catch(() => null) : linkedKey ? await Devices.metaKeyFromBytes(Devices.unb64(linkedKey)).catch(() => null) : null;
     const rows = [];
     for (const row of view.devices) {
       const item = document.createElement('li'); item.className = 'device-row'; item.dataset.deviceId = row.id; item.dataset.state = row.state;
@@ -495,39 +675,24 @@
       const entry = view.list?.devices.find(device => device.deviceId === row.id);
       const described = key && entry ? await Devices.openMeta(key, account.id, row.id, entry.meta) : null;
       name.textContent = described?.label || platformName(described?.platform || row.platform);
+      // m6 §7: no "primary" any more. Whether a device holds the key is shown for this one only (others can't be known).
+      const standing = row.state === 'revoked' ? 'Removed' : row.state === 'pending' ? 'Signed in · not set up' : row.current ? (full ? 'Can unlock your account' : 'Waiting for keys') : described?.via === 'code' ? 'Linked by code' : null;
       const meta = document.createElement('small');
-      meta.textContent = [row.current ? 'This browser' : null, row.primary ? 'Primary · holds your keys' : null, row.state === 'pending' ? 'Signed in · not linked' : null, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
+      meta.textContent = [row.current ? 'This browser' : null, standing, row.lastSeenAt ? `Last seen ${new Date(row.lastSeenAt).toLocaleString()}` : null].filter(Boolean).join(' · ');
       item.append(name, meta);
-      // Any device of the account may revoke another (m5 §4): it is cut off at once; the primary then signs the list without it.
-      if (!amPrimary && !row.current && !row.primary && row.state !== 'revoked') {
-        const revoke = document.createElement('button'); revoke.type = 'button'; revoke.className = 'danger-text device-remove'; revoke.textContent = 'Revoke';
-        revoke.setAttribute('aria-label', `Revoke ${name.textContent}`);
-        revoke.onclick = () => revokeDevice(row).catch(error => { deviceWarning = `Could not revoke the device: ${error.message}`; renderDevices(); });
-        item.append(revoke);
-      }
-      if (linked && row.current) {
-        const leave = document.createElement('button'); leave.type = 'button'; leave.className = 'danger-text device-remove'; leave.textContent = 'Unlink this browser';
-        leave.onclick = () => revokeDevice(row).catch(error => { deviceWarning = `Could not unlink: ${error.message}`; renderDevices(); });
-        item.append(leave);
-        if (window.Linking?.can('becomePrimary')) {
-          const take = document.createElement('button'); take.type = 'button'; take.className = 'link device-become-primary'; take.textContent = 'Make this browser primary';
-          take.onclick = () => window.Linking.run('becomePrimary');
-          item.append(take);
-        }
-      }
-      if (amPrimary && !row.current && !row.primary) {
-        // A linked device is revoked (signed out, dropped from the signed list and from every group); a device that
-        // only signed in is simply removed.
-        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'danger-text device-remove'; remove.textContent = row.state === 'listed' ? 'Revoke' : 'Remove';
-        remove.setAttribute('aria-label', `${remove.textContent} ${name.textContent}`);
-        remove.onclick = () => removeDevice(row).catch(error => { deviceWarning = `Could not remove the device: ${error.message}`; renderDevices(); });
-        item.append(remove);
-        if (row.state === 'listed' && window.Linking?.can('makePrimary')) {
-          const promote = document.createElement('button'); promote.type = 'button'; promote.className = 'link device-promote'; promote.textContent = 'Make primary';
-          promote.setAttribute('aria-label', `Make ${name.textContent} your primary device`);
-          promote.onclick = () => window.Linking.run('makePrimary', row);
-          item.append(promote);
-        }
+      const button = (text, className, run, label = `${text} ${name.textContent}`) => {
+        const element = document.createElement('button'); element.type = 'button'; element.className = className; element.textContent = text;
+        element.setAttribute('aria-label', label);
+        element.onclick = () => run().catch(error => { deviceWarning = `${error.message || error}`; renderDevices(); });
+        item.append(element);
+      };
+      if (row.current && linked && !full && backupExists) button('Enter passphrase', 'link device-unlock', () => restoreWith('pass'), 'Enter your passphrase to unlock this browser');
+      if (row.current && linked) button('Unlink this browser', 'danger-text device-remove', () => revokeDevice(row), 'Unlink this browser');
+      if (!row.current && row.state !== 'revoked') {
+        // A device holding the account key removes another for good (and, once that one held the key, replaces the
+        // key, m6 §6.2); any other device only cuts it off, and a device holding the key finishes it.
+        if (full) button(row.state === 'listed' ? 'Revoke' : 'Remove', 'danger-text device-remove', () => removeDevice({ ...row, label: name.textContent }));
+        else button('Revoke', 'danger-text device-remove', () => revokeDevice(row));
       }
       rows.push(item);
     }
@@ -537,25 +702,186 @@
   window.addEventListener('linking-flows', () => renderDevices());
   /** Revokes one of the account's devices from this (non-primary) device: the server cuts it off; the primary re-signs the list. */
   async function revokeDevice(row) {
-    await api(`/api/devices/${row.id}/revoke`, 'POST', {});
+    // m6 §6.3: with a backup, cutting off another device takes the passphrase (unlinking yourself doesn't).
+    if (backupExists && !row.current) {
+      const done = await window.Linking.confirmRotation({
+        title: `Remove ${deviceLabel(row)}?`, action: 'Remove', proof: true,
+        text: 'The device is signed out and can’t read new messages. A device that can unlock your account then changes your account key.',
+        run: async secret => api(`/api/devices/${row.id}/revoke`, 'POST', { proof: await proveSecret(secret) }),
+      });
+      if (!done) return;
+    } else await api(`/api/devices/${row.id}/revoke`, 'POST', {});
     if (row.current) { try { localStorage.removeItem(`linked-store-v1:${me.id}`); } catch {} signedOut('This browser was unlinked. Messages already here stay in it.'); return; }
     deviceView = await api(`/api/devices/${me.username}`);
-    deviceNotice = 'Device revoked: it was signed out and can no longer receive messages. Your primary device updates your device list next time it’s online.';
+    deviceNotice = 'Device revoked: it was signed out and can no longer receive messages. A device that can unlock your account finishes removing it.';
     renderDevices();
   }
-  /** Signs the device out everywhere and, if it was listed, publishes the list without it. */
+  /**
+   * From a device holding the account key (m6 §6.2): a pending device is simply removed; a listed one could unlock the
+   * account, so removing it replaces the key, after the user confirms (with the passphrase when a backup exists).
+   */
   async function removeDevice(row) {
-    let body = {};
-    if (row.state === 'listed') {
-      const current = deviceView.list, hash = await Devices.hash(Devices.listBytes(current));
-      const list = { v: 1, userId: me.id, version: current.version + 1, prevHash: hash, devices: current.devices.filter(device => device.deviceId !== row.id) };
-      body = await signList(list);
+    if (row.state !== 'listed') {
+      await api(`/api/devices/${row.id}`, 'DELETE', {});
+      deviceView = await api(`/api/devices/${me.username}`);
+      deviceNotice = 'Device removed: it was signed out and can no longer receive messages.'; renderDevices();
+      return;
     }
-    await api(`/api/devices/${row.id}`, 'DELETE', body);
-    if (body.list) await pinOwn(body);
-    deviceView = await api(`/api/devices/${me.username}`);
-    deviceNotice = row.state === 'listed' ? 'Device revoked: it was signed out, left your groups, and can no longer receive messages.' : 'Device removed: it was signed out and can no longer receive messages.';
-    renderDevices();
+    const done = await finishRemoval([row.id], { title: `Remove ${deviceLabel(row)} and change your account key?`, revoke: true });
+    if (done) {
+      if (done.changePass) await changeBackup('pass').catch(error => { deviceWarning = error.message; });
+      deviceNotice = 'Device removed, and your account has a new key. Your other devices pick it up by themselves.';
+      setTimeout(() => location.reload(), 300);
+    }
+  }
+  const deviceLabel = row => row?.label || platformName(row?.platform);
+  /**
+   * Confirms, proves the passphrase if a backup exists, revokes (`revoke`) and replaces the key without `ids`. Resolves
+   * true when done; the caller reloads (this browser is then the inbox device under the new key).
+   */
+  async function finishRemoval(ids, { title, text, action, revoke = false }) {
+    return window.Linking.confirmRotation({
+      title, text, action, proof: backupExists,
+      run: async secret => {
+        const own = (await signer().identity()).pub;
+        let proof;
+        if (backupExists) proof = await proveSecret(secret);
+        if (revoke) for (const id of ids) await api(`/api/devices/${id}/revoke`, 'POST', proof ? { proof } : {});
+        await rotate({ removed: ids, proof });
+      },
+    });
+  }
+  /** The proof (§3.5) that the user knows the passphrase (or, as exactly 24 words, the recovery key), from the served record. */
+  async function proveSecret(secret) {
+    const published = (await api(`/api/devices/${me.username}`)).identity, record = await verifiedRecord(published);
+    const words = secret.trim().split(/\s+/).length === 24, instance = groupInstance((await localDevice()).deviceId, published.sign);
+    try { return (await keysCore(instance)({ cmd: 'backupProve', record, ...(words ? { words: secret } : { passphrase: secret }) })).proof; }
+    catch (error) { throw error.code === 'auth' || error.code === 'invalid' ? new Error('That isn’t your passphrase or recovery key.') : error; }
+  }
+  /** m6 §7: a legacy (non-extractable) key can't move; it is replaced once, the first time it must. */
+  const upgradeKey = () => finishRemoval([], { title: 'Update this browser’s account key?', action: 'Update key', text: 'This browser’s key is from before keys could move between your devices. It gets a new one now; your other devices pick it up by themselves and your contacts keep their verification.' });
+  /**
+   * A device another session revoked (any device may cut one off, m5 §4) while our verified list still names it: only a
+   * device holding the key can finish it, by replacing the key, and only once the user agrees (§6.2).
+   */
+  let unfinished = [];
+  async function finishRemovals() {
+    const holder = signer();
+    if (!holder || !me) return;
+    const own = (await holder.identity()).pub, view = await api(`/api/devices/${me.username}`);
+    if (view.identity?.sign !== own.sign) return;
+    const owned = await Devices.ownDevices({ userId: me.id, aikSign: own.sign, view, pin: readPins()[me.id], metaKey: await deviceMetaKey().catch(() => null) });
+    // Removed devices aren't served as rows at all: our list naming one the server no longer has is one to finish.
+    unfinished = (owned?.devices || []).filter(device => !['listed', 'pending'].includes(view.devices.find(row => row.id === device.deviceId)?.state))
+      .map(device => ({ id: device.deviceId, label: device.described?.label, platform: device.described?.platform }));
+    if (unfinished.length) { deviceWarning = `${unfinished.map(deviceLabel).join(', ')} was removed. Change your account key now?`; deviceView = view; renderDevices(); }
+  }
+  /**
+   * Replaces the account key (§6.2): the old key signs a record handing the account to a new one minted here; this
+   * browser takes messaging over and publishes list version 1 naming every live device except `removed`; the backup
+   * is re-sealed to the backup keys held here. Other devices follow the record and rekey.
+   */
+  async function rotate({ removed = [], proof } = {}) {
+    const cur = signer(), old = (await cur.identity()).pub, self = (await localDevice()).deviceId;
+    const view = await api(`/api/devices/${me.username}`);
+    const owned = await Devices.ownDevices({ userId: me.id, aikSign: old.sign, view, pin: readPins()[me.id], metaKey: await deviceMetaKey() });
+    if (!owned) throw new Error('The device list on the server isn’t one your devices signed. Nothing changed.');
+    await coreHoldsKey(); // The group store swaps its key with ours (rotateIdentity needs it to hold the old one).
+    const record0 = backupExists ? await verifiedRecord(old) : null, local = readJson(`backup-keys-v1:${me.id}`, null);
+    const next = await window.Signal.generateIdentity(); // In memory until the server holds the record.
+    const record = { v: 1, userId: me.id, oldSign: old.sign, newSign: next.pub.sign, newDh: next.pub.dh, at: Date.now() };
+    const signature = Devices.b64(await cur.sign(Devices.successionBytes(record)));
+    const newMeta = await Devices.deviceMetaKey(me.id, bytes => window.Signal.signWith(next, bytes));
+    const keep = [];
+    for (const device of owned.devices) {
+      const row = view.devices.find(value => value.id === device.deviceId);
+      if (device.deviceId === self || removed.includes(device.deviceId) || row?.state !== 'listed') continue;
+      const platform = device.described?.platform || row.platform;
+      // A short-code device stays marked as one under the new key: it unlocks with the passphrase, never by rekey.
+      keep.push({ deviceId: device.deviceId, addedAt: device.addedAt, meta: await Devices.sealMeta(newMeta, me.id, device.deviceId, { label: device.described?.label || platformName(platform), platform, ...(device.described?.via ? { via: device.described.via } : {}) }) });
+    }
+    // Its leaves go from our groups after the key change (verifiedOwnDevices counts them as dropped).
+    const gone = owned.devices.map(device => device.deviceId).filter(id => id !== self && !keep.some(device => device.deviceId === id));
+    writeJson(`removed-devices-v1:${me.id}`, [...new Set([...readJson(`removed-devices-v1:${me.id}`, []), ...gone])]);
+    // Two steps (the core keeps `rotation:pending`, which survives a closed tab): prepared, then published, then held.
+    const secrets = await window.Signal.exportIdentity(next);
+    const accountKey = Devices.b64(Devices.accountKeyBytes(me.id, secrets.signSeed, secrets.dhSecret));
+    secrets.signSeed.fill(0); secrets.dhSecret.fill(0);
+    const instance = groupInstance(self, old.sign), run = keysCore(instance);
+    await run({ cmd: 'rotateIdentity', userId: me.id, key: accountKey, record, signature, at: record.at, commit: false });
+    writeJson(`new-chain-v1:${me.id}`, { aik: record.newSign, keep });
+    try { await api('/api/devices/succession', 'PUT', { record, signature, ...(proof ? { proof } : {}) }); }
+    catch (error) {
+      // Refused: nothing changed anywhere. No answer at all (the server may have taken it): kept, and settled on the next start.
+      if (error.status) { await run({ cmd: 'rotationDrop' }).catch(() => {}); try { localStorage.removeItem(`new-chain-v1:${me.id}`); } catch {} }
+      throw error;
+    }
+    await finishRotation(run, instance, { record, backup: record0 && local ? { record: record0, keys: local } : null });
+  }
+  /**
+   * The server holds the record: the core takes the new key (committing the prepared rotation), this browser's key store
+   * gets it from there, its own certificate moves to the new key, it takes messaging over (list v1 goes up from the
+   * marker) and re-seals the backup. Also the resume after a restart (resumeRotation).
+   */
+  async function finishRotation(run, instance, { record, backup }) {
+    await run({ cmd: 'rotateIdentity', userId: me.id });
+    const accountKey = await run({ cmd: 'exportAccountKey', userId: me.id }), secrets = Devices.parseAccountKey(Devices.unb64(accountKey), me.id);
+    const held = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${me.id}`)), self = (await localDevice()).deviceId;
+    try { await held.adoptIdentity(secrets, { dh: record.newDh, sign: record.newSign }); } finally { secrets.signSeed.fill(0); secrets.dhSecret.fill(0); }
+    writeJson(`group-instance-v1:${me.id}`, { aik: record.newSign, instance });
+    // This browser's own certificate under the new key; every group then gets a self-update carrying it.
+    const leaf = await run({ cmd: 'mlsDeviceLeaf' }), issuedAt = Date.now();
+    await run({ cmd: 'mlsSetDeviceCert', cert: Devices.mlsCertJson(me.id, self, 'web', leaf, record.newSign, issuedAt, Devices.b64(await held.sign(Devices.mlsCertBytes(me.id, self, 'web', leaf, record.newSign, issuedAt)))), aik: record.newSign });
+    try { localStorage.setItem(`mls-cert-v1:${instance}`, '1'); localStorage.setItem(`mls-recertify-v1:${instance}`, '1'); localStorage.removeItem(`linked-store-v1:${me.id}`); } catch {}
+    linked = null; keyBox = null; box = held; backendName = 'signal'; inactive = false; coreKeyed = Promise.resolve();
+    window.Core?.setBackend(me.id, 'signal');
+    // The old key's pin ends here; list v1 under the new key carries the devices the marker (bound to this key) names.
+    const pins = readPins(); delete pins[me.id]; writePins(pins);
+    newChain = Devices.chainMarker(readJson(`new-chain-v1:${me.id}`, null), record.newSign, undefined);
+    await publishKeys(true); // The new key takes the inbox here, and list v1 goes up (from the marker, bound to this key).
+    // The backup follows the key: re-sealed to the backup keys held here (the one proof-free re-seal, §3.5).
+    if (backup) {
+      const out = await run({ cmd: 'backupReseal', userId: me.id, record: backup.record, backupKeys: backup.keys, accountKey });
+      await api('/api/backup', 'PUT', { ...out.record, signature: Devices.b64(await held.sign(Devices.backupKeysBytes(out.record))) });
+      writeJson(`backup-keys-v1:${me.id}`, out.backupKeys);
+    }
+  }
+  /**
+   * On start: a rotation prepared here before the tab closed. Finished if the server took its record (or already serves
+   * its key), dropped if the server never did. Resolves true when this browser now holds the new key.
+   */
+  async function resumeRotation(userId) {
+    const stored = linkedStore(userId);
+    if (stored && !stored.full) return false;
+    // Only a browser whose key store already holds a key (a check that mints nothing: the wasm core keeps its own).
+    if (!stored && !await window.Core?.hasKeys(userId, 'signal').catch(() => false)) return false;
+    const held = window.Signal.box(window.Signal.indexedDbBackend(`webrtc-bun-signal-v1-${userId}`));
+    const pub = (await held.identity()).pub, instance = stored?.instance || groupInstance((await localDevice()).deviceId, pub.sign), run = keysCore(instance);
+    const pending = await run({ cmd: 'rotationPending' }).catch(() => null);
+    if (!pending) return false;
+    const view = await api(`/api/devices/${me.username}`), newSign = pending.identity.sign;
+    // Committed only if the server publishes that key already, or its newest record names it and still authorizes it;
+    // anything else (never taken, or replaced by a later record) is dropped: the old key stays.
+    const open = view.rotation?.newSign === newSign && view.rotation.state === 'open';
+    if (view.identity?.sign !== newSign && !open) { await run({ cmd: 'rotationDrop' }); try { localStorage.removeItem(`new-chain-v1:${me.id}`); } catch {} return false; }
+    const { signature, ...record } = pending.record, local = readJson(`backup-keys-v1:${me.id}`, null);
+    const record0 = view.backup && local ? await verifiedRecord({ sign: record.oldSign }).catch(() => null) : null;
+    await finishRotation(run, instance, { record, backup: record0?.aikSign === record.oldSign ? { record: record0, keys: local } : null });
+    return true;
+  }
+  /** The group store holds the account key too (m6 §1: the core answers rekeys); once per session. */
+  let coreKeyed = null;
+  function coreHoldsKey() {
+    coreKeyed ||= (async () => {
+      const own = (await signer().identity()).pub;
+      await keysCore(groupInstance((await localDevice()).deviceId, own.sign))({ cmd: 'importAccountKey', userId: me.id, key: await accountKeyB64(), published: own });
+    })().catch(error => { coreKeyed = null; throw error; });
+    return coreKeyed;
+  }
+  /** The `backup` frame (§3.5): a read elsewhere is shown; a newer record means our backup keys are stale until a rekey. */
+  function onBackupFrame(message) {
+    if (message.read) { deviceNotice = 'Your backup was opened on a new device.'; say('chats-status', deviceNotice); }
+    api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {});
   }
   /** A contact's served list, checked against the identity key we pinned for them (never the server's word). */
   async function verifyContactDevices(contact) {
@@ -568,21 +894,6 @@
     if (check.ok) { pins[contact.id] = check.pin; writePins(pins); }
     return { ...check, count: view.list.devices.length, version: view.list.version };
   }
-  $('device-takeover').onclick = async () => {
-    $('device-takeover').disabled = true; $('device-takeover').textContent = 'Moving…';
-    let step = 'starting';
-    try {
-      // Each step is named so a failure on a real phone says exactly where it stopped.
-      if (!box) { step = 'opening this browser’s key storage'; await ready; if (!box) throw new Error('encrypted messaging is unavailable in this browser'); }
-      step = 'uploading this device’s keys'; await publishKeys(true);
-      step = 'confirming with the server';
-      const check = await api('/api/keys/count'), here = (await box.prekeys()).identity;
-      if (!check.identity || check.identity.dh !== here.dh || check.identity.sign !== here.sign) throw new Error('the server still lists the other device');
-      say('chats-status', 'Messaging moved to this device. Your contacts will see that your security code changed.');
-    } catch (error) {
-      say('device-banner-text', `Could not move messaging here (${step}): ${error?.message || error}. Reload and try again; if it repeats, send this text to the admin.`);
-    } finally { $('device-takeover').disabled = false; $('device-takeover').textContent = 'Use this device instead'; }
-  };
   async function rememberFlag(id) {
     flagged.add(id);
     await flagged.store?.put('flagged', [...flagged].slice(-500));
@@ -605,11 +916,17 @@
       else if (message.type === 'incoming') incoming(message);
       else if (message.type === 'envelope') inbound = inbound.then(() => receiveEnvelope(socket, message)).catch(() => {});
       else if (['group', 'welcome', 'channel', 'keypackages', 'ephemeral'].includes(message.type)) window.Groups?.frame(message);
-      else if (message.type === 'devices' && message.id === me?.id && linked) followOwnSuccession().then(takeRecert).then(() => window.Groups?.devicesChanged()).catch(() => {});
-      else if (message.type === 'recert' && message.id === me?.id) (linked ? takeRecert() : answerRecerts()).catch(() => {});
-      else if (message.type === 'devices' && message.id === me?.id) { if (!inactive) syncDevices().then(() => window.Groups?.devicesChanged()).catch(() => {}); else api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }).catch(() => {}); }
+      else if (message.type === 'devices' && message.id === me?.id && linked) followOwnSuccession().then(takeRekey).then(() => window.Groups?.devicesChanged()).then(() => keyBox && finishRemovals()).catch(() => {});
+      else if (message.type === 'rekey' && message.id === me?.id) (message.answered ? takeRekey() : answerRekeys()).catch(() => {});
+      else if (message.type === 'recert' && message.id === me?.id && !message.answered) answerRecerts().catch(() => {});
+      else if (message.type === 'backup' && message.id === me?.id) onBackupFrame(message);
+      else if (message.type === 'reset' && message.id === me?.id) { if (message.cancelled) deviceWarning = ''; api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); if (!message.cancelled) say('chats-status', deviceWarning); }).catch(() => {}); }
+      // The inbox device: another device may have replaced the account key (its list v1 comes after the keys), so it
+      // follows first, live; otherwise the usual list upkeep.
+      else if (message.type === 'devices' && message.id === me?.id) followLive().then(followed => { if (followed) return; if (!inactive) return syncDevices().then(() => window.Groups?.devicesChanged()); return api(`/api/devices/${me.username}`).then(view => { deviceView = view; renderDevices(); }); }).catch(() => {});
       else if (message.type === 'devices') { const contact = contactById(message.id); if (contact) verifyContactDevices(contact).catch(() => {}); }
-      else if (message.type === 'keys' && message.id === me?.id) publishKeys().catch(() => {}); // Another device took over messaging.
+      // Another device took messaging over: by replacing the account key (follow it), or a pre-M6 take-over.
+      else if (message.type === 'keys' && message.id === me?.id) followLive().then(followed => followed || publishKeys()).catch(() => {});
       else if (message.type === 'keys') checkIdentity(message.id).then(flushOutgoing).catch(() => {});
       else if (message.type === 'ended' && ringing?.roomId === message.roomId) { const ring = ringing; ringing = null; hideRing(); say('chats-status', `Missed ${ring.kind} call from ${ring.contact.username} · ${clock(Date.now())}`); }
     };
@@ -1028,7 +1345,7 @@
   // ---------- Encryption core (Settings → Advanced) ----------
   let backendName = 'signal', announceBackend = () => {};
   // Set by the link flow when this browser became a linked device: { deviceId, instance } (its group store).
-  let linked = null;
+  let linked = null, keyBox = null;
   const linkedStore = userId => { try { const value = JSON.parse(localStorage.getItem(`linked-store-v1:${userId}`) || 'null'); return value?.instance ? value : null; } catch { return null; } };
   function showBackend() {
     if (backendName === 'linked') {
@@ -1112,7 +1429,7 @@
       await box.acceptChange(contact.id, served);
       if (before.verified) await box.setVerified(contact.id, true, served);
     } catch (error) { if (error.code === 'mismatch') return true; throw error; }
-    const text = `${contact.username} moved to a new device. Verification kept.`;
+    const text = `${contact.username} updated their security key. Verification kept.`; // m6 §6.2
     await window.ChatStore.note(await pairId(contact.id), crypto.randomUUID(), text).catch(() => {});
     say('chats-status', text);
     if (current?.id === contact.id) App.refreshHistory();
@@ -1328,7 +1645,7 @@
   }
   function groupContext() {
     return {
-      me, backend: backendName, box, signWithIdentity, followOwnSuccession, followContact: async contactId => Boolean(contactById(contactId) && box && await checkIdentity(contactId)), recerts: () => (linked ? takeRecert() : answerRecerts()).catch(() => {}), contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
+      me, backend: backendName, box, signWithIdentity, followOwnSuccession, followContact: async contactId => Boolean(contactById(contactId) && box && await checkIdentity(contactId)), recerts: () => Promise.all([takeRekey(), answerRekeys(), answerRecerts(), keyBox || (box && !inactive) ? finishRemovals() : null].map(task => Promise.resolve(task).catch(() => {}))), contacts: () => contacts, render: () => render(), notice: text => say('chats-status', text),
       viewing: id => body.dataset.screen === 'conversation' && window.Groups?.active() === id,
       looking: () => body.dataset.screen === 'conversation' && document.visibilityState === 'visible' && document.hasFocus(),
       socket: () => events, openGroup, verifiedOwnDevices,

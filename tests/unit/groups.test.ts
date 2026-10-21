@@ -15,12 +15,13 @@ const b64 = (text: string) => Buffer.from(text).toString('base64url');
 const sha = (text: string) => createHash('sha256').update(text).digest('hex');
 
 type Cmd = { cmd: string; [key: string]: any };
-function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[]; joinInfo?: () => [number, any]; commit?: () => [number, any] } = {}) {
+function world(options: { log?: (after: number) => any[]; contact?: boolean; dmPeer?: any; poison?: number; removeDevice?: string; epoch?: number; channels?: any[]; own?: { listed: string[]; dropped: string[] } | null; tree?: any[]; joinInfo?: () => [number, any]; commit?: () => [number, any]; succession?: boolean } = {}) {
   const log = { current: options.log };
   const calls: Cmd[] = [], requests: { method: string; path: string; body: any }[] = [];
   let peer: any = { identity: { dh: 'dh1', sign: 'sign1' }, verified: false, changed: false, blocked: false };
   const handlers: Record<string, (command: Cmd) => any> = {
     mlsDeviceLeaf: () => 'leaf', mlsSetDeviceCert: () => ({}), mlsKeyPackages: command => Array(command.count).fill('kp'),
+    acceptSuccession: () => { peer = { identity: { dh: 'dh2', sign: 'sign2' }, verified: peer.verified, changed: false, blocked: false }; return peer; },
     peer: () => peer, notePeer: command => { const changed = peer && (peer.identity.dh !== command.identity.dh || peer.identity.sign !== command.identity.sign); peer = { identity: command.identity, verified: false, changed, blocked: changed }; return peer; },
     // Like chatcore: with `identity`, only that exact pinned identity is accepted.
     acceptChange: command => { if (command.identity && (command.identity.dh !== peer.identity.dh || command.identity.sign !== peer.identity.sign)) throw coded('mismatch', 'The security code changed again.'); peer = { ...peer, blocked: false }; return null; },
@@ -44,6 +45,7 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     ['GET', /^\/api\/channels\/\w+\/members$/, () => [200, { members: [{ userId: ME, username: 'me', deviceId: DEV, admin: true }, { userId: BOB, username: 'bob', deviceId: BOB_DEV, admin: false }] }]],
     ['GET', /^\/api\/mls\/welcomes$/, () => [200, { welcomes: [] }]],
     ['GET', /^\/api\/channels\/\w+\/log\?after=(\d+)$/, (_, match) => [200, { epoch: 3, seq: 9, cursor: 0, entries: log.current?.(Number(match[1])) ?? [], more: false, gap: false }]],
+    ['GET', /^\/api\/devices\/bob$/, () => !options.succession ? [200, {}] : [200, { succession: [{ v: 1, userId: BOB, oldSign: 'sign1', newSign: 'sign2', newDh: 'dh2', at: 1, signature: 'S' }] }]],
     ['GET', /^\/api\/users\/\w+\/identity$/, () => [200, { userId: BOB, username: 'bob', identity: { dh: 'dh2', sign: 'sign2' } }]],
     ['POST', /^\/api\/channels\/\w+\/resolve$/, body => [200, body.action === 'rollback' ? { resolved: 'rollback', epoch: 3, seq: 4, removeDevice: options.removeDevice ?? BOB_DEV } : { resolved: 'dismiss' }]],
     ['POST', /^\/api\/channels\/\w+\/commits$/, () => options.commit?.() ?? [201, { epoch: 4, seq: 6, digest: sha('commit') }]],
@@ -71,7 +73,8 @@ function world(options: { log?: (after: number) => any[]; contact?: boolean; dmP
     navigator: { locks: { request(_name: string, options: any, callback?: any) { const run = callback ?? options; Promise.resolve().then(() => run({})); return Promise.resolve(); } } },
     WebSocket: { OPEN: 1 }, App: app,
     Core: { supported: () => true, groupStore: () => core },
-    DeviceFormat: { deviceKey: async () => ({ deviceId: DEV, sign: async () => 'signature' }), mlsCertBytes: () => new Uint8Array(1), mlsCertJson: () => '{}', b64: (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url') },
+    // A chain is valid here only from bob's first key to his second (its records are checked for real in link.test.ts).
+    DeviceFormat: { successionFrom: async (userId: string, record: any, to: any, records: any[]) => userId === BOB && !record?.changed && !record?.blocked && record?.identity.sign === 'sign1' && to.sign === 'sign2' && records.length ? records : null, deviceKey: async () => ({ deviceId: DEV, sign: async () => 'signature' }), mlsCertBytes: () => new Uint8Array(1), mlsCertJson: () => '{}', b64: (bytes: Uint8Array) => Buffer.from(bytes).toString('base64url') },
   };
   context.Math = Object.assign(Object.create(Math), { random: () => 0 }); // No 0–3 s jitter in tests.
   context.window = context;
@@ -508,16 +511,44 @@ describe('groups.js security rules (docs/m4-groups.md)', () => {
     expect(w.requests.filter(request => request.path.endsWith('/poison'))).toEqual([]);
   });
 
-  test('14. a primary handing the account over reads nothing more until it has stepped down', async () => {
-    const w = world();
+  test('15. a member whose key moved by a signed record is followed by the group store, in whatever order the frames came: no review, no report', async () => {
+    const w = world({ succession: true });
+    let received = 0;
     await w.start();
-    w.Groups.hold();
-    w.calls.length = 0;
-    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: ME, deviceId: DEV2 }, message: b64('recert'), createdAt: Date.now() });
-    w.Groups.frame(live);
-    await Bun.sleep(150);
-    expect(w.of('mlsReceive')).toEqual([]);
-    expect(w.Groups.debug(G).cursor).toBe(0);
+    w.handlers.mlsReceive = () => {
+      if (received++ === 0) throw coded('poison', `poison ${sha('moved')}: device certificate: not signed by the pinned account key`);
+      return { pendingId: 'p1', kind: 'commit', sender: { leaf: 1, userId: BOB, deviceId: BOB_DEV }, epoch: 4, digest: sha('moved') };
+    };
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'commit', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('moved'), createdAt: Date.now() });
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    expect(w.of('acceptSuccession').map(command => command.contact)).toEqual([BOB]);
+    expect(w.Groups.debug(G).status).toBe('active');
+    expect([...w.storage.keys()].filter(key => key.startsWith('pin-changes-v1')).map(key => w.storage.get(key))).toEqual([]);
+    expect(w.requests.filter(request => request.path.endsWith('/poison'))).toEqual([]);
+  });
+
+  test('16. a contact\'s moved key goes through account.js (its one "updated their security key" notice), never a silent 1:1 pin write here', async () => {
+    const w = world({ contact: true, succession: true, dmPeer: { identity: { dh: 'dh1', sign: 'sign1' }, verified: true, changed: false, blocked: false } });
+    const notices: string[] = [];
+    let boxWrites = 0;
+    w.ctx.box.notePeer = async () => { boxWrites++; };
+    // account.js's followContact: follows the record on the 1:1 pin and posts the notice, once per move.
+    (w.ctx as any).followContact = async () => {
+      if (w.dm.peer.identity.sign === 'sign2') return false;
+      w.dm.peer = { identity: { dh: 'dh2', sign: 'sign2' }, verified: true, changed: false, blocked: false };
+      notices.push('bob updated their security key. Verification kept.');
+      return true;
+    };
+    await w.start();
+    let received = 0;
+    // The core doesn't know the member yet (unpinned): pins are refreshed against what the server publishes now.
+    w.handlers.mlsReceive = () => { if (received++ === 0) throw new Error(`no pinned account key for user ${BOB}`); return { ...application({ ...text, id: crypto.randomUUID() }), pendingId: 'p9' }; };
+    w.Groups.frame({ type: 'group', channel: G, seq: 1, epoch: 3, kind: 'app', from: { userId: BOB, deviceId: BOB_DEV }, message: b64('m'), createdAt: Date.now() });
+    await w.until(() => w.Groups.debug(G).cursor === 1, 'processed');
+    expect(notices).toHaveLength(1);
+    expect(boxWrites).toBe(0);
+    expect(w.of('acceptSuccession').map(command => command.contact)).toEqual([BOB]); // the group store followed the same chain
+    expect(w.Groups.debug(G).status).toBe('active');
   });
 
   test('3e. a report refused because the commit was rolled back meanwhile reads on; it never rejoins (or retries a 429 report)', async () => {

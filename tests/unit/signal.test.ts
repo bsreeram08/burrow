@@ -486,3 +486,41 @@ describe('pins', () => {
     });
 });
 
+
+describe('the account key leaves a device only as its two secrets (m6 §1)', () => {
+    const verify = async (pub: string, signature: Uint8Array, bytes: Uint8Array) => crypto.subtle.verify('Ed25519', await crypto.subtle.importKey('raw', Signal.unb64(pub, 32), { name: 'Ed25519' }, false, ['verify']), new Uint8Array(signature), new Uint8Array(bytes));
+    test('a new identity is stored wrapped, exports, and re-imports to the same keys elsewhere', async () => {
+        const A = Signal.box(memory());
+        const pub = (await A.identity()).pub;
+        expect(await A.exportable()).toBe(true);
+        const secrets = await A.exportIdentity();
+        expect([secrets.signSeed.length, secrets.dhSecret.length]).toEqual([32, 32]);
+        const B = Signal.box(memory());
+        expect(await B.adoptIdentity(secrets, pub)).toEqual(pub);
+        const bytes = text('list bytes');
+        expect(await verify(pub.sign, await B.sign(bytes), bytes)).toBe(true);
+        // B's signed prekey verifies under the shared identity, and the two derive the same X25519 key.
+        await Signal.verifySignedPreKey(pub, (await B.prekeys()).signedPreKey);
+        const again = await B.exportIdentity();
+        expect(Signal.b64(again.dhSecret)).toBe(Signal.b64(secrets.dhSecret));
+    });
+    test('an import that does not give the expected public keys is refused', async () => {
+        const secrets = await Signal.box(memory()).exportIdentity();
+        const other = (await Signal.box(memory()).identity()).pub;
+        const B = Signal.box(memory());
+        await expect(B.adoptIdentity(secrets, other)).rejects.toMatchObject({ code: 'invalid' });
+        await expect(B.adoptIdentity({ signSeed: new Uint8Array(31), dhSecret: new Uint8Array(32) })).rejects.toMatchObject({ code: 'invalid' });
+    });
+    test('a legacy identity (a non-extractable key pair) still signs but cannot be exported', async () => {
+        const store = memory();
+        const fresh = await Signal.generateIdentity();
+        const legacy = { ...fresh, sign: await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']) };
+        legacy.pub = { ...fresh.pub, sign: Signal.b64(new Uint8Array(await crypto.subtle.exportKey('raw', legacy.sign.publicKey))) };
+        await store.put('identity', legacy);
+        const A = Signal.box(store);
+        expect(await A.exportable()).toBe(false);
+        expect(await A.exportIdentity()).toBeNull();
+        const bytes = text('still signs');
+        expect(await verify(legacy.pub.sign, await A.sign(bytes), bytes)).toBe(true);
+    });
+});

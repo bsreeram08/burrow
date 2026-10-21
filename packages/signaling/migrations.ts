@@ -140,6 +140,30 @@ const MIGRATIONS: ((db: Database) => void)[] = [
             CREATE INDEX recert_requests_user ON recert_requests (user_id);
         `);
     },
+    // 7 (M6): the account key on every device (docs/m6-account-key.md): an end-to-end encrypted backup of it, the log of who
+    // opened it, rekey requests from devices that do not hold it, and the one re-seal a succession allows.
+    db => {
+        db.exec(`
+            CREATE TABLE account_backups (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, record TEXT NOT NULL, updated_at INTEGER NOT NULL);
+            -- Every attempt to read a backup (rate limited from these rows); found = 1 is the account's security-event log of an opened backup.
+            CREATE TABLE backup_reads (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, session TEXT, device_id TEXT, at INTEGER NOT NULL, found INTEGER NOT NULL);
+            CREATE INDEX backup_reads_user ON backup_reads (user_id, at);
+            CREATE TABLE rekey_requests (device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                platform TEXT NOT NULL, eph TEXT NOT NULL, leaf_sig_key TEXT NOT NULL, signature TEXT NOT NULL, box TEXT, created_at INTEGER NOT NULL);
+            CREATE INDEX rekey_requests_user ON rekey_requests (user_id);
+            -- A succession the server accepted proved the passphrase already: the rotation that follows may publish its first list under the new key
+            -- (which drops the removed devices) and re-seal the backup once each, without another proof.
+            -- A delayed reset of the account key (an identity change without a succession or the passphrase's proof, docs/m6-account-key.md §6.4):
+            -- one open request per account, executable after execute_after from the requesting session only; the log is the rate limit.
+            CREATE TABLE key_resets (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, session TEXT NOT NULL, device_id TEXT, platform TEXT NOT NULL, requested_at INTEGER NOT NULL, execute_after INTEGER NOT NULL);
+            CREATE TABLE key_reset_log (user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE, at INTEGER NOT NULL);
+            -- A succession record authorizes one identity change (the rotation's PUT /api/keys); used = 1 once it did.
+            ALTER TABLE identity_succession ADD COLUMN used INTEGER NOT NULL DEFAULT 0;
+            -- Records that exist now (an abandoned pre-M6 transfer included) must never authorize a change later.
+            UPDATE identity_succession SET used = 1;
+            CREATE TABLE rotation_allowance (user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, new_sign TEXT NOT NULL, since INTEGER NOT NULL, list INTEGER NOT NULL DEFAULT 1, reseal INTEGER NOT NULL DEFAULT 1);
+        `);
+    },
 ];
 
 function columns(db: Database, table: string) { return db.query<{ name: string }, []>(`PRAGMA table_info(${table})`).all().map(column => column.name); }

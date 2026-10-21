@@ -124,7 +124,7 @@ export function createLink(deps: Deps) {
         const typed = typeof body?.code === 'string' ? body.code.toUpperCase().replace(/[\s-]/g, '') : '';
         const device = deps.sessionDevice(user.session);
         const link = typed.length === 8 && [...typed].every(c => CODE_ALPHABET.includes(c)) ? db.query<Link, [string]>('SELECT * FROM link_requests WHERE code_hash = ?').get(sha(typed)) : null;
-        const fine = live(link) && link.state === 'waiting' && link.commit_hash && link.user_id === null && link.purpose === 'link' && link.expect_user === user.id && device !== null && device === primaryOf(user.id);
+        const fine = live(link) && link.state === 'waiting' && link.commit_hash && link.user_id === null && link.purpose === 'link' && link.expect_user === user.id && device !== null && deps.eligible(user.id, device);
         if (!fine) { strike(user.id); return json({ error: 'No link with that code.' }, 404); }
         // Single use: the code stops existing the moment a primary has it.
         db.query('UPDATE link_requests SET code_hash = NULL, user_id = ?, offer_device_id = ? WHERE id = ?').run(user.id, device, link.id);
@@ -145,7 +145,9 @@ export function createLink(deps: Deps) {
 
     async function offer(request: Request, link: Link, user: SessionUser): Promise<Response> {
         const device = deps.sessionDevice(user.session);
-        if (link.state !== 'waiting' || !device || device !== primaryOf(user.id)) return json({ error: 'Only the account\'s primary device links devices.' }, 403);
+        // Any listed device of the account links another (every device holds the account key, docs/m6-account-key.md §2); a pre-M6 transfer is still the primary's alone.
+        const allowed = link.purpose === 'transfer' ? device === primaryOf(user.id) : deps.eligible(user.id, device);
+        if (link.state !== 'waiting' || !device || !allowed) return json({ error: 'Only a listed device of the account links devices.' }, 403);
         if (link.mode === 'code' ? (link.user_id !== user.id || link.offer_device_id !== device) : false) return json({ error: 'Look the code up first.' }, 409);
         if (link.mode === 'qr' && link.user_id && link.user_id !== user.id) return json({ error: 'This link belongs to another account.' }, 403);
         if (link.expect_user && link.expect_user !== user.id) return json({ error: 'This link was not started for your account.' }, 403);

@@ -23,6 +23,9 @@ class FakeDs {
   /// Tests: a different identity than the account's real one, as if its keys changed.
   final Map<String, Map<String, String>> identityOverride = {};
 
+  /// Tests: the inbox (primary) device per user id; the devices view then lists that user's devices.
+  final Map<String, String> inbox = {};
+
   /// Succession records served in a user's devices view (user id → records).
   final Map<String, List<Map<String, dynamic>>> succession = {};
 
@@ -177,7 +180,13 @@ class FakeDs {
       final user = devices.values.where((d) => d.username == view[1]).firstOrNull;
       if (user == null) return _error('No such user.', 404);
       final chain = succession[user.userId];
-      return _json({'userId': user.userId, 'identity': _identity(user.userId), 'list': null, 'signature': null, 'certs': const {}, 'succession': ?chain});
+      return _json({'userId': user.userId, 'identity': _identity(user.userId), 'list': null, 'signature': null, 'certs': const {}, 'succession': ?chain,
+        if (inbox[user.userId] case final primary?)
+          'devices': [
+            for (final d in devices.entries)
+              if (d.value.userId == user.userId) {'id': d.key, 'state': 'listed', 'primary': d.key == primary},
+          ],
+      });
     }
     final published = RegExp(r'^/api/keys/([a-z0-9_]+)/identity$').firstMatch(path);
     if (published != null) {

@@ -54,6 +54,7 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
   bool _focused = true;
   bool _dropping = false;
   final List<ChatMessage> _unreported = [];
+  Future<String>? _reason;
 
   @override
   void initState() {
@@ -294,7 +295,17 @@ class _ConversationScreenState extends ConsumerState<ConversationScreen> with At
       ? child
       : Column(
           children: [
-            Padding(padding: const EdgeInsets.all(12), child: Text(companionNotice, key: const Key('companion-notice'), style: TextStyle(color: color))),
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: FutureBuilder<String>(
+                future: _reason ??= switch (_contact) {
+                  final contact? => _app.messenger?.companionReason(contact),
+                  null => null,
+                },
+                initialData: companionNotice,
+                builder: (context, reason) => Text(reason.data ?? companionNotice, key: const Key('companion-notice'), style: TextStyle(color: color)),
+              ),
+            ),
             Expanded(child: child),
           ],
         );

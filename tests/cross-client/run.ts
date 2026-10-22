@@ -38,6 +38,10 @@ await call('/api/contacts/webuser/accept', { method: 'POST', headers: { 'Content
 const thirdCookie = testing.cookie(thirdUser.id);
 await call('/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: thirdCookie }, body: JSON.stringify({ username: 'appuser' }) });
 await call('/api/contacts/thirduser/accept', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${bearer}` }, body: '{}' });
+// A fourth account (a web browser), the web account's contact, whose chat moves to MLS after the app is linked.
+const fourthUser = testing.createUser('fourthuser'), fourthCookie = testing.cookie(fourthUser.id);
+await call('/api/contacts', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: fourthCookie }, body: JSON.stringify({ username: 'webuser' }) });
+await call('/api/contacts/fourthuser/accept', { method: 'POST', headers: { 'Content-Type': 'application/json', Origin: origin, Cookie: cookie }, body: '{}' });
 step('two accounts (web and app) are mutual contacts, and a third is the app\'s contact');
 
 const signal = (name: string, body = '') => writeFileSync(join(sync, `web-${name}`), body);
@@ -49,7 +53,7 @@ async function waitFor(name: string, timeout = 90000) {
 
 const dart = spawn('flutter', ['test', 'test/cross_client_test.dart', '--reporter', 'expanded'], {
     cwd: appDir, stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, CROSS_BASE: origin, CROSS_TOKEN: bearer, CROSS_ME_ID: appUser.id, CROSS_ME_NAME: 'appuser', CROSS_PEER_ID: webUser.id, CROSS_PEER_NAME: 'webuser', CROSS_THIRD_ID: thirdUser.id, CROSS_THIRD_NAME: 'thirduser', CROSS_DIR: sync, CROSS_DYLIB: dylib },
+    env: { ...process.env, CROSS_BASE: origin, CROSS_TOKEN: bearer, CROSS_ME_ID: appUser.id, CROSS_ME_NAME: 'appuser', CROSS_PEER_ID: webUser.id, CROSS_PEER_NAME: 'webuser', CROSS_THIRD_ID: thirdUser.id, CROSS_THIRD_NAME: 'thirduser', CROSS_FOURTH_ID: fourthUser.id, CROSS_FOURTH_NAME: 'fourthuser', CROSS_DIR: sync, CROSS_DYLIB: dylib },
 });
 let dartOutput = '';
 dart.stdout.on('data', chunk => { dartOutput += chunk; });
@@ -58,12 +62,12 @@ const dartDone = new Promise<number>(resolve => dart.on('exit', code => { if (co
 
 const playwright = await import(process.env.PLAYWRIGHT_MODULE || 'playwright-core');
 const browser = await playwright.chromium.launch();
-async function webPage(as = cookie) {
+async function webPage(as = cookie, move = false) {
     const [name, value] = as.split('=');
     const context = await browser.newContext();
     await context.addCookies([{ name, value, url: origin }]);
     // The web never moves a 1:1 chat to MLS itself here: the app is the first sender (m5 §8).
-    await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
+    if (!move) await context.addInitScript(() => localStorage.setItem('dm-move-test', 'off'));
     const page = await context.newPage();
     page.on('pageerror', (error: Error) => console.log(`  web pageerror: ${error.message}`));
     await page.goto(origin);
@@ -372,6 +376,23 @@ try {
     await page.waitForFunction(() => (window as any).ChatStore.list().then((all: any[]) => all.some(r => r.text === 'from the linked app' && r.direction === 'outgoing')), null, { timeout: 90000 });
     signal('linked-seen');
     step('not the inbox device, the linked app joins the web account\'s channels by itself (named from the bundle) and sends in the moved DM through its group; the web stores it as its own');
+
+    // A chat that moves after the link (production: a QR-linked phone could only queue). The contact's browser moves
+    // it; the pointer reaches the web, the inbox device, only. The app joins the DM by its Welcome, reads, and sends.
+    await waitFor('app-fourth-queued', 60000);
+    const fourth = await webPage(fourthCookie, true);
+    await fourth.page.click('#contact-list .contact.mutual .row-button');
+    await fourth.page.fill('#chat-input', 'fourth to webuser'); await fourth.page.click('#chat-send');
+    const fourthRecords = () => fourth.page.evaluate(() => (window as any).ChatStore.list());
+    for (const end = Date.now() + 120000; !(await fourthRecords()).some((r: any) => r.text === 'linked app to fourth' && r.direction === 'incoming');) {
+        if (Date.now() > end || failed) throw new Error(`fourth never got the linked app's message: ${JSON.stringify((await fourthRecords()).map((r: any) => ({ d: r.direction, s: r.status, t: r.text })))}`);
+        await Bun.sleep(200);
+    }
+    await page.waitForFunction(() => (window as any).ChatStore.list().then((all: any[]) => all.some(r => r.text === 'linked app to fourth' && r.direction === 'outgoing')), null, { timeout: 90000 });
+    await waitFor('app-fourth-read', 90000);
+    await fourth.context.close();
+    signal('fourth-seen');
+    step('a chat the contact moves after the link: the linked app (holding the key, not the inbox) joins the DM by its Welcome, reads it, and its queued 1:1 message reaches the contact; the web stores it as its own');
 
     // M6 §3-§4: the web turns on account backup; the app, signed in on a new device of that account, restores it.
     const webKey = (testing.db.query('SELECT sign FROM identity_keys WHERE user_id = ?').get(webUser.id) as any)?.sign;

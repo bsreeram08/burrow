@@ -34,7 +34,8 @@ class Person {
 
   static Future<Person> start(FakeDs ds, String name, {required List<Contact> Function() contacts, String? userId, bool companion = false}) async {
     final user = User(id: userId ?? '${name}_${'x' * (21 - name.length)}', username: name.replaceAll(RegExp(r'\d'), ''));
-    final device = await localDevice(MemoryDevicePrefs(), user.id);
+    final prefs = MemoryDevicePrefs();
+    final device = await localDevice(prefs, user.id);
     final api = ds.client(userId: user.id, username: user.username, deviceId: device.deviceId);
     final store = await MessageStore.open(databaseFactoryFfi, '${Directory.systemTemp.createTempSync('dm-move').path}/m.db');
     final chat = FakeChatCrypto(me: Identity(dh: 'dh-${user.id}', sign: 'sign-${user.id}'));
@@ -49,6 +50,7 @@ class Person {
       mutualContacts: contacts,
       ack: (_) {},
       viewing: () => person.viewing,
+      devices: prefs,
     )
       ..moveChats = false
       ..companion = companion;
@@ -248,5 +250,41 @@ void main() {
     await laptop.messenger.flush();
     await eventually(() => bob.chat(alice), (l) => has(l, 'from the laptop, early', Direction.incoming), 'bob got the laptop message');
     await eventually(() => alice.chat(bob), (l) => has(l, 'from the laptop, early', Direction.outgoing), 'the phone stores it as ours');
+  });
+
+  test('a device with the account key that is not the inbox sends once the contact moved the chat (it never sees the pointer)', () async {
+    late Contact bobContact;
+    ds.inbox[alice.user.id] = (await alice.messenger.device()).deviceId;
+    final phone = await Person.start(ds, 'alice2', contacts: () => [bobContact], userId: alice.user.id);
+    bobContact = bob.contact;
+    people.add(phone);
+    expect((phone.messenger.active, phone.messenger.full), (false, true), reason: 'holds the key, not the inbox');
+    final early = await phone.messenger.send(bob.contact, 'from the phone, early');
+    // Bob moves the chat: the pointer goes to the inbox device; the phone only gets the Welcome.
+    bob.messenger.moveChats = true;
+    await bob.messenger.send(alice.contact, 'moving');
+    await eventually(() => phone.store.groups(), (g) => g.any((x) => x.kind == GroupKindName.dm && x.active), 'the phone joined the DM group');
+    await phone.messenger.flush();
+    await eventually(() => bob.chat(alice), (l) => has(l, 'from the phone, early', Direction.incoming), 'bob got the phone message');
+    await eventually(() => alice.chat(bob), (l) => has(l, 'from the phone, early', Direction.outgoing), 'the inbox device stores it as ours');
+    expect((await phone.store.get(phone.messenger.conversationWith(bob.user.id), early.id))!.status, MessageStatus.sent);
+    // And it receives through the group.
+    await bob.messenger.send(alice.contact, 'to every device');
+    await eventually(() => phone.chat(bob), (l) => has(l, 'to every device', Direction.incoming), 'the phone reads the group');
+  });
+
+  test('once the account has another device, the inbox device moves every chat it can without waiting to send', () async {
+    alice.messenger.moveChats = true;
+    await alice.messenger.moveAllChats();
+    expect(await alice.store.groups(), isEmpty, reason: 'one device: nothing to do');
+    ds.inbox[alice.user.id] = (await alice.messenger.device()).deviceId;
+    late Contact bobContact;
+    final phone = await Person.start(ds, 'alice2', contacts: () => [bobContact], userId: alice.user.id);
+    bobContact = bob.contact;
+    people.add(phone);
+    await alice.messenger.moveAllChats();
+    await eventually(() => bob.store.groups(), (g) => g.any((x) => x.kind == GroupKindName.dm && x.movedAt != null), 'bob accepted the pointer');
+    await phone.messenger.send(bob.contact, 'from the phone');
+    await eventually(() => bob.chat(alice), (l) => has(l, 'from the phone', Direction.incoming), 'bob got the phone message');
   });
 }

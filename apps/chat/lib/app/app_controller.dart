@@ -850,6 +850,9 @@ class AppController extends Notifier<AppState> {
           await messenger?.syncDevices();
         } catch (_) {}
         if (!(groups?.ready ?? true)) await _startGroups();
+        // The inbox device moves chats for the account's other devices; those take the DM groups they hold (m5 §8).
+        if (active == true) unawaited(messenger?.moveAllChats().catchError((_) {}));
+        if (active == false) unawaited(groups?.adoptDms().catchError((_) {}));
         unawaited(_ownSuccession()?.answerRecerts().catchError((_) => 0));
         unawaited(_checkBackup());
         unawaited(checkRemovedDevices());

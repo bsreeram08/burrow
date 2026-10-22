@@ -447,6 +447,9 @@ class AppController extends Notifier<AppState> {
     await _signedIn(setup.user, setup.token, linked: setup.bundle);
   }
 
+  /// The key database [_signedIn] opened (a linked install keeps the one it linked with).
+  String? _corePath;
+
   Future<void> _signedIn(User user, String token, {Map<String, Object?>? linked}) async {
     _api.token = token;
     await ref.read(tokenStoreProvider).write(token);
@@ -457,7 +460,7 @@ class AppController extends Notifier<AppState> {
     var companion = false;
     try {
       // A linked install keeps the key database it linked with.
-      await _crypto.init((await SharedPreferences.getInstance()).getString('linked-core-v1:${user.id}') ?? 'keys-${user.id}');
+      await _crypto.init(_corePath = (await SharedPreferences.getInstance()).getString('linked-core-v1:${user.id}') ?? 'keys-${user.id}');
       companion = await ref.read(linkCryptoProvider).account() != null;
     } on CryptoException catch (error) {
       if (!error.keysLocked) rethrow;
@@ -872,17 +875,19 @@ class AppController extends Notifier<AppState> {
     state = state.copyWith(inactiveDevice: false);
   }
 
-  /// Recovery, only from the user's confirmed tap: delete this device's unusable key database and start a
-  /// new identity here (contacts see a security-code change). Message history on this device stays.
+  /// Recovery, only from the user's confirmed tap: delete this device's unusable key database (the one it opened).
+  /// The device is then one without the account key (M6 §4): the restore screen unlocks it again (backup, a link, or
+  /// the explicit reset). Nothing here makes a key or touches the other devices. Message history on this device stays.
   Future<void> recoverKeys() async {
     final user = state.user;
     final token = _api.token;
     if (user == null || token == null) return;
-    await _crypto.resetLocal('keys-${user.id}');
+    await _crypto.resetLocal(_corePath ?? 'keys-${user.id}');
+    // A code-linked device's core is gone with it: it restores like any device without the key.
+    await (await SharedPreferences.getInstance()).remove('linked-by-code-v1:${user.id}');
     await _teardown();
     state = state.copyWith(keysLocked: false);
     await _signedIn(user, token);
-    await messenger?.takeOver();
   }
 
   // ---------- The account key and its backup (docs/m6-account-key.md) ----------
@@ -902,9 +907,10 @@ class AppController extends Notifier<AppState> {
       final published = (await _api.keyCount()).identity;
       if (published == null) return false; // A new account: this device makes the key.
       final id = (await m.device()).deviceId;
-      final rows = ((await _api.devices(user.username))['devices'] as List? ?? const []).cast<Map>();
+      final view = await _api.devices(user.username);
+      final rows = (view['devices'] as List? ?? const []).cast<Map>();
       final listed = rows.any((r) => r['id'] == id && r['state'] == 'listed');
-      if (listed) return false;
+      if (listed && await _holdsAccountKey(Identity.fromJson(published), view['succession'])) return false;
       final backup = await _backupState();
       await m.bindSession(); // A pending device of the account, so it may list itself after the restore.
       state = state.copyWith(needsRestore: true, hasBackup: backup.has);
@@ -917,6 +923,14 @@ class AppController extends Notifier<AppState> {
     } catch (_) {
       return false; // Offline: the next reconnect checks again.
     }
+  }
+
+  /// A listed full device holds the published key, or one it was rotated from (another device changed it: followed
+  /// later in [_checkActive]). Anything else is a fresh key database, e.g. after [recoverKeys]: it holds no account key.
+  Future<bool> _holdsAccountKey(Identity published, Object? succession) async {
+    final mine = await _crypto.identity();
+    if (mine == published) return true;
+    return succession is List && succession.any((r) => r is Map && r['oldSign'] == mine.sign);
   }
 
   /// "Enter your passphrase" / "Use your recovery key" on the restore screen (§4): open the backup, hold the account

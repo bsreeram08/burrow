@@ -224,22 +224,27 @@ class _ScaledText extends TextScaler {
 }
 
 /// This device's key database can't be unlocked (store key missing, database reset or tampered). Messaging
-/// stays off; nothing is reset until the user explicitly chooses to start over on this device.
+/// stays off; nothing is reset until the user explicitly chooses to. Then this device is one without the account
+/// key (M6 §4): it unlocks again on the restore screen, and the account key stays what it is.
 class KeysLockedBanner extends ConsumerWidget {
   const KeysLockedBanner({super.key});
-  Future<void> _recover(BuildContext context, WidgetRef ref) async {
+  Future<void> _recover(WidgetRef ref) async {
+    // The banner sits above the router's Navigator (in MaterialApp.builder): the dialog goes on the router's.
+    final context = ref.read(routerProvider).routerDelegate.navigatorKey.currentContext;
+    if (context == null) return;
     final yes = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Start encrypted messaging over on this device?'),
+        title: const Text("Reset this device's keys?"),
         content: const Text(
-          "This device's encryption keys can't be unlocked, so it can't read new messages. Starting over creates "
-          'new keys here. Your contacts will see that your security code changed, and messages sent to the old '
-          'keys can\'t be recovered. Message history already on this device stays.',
+          "This device's encryption keys can't be unlocked, so it can't read new messages. Resetting removes them "
+          'from this device only. Then you use your account here again with your backup passphrase or recovery '
+          'key, or by linking it from another of your devices. Your account key and your other devices stay as '
+          "they are, and so does the message history on this device. Messages sent while it was locked can't be read.",
         ),
         actions: [
           TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Not now')),
-          FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Start over')),
+          FilledButton(key: const Key('recover-keys-confirm'), onPressed: () => Navigator.pop(context, true), child: const Text('Reset keys')),
         ],
       ),
     );
@@ -262,7 +267,7 @@ class KeysLockedBanner extends ConsumerWidget {
               ),
             ),
             const SizedBox(width: 8),
-            FilledButton(key: const Key('recover-keys'), onPressed: () => _recover(context, ref), child: const Text('Recover')),
+            FilledButton(key: const Key('recover-keys'), onPressed: () => _recover(ref), child: const Text('Recover')),
           ],
         ),
       ),

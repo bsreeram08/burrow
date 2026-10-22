@@ -1,4 +1,4 @@
-# Private Chat (Flutter)
+# Burrow (Flutter)
 
 Native client for iOS, Android and macOS (Windows/Linux build if their toolchains
 exist). It speaks the same protocol as the web client in `packages/signaling/public`:

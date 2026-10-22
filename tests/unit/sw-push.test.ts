@@ -42,7 +42,7 @@ describe('push notifications in the service worker', () => {
         const sw = pushWorker();
         await sw.push('bad');
         await sw.push({ type: 'message', from: '<img src=x>' });
-        expect(sw.shown.map(([title]) => title)).toEqual(['Private conversations', 'Private conversations']);
+        expect(sw.shown.map(([title]) => title)).toEqual(['Burrow', 'Burrow']);
         expect(JSON.stringify(sw.shown)).not.toContain('<img');
     });
     test('tapping opens the conversation by username only and never answers; decline routes to the server', async () => {

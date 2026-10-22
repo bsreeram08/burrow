@@ -25,7 +25,7 @@ function run(command: string, args: string[], env: Record<string, string> = {}) 
 /** The client core, or null (with the reason) when the Rust toolchain isn't available: those tests are skipped. */
 export function clientCore(): { core: CoreClass } | { skip: string } {
     if (!run('cargo', ['--version']).ok || !run('wasm-bindgen', ['--version']).ok) return { skip: 'cargo and wasm-bindgen are needed to build the MLS client core' };
-    const dir = join(tmpdir(), `webrtc-bun-mls-client-${process.getuid?.() ?? 0}`);
+    const dir = join(tmpdir(), `burrow-mls-client-${process.getuid?.() ?? 0}`);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const target = join(root, 'crates/chatcore-wasm/target');
     const built = run('cargo', ['build', '--release', '--quiet', '--target', 'wasm32-unknown-unknown', '--features', 'mls,ds,test-hooks', '--manifest-path', join(root, 'crates/chatcore-wasm/Cargo.toml')], { CARGO_TARGET_DIR: target });

@@ -151,7 +151,7 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> with WidgetsBin
       if (ring != null) _acceptIfRinging();
     });
     return MaterialApp.router(
-      title: 'Private Chat',
+      title: 'Burrow',
       debugShowCheckedModeBanner: false,
       theme: tokens.material(),
       routerConfig: router,

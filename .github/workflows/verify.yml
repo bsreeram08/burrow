@@ -16,7 +16,7 @@ jobs:
       - run: bun install --frozen-lockfile
       - run: bun run typecheck
       - run: bun run test
-      - run: docker build -t webrtc-bun:test .
+      - run: docker build -t burrow:test .
   # The messaging core: the committed WebAssembly must be exactly what this source builds (the server has no
   # Rust and serves the committed files), and signal.js, the native core and the WebAssembly core must agree.
   core:

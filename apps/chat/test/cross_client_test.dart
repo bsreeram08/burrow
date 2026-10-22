@@ -61,6 +61,7 @@ void main() {
     final me = User(id: env['CROSS_ME_ID']!, username: env['CROSS_ME_NAME']!);
     final web = Contact(id: env['CROSS_PEER_ID']!, username: env['CROSS_PEER_NAME']!, state: ContactState.mutual, online: true);
     final third = Contact(id: env['CROSS_THIRD_ID']!, username: env['CROSS_THIRD_NAME']!, state: ContactState.mutual, online: true);
+    final fourth = Contact(id: env['CROSS_FOURTH_ID']!, username: env['CROSS_FOURTH_NAME']!, state: ContactState.mutual, online: true);
     final api = Api(baseUrl: base!, clientName: 'ios')..token = env['CROSS_TOKEN']!;
     final crypto = RustChatCrypto(
       directory: () async => dir,
@@ -387,7 +388,16 @@ void main() {
     linkPrefs.setPin(linkedUser.id, linkedUser.id, setup.pin);
     final linkedStore = await MessageStore.open(databaseFactoryFfi, '$dir/messages-companion.db');
     final linkedEvents = EventsClient(url: Uri.parse(base.replaceFirst('http', 'ws')).replace(path: '/api/events'), token: setup.token);
-    final companion = Messenger(api: linkApi, crypto: crypto, store: linkedStore, me: linkedUser, contactById: (id) => id == me.id ? appContact : null, mutualContacts: () => [appContact], ack: linkedEvents.ack, devices: linkPrefs);
+    final companion = Messenger(
+      api: linkApi,
+      crypto: crypto,
+      store: linkedStore,
+      me: linkedUser,
+      contactById: (id) => [appContact, fourth].where((c) => c.id == id).firstOrNull,
+      mutualContacts: () => [appContact, fourth],
+      ack: linkedEvents.ack,
+      devices: linkPrefs,
+    );
     GroupMessenger? linkedGroups;
     final linkedSync = GroupSync(
       api: linkApi,
@@ -398,12 +408,12 @@ void main() {
       platform: 'macos',
       ensurePinned: (ids, {force = false}) async => await linkedGroups?.ensurePinned(ids, force: force) ?? const <String>[],
       verifiedOwnDevices: companion.verifiedOwnDevices,
-      companion: true,
+      // As the app runs a QR-linked device: it holds the account key, so it is not a companion.
       sendCursor: linkedEvents.cursor,
       ackWelcome: linkedEvents.ack,
     );
     linkedSync.notices.listen(notices.add);
-    linkedGroups = GroupMessenger(api: linkApi, sync: linkedSync, chatCrypto: crypto, store: linkedStore, me: linkedUser, contacts: () => [appContact]);
+    linkedGroups = GroupMessenger(api: linkApi, sync: linkedSync, chatCrypto: crypto, store: linkedStore, me: linkedUser, contacts: () => [appContact, fourth]);
     final lg = linkedGroups;
     companion.groups = lg;
     linkedEvents.events.listen((event) {
@@ -422,6 +432,18 @@ void main() {
     await until(() async => (await linkedStore.list(companion.conversationWith(me.id))).any((m) => m.text == 'from the linked app' && m.status == MessageStatus.sent), 'sent through the DM group');
     await signal('app-linked-sent');
     await waitFor('linked-seen', timeout: const Duration(seconds: 120));
+
+    // 13b. The fourth account (a web contact of the web account) moves its chat after the link: the pointer goes to the
+    // web, the inbox device. This app only gets the Welcome; its queued message goes out once it joined the DM.
+    final queued = await companion.send(fourth, 'linked app to fourth');
+    await signal('app-fourth-queued');
+    await until(() async {
+      await companion.flush();
+      return (await linkedStore.get(companion.conversationWith(fourth.id!), queued.id))?.status == MessageStatus.sent;
+    }, 'the queued message went out through the DM group the fourth account made', timeout: const Duration(seconds: 120));
+    await until(() async => (await linkedStore.list(companion.conversationWith(fourth.id!))).any((m) => m.text == 'fourth to webuser' && m.direction == Direction.incoming), 'the fourth account\'s message read through the DM group', timeout: const Duration(seconds: 90));
+    await signal('app-fourth-read');
+    await waitFor('fourth-seen', timeout: const Duration(seconds: 150));
 
     await lg.dispose();
     await linkedEvents.close();

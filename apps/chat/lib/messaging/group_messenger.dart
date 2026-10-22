@@ -626,12 +626,25 @@ class GroupMessenger {
   void Function(String peer, bool on)? dmTyping;
 
   /// The DM group the 1:1 chat with [peerId] moved to, joined and checked here; null while it is on the
-  /// Double Ratchet.
-  Future<String?> dmChannelWith(String peerId) async {
+  /// Double Ratchet. With [adopt] (any device but the inbox device: the pointer travels over the 1:1 session to the
+  /// inbox only), a DM group of the two of us that this device joined and checks out is the proof, and moves the chat.
+  Future<String?> dmChannelWith(String peerId, {bool adopt = false}) async {
     for (final g in await store.groups()) {
-      if (g.kind == GroupKindName.dm && g.peer == peerId && g.active && g.dmChecked && g.movedAt != null) return g.id;
+      if (g.kind != GroupKindName.dm || g.peer != peerId || !g.active) continue;
+      if (g.dmChecked && g.movedAt != null) return g.id;
+      if (adopt && await sync.checkDm(g.id)) {
+        await markMoved(g.id);
+        return g.id;
+      }
     }
     return null;
+  }
+
+  /// [dmChannelWith] `adopt` for every DM group this device holds (a device other than the inbox device).
+  Future<void> adoptDms() async {
+    for (final g in await store.groups()) {
+      if (g.kind == GroupKindName.dm && g.active && g.movedAt == null && g.peer != null) await dmChannelWith(g.peer!, adopt: true);
+    }
   }
 
   /// §8.2: a DM group of the two of us, or null when the other side is already making one.

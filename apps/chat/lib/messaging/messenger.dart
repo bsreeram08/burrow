@@ -29,8 +29,14 @@ const typingHideMs = 6000;
 /// receiver waits this long for the pointer's group.
 const dmMoveRetryMs = 600000;
 
-/// Why a linked device can't send in a chat that is still on the Double Ratchet.
-const companionNotice = 'Messages in this chat go through your other device until it moves to the new encryption.';
+/// Why a device other than the inbox device can't send in a chat that is still on the Double Ratchet.
+const companionNotice = "This chat hasn't moved to the new encryption yet, so only your primary device can send in it. "
+    'It moves the next time your primary device sends here. Messages you write here wait until then.';
+
+/// The same, when the contact has no device that can take the new encryption: the chat can't move yet.
+String cantMoveNotice(String name) =>
+    "$name's app doesn't support the new encryption yet, so only your primary device can send in this chat. "
+    'Messages you write here wait until $name updates their app.';
 
 /// The system line both sides show where a 1:1 chat moved.
 const dmMovedNote = 'Messages in this chat now use the new encryption.';
@@ -171,10 +177,15 @@ class Messenger {
   void markActive() => _setActive(true);
 
   void _setActive(bool value) {
+    if (!value && !_activeKnown) unawaited(_groups?.adoptDms().catchError((_) {}));
+    _activeKnown = true;
     if (active == value) return;
     active = value;
     _activeChanges.add(value);
   }
+
+  /// [checkActive] has decided once: before that, `active == false` says nothing (the inbox device too starts so).
+  bool _activeKnown = false;
 
   /// This install's device for the account (docs/devices.md): its id and device key, created on first use.
   Future<LocalDevice> device() => _device ??= localDevice(devices, me.id);
@@ -644,6 +655,15 @@ class Messenger {
     return message;
   }
 
+  /// Why this device (not the inbox device) can't send to [contact] yet: [companionNotice], or [cantMoveNotice] when
+  /// they have no device that can take the new encryption.
+  Future<String> companionReason(Contact contact) async {
+    try {
+      if (((await api.mlsCapability(contact.username))['devices'] as int? ?? 0) < 1) return cantMoveNotice(contact.username);
+    } catch (_) {}
+    return companionNotice;
+  }
+
   /// A linked device sends only in chats that moved to MLS; the active device sends in all of them.
   Future<void> _requireSendable(Contact contact) async {
     if (keysLocked || (!active && await _dmChannel(contact.id!) == null)) throw const CryptoException(companionNotice);
@@ -776,6 +796,7 @@ class Messenger {
     value.sync.onDmJoined = (channel) {
       final wake = _pointerWake.remove(channel);
       if (wake != null && !wake.isCompleted) wake.complete();
+      if (_activeKnown && !active) unawaited(value.adoptDms().catchError((_) {}));
     };
     dmTyping = (contact, on) async {
       final channel = await value.dmChannelWith(contact.id!);
@@ -790,7 +811,9 @@ class Messenger {
   /// moved to MLS; the rest stay on the primary.
   bool companion = false;
 
-  Future<String?> _dmChannel(String contactId) async => await _groups?.dmChannelWith(contactId);
+  /// Any device but the inbox device never sees the `mls-dm` pointer (it travels over the 1:1 session): the checked
+  /// DM group it was added to as our device moves the chat here (m5 §8.3).
+  Future<String?> _dmChannel(String contactId) async => await _groups?.dmChannelWith(contactId, adopt: _activeKnown && !active);
 
   /// Every payload to a contact: through the DM group once the chat moved, otherwise the 1:1 session.
   Future<void> _sendToContact(Contact contact, Map<String, Object?> payload) async {
@@ -826,6 +849,18 @@ class Messenger {
     await _sendControl(contact, {'v': 1, 'type': 'mls-dm', 'id': const Uuid().v4(), 'channel': channel, 'at': _now()});
     await groups.markMoved(channel);
     await store.note(conversationWith(id), dmMovedNote);
+  }
+
+  /// The account's other devices send only in moved chats: once it has one, the inbox device moves every chat it
+  /// can (§8.2), not only the next one it sends in. Each contact is tried at most once per [dmMoveRetryMs].
+  Future<void> moveAllChats() async {
+    if (!active) return;
+    // The server's word is enough here: moving a chat trusts nothing (each DM group is checked against the pins).
+    final rows = ((await api.devices(me.username))['devices'] as List? ?? const []).cast<Map>();
+    if (rows.where((r) => r['state'] == 'listed').length < 2) return;
+    for (final contact in mutualContacts()) {
+      await _maybeMove(contact).catchError((_) {});
+    }
   }
 
   final Map<String, Completer<void>> _pointerWake = {};

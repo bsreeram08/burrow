@@ -35,7 +35,7 @@ try {
     });
     await page.goto(`${origin}/#roomId=${room.roomId}&token=${room.participants[index].token}`);
     assert.equal(await page.evaluate(() => isSecureContext), true);
-    await page.getByRole('button', { name: 'Video call', exact: true }).click();
+    await page.locator('#join').click();
   }));
   const results = await Promise.all(pages.map(async page => {
     await page.waitForFunction(() => document.getElementById('status').textContent.startsWith('Connected'), null, { timeout: 45000 });

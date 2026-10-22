@@ -27,7 +27,7 @@ void main() {
     await tester.pumpWidget(
       MaterialApp(
         theme: tokens.material(),
-        home: Scaffold(body: ConversationView(tokens: tokens, wallpaper: 'dots', messages: messages, peerName: 'alice', onSend: (_, _) async {})),
+        home: Scaffold(body: ConversationView(tokens: tokens, wallpaper: 'dots', messages: messages, peerName: 'alice', onSend: (_) async {})),
       ),
     );
     await tester.pump(const Duration(seconds: 1));

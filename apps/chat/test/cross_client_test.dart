@@ -15,16 +15,18 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
 import 'package:private_chat/core/events.dart';
-import 'package:private_chat/crypto/chat_crypto.dart' show CryptoException;
+import 'package:private_chat/crypto/account_crypto.dart';
+import 'package:private_chat/crypto/chat_crypto.dart' show CryptoException, Identity;
 import 'package:private_chat/crypto/rust_chat_crypto.dart';
 import 'package:private_chat/crypto/link_crypto.dart';
 import 'package:private_chat/crypto/rust_group_crypto.dart';
 import 'package:private_chat/messaging/attachments.dart';
+import 'package:private_chat/messaging/backup.dart';
+import 'package:private_chat/messaging/succession.dart';
 import 'package:private_chat/messaging/group_messenger.dart';
 import 'package:private_chat/messaging/group_sync.dart';
 import 'package:private_chat/messaging/linking.dart';
 import 'package:private_chat/messaging/messenger.dart';
-import 'package:private_chat/messaging/succession.dart';
 import 'package:private_chat/store/message.dart';
 import 'package:private_chat/store/message_store.dart';
 import 'package:sqflite_common_ffi/sqflite_ffi.dart';
@@ -287,7 +289,17 @@ void main() {
     // takes it, both show the same 6 digits, and the app publishes the list naming it, signs its MLS certificate
     // and sends the sealed grant and bundle.
     final qrText = await waitFor('web-link-qr', timeout: const Duration(seconds: 120));
-    final linkCtx = LinkContext(api: api, crypto: crypto, link: const RustLinkCrypto(), messenger: messenger, store: store, contacts: () => [web, third]);
+    // M6 §2: the QR grant carries the account key, so the linked browser can unlock the account by itself.
+    final linkCtx = LinkContext(
+      api: api,
+      crypto: crypto,
+      link: const RustLinkCrypto(),
+      messenger: messenger,
+      store: store,
+      contacts: () => [web, third],
+      account: const RustAccountCrypto(),
+      backupKeys: const RustAccountCrypto().heldBackupKeys,
+    );
     final primary = await PrimaryLink.fromQr(linkCtx, qrText);
     final laptop = await primary.waitHello(timeout: const Duration(seconds: 90));
     expect(laptop.platform, 'web');
@@ -350,15 +362,15 @@ void main() {
     await events.close();
     await messenger.dispose();
 
-    // 13. The app as a companion device of the web's account (m5 §1, §1.6, §3): a fresh key database shows a QR,
-    // the web (its primary) takes the text, both show the same digits, and the grant is checked before the
-    // Rust core enters companion mode. Then, without the account's keys, it joins the web account's channels
-    // by itself (names from the bundle) and sends in the moved DM through its group.
+    // 13. The app as a device of the web's account (m5 §1, §1.6, §3; M6 §2): a fresh key database shows a QR, the web
+    // takes the text, both show the same digits, and the grant is checked; it carries the account key, so the Rust
+    // core holds it too. Without being the inbox device it joins the web account's channels by itself (names from the
+    // bundle) and sends in the moved DM through its group.
     final linkPrefs = MemoryDevicePrefs();
     final newDevice = await localDevice(linkPrefs, '__link__');
     await crypto.init('keys-link-${newDevice.deviceId}');
     final linkApi = Api(baseUrl: base, clientName: 'macos');
-    final newLink = await NewDeviceLink.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: newDevice, platform: 'macos', label: 'Mac app');
+    final newLink = await NewDeviceLink.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: newDevice, platform: 'macos', label: 'Mac app', account: const RustAccountCrypto());
     await signal('app-link-qr', newLink.qr ?? '');
     stderr.writeln('app: link started, waiting for the offer');
     final digits = await newLink.waitOffer(timeout: const Duration(minutes: 2));
@@ -366,15 +378,16 @@ void main() {
     await signal('app-link-sas', digits);
     final setup = await newLink.waitGrant(timeout: const Duration(minutes: 2));
     expect(setup.user.id, web.id);
-    expect((await const RustLinkCrypto().account())?.userId, web.id, reason: 'the core is a companion of the web account');
-    await expectLater(crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: 0), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'companion')));
+    expect(setup.full, isTrue, reason: 'the QR grant carried the account key');
+    expect(await const RustLinkCrypto().account(), isNull, reason: 'the core holds the account key, not just a pin of it');
+    expect(await crypto.identity(), setup.identity);
+    expect(await const RustAccountCrypto().exportAccountKey(setup.user.id), isNotEmpty);
     final linkedUser = setup.user, appContact = Contact(id: me.id, username: me.username, state: ContactState.mutual, online: true);
     await linkPrefs.writeDevice(linkedUser.id, (await linkPrefs.readDevice('__link__'))!);
     linkPrefs.setPin(linkedUser.id, linkedUser.id, setup.pin);
     final linkedStore = await MessageStore.open(databaseFactoryFfi, '$dir/messages-companion.db');
     final linkedEvents = EventsClient(url: Uri.parse(base.replaceFirst('http', 'ws')).replace(path: '/api/events'), token: setup.token);
-    final companion = Messenger(api: linkApi, crypto: crypto, store: linkedStore, me: linkedUser, contactById: (id) => id == me.id ? appContact : null, mutualContacts: () => [appContact], ack: linkedEvents.ack, devices: linkPrefs)
-      ..companion = true;
+    final companion = Messenger(api: linkApi, crypto: crypto, store: linkedStore, me: linkedUser, contactById: (id) => id == me.id ? appContact : null, mutualContacts: () => [appContact], ack: linkedEvents.ack, devices: linkPrefs);
     GroupMessenger? linkedGroups;
     final linkedSync = GroupSync(
       api: linkApi,
@@ -398,7 +411,8 @@ void main() {
     });
     await linkedEvents.connect();
     await installLinkBundle(setup.bundle, linkedStore);
-    expect(await companion.checkActive(), isFalse);
+    expect(await companion.checkActive(), isFalse, reason: 'it holds the key but leaves the inbox where it is');
+    expect(companion.full, isTrue);
     await lg.start();
     expect(lg.ready, isTrue, reason: lg.unavailable);
     describe = () async => 'companion groups: ${[for (final c in await linkedStore.groups()) '${c.kind.wire} ${c.name} ${c.membership.name} moved=${c.movedAt != null}']}\njoin errors: ${linkedSync.joinErrors}\nnotices: $notices';
@@ -409,25 +423,102 @@ void main() {
     await signal('app-linked-sent');
     await waitFor('linked-seen', timeout: const Duration(seconds: 120));
 
-    // 14. Primary transfer (m5 §5.2): the linked app takes the web account over. It shows a code, the web (the
-    // primary) confirms the same digits and signs the account over; the app publishes the record, its new keys
-    // and list v1 naming the web, and certifies the web's leaf; the web steps down to a linked device and still
-    // reads what the new primary sends.
-    final take = await TakeOver.start(api: linkApi, link: const RustLinkCrypto(), groups: const RustGroupCrypto(), device: await companion.device(), platform: 'macos');
-    await signal('app-take-qr', take.qr);
-    await signal('app-take-sas', await take.waitOffer(timeout: const Duration(minutes: 2)));
-    String? takeMarker;
-    await take.run(companion, platform: 'macos', markers: (read: () async => takeMarker, write: (String? v) async => takeMarker = v), timeout: const Duration(minutes: 2));
-    expect(takeMarker, isNull, reason: 'the resume marker is cleared once the take-over is done');
-    final newKey = await crypto.identity();
-    expect((await linkApi.keyCount()).identity?['sign'], newKey.sign, reason: 'the server serves the new account key');
-    expect(await const RustLinkCrypto().account(), isNull, reason: 'the core holds the account key now');
-    await lg.send(groupId, 'from the new primary');
-    await until(() async => (await linkedStore.list(groupId)).any((m) => m.text == 'from the new primary' && m.status == MessageStatus.sent), 'the new primary sends in "Cross team"');
-    await signal('app-took-over', newKey.sign);
-    await waitFor('takeover-seen', timeout: const Duration(seconds: 150));
     await lg.dispose();
     await linkedEvents.close();
+
+    // 14. A web backup restored in the app (M6 §3, §4): the web turns on account backup with a passphrase; the app,
+    // signed in as a new device of the web account (a pending session), opens the backup with it in an empty key
+    // database, holds the same account key (contacts keep their verification) and lists itself.
+    final restoreJson = jsonDecode(await waitFor('web-backup-on', timeout: const Duration(seconds: 150))) as Map<String, dynamic>;
+    final restorePrefs = MemoryDevicePrefs();
+    await crypto.init('keys-restore');
+    final restoreApi = Api(baseUrl: base, clientName: 'macos')..token = restoreJson['token'] as String;
+    final restored = Messenger(api: restoreApi, crypto: crypto, store: linkedStore, me: linkedUser, contactById: (_) => null, mutualContacts: () => [], ack: (_) {}, devices: restorePrefs);
+    await restored.bindSession();
+    final published = Identity.fromJson((await restoreApi.keyCount()).identity!);
+    final backup = AccountBackup(api: restoreApi, crypto: const RustAccountCrypto(), me: linkedUser);
+    await expectLater(backup.restore(const Unlock.passphrase('not the passphrase at all'), published: published), throwsA(isA<CryptoException>().having((e) => e.code, 'code', 'auth')));
+    expect(await backup.restore(Unlock.passphrase(restoreJson['passphrase'] as String), published: published), published);
+    expect(await crypto.identity(), published, reason: 'the same account key: contacts keep their verification');
+    expect((await const RustAccountCrypto().heldBackupKeys())?.epoch, 1);
+    await restored.publishNextList();
+    final restoredDevice = (await restored.device()).deviceId;
+    final restoredRows = ((await restoreApi.devices(linkedUser.username))['devices'] as List).cast<Map>();
+    expect(restoredRows.any((r) => r['id'] == restoredDevice && r['state'] == 'listed'), isTrue, reason: 'it listed itself');
+    await signal('app-restored', restoredDevice);
+    await waitFor('restore-seen', timeout: const Duration(seconds: 120));
+
+    // 15. Removing a device that holds the account key changes the key (M6 §6.2, §6.3). The restored app (a device
+    // with the key) joins the account's channels, then removes the step-13 app device with the backup passphrase's
+    // proof and rotates: record, new keys, list v1 without it, re-seal. The web browser, the third device, follows
+    // the chain and is rekeyed by the app; the removed device's old key can no longer publish anything.
+    final restoredEvents = EventsClient(url: Uri.parse(base.replaceFirst('http', 'ws')).replace(path: '/api/events'), token: restoreJson['token'] as String);
+    final restoredStore = await MessageStore.open(databaseFactoryFfi, '$dir/messages-restored.db');
+    final restoredMessenger = Messenger(api: restoreApi, crypto: crypto, store: restoredStore, me: linkedUser, contactById: (_) => null, mutualContacts: () => [], ack: restoredEvents.ack, devices: restorePrefs);
+    GroupMessenger? rg;
+    final restoredSync = GroupSync(
+      api: restoreApi,
+      crypto: const RustGroupCrypto(),
+      store: restoredStore,
+      me: linkedUser,
+      device: restoredMessenger.device,
+      platform: 'macos',
+      ensurePinned: (ids, {force = false}) async => await rg?.ensurePinned(ids, force: force) ?? const <String>[],
+      verifiedOwnDevices: restoredMessenger.verifiedOwnDevices,
+      sendCursor: restoredEvents.cursor,
+      ackWelcome: restoredEvents.ack,
+    );
+    final restoredGroups = rg = GroupMessenger(api: restoreApi, sync: restoredSync, chatCrypto: crypto, store: restoredStore, me: linkedUser, contacts: () => []);
+    restoredEvents.events.listen((event) {
+      if (event is! EnvelopeEvent) restoredGroups.onEvent(event);
+    });
+    await restoredEvents.connect();
+    expect(await restoredMessenger.checkActive(), isFalse, reason: 'the inbox stays with the web');
+    expect(restoredMessenger.full, isTrue);
+    await restoredGroups.start();
+    describe = () async => 'restored groups: ${[for (final c in await restoredStore.groups()) '${c.name} ${c.membership.name}']}\njoin errors: ${restoredSync.joinErrors}\nnotices: $notices';
+    await until(() async => (await restoredStore.group(groupId))?.active ?? false, 'the restored app joined "Cross team"', timeout: const Duration(seconds: 120));
+    final oldKey = await crypto.identity();
+    final removedDevice = newDevice.deviceId;
+    final rotatingBackup = AccountBackup(api: restoreApi, crypto: const RustAccountCrypto(), me: linkedUser);
+    final proven = await rotatingBackup.proveForRotation(Unlock.passphrase(restoreJson['passphrase'] as String));
+    await expectLater(restoreApi.revokeDevice(removedDevice), throwsA(isA<ApiException>().having((e) => e.status, 'status', 403)), reason: 'with a backup, not without the proof');
+    expect(await restoreApi.revokeDevice(removedDevice, proof: proven?.proof), [removedDevice]);
+    await AccountRotation(api: restoreApi, account: const RustAccountCrypto(), groups: const RustGroupCrypto(), messenger: restoredMessenger, platform: 'macos', backup: rotatingBackup)
+        .rotate(removed: {removedDevice}, proven: proven);
+    final newKey = await crypto.identity();
+    expect(newKey, isNot(oldKey));
+    expect((await restoreApi.keyCount()).identity?['sign'], newKey.sign, reason: 'the server serves the new key');
+    final v1 = (await restoreApi.devices(linkedUser.username))['list'] as Map;
+    expect((v1['version'], [for (final d in v1['devices'] as List) d['deviceId']].contains(removedDevice)), (1, false));
+    for (final c in await restoredStore.groups()) {
+      if (c.active) await restoredSync.recommitLeaf(c.id);
+    }
+    await signal('app-rotated', newKey.sign);
+    // The web, the third device, asks for the new key; the app answers it (its leaf is in a group the app holds).
+    final rekey = Rekey(
+      api: restoreApi,
+      account: const RustAccountCrypto(),
+      link: const RustLinkCrypto(),
+      store: restoredStore,
+      me: linkedUser,
+      platform: 'macos',
+      device: restoredMessenger.device,
+      messenger: restoredMessenger,
+      updateLeaf: restoredSync.updateLeaf,
+    );
+    var answered = 0;
+    describe = () async => 'rekey skipped: ${rekey.skipped}; requests: ${await restoreApi.rekeyRequests()}';
+    await until(() async => (answered += await rekey.answer()) > 0, 'the web asked for the new key and the app answered', timeout: const Duration(seconds: 120));
+    await waitFor('web-rekeyed', timeout: const Duration(seconds: 120));
+    await restoredGroups.dispose();
+    await restoredEvents.close();
+    // The removed device: its session is gone and its key is no longer the account's.
+    await crypto.init('keys-link-${newDevice.deviceId}');
+    expect(await crypto.identity(), oldKey, reason: 'it still holds the old key');
+    await expectLater(companion.publishNextList(), throwsA(anything), reason: 'but can publish nothing with it');
+    await expectLater(linkApi.uploadKeys((await crypto.preparePrekeys(DateTime.now(), oneTimeOnServer: 0)).toJson()), throwsA(isA<ApiException>()));
+    await signal('removed-checked');
     await signal('done');
   }, skip: base == null ? 'run through tests/cross-client/run.ts' : false, timeout: const Timeout(Duration(minutes: 5)));
 }

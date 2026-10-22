@@ -7,11 +7,12 @@ import '../app/app_controller.dart';
 import '../core/api.dart';
 import '../messaging/messenger.dart' show OwnDevice;
 import 'link/link_device_screen.dart';
-import 'link/transfer_screen.dart';
+import 'account/backup_screen.dart';
+import 'account/unlock_screen.dart';
 import 'widgets/common.dart';
 
 /// Settings → Devices: this account's devices, labelled from the sealed list where this device can open it.
-/// The primary (the device holding the account key) can remove the others.
+/// Any device can remove another; one that holds the account key also changes the key (M6 §6.2).
 Future<void> showDevices(BuildContext context) => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const DevicesScreen()));
 
 String platformName(String platform) =>
@@ -48,11 +49,9 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
   Future<void> _revoke(OwnDevice d) async {
     setState(() => _busy = true);
     try {
-      if (await confirmRevoke(context, ref, d.id, d.label ?? platformName(d.platform))) {
-        // On the primary, publish the list without it right away (other devices wait for the primary).
-        final messenger = ref.read(appProvider.notifier).messenger;
-        if (_devices?.any((x) => x.current && x.primary) ?? false) await messenger?.publishNextList().then((_) => null, onError: (_) => null);
-        if (mounted) showSnack(context, '${d.label ?? platformName(d.platform)} was revoked.');
+      final label = d.label ?? platformName(d.platform);
+      if (await confirmRemove(context, ref, d.id, label)) {
+        if (mounted) showSnack(context, '$label was removed.');
       }
       await _load();
     } finally {
@@ -64,7 +63,8 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
   Widget build(BuildContext context) {
     final devices = _devices;
     final muted = Theme.of(context).textTheme.bodySmall?.color;
-    final amPrimary = devices?.any((d) => d.current && d.primary) ?? false;
+    final state = ref.watch(appProvider);
+    final full = state.fullDevice, removed = state.removedListed;
     return Scaffold(
       appBar: AppBar(title: const Text('Devices')),
       body: _error != null
@@ -74,6 +74,28 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
           : ListView(
               children: [
                 if (_busy) const LinearProgressIndicator(),
+                // Removed from a device that couldn't change the account key: finish it here (M6 §6.2).
+                if (removed != null && full)
+                  MaterialBanner(
+                    key: const Key('removed-needs-rotation'),
+                    content: Text('${removed.label} was removed. Change your account key now?'),
+                    actions: [
+                      TextButton(
+                        onPressed: _busy
+                            ? null
+                            : () async {
+                                setState(() => _busy = true);
+                                try {
+                                  await confirmRemove(context, ref, removed.id, removed.label, alreadyRemoved: true);
+                                  await _load();
+                                } finally {
+                                  if (mounted) setState(() => _busy = false);
+                                }
+                              },
+                        child: const Text('Change account key'),
+                      ),
+                    ],
+                  ),
                 for (final d in devices)
                   ListTile(
                     key: ValueKey('device-${d.id}'),
@@ -86,22 +108,34 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
                     subtitle: Text(
                       [
                         if (d.current) 'This device',
-                        if (d.primary) 'Primary · holds your keys',
-                        if (d.state == 'pending') 'Signed in · not linked',
+                        if (d.current && d.state == 'listed') full ? 'Can unlock your account' : 'Waiting for keys',
+                        // Key status only for this device (M6 §7); another shows how it was linked when its meta says.
+                        if (!d.current && d.viaCode) 'Linked by code',
+                        if (d.state == 'pending') 'Signed in · not set up',
+                        if (d.state == 'revoked') 'Removed',
                         if (d.lastSeenAt != null) 'Last seen ${DateTime.fromMillisecondsSinceEpoch(d.lastSeenAt!).toLocal().toString().substring(0, 16)}',
                       ].join(' · '),
                       style: TextStyle(color: muted),
                     ),
-                    // Any device of the account can revoke another (never the primary: that is a transfer).
-                    trailing: !d.current && !d.primary && d.state != 'revoked'
+                    trailing: d.current && d.state == 'listed' && !full && state.companion && (state.hasBackup ?? false)
+                        ? TextButton(key: const Key('device-enter-passphrase'), onPressed: () => showUnlockThisDevice(context), child: const Text('Enter passphrase'))
+                        : !d.current && d.state != 'revoked'
                         ? TextButton(
                             key: ValueKey('revoke-${d.id}'),
                             onPressed: _busy ? null : () => _revoke(d),
-                            child: Text('Revoke', style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                            child: Text('Remove', style: TextStyle(color: Theme.of(context).colorScheme.error)),
                           )
                         : null,
                   ),
-                if (amPrimary)
+                if (full) ...[
+                  const Divider(),
+                  ListTile(
+                    key: const Key('device-backup'),
+                    leading: const Icon(Icons.shield_outlined),
+                    title: const Text('Account backup'),
+                    subtitle: Text(backupStatus(state)),
+                    onTap: () => showAccountBackup(context),
+                  ),
                   Padding(
                     padding: const EdgeInsets.all(16),
                     child: FilledButton.icon(
@@ -114,33 +148,7 @@ class _DevicesScreenState extends ConsumerState<DevicesScreen> {
                       label: const Text('Link a device'),
                     ),
                   ),
-                // Primary transfer (m5 §5): the primary hands over; a linked device takes over.
-                if (amPrimary && devices.any((d) => !d.current && d.state == 'listed'))
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 16),
-                    child: OutlinedButton.icon(
-                      key: const Key('device-hand-over'),
-                      onPressed: () async {
-                        await showHandOver(context);
-                        await _load();
-                      },
-                      icon: const Icon(Icons.swap_horiz),
-                      label: const Text('Hand over to another device'),
-                    ),
-                  ),
-                if (ref.watch(appProvider.select((s) => s.companion)))
-                  Padding(
-                    padding: const EdgeInsets.all(16),
-                    child: OutlinedButton.icon(
-                      key: const Key('device-take-over'),
-                      onPressed: () async {
-                        await showTakeOver(context);
-                        await _load();
-                      },
-                      icon: const Icon(Icons.key),
-                      label: const Text('Make this device primary'),
-                    ),
-                  ),
+                ],
               ],
             ),
     );

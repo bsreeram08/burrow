@@ -230,3 +230,35 @@ JSON commands: `mlsInitDevice`, `mlsDeviceLeaf`, `mlsSetDeviceCert`, `mlsKeyPack
 (`commit: false` to stage), `mlsCommitReceived`, `mlsAbortReceived`, `mlsMembers`, `mlsRoles`, `mlsView`,
 `mlsValidate`; fields are the camelCase names of the parameters above (`group`, `adds`, `removes: [{userId, deviceId?}]`,
 `roles`, `update`, `welcome`, `tree`, `groupInfo`, `plaintext`, `message`, `pendingId`).
+
+# The account key on every device and its backup (docs/m6-account-key.md)
+
+`feature = "mls"`. Every trusted device holds the account identity key (AIK); a **full** core has the `identity` row, a
+**companion** only the `account` row. The AccountKey bytes (`text16("webrtc-bun-account-key-v1") ‖ text16(userId) ‖
+bytes8(signSeed) ‖ bytes8(dhSecret)`, 95 + len(userId) bytes) are the only form in which the key leaves a core.
+
+| Function (`src/api.rs`) | JSON command | Result |
+|---|---|---|
+| `export_account_key(user_id)` | `exportAccountKey { userId }` | AccountKey (base64url); `companion` on a core without the key |
+| `import_account_key(user_id, key, published?)` | `importAccountKey { userId, key, published? }` | the identity now held; checked against the identity the core pins (companion), its own, or `published` (an empty core, a restore); anything else is `invalid` and changes nothing |
+| `passphrase_generate()` | `passphraseGenerate` | six BIP-39 words |
+| `backup_create(user_id, passphrase, account_key?)` | `backupCreate { userId, passphrase, accountKey? }` | `{ record (unsigned, epoch 1), words, backupKeys, passProof, recoveryProof }`; a custom passphrase is at least 14 characters after NFKC |
+| `backup_sign_keys(user_id, record)` | `backupSignKeys { userId, record }` | the AIK's signature over the record's keys bytes (full core) |
+| `backup_prove(record, passphrase?, words?)` | `backupProve { record, passphrase?, words? }` | `{ proof }` for a change, delete or rotation; `auth` if it is not the record's |
+| `backup_reseal(user_id, record, account_key?, passphrase?, new_recovery)` | `backupReseal { userId, record, backupKeys?, accountKey?, passphrase?, newRecovery? }` | `{ record (unsigned, epoch + 1), backupKeys, words?, passProof?, recoveryProof? }`: sealed to the backup keys this core holds (never to the server's say-so), after a rotation (no secret needed), a new passphrase, or a new recovery key; the old record must be signed by the current or the immediately previous own AIK, not older than the held keys |
+| `backup_open(user_id, record, passphrase?, words?, published?)` | `backupOpen { userId, record, passphrase?, words?, published? }` | `{ accountKey, backupKeys }`; the record's signature is checked first (and `published.sign`); wrong passphrase or words `auth`, malformed words `invalid` |
+| `backup_keys()` / `backup_keys_set(json)` | `backupKeys` / `backupKeysSet { backupKeys }` | the backup keys held (epoch, passPub, recoveryPub), never replaced by a lower epoch |
+| `rotate_identity(user_id, key?, record?, signature?, at, commit)` | `rotateIdentity { userId, at, key?, record?, signature?, commit? }` | `RotateResult { identity, record_json, key }` / `{ identity, record, key }` (`key` is the new AccountKey). With `commit: false` nothing changes in the identity, and the prepared rotation is kept (`rotation:pending`; one at a time, else `pending`): send the record to the server, then call again with `key`, `record`, `signature`, or with none of them to use the stored one, to swap the identity once it was taken. `rotationPending` / `rotation_pending()` shows the stored one (`{ identity, record }`), `rotationDrop` / `rotation_drop()` forgets it; a restart resumes with the first, or drops with the second.  a full core replaces its own account identity (a new key minted here, or `key`; the record signed here, or the one given and checked); the old key is `own-previous` until `at`; `record` and `signature` go together or not at all |
+| `adopt_succession(user_id, record, signature, cert?)` | `adoptSuccession { userId, record, signature, cert? }` | the new identity; on a companion the pin moves, on a **full** core it becomes a companion of the new key; the old key is kept as `own-previous` |
+| `rekey_request(user_id, device_id, platform)` | `rekeyRequest { userId, deviceId, platform }` | `{ eph, leafSigKey, signature }`, idempotent; companion only |
+| `rekey_answer(user_id, device_id, platform, eph, leaf_sig_key, signature, groups, now)` | `rekeyAnswer { …, groups, now, backupKeys? }` | the box for the asker; the request's signature (leaf key, over bytes naming this core's AIK and the platform) and `mlsLeafKnown` over `groups` are checked here, "the device is in the newest list" is the caller's check |
+| `rekey_open(user_id, device_id, platform, box)` | `rekeyOpen { userId, deviceId, platform, box }` | `{ identity, backupKeys }`; the core is full afterwards |
+
+Unlock keys: passphrase -> Argon2id (m 65536 KiB, t 3, p 1, 16-byte salt, 32 bytes) -> HKDF-SHA-256 (no salt,
+`webrtc-bun-backup-pass-v1`) -> an X25519 secret, and `...-pass-proof-v1` -> the proof; recovery key -> 32 random bytes shown
+as 24 BIP-39 English words (NFKD, case and whitespace forgiving, the first four letters of a word are enough) -> HKDF
+(`webrtc-bun-backup-recovery-v1`, `...-recovery-proof-v1`). The box (`seal_box`/`open_box`) is an ephemeral X25519
+exchange, HKDF with the two public keys as salt, AES-256-GCM, with the account, key, epoch and purpose bound as AAD. A
+record may name an Argon2 cost within m 65536-1048576, t 3-10, p 1-4; anything else is refused. The server holds only
+SHA-256 of the public unlock keys and of the proofs. Pinned vectors (computed independently): `tests/account_key.rs`,
+`tests/unit/helpers/account-key-vectors.ts`.

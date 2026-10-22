@@ -8,6 +8,7 @@ import 'package:go_router/go_router.dart';
 import 'app/app_controller.dart';
 import 'push/push_service.dart';
 import 'theme/theme_prefs.dart';
+import 'ui/account/restore_screen.dart';
 import 'ui/call_screen.dart';
 import 'ui/chat_list_screen.dart';
 import 'ui/command_palette.dart';
@@ -156,7 +157,7 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> with WidgetsBin
       routerConfig: router,
       builder: (context, child) {
         final ring = ref.watch(appProvider.select((s) => s.incoming));
-        final inactive = ref.watch(appProvider.select((s) => s.inactiveDevice));
+        final restore = ref.watch(appProvider.select((s) => s.phase == AuthPhase.signedIn && (s.needsRestore || s.restoredSafety != null)));
         final locked = ref.watch(appProvider.select((s) => s.keysLocked));
         final media = MediaQuery.of(context);
         return PaletteShortcut(
@@ -168,7 +169,8 @@ class _PrivateChatAppState extends ConsumerState<PrivateChatApp> with WidgetsBin
                 data: media.copyWith(textScaler: _ScaledText(media.textScaler, textScale)),
                 child: child ?? const SizedBox.shrink(),
               ),
-              if (inactive && !locked) const Positioned(left: 0, right: 0, bottom: 0, child: InactiveDeviceBanner()),
+              // A device the account doesn't list yet unlocks with the backup or is linked (M6 §4) before anything else.
+              if (restore) Positioned.fill(child: HeroControllerScope.none(child: Navigator(onGenerateRoute: (_) => MaterialPageRoute<void>(builder: (_) => const RestoreScreen())))),
               if (locked) const Positioned(left: 0, right: 0, bottom: 0, child: KeysLockedBanner()),
               if (_updateRequired)
                 const Positioned(
@@ -219,49 +221,6 @@ class _ScaledText extends TextScaler {
   bool operator ==(Object other) => other is _ScaledText && other.base == base && other.factor == factor;
   @override
   int get hashCode => Object.hash(base, factor);
-}
-
-/// Shown while another device or browser holds this account's encryption keys.
-class InactiveDeviceBanner extends ConsumerWidget {
-  const InactiveDeviceBanner({super.key});
-  @override
-  Widget build(BuildContext context, WidgetRef ref) => Material(
-    color: const Color(0xFF3D321A),
-    child: SafeArea(
-      top: false,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
-        child: Row(
-          children: [
-            const Expanded(
-              child: Text('Encrypted messaging for this account is active on another device or browser.', style: TextStyle(color: Color(0xFFF2C14E))),
-            ),
-            const SizedBox(width: 8),
-            FilledButton(
-              key: const Key('use-this-device'),
-              onPressed: () async {
-                final yes = await showDialog<bool>(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Start over on this device?'),
-                    content: const Text(
-                      'Do this only if your primary device is lost. This device makes new keys for your account: everyone you talk to sees that your security code changed, and your other devices stop working until you link them again.',
-                    ),
-                    actions: [
-                      TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-                      FilledButton(key: const Key('use-this-device-confirm'), onPressed: () => Navigator.pop(context, true), child: const Text('Start over here')),
-                    ],
-                  ),
-                );
-                if (yes == true) await ref.read(appProvider.notifier).useThisDevice();
-              },
-              child: const Text('Use this device instead'),
-            ),
-          ],
-        ),
-      ),
-    ),
-  );
 }
 
 /// This device's key database can't be unlocked (store key missing, database reset or tampered). Messaging

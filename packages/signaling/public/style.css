@@ -684,3 +684,7 @@ body:not([data-kind="group"]) :is(#conv-info, #conv-leave) { display: none; }
 .device-link-video { width: 100%; border-radius: 12px; background: #000; }
 #device-link-new { margin-top: 8px; }
 .device-link-card input { width: 100%; margin-bottom: 10px; background: var(--surface); border: 1px solid var(--line-strong); border-radius: 12px; padding: 11px 12px; font-family: ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .06em; }
+.backup-words { columns: 3; font: 500 15px/1.8 ui-monospace, "SF Mono", Menlo, monospace; color: var(--text); margin: 8px 0 12px; padding-left: 2.2em; }
+#restore-words, #backup-check input { font: 15px/1.5 ui-monospace, "SF Mono", Menlo, monospace; }
+#backup-check label { display: block; margin-top: 8px; }
+.backup-actions { justify-content: flex-start; flex-wrap: wrap; }

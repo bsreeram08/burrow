@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:uuid/uuid.dart';
 
@@ -29,7 +30,7 @@ const typingHideMs = 6000;
 const dmMoveRetryMs = 600000;
 
 /// Why a linked device can't send in a chat that is still on the Double Ratchet.
-const companionNotice = 'Messages in this chat go through your primary device until it moves to the new encryption.';
+const companionNotice = 'Messages in this chat go through your other device until it moves to the new encryption.';
 
 /// The system line both sides show where a 1:1 chat moved.
 const dmMovedNote = 'Messages in this chat now use the new encryption.';
@@ -68,7 +69,7 @@ class MemoryRotationPrefs implements RotationPrefs {
 
 /// One of this account's devices (Settings → Devices).
 class OwnDevice {
-  const OwnDevice({required this.id, required this.platform, required this.state, required this.primary, required this.current, this.label, this.lastSeenAt});
+  const OwnDevice({required this.id, required this.platform, required this.state, required this.primary, required this.current, this.label, this.lastSeenAt, this.viaCode = false});
   final String id;
   final String platform;
 
@@ -80,6 +81,9 @@ class OwnDevice {
   final bool primary;
   final bool current;
   final int? lastSeenAt;
+
+  /// Linked by short code (its sealed meta says `via: 'code'`, M6 §5), when this device can read the meta.
+  final bool viaCode;
 }
 
 class Messenger {
@@ -151,6 +155,10 @@ class Messenger {
   /// they belong to the active device, and acknowledging them here would delete them.
   bool active = false;
 
+  /// This device holds the account's published key (docs/m6-account-key.md §0): it signs lists and certificates,
+  /// whether or not it is the inbox device ([active]).
+  bool full = false;
+
   /// The key database refused to work mid-session (tampered, reset, identity missing): stop processing and
   /// acknowledging until the user recovers. Envelopes stay on the server.
   bool keysLocked = false;
@@ -189,6 +197,10 @@ class Messenger {
     } catch (_) {}
   }
 
+  /// Binds this session to our device with the device key only (no account key needed): a device signing in on an
+  /// account can then publish the list naming itself after a restore (M6 §4).
+  Future<void> bindSession() => _announce();
+
   /// Compares the server's published identity with ours before uploading anything.
   /// Re-run on sign-in, on reconnect and on a `keys` event for our own id.
   Future<bool> checkActive() async {
@@ -200,10 +212,19 @@ class Messenger {
     final count = await api.keyCount();
     final mine = await crypto.identity();
     final published = count.identity == null ? null : Identity.fromJson(count.identity!);
+    full = published == null || published == mine;
     if (published != null && published != mine) {
       // Another device holds the keys: this one is a pending device of the account.
       await _announce();
       _setActive(false);
+      return false;
+    }
+    // Every full device holds the account key (docs/m6-account-key.md §0); only the inbox device runs the 1:1
+    // Double Ratchet. Another full device leaves the inbox where it is and sends only in chats that moved to MLS.
+    if (published != null && !await _holdsInbox()) {
+      await _announce();
+      _setActive(false);
+      unawaited(flush());
       return false;
     }
     // Before the first upload there is nothing to prove: the upload of the new identity claims the inbox.
@@ -214,6 +235,42 @@ class Messenger {
     _setActive(true);
     unawaited(flush());
     return true;
+  }
+
+  /// Pins our own verified list with the labels this device can read in it (others kept from the previous pin, also
+  /// for devices the list dropped, within the pin's bounds), so a later key change can name what it removed (M6 §6.2).
+  Future<void> _pinOwn(DevicePin pin, Object? list) async {
+    final previous = devices.pin(me.id, me.id)?.labels ?? const <String, String>{};
+    Uint8List? key;
+    try {
+      key = deviceMetaKey(await crypto.deviceMetaSignature(me.id));
+    } catch (_) {
+      // Without the account key: the labels pinned before.
+    }
+    final labels = <String, String>{};
+    for (final d in ((list as Map?)?['devices'] as List? ?? const []).cast<Map>()) {
+      final id = d['deviceId'] as String, metaKey = key;
+      final label = (metaKey == null ? null : openMeta(metaKey, me.id, id, d['meta'] as String? ?? ''))?['label'] ?? previous[id];
+      if (label != null) labels[id] = label;
+    }
+    for (final id in [...pin.devices, ...pin.revoked]) {
+      final label = previous[id];
+      if (label != null) labels.putIfAbsent(id, () => label);
+    }
+    devices.setPin(me.id, me.id, pin.withLabels(labels));
+  }
+
+  /// This device is the account's inbox device (the server's `primary` row), or the account has none yet.
+  Future<bool> _holdsInbox() async {
+    final id = (await device()).deviceId;
+    final List<Map> rows;
+    try {
+      rows = ((await api.devices(me.username))['devices'] as List? ?? const []).cast<Map>();
+    } on ApiException {
+      return true; // A server without the device registry: one device holds everything, as before.
+    }
+    final inbox = rows.where((r) => r['primary'] == true && r['state'] != 'revoked').firstOrNull;
+    return inbox == null || inbox['id'] == id;
   }
 
   /// On the identity-key holder (account.js `syncDevices`): verify the served list against our own key and
@@ -231,7 +288,7 @@ class Messenger {
   String? deviceWarning;
 
   Future<bool> _syncDevicesNow() async {
-    if (!active || keysLocked || _disposed) return false;
+    if ((!active && !full) || keysLocked || _disposed) return false;
     final id = (await device()).deviceId, own = await crypto.identity();
     final view = await api.devices(me.username);
     final served = view['identity'];
@@ -246,13 +303,15 @@ class Messenger {
         _notices.add(deviceWarning!);
         return false;
       }
-      devices.setPin(me.id, me.id, check.pin!);
+      await _pinOwn(check.pin!, view['list']);
       base = (view['list'] as Map).cast<String, dynamic>();
       baseHash = check.hash;
       final rows = (view['devices'] as List? ?? const []).cast<Map>();
       final mine = rows.where((r) => r['id'] == id).firstOrNull;
       final listed = (base['devices'] as List).any((d) => (d as Map)['deviceId'] == id);
-      if (view['currentDevice'] == id && mine?['primary'] == true && listed) {
+      // Listed is enough for a full device that isn't the inbox device; the inbox device also checks it is the one
+      // the server routes 1:1 messages to.
+      if (listed && (!active || (view['currentDevice'] == id && mine?['primary'] == true))) {
         deviceWarning = null;
         return true;
       }
@@ -287,7 +346,7 @@ class Messenger {
     if (view['list'] != null) {
       final check = verifyView(userId: me.id, aikSign: own.sign, list: view['list'], signature: view['signature'], certs: view['certs'], pin: devices.pin(me.id, me.id));
       if (!check.ok) throw CryptoException('The device list on the server is not one this device signed (${check.reason}).');
-      devices.setPin(me.id, me.id, check.pin!);
+      await _pinOwn(check.pin!, view['list']);
       base = (view['list'] as Map).cast<String, dynamic>();
       baseHash = check.hash;
     }
@@ -301,13 +360,19 @@ class Messenger {
       for (final d in (base?['devices'] as List? ?? const []).cast<Map>())
         if (d['deviceId'] != id && !add.any((a) => a['deviceId'] == d['deviceId']) && rows.any((r) => r['id'] == d['deviceId'] && r['state'] == 'listed')) Map<String, dynamic>.from(d),
     ];
-    final self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
+    final metaKey = deviceMetaKey(await crypto.deviceMetaSignature(me.id));
+    var self = (base?['devices'] as List? ?? const []).cast<Map>().where((d) => d['deviceId'] == id).map(Map<String, dynamic>.from).firstOrNull ??
         {
           'deviceId': id,
           'addedAt': _now(),
           // Label and platform, sealed under the account's device-meta key like the web does.
-          'meta': sealMeta(deviceMetaKey(await crypto.deviceMetaSignature(me.id)), me.id, id, label: _deviceLabel(api.client), platform: api.client),
+          'meta': sealMeta(metaKey, me.id, id, label: _deviceLabel(api.client), platform: api.client),
         };
+    // Linked by code and now holding the key (it unlocked with the passphrase): its own list drops `via` (M6 §5).
+    final described = openMeta(metaKey, me.id, id, self['meta'] as String? ?? '');
+    if (described?['via'] != null) {
+      self = {...self, 'meta': sealMeta(metaKey, me.id, id, label: described?['label'] ?? _deviceLabel(api.client), platform: described?['platform'] ?? api.client)};
+    }
     final entries = [...keep, self, ...add]..sort((a, b) => (a['deviceId']! as String).compareTo(b['deviceId']! as String));
     final version = ((base?['version'] as int?) ?? 0) + 1;
     final list = <String, Object?>{'v': 1, 'userId': me.id, 'version': version, 'prevHash': baseHash ?? '', 'devices': entries};
@@ -318,7 +383,7 @@ class Messenger {
     final signed = {'list': list, 'signature': sig.signature, 'certs': sig.certs};
     await api.publishDeviceList(signed, id);
     final after = verifyView(userId: me.id, aikSign: own.sign, list: list, signature: signed['signature'], certs: sig.certs, pin: devices.pin(me.id, me.id));
-    if (after.ok) devices.setPin(me.id, me.id, after.pin!);
+    if (after.ok) await _pinOwn(after.pin!, list);
     return (version: version, hash: listHash(listBytes(list)));
   }
 
@@ -339,7 +404,7 @@ class Messenger {
       if (aik == null || view['list'] == null) return null;
       final check = verifyView(userId: me.id, aikSign: aik, list: view['list'], signature: view['signature'], certs: view['certs'], pin: pin);
       if (!check.ok) return null;
-      devices.setPin(me.id, me.id, check.pin!);
+      await _pinOwn(check.pin!, view['list']);
       return OwnDeviceList(listed: {...check.pin!.devices}, dropped: {...check.pin!.revoked});
     } catch (_) {
       return null;
@@ -369,6 +434,7 @@ class Messenger {
             primary: row['primary'] == true,
             current: row['current'] == true,
             lastSeenAt: row['lastSeenAt'] as int?,
+            viaCode: meta?['via'] == 'code',
           );
         }(),
     ];
@@ -397,7 +463,7 @@ class Messenger {
     if (signed.isNotEmpty) {
       final own = await crypto.identity();
       final after = verifyView(userId: me.id, aikSign: own.sign, list: signed['list'], signature: signed['signature'], certs: signed['certs'], pin: devices.pin(me.id, me.id));
-      if (after.ok) devices.setPin(me.id, me.id, after.pin!);
+      if (after.ok) await _pinOwn(after.pin!, signed['list']);
     }
   }
 
@@ -580,7 +646,7 @@ class Messenger {
 
   /// A linked device sends only in chats that moved to MLS; the active device sends in all of them.
   Future<void> _requireSendable(Contact contact) async {
-    if (keysLocked || (!active && await _dmChannel(contact.id!) == null)) throw CryptoException(companion ? companionNotice : 'Encrypted messaging for this account is active on another device or browser.');
+    if (keysLocked || (!active && await _dmChannel(contact.id!) == null)) throw const CryptoException(companionNotice);
   }
 
   /// Adds or removes our reaction: stored here at once, then sent. Reverted if it can't be sent.
@@ -791,8 +857,9 @@ class Messenger {
 
   /// Sends every queued message, oldest first, keeping each contact's order.
   Future<void> flush() async {
-    // Messages stay queued here until this device is usable (a linked device: until the chat moves to MLS).
-    if ((!active && !companion) || keysLocked || _disposed) return;
+    // Messages stay queued here until this device can send them: the inbox device over the Double Ratchet, any other
+    // device only once the chat moved to MLS (skipped per contact below).
+    if (keysLocked || _disposed) return;
     if (_flushing) {
       _flushAgain = true;
       return;
@@ -969,8 +1036,7 @@ class Messenger {
       try {
         final moved = await crypto.acceptSuccession(id, [for (final r in succession) (r as Map).cast<String, dynamic>()]);
         if (moved.identity == served) {
-          _notices.add('${contact.username} moved to a new device. Verification kept.');
-          _confirmed.remove(id);
+          keyMoved(contact, served);
           return true;
         }
       } on CryptoException {
@@ -980,6 +1046,18 @@ class Messenger {
     await crypto.notePeer(id, served);
     return false;
   }
+
+  /// A contact's pin moved along their signed chain, here or in the group pins (whichever saw it first):
+  /// told once per new key.
+  void keyMoved(Contact contact, Identity now) {
+    final id = contact.id!;
+    if (_movedTo[id] == now.sign) return;
+    _movedTo[id] = now.sign;
+    _notices.add('${contact.username} updated their security key. Verification kept.');
+    _confirmed.remove(id);
+  }
+
+  final Map<String, String> _movedTo = {};
 
   Future<void> regenerateIdentity() async {
     await crypto.resetIdentity();

@@ -70,7 +70,7 @@
     <h2 id="welcome-title">Sign in</h2>
     <p class="note">Use a passkey — your fingerprint, face or screen lock. No passwords.</p>
     <button id="signin" class="primary wide" type="button"><svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2L20 3M17 6l3 3M15 8l2 2"/></svg><span>Sign in with passkey</span></button>
-    <button id="signin-link" class="wide" type="button">Link to my other device</button>
+    <button id="signin-link" class="wide" type="button">Link from another device</button>
     <details id="register-panel"><summary>Have an invite? Create account</summary>
       <form id="register-form">
         <label for="register-invite">Invite code</label>
@@ -110,8 +110,13 @@
     </div>
     <div id="device-banner" class="notify-banner" role="alert" hidden>
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
-      <p id="device-banner-text">Encrypted messaging for this account is active on another device or browser. Messages are not sent or received here.</p>
-      <div class="notify-actions"><button id="device-link-this" class="primary" type="button" hidden>Link this browser</button><button id="device-takeover" class="primary" type="button">Use this device instead</button><button id="device-recover" class="link" type="button" hidden>I can’t use my other devices</button></div>
+      <div><p id="device-banner-text"><strong>Use your account here.</strong> Your messages are end-to-end encrypted. Unlock them on this device with your backup, or link it from a device you already use.</p>
+      <p id="device-banner-nobackup" class="note" hidden>Turn on account backup on one of your devices to sign in without it next time.</p></div>
+      <div class="notify-actions"><button id="device-restore-pass" class="primary" type="button" hidden>Enter your passphrase</button><button id="device-restore-words" type="button" hidden>Use your recovery key</button><button id="device-link-this" type="button" hidden>Link from another device</button><button id="device-recover" class="link" type="button" hidden>I can’t do any of these</button></div>
+    </div>
+    <div id="keychange-notice" class="notify-banner" role="alert" hidden>
+      <p id="keychange-notice-text"></p>
+      <div class="notify-actions"><button id="keychange-notice-dismiss" class="link" type="button">Dismiss</button></div>
     </div>
     <p id="chats-status" role="status" aria-live="polite"></p>
     <section id="pinned-section" class="list-section" aria-labelledby="pinned-head" hidden>
@@ -321,6 +326,62 @@
     <div class="dialog-actions"><button id="recovery-cancel" type="button">Keep trying to link</button><button id="recovery-yes" class="danger" type="button">Start over here</button></div>
   </div></div>
 
+  <div id="restore" class="dialog" role="dialog" aria-modal="true" aria-labelledby="restore-title" hidden><div class="dialog-card">
+    <h2 id="restore-title">Enter your passphrase</h2>
+    <form id="restore-form">
+      <label id="restore-label" for="restore-input">Passphrase</label>
+      <input id="restore-input" type="password" autocomplete="current-password" spellcheck="false" autocapitalize="off">
+      <textarea id="restore-words" rows="4" autocomplete="off" spellcheck="false" autocapitalize="off" hidden></textarea>
+      <p id="restore-note" class="note" hidden>This is not a wallet seed; don’t enter it anywhere else.</p>
+      <p id="restore-status" class="note" role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="restore-cancel" type="button">Cancel</button><button id="restore-submit" class="primary" type="submit">Unlock</button></div>
+    </form>
+    <div id="restore-done" hidden>
+      <p>This device can now use your account.</p>
+      <p>Safety number: <span id="restore-safety" class="safety-number"></span></p>
+      <p class="note">Your contacts don’t need to re-verify you. To check this device, compare a contact’s safety number with them, or with your other device.</p>
+      <div class="dialog-actions"><button id="restore-close" class="primary" type="button">Done</button></div>
+    </div>
+  </div></div>
+
+  <div id="backup" class="dialog" role="dialog" aria-modal="true" aria-labelledby="backup-title" hidden><div class="dialog-card">
+    <h2 id="backup-title">Account backup</h2>
+    <div id="backup-step-pass">
+      <p>Your backup is encrypted with a passphrase only you know. With it, you can use your account on a new device without your other devices.</p>
+      <div id="backup-generated"><p class="note">Your passphrase:</p><p id="backup-passphrase" class="device-link-code"></p>
+        <div class="dialog-actions"><button id="backup-copy-pass" type="button">Copy</button><button id="backup-own" class="link" type="button">Use my own passphrase</button></div></div>
+      <div id="backup-custom" hidden>
+        <label for="backup-pass1">Passphrase (at least 14 characters)</label><input id="backup-pass1" type="password" autocomplete="new-password">
+        <label for="backup-pass2">Type it again</label><input id="backup-pass2" type="password" autocomplete="new-password">
+        <button id="backup-use-generated" class="link" type="button">Use a generated passphrase</button>
+      </div>
+      <div id="backup-current-box" hidden><label for="backup-current">Current passphrase or recovery key</label><input id="backup-current" type="password" autocomplete="current-password"></div>
+    </div>
+    <div id="backup-step-words" hidden>
+      <p>Your recovery key. It opens your backup if you forget the passphrase. Store it offline, for example on paper.</p>
+      <ol id="backup-words" class="backup-words"></ol>
+      <p class="note">This is not a wallet seed; don’t enter it anywhere else.</p>
+      <div class="dialog-actions"><button id="backup-copy-words" type="button">Copy</button></div>
+    </div>
+    <div id="backup-step-check" hidden>
+      <p>Type these words from your recovery key to check you have it.</p>
+      <div id="backup-check"></div>
+    </div>
+    <p id="account-backup-status" class="note" role="status" aria-live="polite"></p>
+    <div class="dialog-actions"><button id="backup-cancel" type="button">Cancel</button><button id="backup-next" class="primary" type="button">Next</button></div>
+  </div></div>
+
+  <div id="keychange" class="dialog" role="alertdialog" aria-labelledby="keychange-title" hidden><div class="dialog-card">
+    <h2 id="keychange-title">Remove this device and change your account key?</h2>
+    <p id="keychange-text">The device is signed out and can’t read new messages. Because it could unlock your account, your account gets a new key; your other devices pick it up by themselves and your contacts keep their verification.</p>
+    <form id="keychange-form">
+      <div id="keychange-proof" hidden><label for="keychange-pass">Your passphrase or recovery key</label><input id="keychange-pass" type="password" autocomplete="current-password">
+        <label class="toggle"><input id="keychange-change-pass" type="checkbox"> Also change your passphrase</label></div>
+      <p id="keychange-status" class="note" role="status" aria-live="polite"></p>
+      <div class="dialog-actions"><button id="keychange-cancel" type="button">Cancel</button><button id="keychange-yes" class="danger" type="submit">Remove and change key</button></div>
+    </form>
+  </div></div>
+
   <div id="remove-confirm" class="dialog" role="alertdialog" aria-labelledby="remove-title" hidden><div class="dialog-card">
     <h2 id="remove-title">Remove this contact?</h2>
     <p>You stop seeing each other online and can no longer call or message until one of you adds the other again. Messages on this device stay.</p>
@@ -394,10 +455,14 @@
     </div>
     <div class="account-only devices-settings">
       <h3>Devices</h3>
-      <p class="note">The device that holds your keys is the primary. It signs the list of your devices; contacts check that signature, so the server cannot add a device they would trust.</p>
+      <p class="note">Devices that can unlock your account sign the list of your devices; contacts check that signature, so the server cannot add a device they would trust.</p>
       <ul id="device-list" class="device-list" aria-label="Your devices"></ul>
       <button id="device-link-new" type="button" hidden>Link a new device</button>
       <p id="devices-status" class="note" role="status" aria-live="polite"></p>
+      <button id="device-finish" class="danger" type="button" hidden>Change account key</button>
+      <h4>Account backup</h4>
+      <p id="backup-state" class="note">Checking…</p>
+      <div class="dialog-actions backup-actions"><button id="backup-on" type="button" hidden>Turn on account backup</button><button id="backup-change-pass" type="button" hidden>Change passphrase</button><button id="backup-new-words" type="button" hidden>New recovery key</button><button id="backup-off" class="danger-text" type="button" hidden>Turn off</button><button id="reset-cancel" class="danger" type="button" hidden>Cancel the reset</button></div>
     </div>
     <div class="account-only">
       <h3>Security</h3>

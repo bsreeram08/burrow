@@ -17,6 +17,8 @@ type Format = {
 const Format = (globalThis as any).DeviceFormat as Format & { successionBytes(record: object): Uint8Array; startBytes(deviceId: string, platform: string, deviceKey: string): Uint8Array; linkClaimBytes(linkId: string, deviceId: string, claim: string): Uint8Array; mlsCertBytes(userId: string, deviceId: string, platform: string, leafSigKey: string, aikSign: string, issuedAt: number): Uint8Array };
 export { Format };
 export const MAX_DEVICES = Format.MAX_DEVICES;
+/** How long an accepted succession stays open for the steps that follow it (the identity change, the first list, the re-seal). */
+export const ROTATION_WINDOW = 60 * 60 * 1000;
 const DEVICE_ID = /^[A-Za-z0-9_-]{22}$/, SIG = /^[A-Za-z0-9_-]{86}$/, KEY = /^[A-Za-z0-9_-]{43}$/;
 /** A bind challenge is single use, for one session, and short lived. */
 const CHALLENGE_LIFETIME = 2 * 60 * 1000, MAX_CHALLENGES = 10000, MAX_SESSION_CHALLENGES = 4, MAX_ACCOUNT_CHALLENGE_SESSIONS = 32;
@@ -37,6 +39,8 @@ type Deps = {
     inboxChanged(userId: string): void;
     /** Devices were revoked (by the account, or dropped by a new list): group memberships and the like go with them. */
     devicesRevoked?(userId: string, ids: string[]): void;
+    /** Whether this caller may remove devices from the account (a proof when it has a backup, docs/m6-account-key.md §6.3); a refusal to send as is. */
+    removalGuard?(user: Caller, body: Record<string, any> | null, firstUnderKey: boolean): [number, object] | null;
 };
 
 /** Ed25519 verification of a base64url signature under a base64url public key (the AIK or a device key). */
@@ -138,9 +142,8 @@ export function createDevices(deps: Deps) {
             // Exactly the next version: no replays, no forks at the same version, no skipping ahead.
             if (list.version !== stored.version + 1) return [409, { error: 'A device list must be the next version.', version: stored.version }];
             if (list.prevHash !== stored.hash) return [409, { error: 'The list does not follow the current one.', version: stored.version }];
-            // Changes come only from the primary device's own session.
-            const current = db.query<{ id: string }, [string]>("SELECT id FROM devices WHERE user_id = ? AND is_primary = 1 AND state = 'listed'").get(user.id);
-            if (!current || sessionDevice(user.session) !== current.id || deviceId !== current.id) return [403, { error: 'Only the primary device can change the device list.' }];
+            // Any device may publish the next list (M6: every device holds the account key): what makes it the account's is the
+            // signature under the current identity key, checked above. That includes a pending device that lists itself on restore.
         } else if (list.version !== 1) return [409, { error: 'The first device list is version 1.', version: 0 }];
         // The publisher must have bound its session to its device with proof of possession (announce).
         if (sessionDevice(user.session) !== deviceId) return [409, { error: 'Announce this device before publishing a list.' }];
@@ -154,24 +157,35 @@ export function createDevices(deps: Deps) {
         // pending ones too. Under the same key a pending device is a newcomer waiting for the primary to list it.
         const firstUnderKey = !stored || stored.aik_sign !== aik;
         const dropped = live(user.id).filter(row => row.state !== 'placeholder' && !listed.has(row.id) && (row.state === 'listed' || firstUnderKey)).map(row => row.id);
+        // A list that drops a device that is listed now removes it from the account: with a backup that needs the proof (or the
+        // allowance a succession leaves for the first list under the new key).
+        if (dropped.some(id => live(user.id).find(row => row.id === id)?.state === 'listed' || firstUnderKey)) {
+            const refused = deps.removalGuard?.(user, body, firstUnderKey);
+            if (refused) return refused;
+        }
         db.transaction(() => {
             // The device that held this account's envelopes (a placeholder, or an unlisted device that claimed
             // messaging) hands them to the device the signed list now makes primary.
             const previous = db.query<{ id: string; state: string }, [string]>("SELECT id, state FROM devices WHERE user_id = ? AND is_primary = 1 AND state != 'revoked'").get(user.id);
-            db.query("UPDATE devices SET is_primary = 0 WHERE user_id = ? AND state != 'revoked'").run(user.id);
+            // The inbox device changes hands only with a new identity (a list under a new key); a next list from any device leaves it.
+            if (firstUnderKey) db.query("UPDATE devices SET is_primary = 0 WHERE user_id = ? AND state != 'revoked'").run(user.id);
             for (const device of list.devices) {
                 // A listed device the server has not seen yet (a companion added by the primary) keeps 'unknown'.
                 db.query(`INSERT INTO devices (id, user_id, platform, state, is_primary, cert, created_at) VALUES (?1, ?2, 'unknown', 'listed', 0, ?3, ?4)
                     ON CONFLICT (id) DO UPDATE SET state = 'listed', cert = ?3`).run(device.deviceId, user.id, certs[device.deviceId]!, now());
             }
-            db.query('UPDATE devices SET is_primary = 1, platform = ?, last_seen_at = ? WHERE id = ?').run(user.client, now(), deviceId);
-            if (previous && previous.id !== deviceId) {
+            db.query('UPDATE devices SET platform = ?, last_seen_at = ? WHERE id = ?').run(user.client, now(), deviceId);
+            if (firstUnderKey) db.query('UPDATE devices SET is_primary = 1 WHERE id = ?').run(deviceId);
+            if (firstUnderKey && previous && previous.id !== deviceId) {
                 db.query('UPDATE device_inbox SET device_id = ? WHERE device_id = ?').run(deviceId, previous.id);
                 if (previous.state === 'placeholder') db.query('DELETE FROM devices WHERE id = ?').run(previous.id);
             }
             db.query('INSERT OR REPLACE INTO device_lists (user_id, aik_sign, version, hash, list, signature, certs, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
                 .run(user.id, aik, list.version, digest(bytes), JSON.stringify(list), body!.signature, JSON.stringify(certs), now());
         })();
+        // A list that drops the inbox device hands the inbox to the publisher before the device goes.
+        const lostInbox = dropped.find(id => db.query('SELECT 1 FROM devices WHERE id = ? AND is_primary = 1').get(id));
+        if (lostInbox) moveInbox(user.id, lostInbox, deviceId);
         revoke(user.id, dropped);
         announceChange(user.id);
         deps.inboxChanged(user.id);
@@ -282,11 +296,24 @@ export function createDevices(deps: Deps) {
      * the primary publishes the next version, which the primary is told to do. The primary itself is handed over,
      * never revoked.
      */
+    /** The inbox (the `is_primary` device and the 1:1 envelopes waiting for it) moves from `from` to `to` if that is a listed device, else to a placeholder. */
+    function moveInbox(userId: string, from: string, to: string | null) {
+        db.transaction(() => {
+            db.query('UPDATE devices SET is_primary = 0 WHERE id = ?').run(from);
+            const target = to && to !== from && eligible(userId, to) ? to : primary(userId);
+            db.query('UPDATE devices SET is_primary = 1 WHERE id = ?').run(target);
+            db.query('UPDATE device_inbox SET device_id = ? WHERE device_id = ?').run(target, from);
+        })();
+    }
+
     function revokeAny(user: Caller, deviceId: string): [number, object] {
         const row = DEVICE_ID.test(deviceId) ? db.query<DeviceRow, [string, string]>("SELECT * FROM devices WHERE id = ? AND user_id = ? AND state != 'revoked'").get(deviceId, user.id) : null;
         if (!row) return [404, { error: 'No such device.' }];
-        if (row.state === 'placeholder' || row.is_primary) return [409, { error: 'The primary device cannot be revoked. Hand the account to another device first.' }];
+        if (row.state === 'placeholder') return [409, { error: 'That is not a device.' }];
+        // The inbox device may be revoked too (M6): its waiting 1:1 envelopes move to the revoker's device, or to a placeholder.
+        if (row.is_primary) moveInbox(user.id, row.id, sessionDevice(user.session));
         revoke(user.id, [deviceId]);
+        deps.inboxChanged(user.id);
         deps.notify(user.id, { type: 'devices', id: user.id, needsList: row.state === 'listed', revoked: deviceId });
         announceChange(user.id);
         return [200, { revoked: [deviceId] }];
@@ -310,6 +337,16 @@ export function createDevices(deps: Deps) {
         if (record.userId !== user.id || record.oldSign !== current || record.newSign === record.oldSign) return [403, { error: 'The record is not from this account\'s current identity key.' }];
         if (!ed25519Verify(current, bytes, signature)) return [403, { error: 'The record is not signed by the current identity key.' }];
         if (Math.abs(record.at - now()) > 10 * 60 * 1000) return [400, { error: 'The record\'s time is not now.' }];
+        // One rotation at a time: while the newest record hands over from the identity published now and has not been used, another
+        // device's different record is refused (it fetches the chain and follows, contract §6.2); the same record again is a retry.
+        const newest = db.query<{ seq: number; old_sign: string; new_sign: string; signature: string; used: number; created_at: number }, [string]>('SELECT seq, old_sign, new_sign, signature, used, created_at FROM identity_succession WHERE user_id = ? ORDER BY seq DESC LIMIT 1').get(user.id);
+        if (newest && newest.old_sign === current && !newest.used) {
+            if (newest.signature === signature && newest.new_sign === record.newSign) return [201, { seq: newest.seq }];
+            // Within the window another device's rotation is in flight. After it, a different record replaces the abandoned one: the old
+            // record authorizes nothing from here on (`used = 2`), and its device finds that out on restart (the owner's `rotation` view).
+            if (now() - newest.created_at < ROTATION_WINDOW) return [409, { error: 'A rotation of this account is already waiting.' }];
+            db.query('UPDATE identity_succession SET used = 2 WHERE user_id = ? AND seq = ?').run(user.id, newest.seq);
+        }
         const count = db.query<{ n: number; max: number | null }, [string]>('SELECT COUNT(*) AS n, MAX(seq) AS max FROM identity_succession WHERE user_id = ?').get(user.id)!;
         db.transaction(() => {
             // The chain keeps its newest records; older ones fall off (contacts that old review the code instead).
@@ -325,7 +362,8 @@ export function createDevices(deps: Deps) {
     // primary answers. The server is not trusted for who owns which leaf key: the primary certifies a (device, leaf key)
     // pair only if a group it holds already contains exactly that leaf (chatcore `mlsLeafKnown`), whatever is relayed here.
     const canonicalKey = (value: unknown) => typeof value === 'string' && KEY.test(value) && Buffer.from(value, 'base64url').length === 32 && Buffer.from(value, 'base64url').toString('base64url') === value;
-    const isPrimaryDevice = (user: Caller) => { const mine = sessionDevice(user.session); return Boolean(mine && db.query('SELECT 1 FROM devices WHERE id = ? AND user_id = ? AND is_primary = 1 AND state = ?').get(mine, user.id, 'listed')); };
+    // Any listed device answers (every device holds the account key, docs/m6-account-key.md §7): during the migration old clients still ask.
+    const isPrimaryDevice = (user: Caller) => eligible(user.id, sessionDevice(user.session));
     /** A listed device (not the primary) asks for a certificate for its own leaf key. Replaces its earlier request. */
     function recertRequest(user: Caller, body: Record<string, any> | null): [number, object] {
         const device = sessionDevice(user.session);
@@ -337,13 +375,13 @@ export function createDevices(deps: Deps) {
     }
     /** The primary lists the requests that still wait. Nothing here is proof of anything: see `mlsLeafKnown`. */
     function recertPending(user: Caller): [number, object] {
-        if (!isPrimaryDevice(user)) return [403, { error: 'Only the primary device answers.' }];
+        if (!isPrimaryDevice(user)) return [403, { error: 'Only a listed device answers.' }];
         const rows = db.query<{ device_id: string; platform: string; leaf_sig_key: string }, [string]>('SELECT device_id, platform, leaf_sig_key FROM recert_requests WHERE user_id = ? AND cert IS NULL ORDER BY created_at').all(user.id);
         return [200, { requests: rows.filter(row => eligible(user.id, row.device_id)).map(row => ({ deviceId: row.device_id, platform: row.platform, leafSigKey: row.leaf_sig_key })) }];
     }
     /** The primary answers with a certificate for exactly the leaf key that was asked about, signed by the current identity key. */
     function recertAnswer(user: Caller, deviceId: string, body: Record<string, any> | null): [number, object] {
-        if (!isPrimaryDevice(user)) return [403, { error: 'Only the primary device answers.' }];
+        if (!isPrimaryDevice(user)) return [403, { error: 'Only a listed device answers.' }];
         const request = DEVICE_ID.test(deviceId) ? db.query<{ platform: string; leaf_sig_key: string }, [string, string]>('SELECT platform, leaf_sig_key FROM recert_requests WHERE device_id = ? AND user_id = ?').get(deviceId, user.id) : null;
         if (!request) return [404, { error: 'No request from that device.' }];
         const aik = aikOf(user.id);

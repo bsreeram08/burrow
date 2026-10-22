@@ -344,12 +344,13 @@ class FakeLinkCrypto implements LinkCrypto {
 
   @override
   Future<Identity> adoptSuccession({required String userId, required Map<String, Object?> record, required String signature, String? certJson}) async {
-    final c = companion;
-    if (c == null || identity != null) throw const CryptoException('not a companion', code: 'invalid');
-    if (record['userId'] != userId || record['oldSign'] != c.identity.sign) throw const CryptoException('the record does not continue from the pin', code: 'invalid');
+    // A companion follows from its pinned account key; a full core (M6) from its own, and becomes a companion.
+    final from = companion?.identity ?? identity ?? (throw const CryptoException('no account here', code: 'invalid'));
+    if (record['userId'] != userId || record['oldSign'] != from.sign) throw const CryptoException('the record does not continue from the pin', code: 'invalid');
     final next = Identity(dh: record['newDh']! as String, sign: record['newSign']! as String);
     adopted.add(record);
-    companion = (userId: userId, identity: next, certJson: certJson ?? c.certJson);
+    companion = (userId: userId, identity: next, certJson: certJson ?? companion?.certJson ?? '');
+    identity = null;
     return next;
   }
 

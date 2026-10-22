@@ -99,7 +99,7 @@ impl Core {
     /// 1:1 crypto and everything that signs with the account key needs the key itself.
     pub(super) fn reject_companion(&mut self) -> Result<()> { if self.account()?.is_some() { Err(companion()) } else { Ok(()) } }
 
-    fn identity_row(&mut self) -> Result<Option<Identity>> { self.get::<Identity>("identity") }
+    pub(super) fn identity_row(&mut self) -> Result<Option<Identity>> { self.get::<Identity>("identity") }
 
     // ---------- Becoming a companion ----------
 
@@ -176,9 +176,14 @@ impl Core {
     /// first when given; without it the old certificate stays until `companion_setup` installs one.
     #[cfg(feature = "mls")]
     pub fn adopt_succession(&mut self, user_id: &str, record: &Value, signature: &str, cert: Option<&str>) -> Result<IdentityPub> {
-        let account = self.account()?.ok_or_else(|| invalid("Only a companion core adopts a succession"))?;
+        // A companion pins the account identity; a full core (M6: it holds the key) follows someone else's rotation too and
+        // becomes a companion of the new key, keeping the old one as `own-previous`.
+        let (pinned, user_ok) = match self.account()? {
+            Some(account) => (account.identity, account.user_id == user_id),
+            None => (self.identity_row()?.ok_or_else(|| invalid("This core holds no account identity"))?.public, true),
+        };
         let record = Record::parse(record)?;
-        if record.user_id != user_id || user_id != account.user_id || record.old_sign != account.identity.sign { return Err(invalid("The record does not continue from this account's identity")); }
+        if !user_ok || record.user_id != user_id || record.old_sign != pinned.sign { return Err(invalid("The record does not continue from this account's identity")); }
         record.verify(signature)?;
         let next = IdentityPub { dh: record.new_dh.clone(), sign: record.new_sign.clone() };
         if !is_key_b64(&next.sign) || !is_key_b64(&next.dh) { return Err(invalid("Invalid account identity")); }
@@ -188,6 +193,10 @@ impl Core {
             let installed = groups.set_device_cert(store, cert_json, &aik)?;
             if installed.user_id != user_id { return Err(invalid("The certificate is for another account")); }
         }
+        if self.identity_row()?.is_some() {
+            self.retire_identity(user_id, &next, record.at)?;
+            return Ok(next);
+        }
         let mut previous = self.own_previous()?;
         previous.push(PreviousKey { sign: record.old_sign.clone(), until: record.at });
         self.store.batch(vec![
@@ -196,6 +205,99 @@ impl Core {
         ])?;
         Ok(next)
     }
+
+    /// A full core replaces its own account identity (docs/m6-account-key.md §6.2, the rotation that removing a device
+    /// owes): the new key is `key` (an AccountKey, e.g. one the web minted in WebCrypto) or, without one, minted here.
+    /// The record handing over from the old key is `external` (`record` and its `signature`, checked: it must continue
+    /// from this identity and name the new one) or signed here. The old key stays as `own-previous` until `at`, pins and
+    /// MLS state stay, 1:1 sessions of the old identity go. Returns the new identity, the signed record
+    /// (`{ v, userId, oldSign, newSign, newDh, at, signature }`) for `PUT /api/devices/succession` and the new AccountKey.
+    /// With `commit = false` nothing changes: take the record to the server, and once it was accepted call again with the
+    /// returned `key`, `record` and `signature` (and `commit = true`) to swap the identity.
+    #[cfg(feature = "mls")]
+    pub fn rotate_identity(&mut self, user_id: &str, key: Option<&str>, external: Option<(&Value, &str)>, at: u64, commit: bool) -> Result<(IdentityPub, Value, String)> {
+        use ed25519_dalek::Signer;
+        if !user_id_ok(user_id) { return Err(invalid("invalid user id")); }
+        self.reject_companion()?;
+        let old = self.identity_row()?.ok_or_else(|| invalid("This core holds no account identity"))?;
+        // A prepared rotation survives a restart (`rotation:pending`, kept like the identity): the server may have taken its record
+        // while the new key existed nowhere else. A commit without a key resumes it; a new prepare waits until it is resumed or dropped.
+        let held = self.store.get("rotation:pending")?;
+        let (mut held_key, mut held_record, mut held_signature, mut at) = (None, None, None, at);
+        if commit && key.is_none() && external.is_none() {
+            let value = held.as_ref().ok_or_else(|| invalid("no rotation is waiting"))?;
+            held_key = value["key"].as_str().map(str::to_string);
+            held_record = Some(value["record"].clone());
+            held_signature = value["signature"].as_str().map(str::to_string);
+            at = value["at"].as_u64().ok_or_else(|| ChatError::storage("malformed pending rotation"))?;
+        } else if !commit && held.is_some() {
+            return Err(ChatError::coded("pending", "A rotation is waiting: resume it or drop it first."));
+        }
+        let key = held_key.as_deref().or(key);
+        let external = match (&held_record, &held_signature) { (Some(record), Some(signature)) => Some((record, signature.as_str())), _ => external };
+        // A core does not know its user id; its device certificate does. A wrong id would swap the key for a record no server takes.
+        if let Some(cert) = { let (groups, store) = self.groups()?; groups.own_cert(store).ok() } {
+            if cert.user_id != user_id { return Err(invalid("this device belongs to another account")); }
+        }
+        let next: Identity = match key {
+            None => crate::protocol::generate_identity(),
+            Some(text) => {
+                let bytes = zeroize::Zeroizing::new(unb64(text, None).map_err(|_| invalid("malformed account key"))?);
+                let (owner, seed, dh_secret) = crate::account_key::parse_account_key(&bytes)?;
+                if owner != user_id { return Err(invalid("the account key is for another account")); }
+                let public = IdentityPub { dh: b64(&crate::account_key::dh_public(&dh_secret)), sign: b64(&crate::account_key::sign_public(&seed)) };
+                Identity { sign: crate::primitives::Secret32(*seed), dh: DhPair { secret: crate::primitives::Secret32(*dh_secret), public: crate::account_key::dh_public(&dh_secret) }, public }
+            }
+        };
+        if same_identity(&old.public, &next.public) || old.public.sign == next.public.sign { return Err(invalid("a rotation names a new key")); }
+        let record = match external {
+            Some((value, _)) => Record::parse(value)?,
+            None => Record::parse(&serde_json::json!({ "v": 1, "userId": user_id, "oldSign": old.public.sign, "newSign": next.public.sign, "newDh": next.public.dh, "at": at }))?,
+        };
+        if record.user_id != user_id || record.old_sign != old.public.sign || record.new_sign != next.public.sign || record.new_dh != next.public.dh { return Err(invalid("The record does not hand this identity over to that key")); }
+        let signature = match external {
+            Some((_, signature)) => { record.verify(signature)?; signature.to_string() }
+            None => b64(&ed25519_dalek::SigningKey::from_bytes(&old.sign.0).sign(&record.bytes()).to_bytes()),
+        };
+        let new_key = zeroize::Zeroizing::new(b64(&crate::account_key::account_key_bytes(user_id, &next.sign.0, &next.dh.secret.0)));
+        let public = next.public.clone();
+        // Not yet: the caller has the record and the key, sends the record to the server, and commits only once it was taken.
+        if !commit {
+            let mut unsigned = record.json(&signature);
+            unsigned.as_object_mut().expect("object").remove("signature");
+            self.store.put("rotation:pending", serde_json::json!({ "key": &*new_key, "record": unsigned, "signature": signature, "at": record.at }))?;
+            return Ok((public, record.json(&signature), (*new_key).clone()));
+        }
+        for prefix in ["sessions:", "opk:", "claim:", "claims:"] { self.store.delete_prefix(prefix)?; }
+        let mut previous = self.own_previous()?;
+        previous.push(PreviousKey { sign: old.public.sign.clone(), until: record.at });
+        self.pending.clear();
+        self.pending_order.clear();
+        self.store.batch(vec![
+            Write::Put("identity".into(), to_value(&next)), Write::Delete("spk".into()), Write::Delete("opk-next".into()), Write::Delete("devlist:last".into()),
+            Write::Put("own-previous".into(), to_value(&previous)), Write::Delete("rotation:pending".into()),
+            Write::Put("rotation:last".into(), serde_json::json!({ "old": old.public.sign, "new": public.sign })),
+        ])?;
+        Ok((public, record.json(&signature), (*new_key).clone()))
+    }
+
+    /// The rotation prepared by `rotate_identity(commit = false)` and not yet committed: the identity it names and its signed
+    /// record. A client looks at it on start: if the server publishes that identity it commits (`rotate_identity` with no key),
+    /// if the server still publishes the old key it drops it.
+    #[cfg(feature = "mls")]
+    pub fn rotation_pending(&mut self) -> Result<Option<(IdentityPub, Value)>> {
+        let Some(value) = self.store.get("rotation:pending")? else { return Ok(None) };
+        let bad = || ChatError::storage("malformed pending rotation");
+        let bytes = zeroize::Zeroizing::new(unb64(value["key"].as_str().ok_or_else(bad)?, None).map_err(|_| bad())?);
+        let (_, seed, dh_secret) = crate::account_key::parse_account_key(&bytes)?;
+        let identity = IdentityPub { dh: b64(&crate::account_key::dh_public(&dh_secret)), sign: b64(&crate::account_key::sign_public(&seed)) };
+        let mut record = value["record"].clone();
+        record.as_object_mut().ok_or_else(bad)?.insert("signature".into(), value["signature"].clone());
+        Ok(Some((identity, record)))
+    }
+
+    /// Forgets a prepared rotation (the server did not take it).
+    pub fn rotation_drop(&mut self) -> Result<()> { self.store.delete("rotation:pending") }
 
     fn own_previous(&mut self) -> Result<Vec<PreviousKey>> { Ok(self.get::<Vec<PreviousKey>>("own-previous")?.unwrap_or_default()) }
 
@@ -225,7 +327,7 @@ impl Core {
         self.store.batch(vec![
             Write::Delete("identity".into()), Write::Delete("spk".into()), Write::Delete("opk-next".into()), Write::Delete("devlist:last".into()),
             Write::Put("account".into(), to_value(&Account { user_id: user_id.to_string(), identity: new_identity.clone() })),
-            Write::Put("own-previous".into(), to_value(&previous)),
+            Write::Put("own-previous".into(), to_value(&previous)), Write::Delete("rotation:pending".into()), Write::Delete("rotation:last".into()),
         ])?;
         self.may_create_identity = false;
         Ok(())

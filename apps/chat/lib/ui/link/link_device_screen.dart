@@ -5,13 +5,17 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../app/app_controller.dart';
 import '../../core/api.dart';
+import '../../crypto/account_crypto.dart';
 import '../../crypto/chat_crypto.dart' show CryptoException;
 import '../../messaging/linking.dart';
 import '../../store/message.dart' show StoreException;
 import '../widgets/common.dart';
+import '../account/backup_screen.dart';
+import '../account/backup_widgets.dart' show unlockFrom;
+import '../account/copy.dart';
 import 'qr.dart';
 
-/// "Link a device" on the primary (docs/m5-linking.md §1): scan the new device's QR (or type its 8-character
+/// "Link a device" on a device that holds the account key (docs/m5-linking.md §1, m6-account-key.md §2): scan the new device's QR (or type its 8-character
 /// code), compare the 6-digit code shown on both screens with the device's name, then Link. Nothing is signed
 /// before that tap.
 Future<void> showLinkDevice(BuildContext context) => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const LinkDeviceScreen()));
@@ -172,30 +176,91 @@ class _LinkDeviceScreenState extends ConsumerState<LinkDeviceScreen> {
   }
 }
 
-/// Revokes another device of this account at once, from any of its devices (m5 §4).
-Future<bool> confirmRevoke(BuildContext context, WidgetRef ref, String deviceId, String name) async {
-  final yes = await showDialog<bool>(
+/// Removes another device of this account (docs/m6-account-key.md §6.2). On a device that holds the account key the
+/// key is changed too, so the removed device's copy is worthless: "Remove <label> and change your account key?",
+/// with the passphrase when the account has a backup (a stolen device can't do this without it). Elsewhere the
+/// device is only cut off and a device with the key finishes the change.
+Future<bool> confirmRemove(BuildContext context, WidgetRef ref, String deviceId, String name, {bool alreadyRemoved = false}) async {
+  final app = ref.read(appProvider.notifier), state = ref.read(appProvider);
+  // With a backup, every removal needs the passphrase (M6 §6.3), whether or not this device changes the key.
+  final full = state.fullDevice, backup = state.hasBackup ?? false;
+  final answer = await showDialog<({Unlock? unlock, bool changePassphrase})>(
     context: context,
-    builder: (context) => AlertDialog(
-      title: Text('Revoke $name?'),
-      content: const Text("It's signed out at once and removed from your groups. Messages it already has stay on it."),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Cancel')),
-        FilledButton(
-          key: const Key('revoke-confirm'),
-          style: FilledButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
-          onPressed: () => Navigator.pop(context, true),
-          child: const Text('Revoke'),
-        ),
-      ],
-    ),
+    builder: (context) => _RemoveDialog(name: name, rotate: full, backup: backup),
   );
-  if (yes != true) return false;
+  if (answer == null) return false;
   try {
-    await ref.read(apiProvider).revokeDevice(deviceId);
-    return true;
-  } on ApiException catch (e) {
-    if (context.mounted) showSnack(context, e.message);
+    await app.removeAndRotate(deviceId, unlock: answer.unlock, alreadyRemoved: alreadyRemoved);
+  } catch (e) {
+    if (context.mounted) showSnack(context, backupError(e, auth: notYourSecret));
     return false;
   }
+  if (answer.changePassphrase && context.mounted) await showAccountBackup(context);
+  return true;
+}
+
+class _RemoveDialog extends StatefulWidget {
+  const _RemoveDialog({required this.name, required this.rotate, required this.backup});
+  final String name;
+  final bool rotate, backup;
+  @override
+  State<_RemoveDialog> createState() => _RemoveDialogState();
+}
+
+class _RemoveDialogState extends State<_RemoveDialog> {
+  final _secret = TextEditingController();
+  bool _change = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _secret.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+    title: Text(widget.rotate ? 'Remove ${widget.name} and change your account key?' : 'Remove ${widget.name}?'),
+    content: SingleChildScrollView(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(widget.rotate ? removeText : 'The device is signed out and can’t read new messages. A device that can unlock your account then changes its key.'),
+          if (widget.backup) ...[
+            const SizedBox(height: 12),
+            TextField(
+              key: const Key('remove-secret'),
+              controller: _secret,
+              obscureText: true,
+              autocorrect: false,
+              decoration: const InputDecoration(labelText: currentSecretLabel),
+            ),
+            if (_error != null) Padding(padding: const EdgeInsets.only(top: 6), child: Text(_error!, style: TextStyle(color: Theme.of(context).colorScheme.error))),
+            CheckboxListTile(
+              key: const Key('remove-change-passphrase'),
+              contentPadding: EdgeInsets.zero,
+              value: _change,
+              onChanged: (v) => setState(() => _change = v ?? false),
+              title: const Text('Also change your passphrase'),
+              subtitle: const Text('If that device may have seen it.'),
+            ),
+          ],
+        ],
+      ),
+    ),
+    actions: [
+      TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+      FilledButton(
+        key: const Key('revoke-confirm'),
+        style: FilledButton.styleFrom(backgroundColor: Theme.of(context).colorScheme.error),
+        onPressed: () {
+          final text = _secret.text.trim();
+          if (widget.backup && text.isEmpty) return setState(() => _error = enterCurrent);
+          Navigator.pop(context, (unlock: widget.backup ? unlockFrom(text) : null, changePassphrase: _change));
+        },
+        child: Text(widget.rotate ? removeAndChange : 'Remove'),
+      ),
+    ],
+  );
 }

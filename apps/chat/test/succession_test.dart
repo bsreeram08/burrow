@@ -42,7 +42,20 @@ void main() {
     final pin = (await crypto.peer('bob-id'))!;
     expect((pin.identity, pin.verified, pin.blocked), (fresh, true, false));
     await Future<void>.delayed(Duration.zero);
-    expect(notices.single, 'bob moved to a new device. Verification kept.');
+    expect(notices.single, 'bob updated their security key. Verification kept.');
+  });
+
+  test('a move the group pins saw first is told once: the 1:1 refresh after it adds nothing', () async {
+    final (messenger, crypto, notices) = await setUpMessenger();
+    final chain = [{'v': 1, 'userId': 'bob-id', 'oldSign': 'old-sign', 'newSign': 'new-sign', 'newDh': 'new-dh', 'at': 1, 'signature': 's'}];
+    // What the group pins do (GroupMessenger.onKeyMoved, wired to keyMoved for contacts).
+    await crypto.acceptSuccession('bob-id', chain);
+    messenger.keyMoved(bob, fresh);
+    messenger.keyMoved(bob, fresh);
+    expect(await messenger.followIdentity(bob, fresh, chain), isFalse);
+    expect((await crypto.peer('bob-id'))!.blocked, isFalse);
+    await Future<void>.delayed(Duration.zero);
+    expect(notices, ['bob updated their security key. Verification kept.']);
   });
 
   test('no chain, or one that does not start at our pin, is a security-code change to review', () async {

@@ -189,7 +189,7 @@ function events(cookie: string, bearer?: string) {
 }
 
 describe('device registry', () => {
-    test('the identity-key holder publishes list v1; lists only move forward and only from the primary', async () => {
+    test('the identity-key holder publishes list v1; lists only move forward, from a session bound to a device the list names', async () => {
         const alice = account('alice'), mine = deviceId();
         expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 1, '', [mine])), deviceId: mine })).status).toBe(409); // keys first
         await publishKeys(alice);
@@ -203,13 +203,18 @@ describe('device registry', () => {
         expect(view.devices).toEqual([expect.objectContaining({ id: mine, state: 'listed', primary: true, current: true })]);
         const second = deviceId(), hash1 = hashOf(v1.list);
         // A list that does not chain to the current one, and one from another session of the same account, are refused:
-        // an unbound session, and one bound to another device.
+        // an unbound session, and one bound to another device than the one it names (M6: any device may publish, not only the primary).
         expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, 'A'.repeat(43), [mine, second])), deviceId: mine })).status).toBe(409);
-        expect((await request('/api/devices/list', 'PUT', alice.session(), { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(403);
+        expect((await request('/api/devices/list', 'PUT', alice.session(), { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(409);
         const other = alice.session();
         expect((await announce(other, second)).status).toBe(200);
-        expect((await request('/api/devices/list', 'PUT', other, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(403);
+        expect((await request('/api/devices/list', 'PUT', other, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(409);
         expect((await publish(alice.cookie, { ...signed(alice.key, listOf(alice.id, 2, hash1, [mine, second])), deviceId: mine })).status).toBe(200);
+        // A device that is not the inbox device publishes the next list for itself; the inbox stays where it was.
+        const v2 = signed(alice.key, listOf(alice.id, 2, hash1, [mine, second]));
+        const hash2 = hashOf(v2.list);
+        expect((await request('/api/devices/list', 'PUT', other, { ...signed(alice.key, listOf(alice.id, 3, hash2, [mine, second])), deviceId: second })).status).toBe(200);
+        expect(((await (await request("/api/devices/alice", "GET", alice.cookie)).json()) as any).devices.find((d: any) => d.id === second).primary).toBe(false);
         // A replay of an older version after v2 is refused too.
         expect((await publish(alice.cookie, { ...v1, deviceId: mine })).status).toBe(409);
     });

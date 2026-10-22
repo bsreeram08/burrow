@@ -110,14 +110,64 @@
   const spkMessage = pub => concat(encoder.encode('webrtc-bun-spk-v1'), pub);
 
   // ---------- Keys ----------
+  // The account identity's Ed25519 key (docs/m6-account-key.md §1) is generated extractable and stored wrapped,
+  // exactly like the X25519 keys, so the account key can reach the user's other devices and the backup. It is
+  // unwrapped non-extractable for signing, and extractable only inside exportIdentity. A legacy identity (a
+  // non-extractable CryptoKeyPair, before M6) still signs but can't be exported: it upgrades by a rotation (§6.2).
+  async function wrapPrivate(privateKey, pub) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    return { wrapped: new Uint8Array(await subtle().wrapKey('pkcs8', privateKey, await wrappingKey(), { name: 'AES-GCM', iv })), iv, pub };
+  }
   async function generateIdentity() {
-    const sign = await subtle().generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+    const sign = await subtle().generateKey({ name: 'Ed25519' }, true, ['sign', 'verify']);
+    const signKey = await wrapPrivate(sign.privateKey, new Uint8Array(await subtle().exportKey('raw', sign.publicKey)));
     const dhKey = await dhPair();
-    return { sign, dh: dhKey, pub: { dh: b64(dhKey.pub), sign: b64(new Uint8Array(await subtle().exportKey('raw', sign.publicKey))) } };
+    return { sign: signKey, dh: dhKey, pub: { dh: b64(dhKey.pub), sign: b64(signKey.pub) } };
+  }
+  const signKeys = new Map();
+  async function signKeyOf(identity) {
+    const sign = identity.sign;
+    if (sign?.privateKey) return sign.privateKey; // legacy
+    if (!ArrayBuffer.isView(sign?.wrapped) || !ArrayBuffer.isView(sign.iv)) throw coded('storage', 'Encryption key is missing from this browser’s storage');
+    const id = b64(sign.pub);
+    if (!signKeys.has(id)) {
+      const key = await subtle().unwrapKey('pkcs8', sign.wrapped, await wrappingKey(), { name: 'AES-GCM', iv: sign.iv }, { name: 'Ed25519' }, false, ['sign']).catch(() => { throw coded('storage', 'Encryption key could not be unlocked in this browser'); });
+      if (signKeys.size > 16) signKeys.clear();
+      signKeys.set(id, key);
+    }
+    return signKeys.get(id);
+  }
+  async function signWith(identity, bytes) { return new Uint8Array(await subtle().sign('Ed25519', await signKeyOf(identity), bytes)); }
+  const exportable = identity => !identity?.sign?.privateKey && ArrayBuffer.isView(identity?.sign?.wrapped) && ArrayBuffer.isView(identity?.dh?.wrapped);
+  // PKCS#8 for a raw 32-byte Ed25519 seed / X25519 secret (RFC 8410): a fixed 16-byte prefix, then the key.
+  const ED25519_PKCS8 = unb64('MC4CAQAwBQYDK2VwBCIEIA'), X25519_PKCS8 = unb64('MC4CAQAwBQYDK2VuBCIEIA');
+  /** The identity's two secrets as raw bytes `{ signSeed, dhSecret }` (the caller zeroes them), or null for a legacy identity. */
+  async function exportIdentity(identity) {
+    if (!exportable(identity)) return null;
+    const raw = async (pair, name, usages) => {
+      const key = await subtle().unwrapKey('pkcs8', pair.wrapped, await wrappingKey(), { name: 'AES-GCM', iv: pair.iv }, { name }, true, usages);
+      const pkcs8 = new Uint8Array(await subtle().exportKey('pkcs8', key));
+      const secret = pkcs8.slice(pkcs8.length - 32); pkcs8.fill(0);
+      return secret;
+    };
+    return { signSeed: await raw(identity.sign, 'Ed25519', ['sign']), dhSecret: await raw(identity.dh, 'X25519', ['deriveBits']) };
+  }
+  /** An identity from exported secrets (a restore or a link that hands over the account key); `expect`: the public keys it must have. */
+  async function importIdentity({ signSeed, dhSecret }, expect) {
+    if (!(signSeed instanceof Uint8Array) || signSeed.length !== 32 || !(dhSecret instanceof Uint8Array) || dhSecret.length !== 32) throw coded('invalid', 'Invalid account key');
+    const load = async (prefix, secret, name, usages) => {
+      const pkcs8 = concat(prefix, secret);
+      const key = await subtle().importKey('pkcs8', pkcs8, { name }, true, usages); pkcs8.fill(0);
+      return { key, pub: unb64((await subtle().exportKey('jwk', key)).x, 32) };
+    };
+    const sign = await load(ED25519_PKCS8, signSeed, 'Ed25519', ['sign']), dh = await load(X25519_PKCS8, dhSecret, 'X25519', ['deriveBits']);
+    const pub = { dh: b64(dh.pub), sign: b64(sign.pub) };
+    if (expect && (expect.dh !== pub.dh || expect.sign !== pub.sign)) throw coded('invalid', 'That account key is for another identity');
+    return { sign: await wrapPrivate(sign.key, sign.pub), dh: await wrapPrivate(dh.key, dh.pub), pub };
   }
   async function generateSignedPreKey(identity, id, now = Date.now()) {
     const pair = await dhPair();
-    const signature = new Uint8Array(await subtle().sign('Ed25519', identity.sign.privateKey, spkMessage(pair.pub)));
+    const signature = await signWith(identity, spkMessage(pair.pub));
     return { id, pair, pub: b64(pair.pub), signature: b64(signature), createdAt: now };
   }
   async function verifySignedPreKey(identityPub, spk) {
@@ -265,7 +315,7 @@
         value = await generateIdentity(); await backend.put('identity', value);
         // Read it back: a browser that cannot keep these keys must fail loudly, not mint new keys on every call.
         const kept = await backend.get('identity');
-        if (!kept?.sign?.privateKey || !ArrayBuffer.isView(kept.dh?.wrapped) || kept.pub?.dh !== value.pub.dh) throw coded('storage', 'This browser cannot keep encryption keys');
+        if (!ArrayBuffer.isView(kept?.sign?.wrapped) || !ArrayBuffer.isView(kept.dh?.wrapped) || kept.pub?.dh !== value.pub.dh) throw coded('storage', 'This browser cannot keep encryption keys');
       }
       return value;
     }
@@ -484,7 +534,19 @@
         if (peer) await backend.put(`peer:${contactId}`, { ...peer, changed: false, blocked: false });
       });
     }
-    return { identity, prekeys, oneTimePreKeys, encryptTo, decryptFrom, notePeer, safety, setVerified, acceptChange, rotate, sessionInfo, resetIdentity, peer: contactId => backend.get(`peer:${contactId}`), forget: contactId => backend.delete(`sessions:${contactId}`) };
+    /**
+     * Holds `secrets` (exported elsewhere, m6 §1) as this store's identity; `expect`: the public keys they must give.
+     * Sessions and prekeys of any earlier identity go, as in resetIdentity; contact pins stay.
+     */
+    async function adoptIdentity(secrets, expect) {
+      const next = await importIdentity(secrets, expect);
+      await resetIdentity();
+      await backend.put('identity', next);
+      return next.pub;
+    }
+    return { identity, prekeys, oneTimePreKeys, encryptTo, decryptFrom, notePeer, safety, setVerified, acceptChange, rotate, sessionInfo, resetIdentity, adoptIdentity,
+      sign: async bytes => signWith(await identity(), bytes), exportable: async () => exportable(await identity()), exportIdentity: async () => exportIdentity(await identity()),
+      peer: contactId => backend.get(`peer:${contactId}`), forget: contactId => backend.delete(`sessions:${contactId}`) };
   }
 
   // IndexedDB backend: CryptoKeys are stored by structured clone and never exported.
@@ -519,6 +581,6 @@
     const set = [mine, theirs].filter(value => ROTATION_CHOICES.includes(value) && value > 0);
     return set.length ? Math.min(...set) : 0;
   }
-  const api = { ROTATION_CHOICES, rotationInterval, MAX_CLAIMS_PER_CONTACT, supported, generateIdentity, generateSignedPreKey, verifySignedPreKey, initiate, respond, encrypt, decrypt, parseEnvelope, safetyNumber, box, indexedDbBackend, b64, unb64, MAX_SKIP };
+  const api = { ROTATION_CHOICES, rotationInterval, MAX_CLAIMS_PER_CONTACT, supported, generateIdentity, exportIdentity, importIdentity, signWith, generateSignedPreKey, verifySignedPreKey, initiate, respond, encrypt, decrypt, parseEnvelope, safetyNumber, box, indexedDbBackend, b64, unb64, MAX_SKIP };
   (typeof window !== 'undefined' ? window : globalThis).Signal = Object.freeze(api);
 })();

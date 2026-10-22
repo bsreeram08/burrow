@@ -27,10 +27,19 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String dco_decode_String(dynamic raw);
 
   @protected
+  BackupOpened dco_decode_backup_opened(dynamic raw);
+
+  @protected
+  BackupResult dco_decode_backup_result(dynamic raw);
+
+  @protected
   bool dco_decode_bool(dynamic raw);
 
   @protected
   Identity dco_decode_box_autoadd_identity(dynamic raw);
+
+  @protected
+  IdentityWith dco_decode_box_autoadd_identity_with(dynamic raw);
 
   @protected
   LinkedAccount dco_decode_box_autoadd_linked_account(dynamic raw);
@@ -67,6 +76,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity dco_decode_identity(dynamic raw);
+
+  @protected
+  IdentityWith dco_decode_identity_with(dynamic raw);
 
   @protected
   LinkAccepted dco_decode_link_accepted(dynamic raw);
@@ -144,6 +156,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity? dco_decode_opt_box_autoadd_identity(dynamic raw);
 
   @protected
+  IdentityWith? dco_decode_opt_box_autoadd_identity_with(dynamic raw);
+
+  @protected
   LinkedAccount? dco_decode_opt_box_autoadd_linked_account(dynamic raw);
 
   @protected
@@ -180,6 +195,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PreviousKey dco_decode_previous_key(dynamic raw);
 
   @protected
+  RekeyRequest dco_decode_rekey_request(dynamic raw);
+
+  @protected
+  Rotation dco_decode_rotation(dynamic raw);
+
+  @protected
   Safety dco_decode_safety(dynamic raw);
 
   @protected
@@ -201,10 +222,21 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   String sse_decode_String(SseDeserializer deserializer);
 
   @protected
+  BackupOpened sse_decode_backup_opened(SseDeserializer deserializer);
+
+  @protected
+  BackupResult sse_decode_backup_result(SseDeserializer deserializer);
+
+  @protected
   bool sse_decode_bool(SseDeserializer deserializer);
 
   @protected
   Identity sse_decode_box_autoadd_identity(SseDeserializer deserializer);
+
+  @protected
+  IdentityWith sse_decode_box_autoadd_identity_with(
+    SseDeserializer deserializer,
+  );
 
   @protected
   LinkedAccount sse_decode_box_autoadd_linked_account(
@@ -245,6 +277,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   Identity sse_decode_identity(SseDeserializer deserializer);
+
+  @protected
+  IdentityWith sse_decode_identity_with(SseDeserializer deserializer);
 
   @protected
   LinkAccepted sse_decode_link_accepted(SseDeserializer deserializer);
@@ -324,6 +359,11 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   Identity? sse_decode_opt_box_autoadd_identity(SseDeserializer deserializer);
 
   @protected
+  IdentityWith? sse_decode_opt_box_autoadd_identity_with(
+    SseDeserializer deserializer,
+  );
+
+  @protected
   LinkedAccount? sse_decode_opt_box_autoadd_linked_account(
     SseDeserializer deserializer,
   );
@@ -370,6 +410,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   PreviousKey sse_decode_previous_key(SseDeserializer deserializer);
 
   @protected
+  RekeyRequest sse_decode_rekey_request(SseDeserializer deserializer);
+
+  @protected
+  Rotation sse_decode_rotation(SseDeserializer deserializer);
+
+  @protected
   Safety sse_decode_safety(SseDeserializer deserializer);
 
   @protected
@@ -391,10 +437,22 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   void sse_encode_String(String self, SseSerializer serializer);
 
   @protected
+  void sse_encode_backup_opened(BackupOpened self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_backup_result(BackupResult self, SseSerializer serializer);
+
+  @protected
   void sse_encode_bool(bool self, SseSerializer serializer);
 
   @protected
   void sse_encode_box_autoadd_identity(Identity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_box_autoadd_identity_with(
+    IdentityWith self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_box_autoadd_linked_account(
@@ -449,6 +507,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_identity(Identity self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_identity_with(IdentityWith self, SseSerializer serializer);
 
   @protected
   void sse_encode_link_accepted(LinkAccepted self, SseSerializer serializer);
@@ -553,6 +614,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   );
 
   @protected
+  void sse_encode_opt_box_autoadd_identity_with(
+    IdentityWith? self,
+    SseSerializer serializer,
+  );
+
+  @protected
   void sse_encode_opt_box_autoadd_linked_account(
     LinkedAccount? self,
     SseSerializer serializer,
@@ -608,6 +675,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_previous_key(PreviousKey self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rekey_request(RekeyRequest self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_rotation(Rotation self, SseSerializer serializer);
 
   @protected
   void sse_encode_safety(Safety self, SseSerializer serializer);

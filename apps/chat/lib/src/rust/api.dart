@@ -7,6 +7,7 @@ import 'frb_generated.dart';
 
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `backup_result`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 /// Opens the account's key database, sealed with `store_key` (32 bytes from the platform keystore).
@@ -589,6 +590,203 @@ Future<void> mlsCheckDm({
   peerUserId: peerUserId,
 );
 
+Future<String> exportAccountKey({required String userId}) =>
+    RustLib.instance.api.crateApiExportAccountKey(userId: userId);
+
+Future<Identity> importAccountKey({
+  required String userId,
+  required String key,
+  Identity? published,
+}) => RustLib.instance.api.crateApiImportAccountKey(
+  userId: userId,
+  key: key,
+  published: published,
+);
+
+Future<String> passphraseGenerate() =>
+    RustLib.instance.api.crateApiPassphraseGenerate();
+
+Future<BackupResult> backupCreate({
+  required String userId,
+  required String passphrase,
+  String? accountKey,
+}) => RustLib.instance.api.crateApiBackupCreate(
+  userId: userId,
+  passphrase: passphrase,
+  accountKey: accountKey,
+);
+
+Future<String> backupSignKeys({
+  required String userId,
+  required String recordJson,
+}) => RustLib.instance.api.crateApiBackupSignKeys(
+  userId: userId,
+  recordJson: recordJson,
+);
+
+Future<String> backupProve({
+  required String recordJson,
+  String? passphrase,
+  String? words,
+}) => RustLib.instance.api.crateApiBackupProve(
+  recordJson: recordJson,
+  passphrase: passphrase,
+  words: words,
+);
+
+Future<BackupResult> backupReseal({
+  required String userId,
+  required String recordJson,
+  String? accountKey,
+  String? passphrase,
+  required bool newRecovery,
+}) => RustLib.instance.api.crateApiBackupReseal(
+  userId: userId,
+  recordJson: recordJson,
+  accountKey: accountKey,
+  passphrase: passphrase,
+  newRecovery: newRecovery,
+);
+
+Future<BackupOpened> backupOpen({
+  required String userId,
+  required String recordJson,
+  String? passphrase,
+  String? words,
+  Identity? published,
+}) => RustLib.instance.api.crateApiBackupOpen(
+  userId: userId,
+  recordJson: recordJson,
+  passphrase: passphrase,
+  words: words,
+  published: published,
+);
+
+Future<String?> backupKeys() => RustLib.instance.api.crateApiBackupKeys();
+
+Future<String> backupKeysSet({required String backupKeysJson}) =>
+    RustLib.instance.api.crateApiBackupKeysSet(backupKeysJson: backupKeysJson);
+
+Future<RekeyRequest> rekeyRequest({
+  required String userId,
+  required String deviceId,
+  required String platform,
+}) => RustLib.instance.api.crateApiRekeyRequest(
+  userId: userId,
+  deviceId: deviceId,
+  platform: platform,
+);
+
+Future<String> rekeyAnswer({
+  required String userId,
+  required String deviceId,
+  required String platform,
+  required String eph,
+  required String leafSigKey,
+  required String signature,
+  required List<String> groups,
+  required BigInt nowMs,
+}) => RustLib.instance.api.crateApiRekeyAnswer(
+  userId: userId,
+  deviceId: deviceId,
+  platform: platform,
+  eph: eph,
+  leafSigKey: leafSigKey,
+  signature: signature,
+  groups: groups,
+  nowMs: nowMs,
+);
+
+Future<IdentityWith> rekeyOpen({
+  required String userId,
+  required String deviceId,
+  required String platform,
+  required String boxed,
+}) => RustLib.instance.api.crateApiRekeyOpen(
+  userId: userId,
+  deviceId: deviceId,
+  platform: platform,
+  boxed: boxed,
+);
+
+Future<Rotation> rotateIdentity({
+  required String userId,
+  String? key,
+  String? recordJson,
+  String? signature,
+  required BigInt at,
+  required bool commit,
+}) => RustLib.instance.api.crateApiRotateIdentity(
+  userId: userId,
+  key: key,
+  recordJson: recordJson,
+  signature: signature,
+  at: at,
+  commit: commit,
+);
+
+/// A rotation prepared (and stored in the core) but not committed: its new identity and the signed record (JSON).
+Future<IdentityWith?> rotationPending() =>
+    RustLib.instance.api.crateApiRotationPending();
+
+/// Forgets a prepared rotation (the server still publishes the old key).
+Future<void> rotationDrop() => RustLib.instance.api.crateApiRotationDrop();
+
+/// `backupOpen`: the AccountKey and the backup keys inside the box.
+class BackupOpened {
+  final String accountKey;
+  final String backupKeysJson;
+
+  const BackupOpened({required this.accountKey, required this.backupKeysJson});
+
+  @override
+  int get hashCode => accountKey.hashCode ^ backupKeysJson.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BackupOpened &&
+          runtimeType == other.runtimeType &&
+          accountKey == other.accountKey &&
+          backupKeysJson == other.backupKeysJson;
+}
+
+/// `backupCreate` / `backupReseal`: the unsigned record, the backup keys to keep, and what to show once.
+class BackupResult {
+  final String recordJson;
+  final String backupKeysJson;
+  final String? words;
+  final String? passProof;
+  final String? recoveryProof;
+
+  const BackupResult({
+    required this.recordJson,
+    required this.backupKeysJson,
+    this.words,
+    this.passProof,
+    this.recoveryProof,
+  });
+
+  @override
+  int get hashCode =>
+      recordJson.hashCode ^
+      backupKeysJson.hashCode ^
+      words.hashCode ^
+      passProof.hashCode ^
+      recoveryProof.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is BackupResult &&
+          runtimeType == other.runtimeType &&
+          recordJson == other.recordJson &&
+          backupKeysJson == other.backupKeysJson &&
+          words == other.words &&
+          passProof == other.passProof &&
+          recoveryProof == other.recoveryProof;
+}
+
 /// A core failure. `code` is the web client's vocabulary (replay, malformed, auth, …); `None` is transient.
 class CoreError implements FrbException {
   final String? code;
@@ -659,6 +857,25 @@ class Identity {
           runtimeType == other.runtimeType &&
           dh == other.dh &&
           sign == other.sign;
+}
+
+/// `rekeyOpen` / `rotateIdentity`: an identity and a JSON text beside it.
+class IdentityWith {
+  final Identity identity;
+  final String? json;
+
+  const IdentityWith({required this.identity, this.json});
+
+  @override
+  int get hashCode => identity.hashCode ^ json.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is IdentityWith &&
+          runtimeType == other.runtimeType &&
+          identity == other.identity &&
+          json == other.json;
 }
 
 class LinkAccepted {
@@ -1120,6 +1337,57 @@ class PreviousKey {
           runtimeType == other.runtimeType &&
           sign == other.sign &&
           until == other.until;
+}
+
+/// `rekeyRequest`: what a companion sends to ask for the account key.
+class RekeyRequest {
+  final String eph;
+  final String leafSigKey;
+  final String signature;
+
+  const RekeyRequest({
+    required this.eph,
+    required this.leafSigKey,
+    required this.signature,
+  });
+
+  @override
+  int get hashCode => eph.hashCode ^ leafSigKey.hashCode ^ signature.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is RekeyRequest &&
+          runtimeType == other.runtimeType &&
+          eph == other.eph &&
+          leafSigKey == other.leafSigKey &&
+          signature == other.signature;
+}
+
+/// A full core replaces its own key in two steps: `commit = false` mints it and signs the record (nothing changes);
+/// after the server took the record, the same `key`, `record_json` and `signature` with `commit = true` swap it.
+class Rotation {
+  final Identity identity;
+  final String recordJson;
+  final String key;
+
+  const Rotation({
+    required this.identity,
+    required this.recordJson,
+    required this.key,
+  });
+
+  @override
+  int get hashCode => identity.hashCode ^ recordJson.hashCode ^ key.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Rotation &&
+          runtimeType == other.runtimeType &&
+          identity == other.identity &&
+          recordJson == other.recordJson &&
+          key == other.key;
 }
 
 class Safety {

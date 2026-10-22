@@ -8,6 +8,7 @@ import { packetBudget } from '../stun-server/native/server';
 import { requestLimiter } from './rate-limit';
 import type { Push } from './push';
 import { migrate } from './migrations';
+import { createAccountKey } from './account-key';
 import { createDevices } from './devices';
 import type { Channels } from './channels';
 
@@ -97,12 +98,16 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
     function announce(userId: string) {
         for (const contact of mutualIds(userId)) notify(contact, { type: 'presence', id: userId, online: online(userId) });
     }
+    // The backup rules reach devices (removing one needs the passphrase's proof); `accountKey` needs `devices`, so it is wired by reference.
+    let accountKey!: ReturnType<typeof createAccountKey>;
     const devices = createDevices({
+        removalGuard: (caller, body, firstUnderKey) => accountKey.authorizeRemoval(caller, body, firstUnderKey),
         db, now, notify: (userId, event) => notify(userId, event), mutualIds: id => mutualIds(id),
         sessionsEnded(userId, sessions) { for (const session of sessions) push?.forgetSession(session); closeDeadStreams(userId); },
         inboxChanged(userId) { for (const socket of listeners.get(userId) ?? []) pump(socket); },
         devicesRevoked(userId, ids) { channels?.devicesRevoked(userId, ids); },
     });
+    accountKey = createAccountKey({ db, now, notify: (userId, event) => notify(userId, event), sessionDevice: devices.sessionDevice, eligible: devices.eligible, aikOf: devices.aikOf });
     /** A fresh session token; only its hash is stored. Web sessions become a cookie, native ones a bearer token. */
     function startSession(userId: string, client = 'web') {
         const token = random(32), expiresAt = now() + SESSION_LIFETIME;
@@ -201,6 +206,9 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         if (!Array.isArray(oneTime) || oneTime.length > 100 || oneTime.some(value => !value || !keyId(value.id) || !KEY.test(value.key))) return json({ error: 'Invalid one-time prekeys' }, 400);
         const existing = db.query<{ dh: string; sign: string }, [string]>('SELECT dh, sign FROM identity_keys WHERE user_id = ?').get(user.id);
         const changed = Boolean(existing && (existing.dh !== identity.dh || existing.sign !== identity.sign));
+        // With a backup a new identity needs a succession that ends in it, the passphrase's proof, or a reset that has waited (docs/m6-account-key.md §6.4).
+        const decision = changed ? accountKey.authorizeIdentityChange(user, body, identity.sign, existing!.sign) : {};
+        if (decision.refused) return decision.refused;
         if ((!existing || changed) && !spk) return json({ error: 'A new identity needs a signed prekey' }, 400);
         try {
             db.transaction(() => {
@@ -213,7 +221,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             })();
         } catch { return json({ error: `At most ${MAX_PREKEYS} one-time prekeys may wait on the server.` }, 400); }
         // A new identity voids lists signed by the old one (and announces 'devices' to the account and its contacts).
-        if (changed) devices.identityChanged(user.id);
+        if (changed) { devices.identityChanged(user.id); accountKey.identityChanged(user.id, Boolean(decision.wipe), Boolean(decision.succession), identity.sign); }
         // A new identity (first or changed) moves the messaging inbox to the uploading session's device.
         devices.keysUploaded(user, changed || !existing);
         // Contacts re-check this identity; a change shows them a security-code notice. ('keys' is kept for one
@@ -420,9 +428,19 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
                 return json({ status: 'removed' });
             }
         }
+        // The account key's backup and rekey relay (docs/m6-account-key.md).
+        const keyed = await accountKey.handle(request, path, user);
+        if (keyed) return keyed;
         // Challenges are exempt (each announce needs one; they are bounded per session in devices.ts).
         if (path === '/api/devices/challenge' ? !allowChallenges(user.id) : path.startsWith('/api/devices') && request.method !== 'GET' && !allowDevices(user.id)) return json({ error: 'Rate limited' }, 429);
-        if (path === '/api/devices/succession' && request.method === 'PUT') { const [status, result] = devices.putSuccession(user, await readBody(request)); return json(result, status); }
+        if (path === '/api/devices/succession' && request.method === 'PUT') {
+            // A listed device, and the passphrase's proof when the account has a backup (docs/m6-account-key.md §6.2).
+            const body = await readBody(request);
+            const refused = accountKey.authorizeSuccession(user, body);
+            if (refused) return refused;
+            const [status, result] = devices.putSuccession(user, body);
+            return json(result, status);
+        }
         if (path === '/api/devices/recert') {
             if (request.method === 'PUT') { const [status, result] = devices.recertRequest(user, await readBody(request)); return json(result, status); }
             if (request.method === 'GET') { const [status, result] = devices.recertPending(user); return json(result, status); }
@@ -432,7 +450,15 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
         const recertMatch = /^\/api\/devices\/recert\/([A-Za-z0-9_-]{22})$/.exec(path);
         if (recertMatch && request.method === 'PUT') { const [status, result] = devices.recertAnswer(user, recertMatch[1]!, await readBody(request)); return json(result, status); }
         const revokeMatch = /^\/api\/devices\/([A-Za-z0-9_-]{22})\/revoke$/.exec(path);
-        if (revokeMatch && request.method === 'POST') { const [status, result] = devices.revokeAny(user, revokeMatch[1]!); return json(result, status); }
+        if (revokeMatch && request.method === 'POST') {
+            // With a backup, removing another device takes the passphrase's proof from a listed device (unlinking yourself does not).
+            const body = await readBody(request);
+            const own = devices.sessionDevice(user.session) === revokeMatch[1];
+            const refused = own ? null : accountKey.authorizeRemoval(user, body);
+            if (refused) return json(refused[1], refused[0]);
+            const [status, result] = devices.revokeAny(user, revokeMatch[1]!);
+            return json(result, status);
+        }
         if (path === '/api/devices/list' && request.method === 'PUT') { const [status, result] = devices.publish(user, await readBody(request)); return json(result, status); }
         if (path === '/api/devices/challenge' && request.method === 'POST') { const [status, result] = devices.challenge(user); return json(result, status); }
         if (path === '/api/devices/announce' && request.method === 'POST') { const [status, result] = devices.announce(user, await readBody(request)); return json(result, status); }
@@ -441,7 +467,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             const owner = userByName(devicesMatch[1]);
             // Your own devices, or a mutual contact's signed list (never another account's pending devices or labels).
             if (!owner || (owner.id !== user.id && !mutual(user.id, owner.id))) return json({ error: 'You can only see your own and your contacts\' devices.' }, 403);
-            return json(devices.view(owner, user));
+            return json(owner.id === user.id ? { ...devices.view(owner, user), backup: accountKey.status(user.id), reset: accountKey.resetStatus(user.id), rotation: accountKey.rotationStatus(user.id, devices.aikOf(user.id)) } : devices.view(owner, user));
         }
         if (devicesMatch?.[2] && request.method === 'DELETE') { const [status, result] = devices.remove(user, devicesMatch[2], await readBody(request)); return json(result, status); }
         if (path === '/api/keys' && request.method === 'PUT') return uploadKeys(user, await readBody(request));

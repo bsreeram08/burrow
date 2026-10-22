@@ -126,20 +126,21 @@ try {
     await bob.unroute('**/api/devices/alice'); await bob.click('#safety-close');
     step('a device injected by the server into alice\'s list was rejected by bob\'s client');
 
-    // Settings → Devices: alice's browser is the primary. A second browser signed in to her account shows up
+    // Settings → Devices: alice's browser can unlock her account. A second browser signed in to her account shows up
     // as pending (it holds no keys); removing it signs it out and closes its stream.
     await alice.click('#conv-back'); await alice.click('#account-menu summary'); await alice.click('#account-settings');
-    await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row').length === 1 && /This browser · Primary/.test(document.getElementById('device-list').textContent), null, { timeout: 15000 });
-    // Her label is sealed inside the signed list: the primary opens it, the server only ever stored ciphertext.
+    await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row').length === 1 && /This browser · Can unlock your account/.test(document.getElementById('device-list').textContent), null, { timeout: 15000 });
+    // Her label is sealed inside the signed list: her browser opens it, the server only ever stored ciphertext.
     const ownLabel = await alice.textContent('#device-list .device-row strong');
-    if (!/ on /.test(ownLabel)) throw new Error(`The primary did not open its sealed device label: ${ownLabel}`);
+    if (!/ on /.test(ownLabel)) throw new Error(`Her browser did not open its sealed device label: ${ownLabel}`);
     if (serverBytes().includes(ownLabel)) throw new Error('The device label reached the server in clear');
     const second = await person();
     const { credentials } = await alice.authenticator.cdp.send('WebAuthn.getCredentials', { authenticatorId: alice.authenticator.authenticatorId });
     for (const credential of credentials) await second.authenticator.cdp.send('WebAuthn.addCredential', { authenticatorId: second.authenticator.authenticatorId, credential });
     await second.goto(origin); await visible(second, '#welcome'); await second.click('#signin'); await visible(second, '#chats');
     await visible(second, '#device-banner');
-    if (!/Link this browser from your primary device/.test(await second.textContent('#device-banner-text'))) throw new Error('The inactive browser does not offer linking from the primary');
+    if (!/Use your account here/.test(await second.textContent('#device-banner-text')) || await second.locator('#device-link-this').isHidden()) throw new Error('The inactive browser does not offer to unlock or link it');
+    if (await second.locator('#device-takeover').count()) throw new Error('"Use this device instead" is still offered');
     await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row[data-state="pending"]').length === 1, null, { timeout: 15000 });
     await alice.locator('.devices-settings').scrollIntoViewIfNeeded(); await shot(alice, 'devices-1-settings');
     await alice.click('#device-list .device-row[data-state="pending"] .device-remove');
@@ -155,7 +156,7 @@ try {
     await second.context().close(); pages.splice(pages.indexOf(second), 1);
     await alice.evaluate(() => { document.getElementById('settings').open = false; });
     await alice.click('#contact-list .contact.mutual .row-button'); await visible(alice, '#conv-head');
-    step('Settings → Devices: sealed label shown on the primary; a second browser was asked to link from the primary, appeared as pending, and removing it signed it out');
+    step('Settings → Devices: sealed label shown on the device holding the key; a second browser was offered to unlock or link, appeared as pending, and removing it signed it out');
   }
 
   // Offline delivery: bob signs out; the envelope waits on the server, which cannot read it.
@@ -333,11 +334,14 @@ try {
   // Key change: bob's device loses its keys (a reinstall). Alice verified him, so sending pauses.
   await bob.evaluate(async keyDb => { const id = (await (await fetch('/api/me')).json()).user.id; await new Promise(done => { const request = indexedDB.deleteDatabase(`${keyDb}${id}`); request.onsuccess = request.onerror = request.onblocked = done; }); }, keyDb);
   await bob.reload(); await visible(bob, '#chats');
-  // A device with new keys never takes over silently: it stays inactive until bob chooses it.
+  // A device with new keys never takes over silently: it stays inactive until bob chooses to start over (no backup).
   await bob.waitForFunction(() => !document.getElementById('device-banner').hidden, null, { timeout: 15000 });
-  await bob.click('#device-takeover');
+  await bob.click('#device-recover'); await visible(bob, '#recovery');
+  const reloaded = bob.waitForEvent('load', { timeout: 20000 });
+  await bob.click('#recovery-yes');
+  await reloaded; await visible(bob, '#chats');
   await bob.waitForFunction(() => document.getElementById('device-banner').hidden, null, { timeout: 15000 });
-  step('a device with new keys stayed inactive until the user moved messaging to it');
+  step('a device with new keys stayed inactive until the user chose to start over on it');
   await alice.waitForFunction(() => !document.getElementById('key-banner').hidden, null, { timeout: 15000 });
   if (!(await alice.textContent('#key-banner-text')).includes('Sending is paused')) throw new Error('Verified contact was not blocked after a key change');
   await shot(alice, 'e2e-3-key-change');

@@ -30,6 +30,9 @@ class Party {
   /// [own]: this account's verified device list as the test wants the party to see it.
   OwnDeviceList? own;
 
+  /// Users this party was asked to pin.
+  final List<String> pinRequests = [];
+
   static Future<Party> join(FakeDs ds, String name) async {
     final user = User(id: '${name}_${'x' * (21 - name.length)}', username: name);
     late Party party;
@@ -47,7 +50,10 @@ class Party {
       me: user,
       device: () async => device,
       platform: 'ios',
-      ensurePinned: (_, {force = false}) async => const <String>[],
+      ensurePinned: (ids, {force = false}) async {
+        party.pinRequests.addAll(ids);
+        return const <String>[];
+      },
       verifiedOwnDevices: () async => party.own,
       backoff: (_) => Duration.zero,
     )
@@ -428,7 +434,9 @@ void main() {
       expect(await alice2.sync.joinOwnChannels(), 0, reason: 'only a current leaf counts');
       alice2.crypto.staleDevices.clear();
       final before = ds.joinInfos[group.id] ?? 0;
+      alice2.pinRequests.clear();
       expect(await alice2.sync.joinOwnChannels(), 1);
+      expect(alice2.pinRequests, contains(bob.user.id), reason: 'members are pinned before the inspection checks their certificates');
       expect(ds.joinInfos[group.id], before + 1, reason: 'the GroupInfo inspected is the one joined: fetched once');
       expect(alice2.crypto.groups, contains(group.id));
       // Never a channel this device left.

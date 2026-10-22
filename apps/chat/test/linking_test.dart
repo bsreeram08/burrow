@@ -5,6 +5,7 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:private_chat/core/api.dart';
 import 'package:private_chat/core/devices.dart';
+import 'package:private_chat/crypto/account_crypto.dart';
 import 'package:private_chat/crypto/chat_crypto.dart';
 import 'package:private_chat/crypto/fake_chat_crypto.dart';
 import 'package:private_chat/crypto/link_crypto.dart';
@@ -128,5 +129,23 @@ void main() {
     final bundle = jsonDecode(utf8.decode(unb64((jsonDecode(await deviceLink.open('L' * 22, p2n[1]['data'] as String)) as Map)['data'] as String))) as Map;
     expect(grant['chunks'], 1);
     expect(((bundle['conversations'] as List).single as Map).containsKey('history'), isFalse);
+  });
+
+  test('M6 §2: a QR grant hands over the account key and the backup keys, sealed; the list entry has no "via"', () async {
+    final account = FakeAccountCrypto(held: chat.me);
+    const keys = BackupKeys(epoch: 3, passPub: 'pp', recoveryPub: 'rp');
+    final link = await PrimaryLink.fromQr(
+      LinkContext(api: api, crypto: chat, link: primaryLink, messenger: messenger, store: store, contacts: () => [bob], wait: (_) async {}, account: account, backupKeys: () async => keys),
+      await deviceLink.qr('L' * 22),
+    );
+    await hello();
+    await link.waitHello();
+    await link.approve();
+    final grant = jsonDecode(await deviceLink.open('L' * 22, p2n[0]['data'] as String)) as Map;
+    expect(await account.importAccountKey(me.id, grant['accountKey'] as String), chat.me);
+    expect(grant['backupKeys'], keys.toJson());
+    final entry = ((published.single['list'] as Map)['devices'] as List).firstWhere((d) => d['deviceId'] == newDevice) as Map;
+    final grantKey = unb64(grant['metaKey'] as String);
+    expect(openMeta(grantKey, me.id, newDevice, entry['meta'] as String)?.containsKey('via'), isFalse);
   });
 }

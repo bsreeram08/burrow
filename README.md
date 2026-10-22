@@ -1,8 +1,12 @@
-# webrtc-bun
+# Burrow
 
-Self-hosted one-to-one audio and video calls, using Bun for signaling and coturn for media relay. The browser client supports camera calls, audio-only calls, mute, camera controls, and ending a room. No Auth0 account, Redis server, or hosted communication service is required by the new runtime.
+A self-hosted, end-to-end encrypted messenger. The server is Bun, with coturn relaying call media. It ships a web client and a Flutter app for iOS, Android and macOS, which interoperate. No hosted communication service is required.
 
-This is a working foundation under active development. The installable browser app adds device-to-device text chat, device-local history, disappearing messages, and encrypted backup files you can keep in Google Drive. See [chat and phone migration](docs/device-chat.md). Account management, group calling, and Signal-style identity verification are future work. See [current status](docs/status.md) and [security boundaries](docs/security.md).
+- **Messaging:** one-to-one and group chats, end to end encrypted (MLS for groups), with replies, reactions, edits, read receipts, attachments, voice messages and link previews. See [messaging](docs/phase1-protocol.md) and [groups](docs/m4-groups.md).
+- **Devices:** every device on an account holds the account key. Link a new one by QR code, or restore it from an encrypted backup that opens with a passphrase or 24 recovery words. See [devices](docs/devices.md), [linking](docs/m5-linking.md) and [account key and backup](docs/m6-account-key.md).
+- **Calls:** one-to-one audio and video calls with a six-digit verification code.
+
+The server holds only encrypted messages and attachments until they are delivered, never their content. See [current status](docs/status.md), [security boundaries](docs/security.md) and the [architecture](docs/workspace-architecture.md).
 
 To integrate calls into your own application, use the [calling API](docs/signaling-api.md). Room creation stays on your trusted backend; each participant receives a separate invitation.
 

@@ -65,7 +65,7 @@ class _WelcomeScreenState extends ConsumerState<WelcomeScreen> {
                   ),
                 ),
                 const SizedBox(height: 20),
-                Text('Private Chat', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)),
+                Text('Burrow', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800)),
                 const SizedBox(height: 8),
                 Text(
                   'End-to-end encrypted messages and calls. Your server can deliver them but never read them.',

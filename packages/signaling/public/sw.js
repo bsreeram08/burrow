@@ -34,7 +34,7 @@ function notification(data) {
   const kind = data?.kind === 'video' ? 'video' : 'voice';
   const base = { icon: '/icon-192.png', badge: '/icon-192.png' };
   // Every push must show something (browsers penalise silent pushes), so unknown data gets a generic note.
-  if (!from || !['message', 'call', 'missed'].includes(data.type)) return ['Private conversations', { ...base, body: 'Open the app to see what is new.', tag: 'generic' }];
+  if (!from || !['message', 'call', 'missed'].includes(data.type)) return ['Burrow', { ...base, body: 'Open the app to see what is new.', tag: 'generic' }];
   if (data.type === 'message') return [`New message from ${from}`, { ...base, body: 'Open the app to read it on this device.', tag: `message-${from}`, data: { open: from } }];
   if (data.type === 'missed') return [`Missed ${kind} call from ${from}`, { ...base, tag: `call-${from}`, data: { open: from } }];
   return [`Incoming ${kind} call from ${from}`, {

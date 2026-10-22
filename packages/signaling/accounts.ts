@@ -289,7 +289,7 @@ export function createAccounts(options: { db: Database; origin: string; now: () 
             if (userByName(username)) return json({ error: 'That username is taken.' }, 409);
             const userId = random(16);
             const registration = await generateRegistrationOptions({
-                rpName: 'Private conversations', rpID, userName: username, userID: new TextEncoder().encode(userId), attestationType: 'none',
+                rpName: 'Burrow', rpID, userName: username, userID: new TextEncoder().encode(userId), attestationType: 'none',
                 authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
             });
             const flowId = addFlow({ kind: 'register', challenge: registration.challenge, source, client, invite, username, userId });

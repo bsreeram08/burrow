@@ -1,5 +1,5 @@
 {
-    "name": "webrtc-bun",
+    "name": "burrow",
     "module": "packages/signaling/server.ts",
     "type": "module",
     "scripts": {

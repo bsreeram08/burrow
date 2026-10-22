@@ -60,7 +60,7 @@ import flutter_callkit_incoming
     let from = (info["from"] as? String) ?? "Contact"
     let kind = (info["kind"] as? String) ?? "voice"
     let data = flutter_callkit_incoming.Data(id: UUID().uuidString, nameCaller: from, handle: from, type: kind == "video" ? 1 : 0)
-    data.appName = "Private Chat"
+    data.appName = "Burrow"
     data.extra = ["from": from, "kind": kind, "roomId": (info["roomId"] as? String) ?? ""]
     data.duration = 45000
     SwiftFlutterCallkitIncomingPlugin.sharedInstance?.showCallkitIncoming(data, fromPushKit: true)

@@ -60,7 +60,7 @@ Future<void> presentPush(PushData push) async {
             id: _uuid(),
             nameCaller: push.from,
             handle: push.from,
-            appName: 'Private Chat',
+            appName: 'Burrow',
             type: push.kind == 'video' ? 1 : 0,
             duration: 45000,
             extra: {'from': push.from, 'kind': push.kind, 'roomId': push.roomId},

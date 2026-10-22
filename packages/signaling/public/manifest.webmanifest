@@ -1,7 +1,7 @@
 {
   "id": "/",
-  "name": "Private conversations",
-  "short_name": "Private chat",
+  "name": "Burrow",
+  "short_name": "Burrow",
   "description": "Device-to-device chat and calls on your own server.",
   "start_url": "/",
   "scope": "/",

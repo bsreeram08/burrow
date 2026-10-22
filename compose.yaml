@@ -1,3 +1,4 @@
+# Kept from the old project name: changing it renames the data volumes.
 name: webrtc-bun
 services:
   signaling:

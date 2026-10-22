@@ -382,14 +382,14 @@ try {
     await page.fill('#backup-pass1', passphrase); await page.fill('#backup-pass2', passphrase);
     await page.click('#backup-next');
     await page.waitForFunction(() => document.querySelectorAll('#backup-words li').length === 24, null, { timeout: 90000 })
-        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#backup-status')}`); });
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#account-backup-status')}`); });
     const words: string[] = await page.$$eval('#backup-words li', items => items.map(item => item.textContent!.trim()));
     await page.click('#backup-next');
     const asked: string[] = await page.$$eval('#backup-check input', inputs => inputs.map(input => input.id));
     for (const id of asked) await page.fill(`#${id}`, words[Number(id.split('-').pop())]!);
     await page.click('#backup-next');
     await page.waitForFunction(() => document.getElementById('backup')!.hidden && document.getElementById('backup-state')!.textContent!.startsWith('On.'), null, { timeout: 90000 })
-        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#backup-status')}`); });
+        .catch(async (error: Error) => { throw new Error(`${error.message}\nweb backup status: ${await page.textContent('#account-backup-status')}`); });
     step('the web turns on account backup: its own passphrase, 24 recovery words shown once, three typed back');
     signal('web-backup-on', JSON.stringify({ passphrase, token: testing.bearer(webUser.id, 'macos') }));
     const restoredDevice = await waitFor('app-restored', 180000);

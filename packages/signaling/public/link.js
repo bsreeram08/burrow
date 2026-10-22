@@ -130,7 +130,7 @@
    */
   function backupFlow(mode, ops) {
     const show = step => { for (const name of ['pass', 'words', 'check']) $(`backup-step-${name}`).hidden = name !== step; };
-    const status = text => { $('backup-status').textContent = text; };
+    const status = text => { $('account-backup-status').textContent = text; };
     let custom = false, generated = '', prepared = null, step = 'pass', asked = [];
     $('backup-title').textContent = { on: 'Turn on account backup', pass: 'Change your passphrase', words: 'New recovery key', off: 'Turn off account backup' }[mode];
     $('backup-current-box').hidden = mode === 'on'; $('backup-current').value = '';
@@ -173,7 +173,8 @@
           } else if (step === 'words') {
             // Three positions at random: typing them back shows the words were kept.
             const list = prepared.words.split(' '), picks = new Set();
-            while (picks.size < 3) picks.add(crypto.getRandomValues(new Uint32Array(1))[0] % list.length);
+            const limit = 2 ** 32 - 2 ** 32 % list.length; // Rejection sampling: no modulo bias.
+            while (picks.size < 3) { const value = crypto.getRandomValues(new Uint32Array(1))[0]; if (value < limit) picks.add(value % list.length); }
             asked = [...picks].sort((a, b) => a - b);
             $('backup-check').replaceChildren(...asked.flatMap(at => {
               const label = Object.assign(document.createElement('label'), { textContent: `Word ${at + 1}`, htmlFor: `backup-check-${at}` });

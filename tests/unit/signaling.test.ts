@@ -177,6 +177,14 @@ describe('self-hosted signaling over real HTTP and WebSocket sockets', () => {
             expect(response.headers.get('x-content-type-options')).toBe('nosniff');
             expect(response.headers.get('permissions-policy')).toContain('camera=(self), microphone=(self)');
             expect(await response.text()).not.toBe('');
+            // Revalidated each load: unchanged files answer 304 with the same policies, nothing resent.
+            expect(response.headers.get('cache-control')).toBe('no-cache');
+            const etag = response.headers.get('etag')!;
+            const again = await instance.request(path, { headers: { 'If-None-Match': etag } });
+            expect(again.status).toBe(304);
+            expect(again.headers.get('content-security-policy')).toBe(csp);
+            expect(await again.text()).toBe('');
+            expect((await instance.request(path, { headers: { 'If-None-Match': '"stale"' } })).status).toBe(200);
         }
         for (const path of ['/server.ts', '/.env', '/%2e%2e/server.ts']) expect((await instance.request(path)).status).toBe(404);
     });

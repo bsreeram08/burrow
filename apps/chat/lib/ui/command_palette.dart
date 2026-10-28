@@ -60,9 +60,27 @@ List<PaletteItem> paletteItems(WidgetRef ref) {
             inChat ? router.pushReplacement('/chat/${c.id}') : router.push('/chat/${c.id}');
           },
         ),
-    PaletteItem(id: 'new', title: 'New conversation', subtitle: 'Add a contact by username', icon: Icons.person_add_alt_1_outlined, run: (context) => showNewConversation(context, ref)),
-    PaletteItem(id: 'settings', title: 'Settings', subtitle: 'Read receipts, link previews', icon: Icons.settings_outlined, run: (context) => showChatSettings(context, ref)),
-    PaletteItem(id: 'theme', title: 'Theme…', subtitle: 'Colours, text size, spacing', icon: Icons.palette_outlined, run: (context) => showThemePicker(context, ref)),
+    PaletteItem(
+      id: 'new',
+      title: 'New conversation',
+      subtitle: 'Add a contact by username',
+      icon: Icons.person_add_alt_1_outlined,
+      run: (context) => showNewConversation(context, ref),
+    ),
+    PaletteItem(
+      id: 'settings',
+      title: 'Settings',
+      subtitle: 'Read receipts, link previews',
+      icon: Icons.settings_outlined,
+      run: (context) => showChatSettings(context, ref),
+    ),
+    PaletteItem(
+      id: 'theme',
+      title: 'Theme…',
+      subtitle: 'Colours, text size, spacing',
+      icon: Icons.palette_outlined,
+      run: (context) => showThemePicker(context, ref),
+    ),
     PaletteItem(
       id: 'density',
       title: 'Toggle density',
@@ -80,7 +98,7 @@ Future<void> showCommandPalette(BuildContext context, WidgetRef ref) async {
   final items = paletteItems(ref);
   final picked = await showDialog<PaletteItem>(
     context: context,
-    barrierColor: Colors.black38,
+    barrierColor: Colors.black54,
     builder: (_) => _Palette(items: items, recents: ref.read(paletteRecentsProvider)),
   );
   if (picked == null || !context.mounted) return;
@@ -146,65 +164,74 @@ class _PaletteState extends State<_Palette> {
     final results = _ordered;
     final scheme = Theme.of(context).colorScheme;
     if (_selected >= results.length) _selected = results.isEmpty ? 0 : results.length - 1;
-    return Align(
-      alignment: const Alignment(0, -.5),
-      child: Material(
-        elevation: 12,
-        borderRadius: BorderRadius.circular(16),
-        clipBehavior: Clip.antiAlias,
-        child: ConstrainedBox(
-          constraints: const BoxConstraints(maxWidth: 560, maxHeight: 440),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              CallbackShortcuts(
-                bindings: {
-                  const SingleActivator(LogicalKeyboardKey.arrowDown): () => setState(() => _selected = results.isEmpty ? 0 : (_selected + 1) % results.length),
-                  const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
-                      setState(() => _selected = results.isEmpty ? 0 : (_selected - 1 + results.length) % results.length),
-                },
-                child: TextField(
-                  key: const Key('palette-input'),
-                  controller: _query,
-                  autofocus: true,
-                  decoration: const InputDecoration(
-                    hintText: 'Jump to a chat or run an action',
-                    prefixIcon: Icon(Icons.search),
-                    border: InputBorder.none,
-                    enabledBorder: InputBorder.none,
-                    filled: false,
-                    contentPadding: EdgeInsets.symmetric(vertical: 16),
-                  ),
-                  onChanged: (_) => setState(() => _selected = 0),
-                  onSubmitted: (_) {
-                    if (results.isNotEmpty) Navigator.pop(context, results[_selected]);
-                  },
-                ),
-              ),
-              const Divider(height: 1),
-              Flexible(
-                child: results.isEmpty
-                    ? const Padding(padding: EdgeInsets.all(24), child: Text('Nothing matches. Try a contact name or an action like "theme".'))
-                    : ListView.builder(
-                        shrinkWrap: true,
-                        padding: const EdgeInsets.symmetric(vertical: 6),
-                        itemCount: results.length,
-                        itemBuilder: (context, i) {
-                          final item = results[i];
-                          final recent = widget.recents.contains(item.id) && _query.text.isEmpty;
-                          return ListTile(
-                            dense: true,
-                            selected: i == _selected,
-                            selectedTileColor: scheme.primary.withValues(alpha: .12),
-                            leading: Icon(item.icon),
-                            title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.w600)),
-                            subtitle: item.subtitle == null && !recent ? null : Text([if (recent) 'Recent', ?item.subtitle].join(' · ')),
-                            onTap: () => Navigator.pop(context, item),
-                          );
-                        },
+    // On a phone it sits at the top, inset from the edges and above the keyboard, so it never half-covers the
+    // header behind it; wider screens keep it floating in the upper middle.
+    final phone = MediaQuery.sizeOf(context).width < 600;
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(12, 12, 12, 12 + MediaQuery.viewInsetsOf(context).bottom),
+        child: Align(
+          alignment: phone ? Alignment.topCenter : const Alignment(0, -.5),
+          child: Material(
+            elevation: 12,
+            borderRadius: BorderRadius.circular(16),
+            clipBehavior: Clip.antiAlias,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 560, maxHeight: 440),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CallbackShortcuts(
+                    bindings: {
+                      const SingleActivator(LogicalKeyboardKey.arrowDown): () =>
+                          setState(() => _selected = results.isEmpty ? 0 : (_selected + 1) % results.length),
+                      const SingleActivator(LogicalKeyboardKey.arrowUp): () =>
+                          setState(() => _selected = results.isEmpty ? 0 : (_selected - 1 + results.length) % results.length),
+                    },
+                    child: TextField(
+                      key: const Key('palette-input'),
+                      controller: _query,
+                      autofocus: true,
+                      decoration: const InputDecoration(
+                        hintText: 'Jump to a chat or run an action',
+                        prefixIcon: Icon(Icons.search),
+                        border: InputBorder.none,
+                        enabledBorder: InputBorder.none,
+                        filled: false,
+                        contentPadding: EdgeInsets.symmetric(vertical: 16),
                       ),
+                      onChanged: (_) => setState(() => _selected = 0),
+                      onSubmitted: (_) {
+                        if (results.isNotEmpty) Navigator.pop(context, results[_selected]);
+                      },
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Flexible(
+                    child: results.isEmpty
+                        ? const Padding(padding: EdgeInsets.all(24), child: Text('Nothing matches. Try a contact name or an action like "theme".'))
+                        : ListView.builder(
+                            shrinkWrap: true,
+                            padding: const EdgeInsets.symmetric(vertical: 6),
+                            itemCount: results.length,
+                            itemBuilder: (context, i) {
+                              final item = results[i];
+                              final recent = widget.recents.contains(item.id) && _query.text.isEmpty;
+                              return ListTile(
+                                dense: true,
+                                selected: i == _selected,
+                                selectedTileColor: scheme.primary.withValues(alpha: .12),
+                                leading: Icon(item.icon),
+                                title: Text(item.title, style: const TextStyle(fontWeight: FontWeight.w600)),
+                                subtitle: item.subtitle == null && !recent ? null : Text([if (recent) 'Recent', ?item.subtitle].join(' · ')),
+                                onTap: () => Navigator.pop(context, item),
+                              );
+                            },
+                          ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
         ),
       ),
@@ -226,10 +253,7 @@ class PaletteShortcut extends ConsumerWidget {
     }
 
     return CallbackShortcuts(
-      bindings: {
-        const SingleActivator(LogicalKeyboardKey.keyK, meta: true): open,
-        const SingleActivator(LogicalKeyboardKey.keyK, control: true): open,
-      },
+      bindings: {const SingleActivator(LogicalKeyboardKey.keyK, meta: true): open, const SingleActivator(LogicalKeyboardKey.keyK, control: true): open},
       child: Focus(autofocus: true, child: child),
     );
   }

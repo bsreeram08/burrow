@@ -221,11 +221,16 @@ export function startSignaling(options: SignalingOptions) {
             if (requestOrigin && requestOrigin !== options.origin) return json({ error: 'Origin denied' }, 403);
             if (request.method === 'GET' && ['/', '/app.js', '/account.js', '/devices.js', '/qr.js', '/link.js', '/devicelink.js', '/groups.js', '/alerts.js', '/theme.js', '/commands.js', '/emoji.js', '/emoji-data.json', '/wallpaper-circuit.svg', '/chat-store.js', '/signal.js', '/verify.js', '/markdown.js', '/files.js', '/palette.js', '/core.js', '/core-worker.js', '/vendor/simplewebauthn-browser.js', '/style.css', '/install.js', '/sw.js', '/manifest.webmanifest', '/icon-192.png', '/icon-512.png'].includes(url.pathname)) {
                 const path = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
-                return new Response(Bun.file(new URL(`./public/${path}`, import.meta.url)), { headers: {
+                const file = Bun.file(new URL(`./public/${path}`, import.meta.url));
+                // Revalidated on every load (no-cache), so a deploy shows at once; unchanged files answer 304 instead of resending ~750 KB.
+                const etag = `"${file.size.toString(36)}-${file.lastModified.toString(36)}"`;
+                const headers = {
                     'Content-Security-Policy': PAGE_CSP,
                     'Permissions-Policy': 'camera=(self), microphone=(self), display-capture=()',
-                    'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-store',
-                } });
+                    'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-cache', ETag: etag,
+                };
+                if (request.headers.get('if-none-match') === etag) return new Response(null, { status: 304, headers });
+                return new Response(file, { headers });
             }
             // The WebAssembly messaging core (scripts/build-wasm.ts): content-hashed, so cached immutably; only the
             // manifest that names the current files is revalidated.

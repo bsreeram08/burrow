@@ -118,6 +118,11 @@ suite('KeyPackages', () => {
         expect(over.status).toBe(400);
         expect(over.body.oneTime).toBe(100);
         expect((await a1.api('PUT', '/api/mls/keypackages', { keyPackages: Array(101).fill(more[0]) })).status).toBe(400);
+        // `replace` (a carried-over store): the stored one-time packages go, the new set takes their place.
+        await Bun.sleep(1100);
+        const fresh = a1.client.call({ cmd: 'mlsKeyPackages', count: 3 });
+        expect((await a1.api('PUT', '/api/mls/keypackages', { keyPackages: fresh, replace: true })).body).toMatchObject({ oneTime: 3 });
+        expect(rows('SELECT kp FROM mls_key_packages WHERE device_id = ? AND last_resort = 0', a1.deviceId).map(row => row.kp).sort()).toEqual([...fresh].sort());
     });
 
     test('lifetimes: a KeyPackage is kept until it expires (about 90 days) and then swept', async () => {

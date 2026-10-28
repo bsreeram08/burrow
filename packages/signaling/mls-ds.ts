@@ -145,10 +145,13 @@ export function createKeyPackages(deps: Deps) {
         const aik = deps.aikOf(user.id);
         if (!aik) return json({ error: 'Publish encryption keys first.' }, 409);
         try {
-            const have = oneTime(id!);
+            // `replace`: this device's store changed (a carried-over store), so its stored one-time packages can't be opened.
+            const replace = body?.replace === true;
+            const have = replace ? 0 : oneTime(id!);
             if (have + list.length > ONE_TIME_MAX) return json({ error: `At most ${ONE_TIME_MAX} one-time KeyPackages per device.`, oneTime: have }, 400);
             deps.ds.transaction(call => {
                 pinAccounts(deps, call, [user.id]);
+                if (replace) db.query('DELETE FROM mls_key_packages WHERE device_id = ? AND last_resort = 0').run(id);
                 const check = (kp: string, last: boolean) => {
                     const info = call({ cmd: 'dsKeyPackage', keyPackage: kp }) as { userId: string; deviceId: string; aikSign: string; lastResort: boolean; notAfter: number; notBefore: number };
                     // Bound to this very device and to the account key its signed list chains to.

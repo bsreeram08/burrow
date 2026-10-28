@@ -1,5 +1,6 @@
 // A browser that generated new identity keys (no succession) keeps its groups: it rejoins them under the new key,
-// so its chats keep working and a newly linked device of the other person can still join the DM. Before, the
+// so its chats keep working (also when the new keys dropped its other browser, whose leaf stays behind) and a newly
+// linked device of the other person can still join the DM. Before, the
 // browser started an empty store and its old leaf (old key) blocked every new device from joining.
 // Usage: node tests/browser/key-reset-groups.mjs
 // (Was: Linked devices and DMs on MLS end to end (docs/m5-linking.md), in Chromium against the real server:
@@ -80,6 +81,25 @@ const moved = page => page.evaluate(() => Object.keys(JSON.parse(localStorage.ge
 const dmStates = () => Object.values(JSON.parse(localStorage.getItem(`dm-moved-v1:${window.App.accountId}`) || '{}')).map(value => window.Groups.debug(typeof value === 'string' ? value : value?.channel));
 const diag = page => page.evaluate(dmStates => ({ moved: localStorage.getItem(`dm-moved-v1:${window.App.accountId}`), dms: new Function(`return (${dmStates})()`)(), chat: document.getElementById('chat-status').textContent, banner: document.getElementById('group-banner-text')?.textContent, key: document.getElementById('key-banner-text')?.textContent }), String(dmStates)).catch(error => error.message);
 
+/** Links a fresh browser to `primary`'s account (QR text typed across); returns it once it shows its chats. */
+async function linkBrowser(primary, label) {
+  const page = await person(label, { passkey: false });
+  await page.goto(origin); await visible(page, '#welcome');
+  await page.click('#signin-link'); await visible(page, '#link-qr svg');
+  const qrText = (await page.textContent('#link-code')).replace(/\s+/g, '');
+  await primary.click('#conv-back').catch(() => {});
+  await primary.click('#account-menu summary'); await primary.click('#account-settings');
+  await visible(primary, '#device-link-new'); await primary.click('#device-link-new');
+  await visible(primary, '#link-code-input'); await primary.fill('#link-code-input', qrText);
+  await primary.click('#link-code-submit'); await visible(primary, '#link-confirm'); await primary.click('#link-match');
+  await until(primary, () => /^Linked/.test(document.getElementById('link-status').textContent), undefined, 60000);
+  await primary.click('#link-cancel'); await primary.evaluate(() => { document.getElementById('settings').open = false; });
+  await visible(page, '#chats', 60000);
+  await until(page, () => window.App?.accountId && localStorage.getItem(`linked-store-v1:${window.App.accountId}`), undefined, 60000);
+  return page;
+}
+const dmActive = page => until(page, () => Object.values(JSON.parse(localStorage.getItem(`groups-v1:${window.Groups.instance()}`) || '{}')).some(ch => ch.kind === 'dm' && ch.status === 'active'), undefined, 60000);
+
 try {
   const bootstrap = spawnSync('bun', ['--no-env-file', 'scripts/create-invite.ts'], { cwd: root, env, encoding: 'utf8' });
   const firstInvite = /Invite code: (\S+)/.exec(bootstrap.stdout)?.[1];
@@ -99,9 +119,13 @@ try {
   await say(alice, 'Hello on MLS'); await sees(bob, 'Hello on MLS');
   await until(alice, () => Object.keys(JSON.parse(localStorage.getItem(`dm-moved-v1:${window.App.accountId}`) || '{}')).length === 1);
   step('alice and bob chat in an MLS DM');
+  // alice also has a second browser in the DM: the new keys' list drops it, leaving its leaf behind (as in production).
+  const aliceLaptop = await linkBrowser(alice, 'alice-laptop');
+  await dmActive(aliceLaptop);
+  step('alice\'s second browser joined the DM');
 
   // ---------- alice's browser generates new identity keys: no succession ----------
-  await alice.click('#conv-back');
+  if (await alice.locator('#conv-back').isVisible()) await alice.click('#conv-back');
   await alice.click('#account-menu summary'); await alice.click('#account-settings');
   await alice.locator('#identity-reset').scrollIntoViewIfNeeded(); await alice.click('#identity-reset'); await alice.click('#identity-yes');
   await until(alice, () => /New identity keys are in use/.test(document.getElementById('security-status').textContent));
@@ -112,28 +136,15 @@ try {
   await visible(bob, '#key-banner-review', 60000);
   await bob.click('#key-banner-review'); await visible(bob, '#safety');
   await bob.click('#safety-accept');
-  await until(alice, () => Object.values(JSON.parse(localStorage.getItem(`groups-v1:${window.Groups.instance()}`) || '{}')).some(ch => ch.kind === 'dm' && ch.status === 'active'), undefined, 60000);
+  await dmActive(alice);
   await openDm(alice, 'bob');
   await say(alice, 'After my new keys'); await sees(bob, 'After my new keys', 60000);
   await say(bob, 'Reply to new keys'); await sees(alice, 'Reply to new keys', 60000);
   step('alice\'s browser kept its DM across the new keys: both ways still work');
 
   // ---------- bob links a second browser: it must be able to join the DM ----------
-  const laptop = await person('bob-laptop', { passkey: false });
-  await laptop.goto(origin); await visible(laptop, '#welcome');
-  await laptop.click('#signin-link'); await visible(laptop, '#link-qr svg');
-  const qrText = (await laptop.textContent('#link-code')).replace(/\s+/g, '');
-  await bob.click('#conv-back').catch(() => {});
-  await bob.click('#account-menu summary'); await bob.click('#account-settings');
-  await visible(bob, '#device-link-new'); await bob.click('#device-link-new');
-  await visible(bob, '#link-code-input'); await bob.fill('#link-code-input', qrText);
-  await bob.click('#link-code-submit'); await visible(bob, '#link-confirm'); await bob.click('#link-match');
-  await until(bob, () => /^Linked/.test(document.getElementById('link-status').textContent), undefined, 60000);
-  await bob.click('#link-cancel'); await bob.evaluate(() => { document.getElementById('settings').open = false; });
-  await visible(laptop, '#chats', 60000);
-  await until(laptop, () => window.App?.accountId && localStorage.getItem(`linked-store-v1:${window.App.accountId}`), undefined, 60000);
-  await laptop.waitForTimeout(5000);
-  await until(laptop, () => Object.values(JSON.parse(localStorage.getItem(`groups-v1:${window.Groups.instance()}`) || '{}')).some(ch => ch.kind === 'dm' && ch.status === 'active'), undefined, 60000);
+  const laptop = await linkBrowser(bob, 'bob-laptop');
+  await dmActive(laptop);
   await openDm(alice, 'bob'); await say(alice, 'To all of bob\'s devices');
   await openDm(laptop, 'alice'); await sees(laptop, 'To all of bob\'s devices', 60000);
   step('bob\'s newly linked browser joined the DM and gets alice\'s messages');

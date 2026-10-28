@@ -168,10 +168,11 @@
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
       flushAll();
       ctx.render();
-      for (const [id, ch] of channels) if (ch.resync) enqueue(id, async () => { await resyncInner(id); delete ch.resync; save(); }).catch(error => failed(id, error));
+      const resyncs = [...channels].filter(([, ch]) => ch.resync).map(([id, ch]) => enqueue(id, async () => { await resyncInner(id); delete ch.resync; save(); }).catch(error => failed(id, error)));
       try { localStorage.removeItem(`mls-carried-v1:${instance}`); } catch {}
       // Leaves of removed devices go first: a group holding a device the new key's list dropped refuses other commits.
-      removeOwnStale().catch(() => {}).finally(() => { for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id); });
+      // After a carried store's rejoins, its other devices' old leaves are stale there and go too.
+      Promise.all(resyncs).then(() => removeOwnStale()).catch(() => {}).finally(() => { for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id); });
       ctx.recerts?.(); // Certificates under a new account key: asked for, answered or installed (m5 §5.2.2).
     } catch (error) {
       if (mine !== generation) return;

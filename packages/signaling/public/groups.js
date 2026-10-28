@@ -105,6 +105,28 @@
     });
   }
   let lockedFor = null;
+  /**
+   * This browser's account key changed without a succession or a rotation by this device: its groups live in the
+   * store under the old key, whose leaf key the groups' trees still name. A fresh store could never rejoin them (its
+   * new leaf key can't replace the old leaf, and the old leaf can't commit), so that store comes along: certified
+   * under the new key, every group rejoined (m5 §6), its KeyPackages replaced. Only when the new key's store holds no
+   * working group yet.
+   */
+  function carriedStore(aik) {
+    const prefix = `groups-v1:${me.id}-${deviceId}-`, fresh = `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
+    const working = name => { try { return Object.values(JSON.parse(localStorage.getItem(`groups-v1:${name}`) || '{}')).filter(ch => ch?.status === 'active'); } catch { return []; } };
+    if (working(fresh).length) return null;
+    const earlier = Object.keys(localStorage).filter(key => key.startsWith(prefix) && key !== `groups-v1:${fresh}`).map(key => key.slice('groups-v1:'.length))
+      .map(name => ({ name, last: Math.max(0, ...working(name).map(ch => ch.lastAt || 0)), count: working(name).length })).filter(store => store.count).sort((a, b) => b.last - a.last)[0];
+    if (!earlier) return null;
+    try {
+      localStorage.setItem(`group-instance-v1:${me.id}`, JSON.stringify({ aik, instance: earlier.name }));
+      localStorage.removeItem(`mls-cert-v1:${earlier.name}`); // Certified again below, under the new key, for the same leaf key.
+      localStorage.setItem(`mls-carried-v1:${earlier.name}`, '1');
+      localStorage.setItem(`mls-kp-replace-v1:${earlier.name}`, '1');
+    } catch { return null; }
+    return earlier.name;
+  }
   function stop() {
     generation++; enabled = false; ctx = null; run = null; me = null; currentId = null; channels = new Map(); queues.clear(); pinned.clear();
     for (const timer of cursorTimers.values()) clearTimeout(timer);
@@ -120,9 +142,11 @@
       // One store per (account, device, account key): a new device id or identity starts clean (m4 §9). A primary
       // transfer (m5 §5) keeps the store under the new key: its core adopted the succession.
       const kept = (() => { try { return JSON.parse(localStorage.getItem(`group-instance-v1:${me.id}`) || 'null'); } catch { return null; } })();
-      instance = linked?.instance || (kept?.aik === aik && kept.instance) || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
+      instance = linked?.instance || (kept?.aik === aik && kept.instance) || carriedStore(aik) || `${me.id}-${deviceId}-${aik.slice(0, 12)}`;
       run = window.Core.groupStore(me.id, instance);
       load();
+      // Carried over from an earlier key: every group is rejoined under the new certificate (the old leaf key replaces itself).
+      if (localStorage.getItem(`mls-carried-v1:${instance}`)) { for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.resync = true; persist(); }
       // This device replaced the account key (m6 §6.2): every group gets a self-update with the new certificate.
       if (localStorage.getItem(`mls-recertify-v1:${instance}`)) { for (const ch of channels.values()) if (!['left', 'removed'].includes(ch.status)) ch.recertify = true; persist(); localStorage.removeItem(`mls-recertify-v1:${instance}`); }
       if (linked) await ctx.followOwnSuccession?.().catch(() => {}); // Our account moved to a new primary meanwhile (m5 §5.2 step 6).
@@ -144,6 +168,8 @@
       for (const [id, ch] of channels) if (usable(ch)) enqueue(id, () => syncInner(id)).catch(error => failed(id, error));
       flushAll();
       ctx.render();
+      for (const [id, ch] of channels) if (ch.resync) enqueue(id, async () => { await resyncInner(id); delete ch.resync; save(); }).catch(error => failed(id, error));
+      try { localStorage.removeItem(`mls-carried-v1:${instance}`); } catch {}
       // Leaves of removed devices go first: a group holding a device the new key's list dropped refuses other commits.
       removeOwnStale().catch(() => {}).finally(() => { for (const [id, ch] of channels) if (ch.recertify && usable(ch)) recertify(id); });
       ctx.recerts?.(); // Certificates under a new account key: asked for, answered or installed (m5 §5.2.2).
@@ -203,11 +229,14 @@
   }
   async function topUpNow(count) {
     count ||= await must('/api/mls/keypackages');
-    const want = Math.min(KEYPACKAGES, count.max ?? KEYPACKAGES) - count.oneTime;
-    const body = {};
-    if (count.oneTime < LOW_WATER && want > 0) body.keyPackages = await run({ cmd: 'mlsKeyPackages', count: want });
-    if (!count.lastResort) body.lastResort = (await run({ cmd: 'mlsKeyPackages', count: 1, lastResort: true }))[0];
+    // A carried-over store (carriedStore): the server's packages belong to the store left behind, so all of them go.
+    const replace = localStorage.getItem(`mls-kp-replace-v1:${instance}`) === '1';
+    const want = Math.min(KEYPACKAGES, count.max ?? KEYPACKAGES) - (replace ? 0 : count.oneTime);
+    const body = replace ? { replace: true } : {};
+    if ((replace || count.oneTime < LOW_WATER) && want > 0) body.keyPackages = await run({ cmd: 'mlsKeyPackages', count: want });
+    if (replace || !count.lastResort) body.lastResort = (await run({ cmd: 'mlsKeyPackages', count: 1, lastResort: true }))[0];
     if (body.keyPackages || body.lastResort) await must('/api/mls/keypackages', 'PUT', body);
+    if (replace) try { localStorage.removeItem(`mls-kp-replace-v1:${instance}`); } catch {}
   }
 
   // ---------- Pins (§3) ----------
@@ -334,6 +363,10 @@
     const ch = channels.get(id);
     if (!ch) return;
     ch.status = 'paused'; ch.pausedFor = userId; save(); paint(id);
+    // The 1:1 safety sheet can accept this very code before the group notices it (a moved DM shows only that sheet):
+    // that explicit decision, remembered by contactAccepted, covers it here too. Nothing else does.
+    const earlier = (() => { try { return JSON.parse(localStorage.getItem(acceptedKey(userId)) || 'null'); } catch { return null; } })();
+    if (earlier && ctx?.box) ctx.box.peer(userId).then(theirs => same(earlier, theirs?.identity) && acceptSame(userId, theirs)).then(done => { if (done) pinsChanged(userId); }).catch(() => {});
   }
   /** The user accepted a changed security code (1:1 safety sheet or the group banner): resume what waited for it. */
   /**
@@ -342,9 +375,18 @@
    */
   async function contactAccepted(userId) {
     if (!run || !ctx?.box) return;
-    const [mine, theirs] = await Promise.all([run({ cmd: 'peer', contact: userId }).catch(() => null), ctx.box.peer(userId).catch(() => null)]);
-    if (mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity)) { await run({ cmd: 'acceptChange', contact: userId, identity: theirs.identity }); forgetChange(userId); }
+    const theirs = await ctx.box.peer(userId).catch(() => null);
+    if (theirs && !theirs.blocked) try { localStorage.setItem(acceptedKey(userId), JSON.stringify(theirs.identity)); } catch {}
+    await acceptSame(userId, theirs);
     pinsChanged(userId);
+  }
+  const acceptedKey = userId => `group-accepted-v1:${instance}:${userId}`;
+  /** Accepts in the group store the key the 1:1 pin trusts, if that is exactly the one the group store is waiting on. */
+  async function acceptSame(userId, theirs) {
+    const mine = await run({ cmd: 'peer', contact: userId }).catch(() => null);
+    if (!(mine?.blocked && theirs && !theirs.blocked && same(mine.identity, theirs.identity))) return false;
+    await run({ cmd: 'acceptChange', contact: userId, identity: theirs.identity }); forgetChange(userId);
+    return true;
   }
   function pinsChanged(userId) {
     pinned.delete(userId);

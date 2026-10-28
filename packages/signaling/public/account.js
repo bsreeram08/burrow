@@ -600,6 +600,8 @@
     $('backup-on').hidden = !full || Boolean(state);
     for (const id of ['backup-change-pass', 'backup-new-words', 'backup-off']) $(id).hidden = !full || !state;
     $('device-banner-nobackup').hidden = backupExists;
+    // The chat list asks a device holding the key to set a passphrase, until it's on or put off for a week.
+    $('backup-nudge').hidden = !deviceView || !full || backupExists || readJson(`backup-nudge-later-v1:${me?.id}`, 0) > Date.now();
     // §6.5: a reset asked for without the passphrase waits a week; the account's listed devices may cancel it.
     const reset = deviceView?.reset, listedHere = deviceView?.devices?.find(row => row.current)?.state === 'listed';
     $('reset-cancel').hidden = !reset || !listedHere;
@@ -639,6 +641,8 @@
     deviceNotice = { on: 'Account backup is on. You can now use your account on a new device with your passphrase or recovery key.', pass: 'Your passphrase was changed.', words: 'Your new recovery key is saved. The old one no longer works.', off: 'Account backup is off.' }[mode];
     deviceView = await api(`/api/devices/${me.username}`); renderDevices();
   }
+  $('backup-nudge-on').onclick = () => changeBackup('on').catch(error => say('chats-status', error.message));
+  $('backup-nudge-later').onclick = () => { writeJson(`backup-nudge-later-v1:${me.id}`, Date.now() + 7 * 24 * 3600 * 1000); $('backup-nudge').hidden = true; };
   $('backup-on').onclick = () => changeBackup('on').catch(error => { deviceWarning = error.message; renderDevices(); });
   $('backup-change-pass').onclick = () => changeBackup('pass').catch(error => { deviceWarning = error.message; renderDevices(); });
   $('backup-new-words').onclick = () => changeBackup('words').catch(error => { deviceWarning = error.message; renderDevices(); });

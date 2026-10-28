@@ -289,6 +289,15 @@ body[data-auth="out"][data-state="lobby"] .guest-divider { display: block; }
 body:not([data-auth="in"]) .account-only { display: none !important; }
 .notify-banner { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; align-items: start; border: 1px solid var(--line); background: var(--surface-2); border-radius: var(--radius); padding: 12px 14px; margin-bottom: 12px; }
 .notify-banner[hidden] { display: none; }
+/* A browser that doesn't hold the account's keys yet: one clear setup card instead of an empty chat list. */
+.device-setup { border: 1px solid var(--ok-line); background: var(--surface-2); border-radius: var(--radius); padding: 20px 18px; margin-bottom: 16px; text-align: center; }
+.device-setup[hidden] { display: none; }
+.device-setup > .icon { width: 40px; height: 40px; padding: 8px; border-radius: 12px; background: var(--ok-bg); color: var(--accent); }
+.device-setup h2 { font-size: 20px; margin: 10px 0 6px; }
+.device-setup > p { margin: 0 0 14px; color: var(--muted); font-size: 15px; }
+.device-choices { display: grid; gap: 8px; margin-bottom: 10px; }
+.device-setup .note { margin: 4px 0 8px; font-size: 14px; }
+#chats:has(#device-banner:not([hidden])) :is(#contact-form, #notify-banner, #backup-nudge, .list-section) { display: none !important; }
 .notify-banner .icon { color: var(--accent); margin-top: 2px; }
 .notify-banner p { margin: 0; font-size: 15px; }
 .notify-actions { grid-column: 2; display: flex; gap: 16px; align-items: center; margin-top: 6px; }

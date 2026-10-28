@@ -188,7 +188,7 @@ try {
   for (const credential of credentials) await phone.authenticator.cdp.send('WebAuthn.addCredential', { authenticatorId: phone.authenticator.authenticatorId, credential });
   await phone.goto(origin); await visible(phone, '#welcome'); await phone.click('#signin'); await visible(phone, '#chats');
   await visible(phone, '#device-restore-words');
-  if (!/Use your account here/.test(await phone.textContent('#device-banner-text'))) throw new Error('the restore screen is missing');
+  if (!/Set up this device/.test(await phone.textContent('#device-banner'))) throw new Error('the restore screen is missing');
   await shot(phone, 'restore-screen');
   await phone.click('#device-restore-words'); await visible(phone, '#restore');
   // Each word may be given by its first four letters, in any case and spacing.

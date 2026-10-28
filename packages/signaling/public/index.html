@@ -108,11 +108,22 @@
       <p id="notify-banner-text">Get notified about messages and calls, even when this app is closed.</p>
       <div class="notify-actions"><button id="notify-enable" class="primary" type="button">Turn on</button><button id="notify-dismiss" class="link" type="button">Not now</button></div>
     </div>
-    <div id="device-banner" class="notify-banner" role="alert" hidden>
+    <section id="device-banner" class="device-setup" role="alert" aria-labelledby="device-setup-title" hidden>
       <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="2" width="14" height="20" rx="2"/><path d="M12 18h.01"/></svg>
-      <div><p id="device-banner-text"><strong>Use your account here.</strong> Your messages are end-to-end encrypted. Unlock them on this device with your backup, or link it from a device you already use.</p>
-      <p id="device-banner-nobackup" class="note" hidden>Turn on account backup on one of your devices to sign in without it next time.</p></div>
-      <div class="notify-actions"><button id="device-restore-pass" class="primary" type="button" hidden>Enter your passphrase</button><button id="device-restore-words" type="button" hidden>Use your recovery key</button><button id="device-link-this" type="button" hidden>Link from another device</button><button id="device-recover" class="link" type="button" hidden>I can’t do any of these</button></div>
+      <h2 id="device-setup-title">Set up this device</h2>
+      <p id="device-banner-text">Your messages are end-to-end encrypted: only your own devices hold the keys, not the server. Bring them here in one step.</p>
+      <div class="device-choices">
+        <button id="device-restore-pass" class="primary wide" type="button" hidden>Enter your backup passphrase</button>
+        <button id="device-restore-words" class="wide" type="button" hidden>Use your 24-word recovery key</button>
+        <button id="device-link-this" class="wide" type="button" hidden>Approve from a device you already use</button>
+      </div>
+      <p id="device-banner-nobackup" class="note" hidden>This account has no backup passphrase, so approve this device from one you already use. Turn on backup there, and next time the passphrase alone is enough.</p>
+      <button id="device-recover" class="link" type="button" hidden>I don’t have my other device or passphrase</button>
+    </section>
+    <div id="backup-nudge" class="notify-banner" hidden>
+      <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+      <p><strong>Set a backup passphrase.</strong> Then a new phone or browser signs in with just that passphrase, no other device needed, and losing this one can’t lock you out.</p>
+      <div class="notify-actions"><button id="backup-nudge-on" class="primary" type="button">Set passphrase</button><button id="backup-nudge-later" class="link" type="button">Later</button></div>
     </div>
     <div id="keychange-notice" class="notify-banner" role="alert" hidden>
       <p id="keychange-notice-text"></p>

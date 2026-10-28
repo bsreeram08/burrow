@@ -143,6 +143,26 @@ suite('linking a new device (QR)', () => {
         expect((await call('PUT', '/api/mls/keypackages', { body: { keyPackages: kps }, cookie })).status).toBe(201);
     });
 
+    test('a signed-in pending browser links under the id it announced, for its own account only', async () => {
+        await start();
+        const alice = account('alice'), bob = account('bob'), n = newcomer();
+        run("INSERT INTO devices (id, user_id, platform, state, sig_key, created_at) VALUES (?, ?, 'web', 'pending', ?, ?)", n.deviceId, alice.id, n.deviceKey, clock);
+        // Another key under that id is still refused.
+        const other = newcomer();
+        const forged = { ...other.start(), deviceId: n.deviceId, signature: b64(sign(null, F.startBytes(n.deviceId, 'web', other.deviceKey), other.key)) };
+        expect((await call('POST', '/api/link/start', { body: forged })).status).toBe(409);
+        // Bob's primary can't take it.
+        const stray = await call('POST', '/api/link/start', { body: n.start() });
+        expect(stray.status).toBe(201);
+        const { qr } = n.client.call({ cmd: 'linkQr', linkId: stray.body.linkId, now: clock });
+        const accepted = bob.client.call({ cmd: 'linkAccept', qr, now: clock });
+        expect((await call('POST', `/api/link/${stray.body.linkId}/offer`, { body: { eph: accepted.eph }, cookie: bob.cookie })).status).toBe(403);
+        await call('DELETE', `/api/link/${stray.body.linkId}`, { claim: stray.body.claim });
+        const link = await qrLink(alice, n);
+        await finishLink(alice, n, link);
+        expect(rows('SELECT state FROM devices WHERE id = ?', n.deviceId)[0].state).toBe('listed');
+    });
+
     test('the server relays only to the two parties, in their own direction, with bounds', async () => {
         await start();
         const alice = account('alice'), bob = account('bob'), n = newcomer();

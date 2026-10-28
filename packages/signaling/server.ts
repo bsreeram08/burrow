@@ -229,7 +229,8 @@ export function startSignaling(options: SignalingOptions) {
                     'Permissions-Policy': 'camera=(self), microphone=(self), display-capture=()',
                     'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-cache', ETag: etag,
                 };
-                if (request.headers.get('if-none-match') === etag) return new Response(null, { status: 304, headers });
+                // A compressing proxy (nginx gzip) weakens the tag to W/"…"; the file is the same either way.
+                if (request.headers.get('if-none-match')?.replace(/^W\//, '') === etag) return new Response(null, { status: 304, headers });
                 return new Response(file, { headers });
             }
             // The WebAssembly messaging core (scripts/build-wasm.ts): content-hashed, so cached immutably; only the

@@ -182,6 +182,7 @@ describe('self-hosted signaling over real HTTP and WebSocket sockets', () => {
             const etag = response.headers.get('etag')!;
             const again = await instance.request(path, { headers: { 'If-None-Match': etag } });
             expect(again.status).toBe(304);
+            expect((await instance.request(path, { headers: { 'If-None-Match': `W/${etag}` } })).status).toBe(304);
             expect(again.headers.get('content-security-policy')).toBe(csp);
             expect(await again.text()).toBe('');
             expect((await instance.request(path, { headers: { 'If-None-Match': '"stale"' } })).status).toBe(200);

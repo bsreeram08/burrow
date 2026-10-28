@@ -85,14 +85,19 @@ export function createLink(deps: Deps) {
             // A listed companion asks to become primary: it proves who it is with its session and its registered key.
             if (!user || deps.sessionDevice(user.session) !== body.deviceId || !deps.eligible(user.id, body.deviceId) || deps.sigKey(body.deviceId) !== body.deviceKey) return json({ error: 'Only a listed device of the account can take over as primary.' }, 403);
             userId = user.id; expect = user.id;
-        } else if (db.query('SELECT 1 FROM devices WHERE id = ?').get(body.deviceId)) return json({ error: 'That device id is taken.' }, 409);
+        } else {
+            // A signed-in browser the account doesn't list yet links under the id it announced: same key (the signature above proves it), same account only.
+            const existing = db.query<{ user_id: string; state: string; sig_key: string | null }, [string]>('SELECT user_id, state, sig_key FROM devices WHERE id = ?').get(body.deviceId);
+            if (existing && !(existing.state === 'pending' && existing.sig_key === body.deviceKey)) return json({ error: 'That device id is taken.' }, 409);
+            if (existing) expect = existing.user_id;
+        }
         let code: string | null = null, codeHash: string | null = null;
         if (mode === 'code') {
             if (purpose === 'link') {
                 const name = typeof body.username === 'string' ? body.username.trim().toLowerCase() : '';
                 const owner = db.query<{ id: string }, [string]>('SELECT id FROM users WHERE username = ?').get(name);
                 // Only the named account's primary can complete a code link; not finding it says nothing about the account.
-                expect = owner?.id ?? randomBytes(16).toString('base64url');
+                expect = expect ?? owner?.id ?? randomBytes(16).toString('base64url');
             }
             code = Array.from(randomBytes(8), byte => CODE_ALPHABET[byte % CODE_ALPHABET.length]).join('');
             codeHash = sha(code);
@@ -158,7 +163,8 @@ export function createLink(deps: Deps) {
                 const live_ = db.query<{ n: number }, [string]>("SELECT COUNT(*) AS n FROM devices WHERE user_id = ? AND state NOT IN ('revoked', 'placeholder')").get(user.id)!.n;
                 if (live_ >= MAX_DEVICES) throw Object.assign(new Error('full'), { status: 429 });
                 // The device exists for this account only, with the key it registered, until the primary's list names it.
-                db.query("INSERT INTO devices (id, user_id, platform, state, sig_key, created_at) VALUES (?, ?, ?, 'pending', ?, ?)").run(link.device_id, user.id, link.platform, link.device_key, now());
+                // Already there when a signed-in pending browser started the link (start bound expect_user to its account).
+                db.query("INSERT OR IGNORE INTO devices (id, user_id, platform, state, sig_key, created_at) VALUES (?, ?, ?, 'pending', ?, ?)").run(link.device_id, user.id, link.platform, link.device_key, now());
             }
             db.query("UPDATE link_requests SET state = 'offered', user_id = ?, offer_device_id = ?, eph = ? WHERE id = ?").run(user.id, device, body!.eph, link.id);
         })();

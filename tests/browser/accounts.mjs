@@ -139,7 +139,7 @@ try {
     for (const credential of credentials) await second.authenticator.cdp.send('WebAuthn.addCredential', { authenticatorId: second.authenticator.authenticatorId, credential });
     await second.goto(origin); await visible(second, '#welcome'); await second.click('#signin'); await visible(second, '#chats');
     await visible(second, '#device-banner');
-    if (!/Use your account here/.test(await second.textContent('#device-banner-text')) || await second.locator('#device-link-this').isHidden()) throw new Error('The inactive browser does not offer to unlock or link it');
+    if (!/Set up this device/.test(await second.textContent('#device-banner')) || await second.locator('#device-link-this').isHidden()) throw new Error('The inactive browser does not offer to unlock or link it');
     if (await second.locator('#device-takeover').count()) throw new Error('"Use this device instead" is still offered');
     await alice.waitForFunction(() => document.querySelectorAll('#device-list .device-row[data-state="pending"]').length === 1, null, { timeout: 15000 });
     await alice.locator('.devices-settings').scrollIntoViewIfNeeded(); await shot(alice, 'devices-1-settings');

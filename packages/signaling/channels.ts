@@ -99,7 +99,7 @@ export function createChannels(deps: Deps) {
      * of their account (a certificate-valid leaf for a device the signed list does not name is refused); the kind's
      * user and leaf limits hold. Returns who joined and who left.
      */
-    function mirror(channel: Row, tree: MemberView[], seq: number, before: Set<string> = new Set()) {
+    function mirror(channel: Row, tree: MemberView[], seq: number, leftover: (member: MemberView) => boolean = () => false) {
         const old = new Map(members(channel.id).map(row => [row.device_id, row]));
         const blocked = new Set(db.query<{ device_id: string }, [string]>('SELECT device_id FROM channel_bans WHERE channel_id = ?').all(channel.id).map(row => row.device_id));
         const next = tree.filter(member => !blocked.has(member.deviceId));
@@ -109,9 +109,9 @@ export function createChannels(deps: Deps) {
         for (const member of next) {
             keep.add(member.deviceId);
             if (!old.has(member.deviceId)) {
-                // Already a leaf before this commit, dropped from the mirror when its device was revoked: a stale leaf
-                // that waits for removal, not a new member. Left as it was (no row); only devices this commit adds are checked.
-                if (before.has(member.deviceId)) continue;
+                // A leaf of the committer's own revoked device, already in the tree: its resync can't remove it (an
+                // external commit only replaces its own leaf), so it is left as it was (no row) and removed right after.
+                if (leftover(member)) continue;
                 if (!deps.eligible(member.userId, member.deviceId)) throw new Abort(422, 'A group member is not a device in its owner\'s signed device list.');
                 added.push({ userId: member.userId, deviceId: member.deviceId });
                 db.query('INSERT INTO channel_members (channel_id, device_id, user_id, admin, cursor, joined_seq) VALUES (?, ?, ?, ?, ?, ?)').run(channel.id, member.deviceId, member.userId, member.admin ? 1 : 0, seq, seq);
@@ -215,7 +215,8 @@ export function createChannels(deps: Deps) {
                 // Certificates are checked against pinned account keys: needed for handshakes, not for application messages.
                 if (mode !== 'app') pinAccounts(deps, call, [user.id, ...usersOf(current), ...joinerRows.map(row => row!.user_id)]);
                 const before = mode === 'app' ? null : call({ cmd: 'dsSnapshot', group: channelId }) as string;
-                const leavesBefore = new Set(mode === 'app' ? [] : treeOf(call, channelId).map(member => member.deviceId));
+                // Only an external resync may keep its own account's leftover leaves, and only ones the tree already held.
+                const leavesBefore = new Set(mode === 'external' ? treeOf(call, channelId).filter(member => member.userId === user.id).map(member => member.deviceId) : []);
                 const verdict = call({ cmd: 'dsSubmit', group: channelId, message: text, expect: mode === 'app' ? 'application' : 'commit' }) as { accepted?: { epoch: number; digest: string }; conflict?: { epoch: number } };
                 if (verdict.conflict) return { status: 409, body: { error: 'The group moved on. Fetch the log from your cursor, rebuild and retry.', epoch: verdict.conflict.epoch, seq: channel.seq } };
                 const seq = channel.seq + 1, digest = verdict.accepted!.digest, created = now();
@@ -227,7 +228,7 @@ export function createChannels(deps: Deps) {
                 }
                 const epoch = verdict.accepted!.epoch;
                 const updated: Row = { ...channel, epoch, seq };
-                const change = mirror(updated, treeOf(call, channelId), seq, leavesBefore);
+                const change = mirror(updated, treeOf(call, channelId), seq, member => member.userId === user.id && member.deviceId !== deviceId && leavesBefore.has(member.deviceId));
                 const added = change.added.map(item => item.deviceId).sort();
                 if (mode === 'external') {
                     // An external join adds at most the caller's own device (a resync replaces it in place).
